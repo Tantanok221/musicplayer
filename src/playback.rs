@@ -12,7 +12,7 @@ use rodio::{Decoder, Source};
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -420,9 +420,73 @@ fn send_packet(tx: &Sender<Packet>, mut packet: Packet, clock: &Clock) -> bool {
     }
 }
 
+/// The queue and repeat mode a running decoder follows. The player edits it in
+/// place so repeat, shuffle, and queue additions apply at the next track
+/// boundary without restarting the audible track.
+#[derive(Default)]
+struct Plan {
+    queue: Vec<Arc<Track>>,
+    repeat: RepeatMode,
+    /// Tracks the decoder has started in this epoch, and the latest one.
+    begun: u64,
+    decoding: Option<(usize, String)>,
+    finished: bool,
+}
+impl Plan {
+    fn shared(queue: Vec<Arc<Track>>, repeat: RepeatMode) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            queue,
+            repeat,
+            ..Default::default()
+        }))
+    }
+
+    fn next(&self, index: usize) -> Option<(usize, Arc<Track>)> {
+        let next = match self.repeat {
+            RepeatMode::One => index,
+            _ if index + 1 < self.queue.len() => index + 1,
+            RepeatMode::All => 0,
+            RepeatMode::Off => return None,
+        };
+        self.queue.get(next).map(|track| (next, track.clone()))
+    }
+
+    fn commit(&mut self, index: usize, track: Option<&Arc<Track>>) {
+        match track {
+            Some(track) => {
+                self.begun += 1;
+                self.decoding = Some((index, track.id.clone()));
+            }
+            None => self.finished = true,
+        }
+    }
+
+    /// Applies an edited queue and repeat mode. Returns false when the decoder
+    /// has already moved past the audible track toward a different next track,
+    /// or stopped where the edit now continues, so only a restart can honor it.
+    fn retarget(
+        &mut self,
+        queue: &[Arc<Track>],
+        repeat: RepeatMode,
+        audible: Option<usize>,
+        audible_begun: u64,
+    ) -> bool {
+        self.queue = queue.to_vec();
+        self.repeat = repeat;
+        let expected = audible
+            .and_then(|index| self.next(index))
+            .map(|(index, track)| (index, track.id.clone()));
+        if self.begun > audible_begun.max(1) {
+            self.decoding == expected
+        } else {
+            !self.finished || expected.is_none()
+        }
+    }
+}
+
 struct DecodeRequest {
     listen_id: u64,
-    queue: Vec<Arc<Track>>,
+    plan: Arc<Mutex<Plan>>,
     index: usize,
     position: f64,
     prefs: Preferences,
@@ -438,7 +502,7 @@ fn decode_queue(
 ) {
     let DecodeRequest {
         mut listen_id,
-        queue,
+        plan,
         mut index,
         mut position,
         prefs,
@@ -450,20 +514,24 @@ fn decode_queue(
         tokio::task::JoinHandle<Result<StreamDownload<TempStorageProvider>>>,
     > = None;
     let mut final_format = None;
-    loop {
+    let mut current = {
+        let mut plan = plan.lock().unwrap();
+        let track = plan.queue.get(index).cloned();
+        plan.commit(index, track.as_ref());
+        track
+    };
+    while let Some(track) = current.take() {
         if clock.epoch.load(Ordering::Acquire) != epoch {
             return;
         }
-        let Some(track) = queue.get(index) else {
-            break;
-        };
+        let next = plan.lock().unwrap().next(index);
         let source_result = if let Some(task) = prefetched.take() {
             runtime
                 .block_on(task)
                 .map_err(anyhow::Error::from)
                 .and_then(|v| v)
         } else {
-            runtime.block_on(stream(&server, track))
+            runtime.block_on(stream(&server, &track))
         };
         let decoded = source_result.and_then(|source| decoder(source, &track.suffix));
         let mut decoded = match decoded {
@@ -479,15 +547,8 @@ fn decode_queue(
             let _ = errors.send((epoch, format!("Could not seek this track: {error}")));
             return;
         }
-        let next = match prefs.repeat {
-            RepeatMode::One => Some(index),
-            _ if index + 1 < queue.len() => Some(index + 1),
-            RepeatMode::All => Some(0),
-            _ => None,
-        };
-        if let Some(next) = next {
+        if let Some((_, track)) = next.clone() {
             let server = server.clone();
-            let track = queue[next].clone();
             prefetched = Some(runtime.spawn(async move { stream(&server, &track).await }));
         }
         let listen = Arc::new(AudibleListen {
@@ -533,11 +594,26 @@ fn decode_queue(
             first = false;
         }
         position = 0.;
-        if let Some(next) = next {
+        // Choosing and recording the next track under one lock lets the player
+        // tell whether an edit arrived before or after this decision.
+        let planned = {
+            let mut plan = plan.lock().unwrap();
+            let planned = plan.next(index);
+            plan.commit(
+                planned.as_ref().map_or(index, |(next, _)| *next),
+                planned.as_ref().map(|(_, track)| track),
+            );
+            planned
+        };
+        if planned.as_ref().map(|(_, track)| &track.id) != next.as_ref().map(|(_, track)| &track.id)
+            && let Some(task) = prefetched.take()
+        {
+            task.abort();
+        }
+        if let Some((next, track)) = planned {
             listen_id = rand::random();
             index = next;
-        } else {
-            break;
+            current = Some(track);
         }
     }
     if let Some(format) = final_format {
@@ -648,6 +724,8 @@ fn run(
     let mut listen_seed = None;
     let mut last_tick = Instant::now();
     let mut started = false;
+    let mut plan = Plan::shared(Vec::new(), RepeatMode::Off);
+    let mut plan_boundary = 0;
     let mut pending_output: Option<(Packet, Instant)> = None;
     let mut media = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
         dbus_name: "sonora",
@@ -663,6 +741,18 @@ fn run(
         });
     }
     let position = |clock: &Clock| clock.position();
+    // Re-plans the running decoder; true when the stream must restart instead.
+    let replan = |plan: &Mutex<Plan>,
+                  queue: &[Arc<Track>],
+                  repeat: RepeatMode,
+                  index: Option<usize>,
+                  plan_boundary: u64| {
+        let audible_begun = clock.boundary.load(Ordering::Acquire) - plan_boundary;
+        !plan
+            .lock()
+            .unwrap()
+            .retarget(queue, repeat, index, audible_begun)
+    };
     loop {
         let mut batch = VecDeque::new();
         // Media keys and UI commands wake immediately. A paused player only checks
@@ -818,23 +908,19 @@ fn run(
                     started = false;
                 }
                 PlayerCommand::Append(tracks) => {
-                    base_position = if started {
-                        position(&clock)
-                    } else {
-                        base_position
-                    };
                     queue.extend(tracks);
-                    restart = started;
+                    if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
+                        base_position = position(&clock);
+                        restart = true;
+                    }
                 }
                 PlayerCommand::PlayNext(tracks) => {
-                    base_position = if started {
-                        position(&clock)
-                    } else {
-                        base_position
-                    };
                     let at = index.map_or(0, |i| i + 1);
                     queue.splice(at..at, tracks);
-                    restart = started;
+                    if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
+                        base_position = position(&clock);
+                        restart = true;
+                    }
                 }
                 PlayerCommand::Remove(at) => {
                     if at < queue.len() {
@@ -930,24 +1016,23 @@ fn run(
                     }
                 }
                 PlayerCommand::Preferences(value) => {
-                    let rebuffer = prefs.gain != value.gain || prefs.repeat != value.repeat;
-                    if !prefs.shuffle && value.shuffle {
-                        base_position = if started {
-                            position(&clock)
-                        } else {
-                            base_position
-                        };
-                        if let Some(i) = index {
-                            queue[i + 1..].shuffle(&mut rand::rng());
-                        }
-                        restart = started;
+                    let regain = prefs.gain != value.gain;
+                    let shuffled = !prefs.shuffle && value.shuffle;
+                    let replanned = shuffled || prefs.repeat != value.repeat;
+                    if shuffled && let Some(i) = index {
+                        queue[i + 1..].shuffle(&mut rand::rng());
+                        queue_dirty = true;
                     }
                     prefs = value;
                     clock.volume.store(
                         (prefs.volume.clamp(0., 1.) as f64).to_bits(),
                         Ordering::Relaxed,
                     );
-                    if rebuffer && started {
+                    if started
+                        && (regain
+                            || (replanned
+                                && replan(&plan, &queue, prefs.repeat, index, plan_boundary)))
+                    {
                         base_position = position(&clock);
                         restart = true;
                     }
@@ -979,9 +1064,11 @@ fn run(
             drop(output.take());
             output_id = default_output_id();
             if let (Some(at), Some(server), true) = (index, server.clone(), output_id.is_some()) {
+                plan = Plan::shared(queue.clone(), prefs.repeat);
+                plan_boundary = clock.boundary.load(Ordering::Acquire);
                 let request = DecodeRequest {
                     listen_id: *listen_seed.get_or_insert_with(rand::random),
-                    queue: queue.clone(),
+                    plan: plan.clone(),
                     index: at,
                     position: base_position,
                     prefs: prefs.clone(),
@@ -1268,7 +1355,7 @@ mod tests {
         clock.epoch.store(1, Ordering::Release);
         let request = DecodeRequest {
             listen_id: 1,
-            queue,
+            plan: Plan::shared(queue, RepeatMode::Off),
             index: 0,
             position: 0.,
             prefs: Preferences {
@@ -1380,11 +1467,14 @@ mod tests {
         clock.epoch.store(1, Ordering::Release);
         let request = DecodeRequest {
             listen_id: 1,
-            queue: vec![Arc::new(Track {
-                id: "unsupported".into(),
-                suffix: "flac".into(),
-                ..Default::default()
-            })],
+            plan: Plan::shared(
+                vec![Arc::new(Track {
+                    id: "unsupported".into(),
+                    suffix: "flac".into(),
+                    ..Default::default()
+                })],
+                RepeatMode::Off,
+            ),
             index: 0,
             position: 0.,
             prefs: Preferences::default(),
@@ -1412,6 +1502,55 @@ mod tests {
         assert!(pcm.try_recv().is_err());
         http.abort();
     }
+    fn tracks(count: usize) -> Vec<Arc<Track>> {
+        (0..count)
+            .map(|index| {
+                Arc::new(Track {
+                    id: index.to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_edits_apply_at_the_next_boundary_without_restarting() {
+        let queue = tracks(3);
+        let plan = Plan::shared(queue.clone(), RepeatMode::Off);
+        let mut plan = plan.lock().unwrap();
+        plan.commit(1, queue.get(1));
+        assert_eq!(plan.next(1).map(|(i, _)| i), Some(2));
+        // Still decoding the audible track: any edit is picked up later.
+        assert!(plan.retarget(&queue, RepeatMode::One, Some(1), 0));
+        assert_eq!(plan.next(1).map(|(i, _)| i), Some(1));
+        let mut reordered = queue.clone();
+        reordered.swap(1, 2);
+        assert!(plan.retarget(&reordered, RepeatMode::Off, Some(1), 1));
+        assert_eq!(plan.next(1).map(|(_, t)| t.id.clone()), Some("1".into()));
+    }
+
+    #[test]
+    fn plan_requires_restart_only_when_decoder_already_chose_differently() {
+        let queue = tracks(3);
+        let plan = Plan::shared(queue.clone(), RepeatMode::Off);
+        let mut plan = plan.lock().unwrap();
+        plan.commit(1, queue.get(1));
+        plan.commit(2, queue.get(2));
+        // The decoder is ahead on track 2 while track 1 is audible.
+        assert!(plan.retarget(&queue, RepeatMode::All, Some(1), 1));
+        assert!(!plan.retarget(&queue, RepeatMode::One, Some(1), 1));
+        // Once track 2 is audible, the same edit waits for its end.
+        assert!(plan.retarget(&queue, RepeatMode::One, Some(2), 2));
+
+        let plan = Plan::shared(queue.clone(), RepeatMode::Off);
+        let mut plan = plan.lock().unwrap();
+        plan.commit(2, queue.get(2));
+        plan.commit(2, None);
+        // The decoder stopped after the last track; repeat needs a new stream.
+        assert!(!plan.retarget(&queue, RepeatMode::All, Some(2), 1));
+        assert!(plan.retarget(&queue, RepeatMode::Off, Some(2), 1));
+    }
+
     #[test]
     fn listened_time_counts_only_consumed_samples_including_partial_packets() {
         let clock = Arc::new(Clock::default());

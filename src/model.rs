@@ -294,7 +294,7 @@ pub enum GainMode {
     #[default]
     Album,
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum RepeatMode {
     #[default]
     Off,
