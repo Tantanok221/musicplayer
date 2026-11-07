@@ -1003,10 +1003,17 @@ impl MusicApp {
     }
     fn art(&mut self, id: &str, side: f32, cx: &App) -> AnyElement {
         if let Some(path) = self.artwork.get(id) {
-            return img(path.clone())
-                .image_cache(&self.image_cache)
+            return div()
                 .size(px(side))
-                .object_fit(ObjectFit::Cover)
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(
+                    img(path.clone())
+                        .image_cache(&self.image_cache)
+                        .size_full()
+                        .aspect_square()
+                        .object_fit(ObjectFit::Cover),
+                )
                 .into_any_element();
         }
         if !id.is_empty() && self.art_requested.insert(id.into()) {
