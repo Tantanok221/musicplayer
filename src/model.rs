@@ -273,7 +273,7 @@ pub enum Sort {
     Format,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct LibraryQuery {
     pub text: String,

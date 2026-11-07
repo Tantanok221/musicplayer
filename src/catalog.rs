@@ -665,29 +665,41 @@ impl Catalog {
             .map(|row| Ok(serde_json::from_str(&row.get::<_, String>(0)?)?))
             .transpose()
     }
+    /// Uses primary-key lookups and the cached navigator index; a full track scan
+    /// per similar artist made the page wait over a second on large libraries.
     pub fn hydrate_artist_profile(&self, profile: &mut ArtistProfile) -> Result<()> {
-        let owned = self
-            .artist_tracks(&profile.name, &profile.id)?
-            .into_iter()
-            .map(|track| track.id.clone())
-            .collect::<HashSet<_>>();
         let mut seen = HashSet::new();
         let ids = profile
             .popular
             .iter()
-            .filter(|track| owned.contains(&track.id) && seen.insert(track.id.clone()))
-            .take(10)
+            .filter(|track| seen.insert(track.id.clone()))
             .map(|track| track.id.clone())
             .collect::<Vec<_>>();
-        profile.popular = self.by_ids(&ids)?;
+        let mut popular = self.by_ids(&ids)?;
+        popular.truncate(10);
+        profile.popular = popular;
         let mut names = HashSet::new();
         profile.similar.retain(|similar| {
             normalize(&similar.name) != normalize(&profile.name)
                 && names.insert(normalize(&similar.name))
         });
         profile.similar.truncate(12);
+        if profile.similar.is_empty() {
+            return Ok(());
+        }
+        let navigator = self.facets()?.navigator;
+        let credits = navigator.artists.iter().chain(&navigator.album_artists);
+        let mut owned_names = HashSet::new();
+        let mut owned_ids = HashSet::new();
+        for facet in credits {
+            owned_names.insert(normalize(&facet.label));
+            if !facet.detail.is_empty() {
+                owned_ids.insert(facet.detail.as_str());
+            }
+        }
         for similar in &mut profile.similar {
-            similar.in_library = !self.artist_tracks(&similar.name, &similar.id)?.is_empty();
+            similar.in_library = owned_names.contains(&normalize(&similar.name))
+                || (!similar.id.is_empty() && owned_ids.contains(similar.id.as_str()));
         }
         Ok(())
     }

@@ -36,6 +36,7 @@ actions!(
         OpenSettings,
         FocusSearch,
         GoBack,
+        GoForward,
         Refresh,
         ToggleNavigator,
         ToggleNavigatorAutoHide,
@@ -51,9 +52,37 @@ actions!(
 
 const POPULAR_PER_ALBUM: usize = 3;
 
+/// A page Back and Forward can return to.
+#[derive(Clone, PartialEq)]
+struct Location {
+    workspace: Workspace,
+    artist: Option<(String, String)>,
+    query: LibraryQuery,
+}
+const HISTORY_LIMIT: usize = 50;
+
 /// Clicking the current rating clears it; any other star sets that rating.
 fn rating_after_click(rating: u8, clicked: u8) -> u8 {
     if clicked == rating { 0 } else { clicked }
+}
+
+const ARTIST_SONG_COLUMN_MIN: f32 = 300.;
+
+/// Wrapped line count of the artist biography at its 11px system font size.
+fn biography_lines(text: &str, width: f32, cx: &App) -> usize {
+    if width <= 0. {
+        return 0;
+    }
+    let mut wrapper = cx
+        .text_system()
+        .line_wrapper(font(".AppleSystemUIFont"), px(11.));
+    text.lines()
+        .map(|line| {
+            1 + wrapper
+                .wrap_line(&[LineFragment::text(line)], px(width), Default::default())
+                .count()
+        })
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +247,9 @@ pub struct MusicApp {
     rating_hover: Option<(String, u8)>,
     information_width: f32,
     navigator_peek: Option<Task<()>>,
+    history_back: Vec<Location>,
+    history_forward: Vec<Location>,
+    restoring_location: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl MusicApp {
@@ -385,6 +417,9 @@ impl MusicApp {
             rating_hover: None,
             information_width: 300.,
             navigator_peek: None,
+            history_back: vec![],
+            history_forward: vec![],
+            restoring_location: false,
             _subscriptions: subscriptions,
         }
     }
@@ -705,12 +740,79 @@ impl MusicApp {
         self.save_preferences();
         cx.notify();
     }
+    fn location(&self) -> Location {
+        Location {
+            workspace: self.workspace,
+            artist: self
+                .artist_name
+                .clone()
+                .map(|name| (name, self.artist_id.clone())),
+            query: if self.workspace == Workspace::Explorer {
+                self.query.clone()
+            } else {
+                LibraryQuery::default()
+            },
+        }
+    }
+    /// Record the current page before navigating away from it.
+    fn remember_location(&mut self) {
+        if self.restoring_location {
+            return;
+        }
+        let location = self.location();
+        if self.history_back.last() != Some(&location) {
+            self.history_back.push(location);
+            if self.history_back.len() > HISTORY_LIMIT {
+                self.history_back.remove(0);
+            }
+        }
+        self.history_forward.clear();
+    }
+    fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(location) = self.history_back.pop() {
+            self.history_forward.push(self.location());
+            self.restore_location(location, window, cx);
+        }
+    }
+    fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(location) = self.history_forward.pop() {
+            self.history_back.push(self.location());
+            self.restore_location(location, window, cx);
+        }
+    }
+    fn restore_location(
+        &mut self,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restoring_location = true;
+        if let Some((name, id)) = location.artist {
+            self.open_artist(name, id, window, cx);
+        } else {
+            self.switch_workspace(location.workspace, window, cx);
+            if location.workspace == Workspace::Explorer {
+                self.search_text = location.query.text.clone();
+                self.search.update(cx, |input, cx| {
+                    input.set_value(self.search_text.clone(), window, cx)
+                });
+                self.explorer_query = location.query.clone();
+                self.query = location.query;
+                self.request_query(cx);
+            }
+        }
+        self.restoring_location = false;
+        cx.notify();
+    }
     fn switch_workspace(
         &mut self,
         workspace: Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if workspace != self.workspace || self.artist_name.is_some() {
+            self.remember_location();
+        }
         if self.workspace == Workspace::Explorer {
             self.explorer_query = self.query.clone();
         }
@@ -857,6 +959,7 @@ impl MusicApp {
         if name.trim().is_empty() {
             return;
         }
+        self.remember_location();
         let origin = if self.artist_name.is_some() {
             self.artist_origin
         } else {
@@ -888,6 +991,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_location();
         self.switch_workspace(Workspace::Explorer, window, cx);
         self.query = filter.query();
         self.explorer_query = self.query.clone();
@@ -1226,6 +1330,24 @@ impl MusicApp {
             .child(
                 // The transparent macOS title bar places traffic lights in this area.
                 div().w(px(78.)).h_full().flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(2.))
+                    .pr_2()
+                    .child(
+                        short_button("history-back", Glyph::ChevronLeft, "Back")
+                            .disabled(self.history_back.is_empty())
+                            .on_click(cx.listener(|app, _, window, cx| app.go_back(window, cx))),
+                    )
+                    .child(
+                        short_button("history-forward", Glyph::ChevronRight, "Forward")
+                            .disabled(self.history_forward.is_empty())
+                            .on_click(cx.listener(|app, _, window, cx| app.go_forward(window, cx))),
+                    ),
             )
             .child(tabs)
             .child(
@@ -2520,13 +2642,12 @@ impl MusicApp {
                 .child(title),
         );
         if tracks.is_empty() {
-            section = section.child(div().text_size(px(11.)).text_color(colors.muted).child(
-                if personal {
-                    "No plays recorded yet."
-                } else {
-                    "Popular songs are unavailable from Navidrome."
-                },
-            ));
+            section = section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .child("No plays recorded yet."),
+            );
         }
         for (i, track) in tracks
             .iter()
@@ -2697,23 +2818,12 @@ impl MusicApp {
             .min_w_0()
             .overflow_y_scroll()
             .p_4();
-        page = page.child(
-            Button::new("artist-back")
-                .ghost()
-                .small()
-                .icon(Glyph::ChevronLeft)
-                .label("Back")
-                .on_click(cx.listener(|app, _, window, cx| {
-                    let origin = app.artist_origin;
-                    app.switch_workspace(origin, window, cx);
-                })),
-        );
         let Some(albums) = self.artist_albums.clone() else {
             return page
-                .child(div().mt_4().child("Loading artist releases…"))
+                .child(div().child("Loading artist releases…"))
                 .into_any_element();
         };
-        let mut hero = div().my_4().flex().items_center().gap_4();
+        let mut hero = div().mb_4().flex().items_center().gap_4();
         let fallback = albums
             .first()
             .map(|album| album.cover_art.as_str())
@@ -2752,29 +2862,42 @@ impl MusicApp {
         );
         if let Some(profile) = &profile {
             if !profile.biography.is_empty() {
+                let overflows = self.biography_expanded
+                    || biography_lines(&profile.biography, self.library_width - 32., cx) > 3;
                 page = page
                     .child(
+                        // A distinct id per state: text keeps its measured layout across
+                        // frames, so removing the clamp alone leaves three lines.
                         div()
+                            .id(if self.biography_expanded {
+                                "artist-bio-full"
+                            } else {
+                                "artist-bio-clamped"
+                            })
                             .mb_1()
                             .text_size(px(11.))
                             .text_color(colors.muted)
-                            .when(!self.biography_expanded, |text| text.line_clamp(3))
+                            .when(!self.biography_expanded, |text| {
+                                text.line_clamp(3).text_ellipsis()
+                            })
                             .child(profile.biography.clone()),
                     )
-                    .child(
-                        Button::new("artist-bio-more")
-                            .ghost()
-                            .small()
-                            .label(if self.biography_expanded {
-                                "Show less"
-                            } else {
-                                "Read more"
-                            })
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.biography_expanded = !app.biography_expanded;
-                                cx.notify();
-                            })),
-                    );
+                    .when(overflows, |page| {
+                        page.child(
+                            Button::new("artist-bio-more")
+                                .ghost()
+                                .small()
+                                .label(if self.biography_expanded {
+                                    "Show less"
+                                } else {
+                                    "Read more"
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.biography_expanded = !app.biography_expanded;
+                                    cx.notify();
+                                })),
+                        )
+                    });
             }
             if let Some(url) = profile_url(&profile.url) {
                 page = page.child(
@@ -2809,18 +2932,28 @@ impl MusicApp {
             .as_ref()
             .map(|profile| profile.popular.clone())
             .unwrap_or_default();
-        let top = self.artist_song_section("Popular songs", popular, false, cx);
-        let personal = self.artist_song_section("Your most played", data.most_played, true, cx);
-        page = page.child(
+        let column = |section: AnyElement| {
             div()
-                .mt_4()
-                .flex()
-                .gap_4()
-                .min_w_0()
-                .flex_col()
-                .child(top)
-                .child(personal),
-        );
+                .flex_1()
+                .min_w(px(ARTIST_SONG_COLUMN_MIN))
+                .child(section)
+        };
+        let mut songs = div().mt_4().flex().flex_wrap().gap_4().min_w_0();
+        if !popular.is_empty() {
+            songs = songs.child(column(self.artist_song_section(
+                "Popular songs",
+                popular,
+                false,
+                cx,
+            )));
+        }
+        songs = songs.child(column(self.artist_song_section(
+            "Your most played",
+            data.most_played,
+            true,
+            cx,
+        )));
+        page = page.child(songs);
         if albums.is_empty() {
             let similar = self.similar_artists(profile.clone(), cx);
             return page
@@ -4968,9 +5101,15 @@ impl Render for MusicApp {
                 app.search.read(cx).focus_handle(cx).focus(window, cx)
             }))
             .on_action(cx.listener(|app, _: &Refresh, _, _| app.service.send(Command::Refresh)))
+            .on_action(cx.listener(|app, _: &GoForward, window, cx| {
+                app.go_forward(window, cx);
+                app.focus.focus(window, cx);
+            }))
             .on_action(cx.listener(|app, _: &GoBack, window, cx| {
                 if app.settings {
                     app.settings = false;
+                } else if !app.history_back.is_empty() {
+                    app.go_back(window, cx);
                 } else if app.artist_name.is_some() {
                     let origin = app.artist_origin;
                     app.switch_workspace(origin, window, cx);

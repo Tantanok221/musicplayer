@@ -38,6 +38,7 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-right", NextTrack, Some("Sonora")),
             KeyBinding::new("cmd-left", PreviousTrack, Some("Sonora")),
             KeyBinding::new("cmd-[", GoBack, Some("Sonora")),
+            KeyBinding::new("cmd-]", GoForward, Some("Sonora")),
             KeyBinding::new("cmd-1", ExplorerWorkspace, Some("Sonora")),
             KeyBinding::new("cmd-2", QueueWorkspace, Some("Sonora")),
             KeyBinding::new("cmd-3", PlaylistsWorkspace, Some("Sonora")),
@@ -70,6 +71,9 @@ fn main() -> Result<()> {
             menu(
                 "View",
                 vec![
+                    MenuItem::action("Back", GoBack),
+                    MenuItem::action("Forward", GoForward),
+                    MenuItem::separator(),
                     MenuItem::action("Music Explorer", ExplorerWorkspace),
                     MenuItem::action("Queue", QueueWorkspace),
                     MenuItem::action("Now Playing", PlayingWorkspace),

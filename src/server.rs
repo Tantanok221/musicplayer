@@ -302,17 +302,19 @@ impl Server {
         if !full {
             return Ok(profile);
         }
-        if let Ok(info) = self
-            .request(
-                "getArtistInfo2",
-                &[
-                    ("id", id.clone()),
-                    ("count", "12".into()),
-                    ("includeNotPresent", "true".into()),
-                ],
-            )
-            .await
-        {
+        let info_params = [
+            ("id", id.clone()),
+            ("count", "12".into()),
+            ("includeNotPresent", "true".into()),
+        ];
+        let (info, popular) = tokio::join!(
+            self.request("getArtistInfo2", &info_params),
+            self.top_songs(name, &id)
+        );
+        if let Ok(popular) = popular {
+            profile.popular = popular;
+        }
+        if let Ok(info) = info {
             let info = &info["artistInfo2"];
             profile.complete = true;
             profile.biography = plain_biography(info["biography"].as_str().unwrap_or_default());
@@ -351,9 +353,6 @@ impl Server {
                     })
                 })
                 .collect();
-        }
-        if let Ok(popular) = self.top_songs(name, &id).await {
-            profile.popular = popular;
         }
         Ok(profile)
     }
