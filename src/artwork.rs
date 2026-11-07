@@ -72,6 +72,23 @@ impl ArtworkQueue {
         self.pending.push_back(id.into());
         false
     }
+    pub fn next_retry(&self, now: Instant) -> Option<Duration> {
+        if self
+            .requests
+            .values()
+            .filter(|request| request.in_flight)
+            .count()
+            >= MAX_IN_FLIGHT
+        {
+            return None;
+        }
+        self.pending
+            .iter()
+            .filter_map(|id| self.requests.get(id))
+            .filter(|request| !request.in_flight && request.attempts < MAX_ATTEMPTS)
+            .map(|request| request.ready_at.saturating_duration_since(now))
+            .min()
+    }
     pub fn retry_failed(&mut self, now: Instant) {
         for (id, request) in &mut self.requests {
             if !request.in_flight {
@@ -88,6 +105,21 @@ impl ArtworkQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_queue_has_no_timer_and_backoff_uses_its_deadline() {
+        let mut queue = ArtworkQueue::default();
+        let now = Instant::now();
+        assert_eq!(queue.next_retry(now), None);
+        queue.request("cover".into(), now);
+        assert_eq!(queue.next_retry(now), Some(Duration::ZERO));
+        queue.take_ready(now);
+        assert_eq!(queue.next_retry(now), None);
+        queue.finished("cover", false, now);
+        assert_eq!(queue.next_retry(now), Some(Duration::from_secs(2)));
+        queue.take_ready(now + Duration::from_secs(2));
+        queue.finished("cover", true, now);
+        assert_eq!(queue.next_retry(now), None);
+    }
     #[test]
     fn pending_requests_survive_the_connection_wait_and_are_deduplicated() {
         let mut queue = ArtworkQueue::default();

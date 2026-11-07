@@ -1,6 +1,8 @@
+pub mod artists;
 pub mod artwork;
 pub mod browser;
 pub mod catalog;
+pub mod listening;
 pub mod lyrics;
 pub mod model;
 pub mod platform;

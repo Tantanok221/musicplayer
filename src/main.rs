@@ -1,3 +1,4 @@
+mod artwork_cache;
 mod ui;
 use anyhow::Result;
 use gpui_kit::component::{Theme, ThemeMode};

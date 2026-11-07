@@ -1,9 +1,11 @@
 use crate::{
+    artists::{ArtistPageData, ArtistProfile},
     browser::{BrowserView, Facet, NavigatorView},
+    listening::ListenReport,
     model::*,
 };
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     cell::RefCell,
@@ -121,6 +123,8 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS albums_name ON albums(name);
             CREATE INDEX IF NOT EXISTS albums_artist ON albums(artist);
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS artist_profiles (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS listen_submissions (id TEXT PRIMARY KEY, track_id TEXT NOT NULL, started_ms INTEGER NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS track_search USING fts5(search, content='tracks', content_rowid='rowid', tokenize='trigram');
             CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
@@ -596,6 +600,158 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
+    pub fn artist_tracks(&self, name: &str, id: &str) -> Result<Vec<Arc<Track>>> {
+        let mut statement = self.conn.prepare("SELECT data FROM tracks WHERE artist_matches(artist,?1) OR artist_matches(album_artist,?1)
+            OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?1) OR (?2!='' AND json_extract(a.value,'$.id')=?2))
+            OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?1) OR (?2!='' AND json_extract(a.value,'$.id')=?2))")?;
+        statement
+            .query_map(params![name, id], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
+            .collect()
+    }
+    pub fn artist_page(&self, name: &str, id: &str) -> Result<ArtistPageData> {
+        let albums = self.artist_releases(name, id)?;
+        let artist_tracks = self.artist_tracks(name, id)?;
+        let mut most_played = artist_tracks.clone();
+        most_played.retain(|track| track.play_count.unwrap_or(0) > 0);
+        most_played.sort_by(|a, b| {
+            b.play_count
+                .unwrap_or(0)
+                .cmp(&a.play_count.unwrap_or(0))
+                .then_with(|| normalize(&a.title).cmp(&normalize(&b.title)))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        most_played.truncate(10);
+        let release_ids = albums
+            .iter()
+            .map(|album| album.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut counts = BTreeMap::<String, (String, HashSet<String>)>::new();
+        for (album_id, genres) in albums
+            .iter()
+            .map(|album| (album.id.as_str(), album.genre.clone()))
+            .chain(
+                artist_tracks
+                    .iter()
+                    .filter(|track| release_ids.contains(track.album_id.as_str()))
+                    .map(|track| (track.album_id.as_str(), track.genres_label())),
+            )
+        {
+            for genre in genres.split(" · ").filter(|genre| !genre.is_empty()) {
+                counts
+                    .entry(normalize(genre))
+                    .or_insert_with(|| (genre.into(), HashSet::new()))
+                    .1
+                    .insert(album_id.into());
+            }
+        }
+        let mut genres = counts
+            .into_values()
+            .map(|(name, albums)| (name, albums.len()))
+            .collect::<Vec<_>>();
+        genres.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(ArtistPageData {
+            albums,
+            most_played,
+            genres: genres.into_iter().take(5).map(|item| item.0).collect(),
+        })
+    }
+    pub fn artist_profile(&self, key: &str) -> Result<Option<ArtistProfile>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT data FROM artist_profiles WHERE key=?")?;
+        let mut rows = statement.query([key])?;
+        rows.next()?
+            .map(|row| Ok(serde_json::from_str(&row.get::<_, String>(0)?)?))
+            .transpose()
+    }
+    pub fn hydrate_artist_profile(&self, profile: &mut ArtistProfile) -> Result<()> {
+        let owned = self
+            .artist_tracks(&profile.name, &profile.id)?
+            .into_iter()
+            .map(|track| track.id.clone())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let ids = profile
+            .popular
+            .iter()
+            .filter(|track| owned.contains(&track.id) && seen.insert(track.id.clone()))
+            .take(10)
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        profile.popular = self.by_ids(&ids)?;
+        let mut names = HashSet::new();
+        profile.similar.retain(|similar| {
+            normalize(&similar.name) != normalize(&profile.name)
+                && names.insert(normalize(&similar.name))
+        });
+        profile.similar.truncate(12);
+        for similar in &mut profile.similar {
+            similar.in_library = !self.artist_tracks(&similar.name, &similar.id)?.is_empty();
+        }
+        Ok(())
+    }
+    pub fn invalidate_artist_profiles(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE artist_profiles SET data=json_set(data,'$.fetched_ms',0)",
+            [],
+        )?;
+        Ok(())
+    }
+    pub fn save_artist_profile(&self, key: &str, profile: &ArtistProfile) -> Result<()> {
+        self.conn.execute("INSERT INTO artist_profiles(key,data) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET data=excluded.data", params![key, serde_json::to_string(profile)?])?;
+        Ok(())
+    }
+    pub fn queue_scrobble(&self, report: &ListenReport) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO listen_submissions(id,track_id,started_ms,state) VALUES(?1,?2,?3,'pending')", params![report.id.to_string(), report.track_id, report.started_ms])?;
+        Ok(())
+    }
+    pub fn pending_scrobbles(&self, account: &str) -> Result<Vec<ListenReport>> {
+        let mut statement = self.conn.prepare("SELECT id,track_id,started_ms FROM listen_submissions WHERE state='pending' ORDER BY started_ms,id")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(ListenReport {
+                    id: row.get::<_, String>(0)?.parse().unwrap_or_default(),
+                    account: account.into(),
+                    track_id: row.get(1)?,
+                    started_ms: row.get(2)?,
+                    submission: true,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn attempt_scrobble(&self, id: u64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE listen_submissions SET state='attempted' WHERE id=? AND state='pending'",
+            [id.to_string()],
+        )? == 1)
+    }
+    pub fn finish_scrobble(&self, id: u64, confirmed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE listen_submissions SET state=?1 WHERE id=?2",
+            params![
+                if confirmed { "confirmed" } else { "uncertain" },
+                id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn refresh_play_count(&self, fresh: &Track) -> Result<Option<Arc<Track>>> {
+        let Some(old) = self.by_ids(std::slice::from_ref(&fresh.id))?.pop() else {
+            return Ok(None);
+        };
+        let mut track = (*old).clone();
+        track.play_count = fresh.play_count;
+        self.conn.execute(
+            "UPDATE tracks SET plays=?1,data=?2 WHERE id=?3",
+            params![
+                track.play_count.unwrap_or(0),
+                serde_json::to_string(&track)?,
+                track.id
+            ],
+        )?;
+        Ok(Some(Arc::new(track)))
+    }
     pub fn album_queue_from(&self, track_id: &str) -> Result<Vec<Arc<Track>>> {
         let Some(track) = self.by_ids(&[track_id.into()])?.into_iter().next() else {
             anyhow::bail!("This track is no longer in the library. Refresh and try again.");
@@ -650,6 +806,55 @@ impl Catalog {
         }
         tx.commit()?;
         *self.facets.borrow_mut() = None;
+        Ok(())
+    }
+    /// Refresh metadata while retaining previously downloaded offline songs.
+    pub fn save_playlist_summaries(
+        &mut self,
+        playlists: &[Playlist],
+        complete: bool,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for playlist in playlists {
+            let mut metadata = serde_json::to_value(playlist)?;
+            metadata.as_object_mut().unwrap().remove("entry");
+            tx.execute("INSERT INTO playlists(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=json_patch(playlists.data,excluded.data)", params![playlist.id, metadata.to_string()])?;
+        }
+        if complete {
+            let ids = playlists
+                .iter()
+                .map(|playlist| &playlist.id)
+                .collect::<Vec<_>>();
+            tx.execute(
+                "DELETE FROM playlists WHERE id NOT IN (SELECT value FROM json_each(?1))",
+                [serde_json::to_string(&ids)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Sidebar metadata never needs to deserialize every playlist's songs.
+    pub fn playlist_summaries(&self) -> Result<Vec<Playlist>> {
+        self.conn
+            .prepare("SELECT json_remove(data, '$.entry') FROM playlists ORDER BY json_extract(data,'$.name') COLLATE NOCASE")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect()
+    }
+    pub fn playlist(&self, id: &str) -> Result<Option<Playlist>> {
+        self.conn
+            .query_row("SELECT data FROM playlists WHERE id=?", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+    pub fn save_playlist(&self, playlist: &Playlist) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO playlists VALUES(?1,?2)",
+            params![playlist.id, serde_json::to_string(playlist)?],
+        )?;
         Ok(())
     }
     pub fn playlists(&self) -> Result<Vec<Playlist>> {

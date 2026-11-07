@@ -246,7 +246,7 @@ pub struct Playlist {
     pub song_count: u32,
     pub duration: f64,
     pub cover_art: String,
-    pub entry: Vec<Track>,
+    pub entry: Arc<Vec<Arc<Track>>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -326,6 +326,8 @@ impl Default for Preferences {
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SavedQueue {
+    #[serde(default)]
+    pub listen: Option<crate::listening::ListenSession>,
     pub ids: Vec<TrackId>,
     pub index: Option<usize>,
     pub position: f64,
@@ -339,7 +341,7 @@ pub struct PlaybackSnapshot {
     pub position: f64,
     pub duration: f64,
     pub index: Option<usize>,
-    pub queue: Vec<Arc<Track>>,
+    pub queue: Arc<Vec<Arc<Track>>>,
     pub error: Option<String>,
 }
 

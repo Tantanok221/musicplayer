@@ -1,6 +1,8 @@
 use crate::{
+    artists::{ArtistPageData, ArtistProfile, cache_key},
     artwork::ArtworkQueue,
     catalog::{Catalog, LibraryView},
+    listening::ListenReport,
     lyrics::Lyrics,
     model::*,
     platform::{Account, Paths},
@@ -10,13 +12,13 @@ use crate::{
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const SIGN_IN_NOTICE: &str =
@@ -39,7 +41,10 @@ pub enum Command {
     Query(u64, LibraryQuery),
     Page(u64, LibraryQuery, usize),
     Album(String),
-    Artist(String, String),
+    Artist(u64, String, String),
+    ArtistProfile(String, String, bool),
+    ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
+    ScrobbleFinished(String, u64, Result<Option<Arc<Track>>, String>),
     GroupTracks(u64, LibraryQuery, String),
     PlayTrack(String),
     Playlist(String),
@@ -54,7 +59,7 @@ pub enum Command {
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(SavedQueue),
-    Scrobble(String, bool),
+    Scrobble(ListenReport),
     Connected(Server, String),
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
@@ -74,7 +79,8 @@ pub enum Event {
     View(u64, LibraryView),
     Page(u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
-    Artist(String, Vec<Arc<Album>>),
+    Artist(u64, ArtistPageData),
+    ArtistProfile(String, Arc<ArtistProfile>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
@@ -118,8 +124,8 @@ impl Service {
                         PlayerEvent::Persist(queue) => {
                             let _ = command_tx.send(Command::Persist(queue));
                         }
-                        PlayerEvent::Scrobble(id, submission) => {
-                            let _ = command_tx.send(Command::Scrobble(id, submission));
+                        PlayerEvent::Scrobble(report) => {
+                            let _ = command_tx.send(Command::Scrobble(report));
                         }
                         PlayerEvent::Error(error) => {
                             let _ = event_tx.send(Event::Error(error));
@@ -180,8 +186,7 @@ fn begin_sync(
                     let _=events.send(Event::Status(format!("Syncing {} · {offset:} indexed",if kind=="song"{"tracks"}else{"albums"})));
                 }
             }
-            let mut playlists=server.playlists().await?;
-            for playlist in &mut playlists{*playlist=server.playlist(&playlist.id).await?;}
+            let playlists=server.playlists().await?;
             let scanning_after=server.scan_status().await?;
             Ok((playlists,!scanning_before&&!scanning_after))
         }.await;
@@ -211,9 +216,10 @@ fn run(
         catalog.by_ids(&queue.ids)?,
         queue.index.unwrap_or(0),
         queue.position,
+        queue.listen,
     ));
     events.send(Event::Ready(account.clone(), prefs))?;
-    events.send(Event::Playlists(catalog.playlists()?))?;
+    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     events.send(Event::Status(
         if account.is_some() {
             "Cached library · connecting…"
@@ -261,6 +267,9 @@ fn run(
     let mut current_request = 0;
     let mut failed_generations = HashSet::new();
     let mut artwork_queue = ArtworkQueue::default();
+    let mut profile_requests = HashSet::new();
+    let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
+    let mut submission_requests = HashSet::new();
     let mut published = 0;
     loop {
         if let Some(server) = server.clone() {
@@ -278,7 +287,55 @@ fn run(
                 });
             }
         }
-        let command = match rx.recv_timeout(Duration::from_millis(200)) {
+        if let Some(server) = server.clone() {
+            while profile_requests.len() < 4 {
+                let Some((name, id, full)) = profile_pending.pop_front() else {
+                    break;
+                };
+                let key = cache_key(&name, &id);
+                let namespace = server.account.namespace();
+                if !profile_requests.insert((namespace.clone(), key.clone(), full)) {
+                    continue;
+                }
+                let tx = tx.clone();
+                let server = server.clone();
+                runtime.spawn(async move {
+                    let result = server.artist_profile(&name, &id, full).await.map_err(|_| {
+                        "Artist information is unavailable from Navidrome.".to_string()
+                    });
+                    let _ = tx.send(Command::ArtistProfileLoaded(namespace, key, full, result));
+                });
+            }
+        }
+        if let Some(server) = server.clone() {
+            for report in catalog
+                .pending_scrobbles(&server.account.namespace())?
+                .into_iter()
+                .take(4_usize.saturating_sub(submission_requests.len()))
+            {
+                if catalog.attempt_scrobble(report.id)? {
+                    submission_requests.insert((report.account.clone(), report.id));
+                    let tx = tx.clone();
+                    let server = server.clone();
+                    runtime.spawn(async move {
+                        let result = match server.scrobble(&report.track_id, true, report.started_ms).await {
+                            Ok(()) => Ok(server.song(&report.track_id).await.ok().map(Arc::new)),
+                            Err(_) => Err("Play confirmation was lost or rejected. It will not be sent again automatically to avoid duplicates.".into()),
+                        };
+                        let _ = tx.send(Command::ScrobbleFinished(report.account, report.id, result));
+                    });
+                }
+            }
+        }
+        // Completed requests wake this actor; only artwork backoff needs a timer.
+        let retry = server
+            .as_ref()
+            .and_then(|_| artwork_queue.next_retry(Instant::now()));
+        let received = match retry {
+            Some(wait) => rx.recv_timeout(wait),
+            None => rx.recv().map_err(|_| flume::RecvTimeoutError::Disconnected),
+        };
+        let command = match received {
             Ok(c) => c,
             Err(flume::RecvTimeoutError::Timeout) => continue,
             Err(flume::RecvTimeoutError::Disconnected) => break,
@@ -297,7 +354,7 @@ fn run(
             match command {
                 Command::Initialize => {
                     events.send(Event::Ready(account.clone(), catalog.state("preferences")?))?;
-                    events.send(Event::Playlists(catalog.playlists()?))?;
+                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                     if let Some(account) = &account {
                         match paths.credentials(account) {
                             Ok(Some(_)) => {}
@@ -340,6 +397,7 @@ fn run(
                             );
                         }
                         artwork_queue = ArtworkQueue::default();
+                        profile_pending.clear();
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
                         let prefs: Preferences = catalog.state("preferences")?;
                         player.send(PlayerCommand::Preferences(prefs.clone()));
@@ -348,6 +406,7 @@ fn run(
                             catalog.by_ids(&queue.ids)?,
                             queue.index.unwrap_or(0),
                             queue.position,
+                            queue.listen,
                         ));
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
                     }
@@ -365,6 +424,7 @@ fn run(
                     }
                 }
                 Command::Refresh => {
+                    catalog.invalidate_artist_profiles()?;
                     artwork_queue.retry_failed(Instant::now());
                     events.send(Event::ArtworkRetrying)?;
                     if let Some(server) = server.clone() {
@@ -409,9 +469,9 @@ fn run(
                         if can_delete {
                             catalog.finish_sync(generation)?;
                         }
-                        catalog.save_playlists(&playlists)?;
+                        catalog.save_playlist_summaries(&playlists, can_delete)?;
                         syncing = false;
-                        events.send(Event::Playlists(playlists))?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                         events.send(Event::Status(if can_delete {
                             format!("Up to date · {} tracks", catalog.count()?)
@@ -464,14 +524,87 @@ fn run(
                         });
                     }
                 }
-                Command::Artist(name, id) => {
-                    events.send(Event::Artist(
-                        name.clone(),
-                        catalog.artist_releases(&name, &id)?,
-                    ))?;
+                Command::Artist(request, name, id) => {
+                    events.send(Event::Artist(request, catalog.artist_page(&name, &id)?))?;
+                    let _ = tx.send(Command::ArtistProfile(name, id, true));
+                }
+                Command::ArtistProfile(name, id, full) => {
+                    let key = cache_key(&name, &id);
+                    let mut cached = catalog.artist_profile(&key)?;
+                    if let Some(profile) = &mut cached {
+                        catalog.hydrate_artist_profile(profile)?;
+                    }
+                    if let Some(profile) = &cached {
+                        events
+                            .send(Event::ArtistProfile(key.clone(), Arc::new(profile.clone())))?;
+                    }
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let fresh = cached
+                        .as_ref()
+                        .is_some_and(|profile| profile.fresh(full, now));
+                    if !fresh && server.is_some() {
+                        let namespace =
+                            account.as_ref().map(Account::namespace).unwrap_or_default();
+                        if !profile_requests.contains(&(namespace, key.clone(), full))
+                            && !profile_pending.iter().any(
+                                |(pending_name, pending_id, pending_full)| {
+                                    cache_key(pending_name, pending_id) == key
+                                        && (*pending_full || !full)
+                                },
+                            )
+                        {
+                            if full {
+                                profile_pending.push_front((name, id, full));
+                            } else {
+                                profile_pending.push_back((name, id, full));
+                            }
+                        }
+                    } else if cached.is_none() && server.is_none() {
+                        events.send(Event::ArtistProfile(
+                            key,
+                            Arc::new(ArtistProfile {
+                                name,
+                                ..Default::default()
+                            }),
+                        ))?;
+                    }
+                }
+                Command::ArtistProfileLoaded(namespace, key, full, result) => {
+                    profile_requests.remove(&(namespace.clone(), key.clone(), full));
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        let previous = catalog.artist_profile(&key)?;
+                        let mut profile = result.unwrap_or_else(|_| ArtistProfile {
+                            fetched_ms: chrono::Utc::now().timestamp_millis(),
+                            ..Default::default()
+                        });
+                        if !profile.complete
+                            && let Some(old) = previous
+                        {
+                            if profile.name.is_empty() {
+                                profile.name = old.name;
+                            }
+                            if profile.id.is_empty() {
+                                profile.id = old.id;
+                            }
+                            if profile.portrait.is_empty() {
+                                profile.portrait = old.portrait;
+                            }
+                            profile.biography = old.biography;
+                            profile.similar = old.similar;
+                            profile.popular = old.popular;
+                            profile.url = old.url;
+                            if old.complete {
+                                profile.complete = true;
+                                profile.fetched_ms = old.fetched_ms;
+                            }
+                        }
+                        catalog.hydrate_artist_profile(&mut profile)?;
+                        catalog.save_artist_profile(&key, &profile)?;
+                        events.send(Event::ArtistProfile(key, Arc::new(profile)))?;
+                    }
                 }
                 Command::Playlist(id) => {
-                    if let Some(playlist) = catalog.playlists()?.into_iter().find(|p| p.id == id) {
+                    if let Some(playlist) = catalog.playlist(&id)? {
                         events.send(Event::Playlist(playlist))?;
                     }
                     if let Some(server) = server.clone() {
@@ -491,19 +624,13 @@ fn run(
                     }
                 }
                 Command::PlaylistsLoaded(playlists) => {
-                    catalog.save_playlists(&playlists)?;
-                    events.send(Event::Playlists(playlists))?;
+                    catalog.save_playlist_summaries(&playlists, true)?;
+                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                 }
                 Command::PlaylistLoaded(playlist) => {
-                    let mut playlists = catalog.playlists()?;
-                    if let Some(existing) = playlists.iter_mut().find(|p| p.id == playlist.id) {
-                        *existing = playlist.clone();
-                    } else {
-                        playlists.push(playlist.clone());
-                    }
-                    catalog.save_playlists(&playlists)?;
+                    catalog.save_playlist(&playlist)?;
                     events.send(Event::Playlist(playlist))?;
-                    events.send(Event::Playlists(playlists))?;
+                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                 }
                 Command::Lyrics(track) => {
                     // Older cache entries contain flattened text with timing discarded.
@@ -591,16 +718,35 @@ fn run(
                     player.send(PlayerCommand::Preferences(prefs));
                 }
                 Command::Persist(queue) => catalog.set_state("queue", &queue)?,
-                Command::Scrobble(id, submission) => {
-                    if let Some(server) = server.clone() {
-                        let events = events.clone();
-                        runtime.spawn(async move {
-                            if let Err(error) = server.scrobble(&id, submission).await {
-                                let _ = events.send(Event::Error(format!(
-                                    "Playback history was not saved: {error:#}"
-                                )));
+                Command::Scrobble(report) => {
+                    if account.as_ref().map(Account::namespace) == Some(report.account.clone()) {
+                        if report.submission {
+                            catalog.queue_scrobble(&report)?;
+                        } else if let Some(server) = server.clone() {
+                            runtime.spawn(async move {
+                                let _ = server
+                                    .scrobble(&report.track_id, false, report.started_ms)
+                                    .await;
+                            });
+                        }
+                    }
+                }
+                Command::ScrobbleFinished(namespace, id, result) => {
+                    submission_requests.remove(&(namespace.clone(), id));
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        catalog.finish_scrobble(id, result.is_ok())?;
+                        match result {
+                            Ok(Some(fresh)) => {
+                                if let Some(track) = catalog.refresh_play_count(&fresh)? {
+                                    player.send(PlayerCommand::UpdateTrack(track.clone()));
+                                    events.send(Event::TrackUpdated(track))?;
+                                }
                             }
-                        });
+                            Ok(None) => {}
+                            Err(message) => {
+                                events.send(Event::Error(message))?;
+                            }
+                        }
                     }
                 }
                 Command::Mutate(mutation) => {
@@ -660,7 +806,28 @@ fn run(
                         _ => {
                             if let Some(server) = server.clone() {
                                 let tx = tx.clone();
-                                runtime.spawn(async move{match server.playlists().await{Ok(mut playlists)=>{let mut error=None;for playlist in &mut playlists{match server.playlist(&playlist.id).await{Ok(detail)=>*playlist=detail,Err(e)=>{error=Some(e);break;}}}if let Some(error)=error{let _=tx.send(Command::Error(format!("Saved, but could not refresh playlists: {error:#}")));}else{let _=tx.send(Command::PlaylistsLoaded(playlists));}}Err(error)=>{let _=tx.send(Command::Error(format!("Saved, but could not refresh playlists: {error:#}")));}}});
+                                let changed_id = match mutation {
+                                    Mutation::ReplacePlaylist(id, _)
+                                    | Mutation::RenamePlaylist(id, _) => Some(id),
+                                    _ => None,
+                                };
+                                runtime.spawn(async move {
+                                    let result = async {
+                                        let playlists = server.playlists().await?;
+                                        let _ = tx.send(Command::PlaylistsLoaded(playlists));
+                                        if let Some(id) = changed_id {
+                                            let playlist = server.playlist(&id).await?;
+                                            let _ = tx.send(Command::PlaylistLoaded(playlist));
+                                        }
+                                        Ok::<_, anyhow::Error>(())
+                                    }
+                                    .await;
+                                    if let Err(error) = result {
+                                        let _ = tx.send(Command::Error(format!(
+                                            "Saved, but could not refresh playlists: {error:#}"
+                                        )));
+                                    }
+                                });
                             }
                         }
                     }

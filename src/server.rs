@@ -1,4 +1,5 @@
 use crate::{
+    artists::{ArtistProfile, SimilarArtist, plain_biography, profile_url},
     lyrics::Lyrics,
     model::*,
     platform::{Account, ServerCredentials},
@@ -55,6 +56,7 @@ impl Server {
             account,
             credentials,
             http: reqwest::Client::builder()
+                .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(60))
                 .build()?,
@@ -233,13 +235,131 @@ impl Server {
         .await?;
         Ok(())
     }
-    pub async fn scrobble(&self, id: &str, submission: bool) -> Result<()> {
+    pub async fn scrobble(&self, id: &str, submission: bool, started_ms: i64) -> Result<()> {
         self.request(
             "scrobble",
-            &[("id", id.into()), ("submission", submission.to_string())],
+            &[
+                ("id", id.into()),
+                ("submission", submission.to_string()),
+                ("time", started_ms.to_string()),
+            ],
         )
         .await?;
         Ok(())
+    }
+    pub async fn song(&self, id: &str) -> Result<Track> {
+        self.value("getSong", &[("id", id.into())], "song").await
+    }
+    pub async fn artist_profile(&self, name: &str, id: &str, full: bool) -> Result<ArtistProfile> {
+        let mut artist = None;
+        if !id.is_empty()
+            && id != "-1"
+            && let Ok(value) = self.request("getArtist", &[("id", id.into())]).await
+            && normalize(value["artist"]["name"].as_str().unwrap_or_default()) == normalize(name)
+        {
+            artist = Some(value["artist"].clone());
+        }
+        if artist.is_none() {
+            let value = self
+                .request(
+                    "search3",
+                    &[
+                        ("query", name.into()),
+                        ("artistCount", "500".into()),
+                        ("albumCount", "0".into()),
+                        ("songCount", "0".into()),
+                    ],
+                )
+                .await?;
+            artist = value["searchResult3"]["artist"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| {
+                            normalize(item["name"].as_str().unwrap_or_default()) == normalize(name)
+                        })
+                        .cloned()
+                });
+        }
+        let artist = artist.context("No individual artist profile is available on the server")?;
+        let id = artist["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && *id != "-1")
+            .context("Artist ID unavailable")?
+            .to_string();
+        let mut profile = ArtistProfile {
+            name: name.into(),
+            id: id.clone(),
+            fetched_ms: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
+        profile.portrait = artist["coverArt"].as_str().unwrap_or_default().into();
+        if profile.portrait.is_empty() {
+            profile.portrait = image_key(artist["artistImageUrl"].as_str().unwrap_or_default());
+        }
+        if !full {
+            return Ok(profile);
+        }
+        if let Ok(info) = self
+            .request(
+                "getArtistInfo2",
+                &[
+                    ("id", id.clone()),
+                    ("count", "12".into()),
+                    ("includeNotPresent", "true".into()),
+                ],
+            )
+            .await
+        {
+            let info = &info["artistInfo2"];
+            profile.complete = true;
+            profile.biography = plain_biography(info["biography"].as_str().unwrap_or_default());
+            profile.url =
+                profile_url(info["lastFmUrl"].as_str().unwrap_or_default()).unwrap_or_default();
+            for field in ["largeImageUrl", "mediumImageUrl", "smallImageUrl"] {
+                let key = image_key(info[field].as_str().unwrap_or_default());
+                if !key.is_empty() {
+                    profile.portrait = key;
+                    break;
+                }
+            }
+            profile.similar = info["similarArtist"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    let name = item["name"].as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let portrait = item["coverArt"].as_str().unwrap_or_default();
+                    Some(SimilarArtist {
+                        name: name.into(),
+                        id: item["id"]
+                            .as_str()
+                            .filter(|id| *id != "-1")
+                            .unwrap_or_default()
+                            .into(),
+                        portrait: if portrait.is_empty() {
+                            image_key(item["artistImageUrl"].as_str().unwrap_or_default())
+                        } else {
+                            portrait.into()
+                        },
+                        in_library: false,
+                    })
+                })
+                .collect();
+        }
+        let mut params = vec![("artist", name.into()), ("count", "50".into())];
+        if self.extensions.contains("topSongsByArtistId") {
+            params.push(("id", id));
+        }
+        if let Ok(value) = self.request("getTopSongs", &params).await {
+            profile.popular =
+                serde_json::from_value(value["topSongs"]["song"].clone()).unwrap_or_default();
+        }
+        Ok(profile)
     }
     pub async fn lyrics(&self, track: &Track) -> Result<Lyrics> {
         if let Ok(response) = self
@@ -280,7 +400,18 @@ impl Server {
         }
         let response = self
             .http
-            .get(self.url("getCoverArt", &[("id", id.into()), ("size", "512".into())])?)
+            .get(if let Some(remote) = id.strip_prefix("remote:") {
+                let url = Url::parse(remote).context("Invalid artist image")?;
+                anyhow::ensure!(
+                    matches!(url.scheme(), "https" | "http")
+                        && url.username().is_empty()
+                        && url.password().is_none(),
+                    "Invalid artist image"
+                );
+                url
+            } else {
+                self.url("getCoverArt", &[("id", id.into()), ("size", "512".into())])?
+            })
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Artwork request failed: {}", e.without_url()))?;
@@ -318,4 +449,18 @@ impl Server {
         }
         Ok(path)
     }
+}
+
+fn image_key(value: &str) -> String {
+    let Ok(url) = Url::parse(value) else {
+        return String::new();
+    };
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || value.contains("2a96cbd8b46e442fc41c2b86b821562f")
+    {
+        return String::new();
+    }
+    format!("remote:{url}")
 }

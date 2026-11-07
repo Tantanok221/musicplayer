@@ -165,6 +165,7 @@ fn filters_pagination_order_and_saved_state_survive_reopen() {
                 .all(|t| t.artist == "青葉市子" && t.year == Some(2016))
         );
         let queue = SavedQueue {
+            listen: None,
             ids: vec!["test-0".into(), "test-1".into()],
             index: Some(1),
             position: 42.,
@@ -204,4 +205,67 @@ fn test_tracks(count: usize) -> Vec<Track> {
             ..Default::default()
         })
         .collect()
+}
+
+#[test]
+fn playlist_summaries_leave_offline_songs_in_the_catalog() {
+    let mut catalog = Catalog::memory().unwrap();
+    let playlist = Playlist {
+        id: "large".into(),
+        name: "Library".into(),
+        song_count: 1000,
+        entry: std::sync::Arc::new(
+            (0..1000)
+                .map(|i| std::sync::Arc::new(sample(&i.to_string(), "Song")))
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    catalog.save_playlists(&[playlist]).unwrap();
+    let summaries = catalog.playlist_summaries().unwrap();
+    assert_eq!(summaries[0].song_count, 1000);
+    assert!(summaries[0].entry.is_empty());
+    let mut full = catalog.playlist("large").unwrap().unwrap();
+    assert_eq!(full.entry.len(), 1000);
+    full.name = "Renamed".into();
+    catalog.save_playlist(&full).unwrap();
+    assert_eq!(catalog.playlist_summaries().unwrap()[0].name, "Renamed");
+    assert_eq!(
+        catalog.playlist("large").unwrap().unwrap().entry.len(),
+        1000
+    );
+    assert!(catalog.playlist("missing").unwrap().is_none());
+}
+
+#[test]
+fn summary_refresh_keeps_cached_songs_and_only_reconciles_complete_lists() {
+    let mut catalog = Catalog::memory().unwrap();
+    let existing = Playlist {
+        id: "kept".into(),
+        name: "Old name".into(),
+        entry: std::sync::Arc::new(vec![std::sync::Arc::new(sample("song", "Offline song"))]),
+        ..Default::default()
+    };
+    let missing = Playlist {
+        id: "missing".into(),
+        ..Default::default()
+    };
+    catalog.save_playlists(&[existing, missing]).unwrap();
+    let summary = Playlist {
+        id: "kept".into(),
+        name: "New name".into(),
+        song_count: 2,
+        ..Default::default()
+    };
+    catalog
+        .save_playlist_summaries(std::slice::from_ref(&summary), false)
+        .unwrap();
+    let cached = catalog.playlist("kept").unwrap().unwrap();
+    assert_eq!(cached.name, "New name");
+    assert_eq!(cached.song_count, 2);
+    assert_eq!(cached.entry[0].title, "Offline song");
+    assert!(catalog.playlist("missing").unwrap().is_some());
+    catalog.save_playlist_summaries(&[summary], true).unwrap();
+    assert!(catalog.playlist("missing").unwrap().is_none());
+    assert_eq!(catalog.playlist("kept").unwrap().unwrap().entry.len(), 1);
 }

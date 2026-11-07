@@ -10,6 +10,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 use sonora::{
+    artists::{ArtistPageData, ArtistProfile, cache_key, lastfm_url, profile_url},
     browser::*,
     catalog::LibraryView,
     lyrics::Lyrics,
@@ -127,6 +128,7 @@ fn technical(track: &Track) -> String {
 
 pub struct MusicApp {
     service: Service,
+    image_cache: Entity<crate::artwork_cache::ArtworkCache>,
     workspace: Workspace,
     view: LibraryView,
     query: LibraryQuery,
@@ -172,6 +174,14 @@ pub struct MusicApp {
     lyrics_follow: Option<(String, Option<usize>)>,
     lyrics_scroll_motion: Option<(Instant, f32, f32)>,
     artist_name: Option<String>,
+    artist_id: String,
+    artist_request: u64,
+    artist_data: Option<ArtistPageData>,
+    artist_profiles: HashMap<String, Arc<ArtistProfile>>,
+    profile_requested: HashSet<String>,
+    biography_expanded: bool,
+    popular_expanded: bool,
+    most_played_expanded: bool,
     artist_albums: Option<Vec<Arc<Album>>>,
     artist_origin: Workspace,
     highlight_album: Option<(String, Vec<Arc<Track>>)>,
@@ -275,8 +285,10 @@ impl MusicApp {
         let request = service.query(query.clone());
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let image_cache = crate::artwork_cache::ArtworkCache::new(cx);
         Self {
             service,
+            image_cache,
             workspace: Workspace::Explorer,
             view: LibraryView::default(),
             query: query.clone(),
@@ -322,6 +334,14 @@ impl MusicApp {
             lyrics_follow: None,
             lyrics_scroll_motion: None,
             artist_name: None,
+            artist_id: String::new(),
+            artist_request: 0,
+            artist_data: None,
+            artist_profiles: HashMap::new(),
+            profile_requested: HashSet::new(),
+            biography_expanded: false,
+            popular_expanded: false,
+            most_played_expanded: false,
             artist_albums: None,
             artist_origin: Workspace::Explorer,
             highlight_album: None,
@@ -371,6 +391,9 @@ impl MusicApp {
                     .is_some_and(|old| old.namespace() != account.namespace())
                 {
                     self.artwork.clear();
+                    self.artist_profiles.clear();
+                    self.profile_requested.clear();
+                    self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
                 }
@@ -390,6 +413,14 @@ impl MusicApp {
             }
             Event::View(request, view) => {
                 if request == self.request {
+                    if let Some(name) = &self.artist_name {
+                        self.service.send(Command::Artist(
+                            self.artist_request,
+                            name.clone(),
+                            self.artist_id.clone(),
+                        ));
+                    }
+
                     let ids = view
                         .albums
                         .iter()
@@ -439,10 +470,14 @@ impl MusicApp {
                     }
                 }
             }
-            Event::Artist(name, albums) => {
-                if self.artist_name.as_ref() == Some(&name) {
-                    self.artist_albums = Some(albums);
+            Event::Artist(request, data) => {
+                if self.artist_name.is_some() && self.artist_request == request {
+                    self.artist_albums = Some(data.albums.clone());
+                    self.artist_data = Some(data);
                 }
+            }
+            Event::ArtistProfile(key, profile) => {
+                self.artist_profiles.insert(key, profile);
             }
             Event::Album(id, tracks) => {
                 if self.highlight_requested.as_ref() == Some(&id) {
@@ -450,10 +485,21 @@ impl MusicApp {
                 }
             }
             Event::Playlists(playlists) => {
-                if let Some(current) = &self.playlist {
-                    self.playlist = playlists.iter().find(|p| p.id == current.id).cloned();
+                if let Some(current) = &mut self.playlist {
+                    if let Some(summary) = playlists.iter().find(|p| p.id == current.id) {
+                        current.name.clone_from(&summary.name);
+                        current.song_count = summary.song_count;
+                    } else {
+                        self.playlist = None;
+                    }
                 }
-                self.playlists = playlists;
+                self.playlists = playlists
+                    .into_iter()
+                    .map(|mut playlist| {
+                        playlist.entry = Arc::default();
+                        playlist
+                    })
+                    .collect();
             }
             Event::Playlist(playlist) => {
                 if self.playlist.as_ref().is_some_and(|p| p.id == playlist.id) {
@@ -461,6 +507,13 @@ impl MusicApp {
                 }
             }
             Event::TrackUpdated(track) => {
+                if let Some(name) = self.artist_name.clone() {
+                    self.service.send(Command::Artist(
+                        self.artist_request,
+                        name,
+                        self.artist_id.clone(),
+                    ));
+                }
                 if self.selected.as_ref().is_some_and(|t| t.id == track.id) {
                     self.selected = Some(track.clone());
                 }
@@ -479,9 +532,9 @@ impl MusicApp {
                     }
                 }
                 if let Some(playlist) = &mut self.playlist {
-                    for value in &mut playlist.entry {
+                    for value in Arc::make_mut(&mut playlist.entry) {
                         if value.id == track.id {
-                            *value = (*track).clone();
+                            *value = track.clone();
                         }
                     }
                 }
@@ -493,7 +546,17 @@ impl MusicApp {
             Event::ArtworkFailed(id) => {
                 self.art_failures.insert(id);
             }
-            Event::ArtworkRetrying => self.art_failures.clear(),
+            Event::ArtworkRetrying => {
+                self.art_failures.clear();
+                self.profile_requested.clear();
+                if let Some(name) = &self.artist_name {
+                    self.service.send(Command::ArtistProfile(
+                        name.clone(),
+                        self.artist_id.clone(),
+                        true,
+                    ));
+                }
+            }
             Event::Lyrics(id, text) => {
                 self.lyrics.insert(id, text);
             }
@@ -710,6 +773,12 @@ impl MusicApp {
         self.switch_workspace(Workspace::Explorer, window, cx);
         self.artist_origin = origin;
         self.artist_name = Some(name.clone());
+        self.artist_id = id.clone();
+        self.artist_request += 1;
+        self.artist_data = None;
+        self.biography_expanded = false;
+        self.popular_expanded = false;
+        self.most_played_expanded = false;
         self.artist_albums = None;
         self.selected_album = None;
         self.group_tracks.clear();
@@ -717,7 +786,8 @@ impl MusicApp {
         self.search_text.clear();
         self.search
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.service.send(Command::Artist(name, id));
+        self.service
+            .send(Command::Artist(self.artist_request, name, id));
         cx.notify();
     }
     fn open_explorer_filter(
@@ -910,9 +980,31 @@ impl MusicApp {
             InfoSource::Playing => self.playback.track.clone(),
         }
     }
+    fn artist_portrait(
+        &mut self,
+        name: &str,
+        id: &str,
+        fallback: &str,
+        side: f32,
+        cx: &App,
+    ) -> AnyElement {
+        let key = cache_key(name, id);
+        if self.profile_requested.insert(key.clone()) {
+            self.service
+                .send(Command::ArtistProfile(name.into(), id.into(), false));
+        }
+        let portrait = self
+            .artist_profiles
+            .get(&key)
+            .map(|profile| profile.portrait.clone())
+            .filter(|portrait| !portrait.is_empty() && !self.art_failures.contains(portrait))
+            .unwrap_or_else(|| fallback.into());
+        self.art(&portrait, side, cx)
+    }
     fn art(&mut self, id: &str, side: f32, cx: &App) -> AnyElement {
         if let Some(path) = self.artwork.get(id) {
             return img(path.clone())
+                .image_cache(&self.image_cache)
                 .size(px(side))
                 .object_fit(ObjectFit::Cover)
                 .into_any_element();
@@ -1285,7 +1377,18 @@ impl MusicApp {
                                     || app.query.genre == item.id
                             }
                         };
-                        let art = app.art(&item.artwork, 34., cx);
+                        let art =
+                            if matches!(mode, NavigatorMode::Artist | NavigatorMode::AlbumArtist) {
+                                app.artist_portrait(
+                                    &item.label,
+                                    &item.detail,
+                                    &item.artwork,
+                                    34.,
+                                    cx,
+                                )
+                            } else {
+                                app.art(&item.artwork, 34., cx)
+                            };
                         let id = item.id.clone();
                         let artist_id = item.detail.clone();
                         div()
@@ -2192,9 +2295,197 @@ impl MusicApp {
         .size_full()
         .into_any_element()
     }
+    fn artist_song_section(
+        &mut self,
+        title: &'static str,
+        tracks: Vec<Arc<Track>>,
+        personal: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let expanded = if personal {
+            self.most_played_expanded
+        } else {
+            self.popular_expanded
+        };
+        let mut section = div().w_full().min_w_0().flex().flex_col().gap_1().child(
+            div()
+                .mb_2()
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        );
+        if tracks.is_empty() {
+            section = section.child(div().text_size(px(11.)).text_color(colors.muted).child(
+                if personal {
+                    "No plays recorded yet."
+                } else {
+                    "Popular songs are unavailable from Navidrome."
+                },
+            ));
+        }
+        for (i, track) in tracks
+            .iter()
+            .take(if expanded { 10 } else { 5 })
+            .enumerate()
+        {
+            let row = self.track_row(
+                track.clone(),
+                i + 1,
+                format!("artist-{}-{}", personal, track.id),
+                None,
+                cx,
+            );
+            let art = self.art(&track.cover_art, 36., cx);
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .size(px(36.))
+                            .flex_shrink_0()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(art),
+                    )
+                    .child(div().flex_1().min_w_0().child(row))
+                    .when(personal, |row| {
+                        row.child(
+                            div()
+                                .w(px(48.))
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(colors.muted)
+                                .child(format!("{} plays", track.play_count.unwrap_or(0))),
+                        )
+                    }),
+            );
+        }
+        if tracks.len() > 5 {
+            section = section.child(
+                Button::new(if personal {
+                    "more-personal"
+                } else {
+                    "more-popular"
+                })
+                .ghost()
+                .small()
+                .label(if expanded { "Show less" } else { "Show more" })
+                .on_click(cx.listener(move |app, _, _, cx| {
+                    if personal {
+                        app.most_played_expanded = !app.most_played_expanded;
+                    } else {
+                        app.popular_expanded = !app.popular_expanded;
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        section.into_any_element()
+    }
+    fn similar_artists(
+        &mut self,
+        profile: Option<Arc<ArtistProfile>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(profile) = profile.filter(|profile| !profile.similar.is_empty()) else {
+            return div().into_any_element();
+        };
+        let colors = ink(cx);
+        let mut cards = div().flex().flex_wrap().gap_3();
+        for similar in profile.similar.iter().take(12) {
+            let item = similar.clone();
+            let fallback = self
+                .view
+                .navigator
+                .artists
+                .iter()
+                .chain(&self.view.navigator.album_artists)
+                .find(|artist| normalize(&artist.label) == normalize(&item.name))
+                .map(|artist| artist.artwork.clone())
+                .unwrap_or_default();
+            let art = if item.in_library {
+                self.artist_portrait(&item.name, &item.id, &fallback, 88., cx)
+            } else {
+                self.art(&item.portrait, 88., cx)
+            };
+            cards = cards.child(
+                div()
+                    .id(SharedString::from(format!("similar-{}", item.name)))
+                    .role(Role::Button)
+                    .aria_label(format!(
+                        "{} {}",
+                        if item.in_library {
+                            "Open artist"
+                        } else {
+                            "View on Last.fm:"
+                        },
+                        item.name
+                    ))
+                    .w(px(112.))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_color(if item.in_library {
+                        colors.text
+                    } else {
+                        colors.muted
+                    })
+                    .items_center()
+                    .text_center()
+                    .child(
+                        div()
+                            .size(px(88.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .overflow_hidden()
+                            .when(!item.in_library, |image| image.opacity(0.4))
+                            .child(art),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(11.))
+                            .truncate()
+                            .child(item.name.clone()),
+                    )
+                    .when(!item.in_library, |card| {
+                        card.child(div().text_size(px(9.)).child("Not in your library"))
+                    })
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        if item.in_library {
+                            app.open_artist(item.name.clone(), item.id.clone(), window, cx);
+                        } else {
+                            cx.open_url(&lastfm_url(&item.name));
+                        }
+                    })),
+            );
+        }
+        div()
+            .mt_5()
+            .child(
+                div()
+                    .mb_3()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Similar artists to {}", profile.name)),
+            )
+            .child(cards)
+            .into_any_element()
+    }
     fn artist_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let name = self.artist_name.clone().unwrap_or_default();
+        let profile = self
+            .artist_profiles
+            .get(&cache_key(&name, &self.artist_id))
+            .cloned();
+        let data = self.artist_data.clone().unwrap_or_default();
         let mut page = div()
             .id("artist-page")
             .size_full()
@@ -2218,9 +2509,11 @@ impl MusicApp {
                 .into_any_element();
         };
         let mut hero = div().my_4().flex().items_center().gap_4();
-        if let Some(album) = albums.first() {
-            hero = hero.child(self.art(&album.cover_art, 80., cx));
-        }
+        let fallback = albums
+            .first()
+            .map(|album| album.cover_art.as_str())
+            .unwrap_or_default();
+        hero = hero.child(self.artist_portrait(&name, &self.artist_id.clone(), fallback, 80., cx));
         page = page.child(
             hero.child(
                 div()
@@ -2237,7 +2530,7 @@ impl MusicApp {
                             .mt_1()
                             .text_size(px(25.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(name),
+                            .child(name.clone()),
                     )
                     .child(
                         div()
@@ -2252,8 +2545,81 @@ impl MusicApp {
                     ),
             ),
         );
+        if let Some(profile) = &profile {
+            if !profile.biography.is_empty() {
+                page = page
+                    .child(
+                        div()
+                            .mb_1()
+                            .text_size(px(11.))
+                            .text_color(colors.muted)
+                            .when(!self.biography_expanded, |text| text.line_clamp(3))
+                            .child(profile.biography.clone()),
+                    )
+                    .child(
+                        Button::new("artist-bio-more")
+                            .ghost()
+                            .small()
+                            .label(if self.biography_expanded {
+                                "Show less"
+                            } else {
+                                "Read more"
+                            })
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.biography_expanded = !app.biography_expanded;
+                                cx.notify();
+                            })),
+                    );
+            }
+            if let Some(url) = profile_url(&profile.url) {
+                page = page.child(
+                    Button::new("artist-source")
+                        .ghost()
+                        .small()
+                        .label("Artist profile ↗")
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+        }
+        if !data.genres.is_empty() {
+            let mut chips = div()
+                .mt_2()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .text_size(px(10.))
+                .text_color(colors.muted)
+                .child("From your library:");
+            for (index, genre) in data.genres.iter().enumerate() {
+                chips = chips.child(self.metadata_link(
+                    ExplorerFilter::Genre(genre.clone()),
+                    format!("artist-genre-{index}"),
+                    cx,
+                ));
+            }
+            page = page.child(chips);
+        }
+        let popular = profile
+            .as_ref()
+            .map(|profile| profile.popular.clone())
+            .unwrap_or_default();
+        let top = self.artist_song_section("Popular songs", popular, false, cx);
+        let personal = self.artist_song_section("Your most played", data.most_played, true, cx);
+        page = page.child(
+            div()
+                .mt_4()
+                .flex()
+                .gap_4()
+                .min_w_0()
+                .flex_col()
+                .child(top)
+                .child(personal),
+        );
         if albums.is_empty() {
+            let similar = self.similar_artists(profile.clone(), cx);
             return page
+                .child(similar)
                 .child(
                     div()
                         .text_color(colors.muted)
@@ -2371,7 +2737,8 @@ impl MusicApp {
             }
             page = page.child(section);
         }
-        page.into_any_element()
+        page.child(self.similar_artists(profile, cx))
+            .into_any_element()
     }
     fn covers_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let (columns, side) = cover_layout(self.library_width);
@@ -3433,12 +3800,7 @@ impl MusicApp {
     fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         if let Some(playlist) = self.playlist.clone() {
-            let tracks = playlist
-                .entry
-                .iter()
-                .cloned()
-                .map(Arc::new)
-                .collect::<Vec<_>>();
+            let tracks = playlist.entry.clone();
             let values = tracks
                 .iter()
                 .enumerate()
@@ -3485,7 +3847,7 @@ impl MusicApp {
                                 .on_click(cx.listener(move |app, _, _, _| {
                                     app.service
                                         .player
-                                        .send(PlayerCommand::Replace(play.clone(), 0))
+                                        .send(PlayerCommand::Replace(play.as_ref().clone(), 0))
                                 })),
                         )
                         .child(
@@ -3634,6 +3996,11 @@ impl MusicApp {
             .child(div().text_size(px(11.)).text_color(colors.muted).child("Enter your server address and credentials. Sonora saves a login token locally so you stay signed in. Your password is not saved. The token file is unencrypted and readable only by your macOS user."))
             .child("Server address").child(Input::new(&self.server_url).small()).child("Username").child(Input::new(&self.username).small()).child("Password").child(Input::new(&self.password).small())
             .child(div().child(Button::new("connect-library").small().label("Connect").on_click(cx.listener(|app,_,_,cx|{app.status="Connecting…".into();app.error=None;app.service.send(Command::Connect(Account{url:app.server_url.read(cx).value().to_string(),username:app.username.read(cx).value().to_string()},app.password.read(cx).value().to_string()));cx.notify();}))))
+            .child(div().pt_4().border_t_1().border_color(colors.line).font_weight(FontWeight::SEMIBOLD).child("Last.fm via Navidrome"))
+            .child(div().text_size(px(11.)).text_color(colors.muted).child("Sonora reports plays only to Navidrome. Link Last.fm in your Navidrome personal settings to forward them. Artist information follows your server's metadata-agent order. Uncertain submissions are not resent automatically, to avoid duplicates."))
+            .child(Button::new("open-navidrome").ghost().small().label("Open Navidrome ↗").disabled(self.account.is_none()).on_click(cx.listener(|app,_,_,cx| {
+                if let Some(account) = &app.account { cx.open_url(&account.url); }
+            })))
             .child(div().pt_4().border_t_1().border_color(colors.line).font_weight(FontWeight::SEMIBOLD).child("Playback"))
             .child(div().text_size(px(11.)).text_color(colors.muted).child("ReplayGain"))
             .child(div().flex().gap_2().children([GainMode::Off,GainMode::Track,GainMode::Album].into_iter().enumerate().map(|(i,mode)|{let label=match mode{GainMode::Off=>"Off",GainMode::Track=>"Track",GainMode::Album=>"Album"};Button::new(("gain",i)).small().label(label).selected(self.preferences.gain==mode).on_click(cx.listener(move|app,_,_,cx|{app.preferences.gain=mode.clone();app.save_preferences();cx.notify();}))})))
@@ -4110,9 +4477,11 @@ impl MusicApp {
 }
 impl Render for MusicApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.image_cache
+            .update(cx, |cache, cx| cache.begin_frame(window, cx));
         let colors = ink(cx);
         let body = if self.workspace == Workspace::NowPlaying && !self.settings {
-            if self.playback.playing {
+            if self.playback.playing && window.is_window_active() {
                 window.request_animation_frame();
             }
             self.now_playing_view(window, cx)

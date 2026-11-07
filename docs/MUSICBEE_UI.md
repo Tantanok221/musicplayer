@@ -31,6 +31,11 @@ References:
 16. Artist credits split on ampersands, commas, and semicolons, including full-width variants. Individual names drive links, facets, counts, filters, and discography membership. Counts deduplicate shared albums; matching uses whole names rather than substrings. Combined artist IDs are not reused for each split credit.
 17. Genre and year metadata links open Music Explorer with a fresh genre or year filter. Genres are linked individually, preserving names such as R&B. Release-year clicks do not select or play their enclosing album card. Active filter chips and Clear filters remove metadata filters; playback stays unchanged.
 
+18. Playback requests original audio and opens output using the decoded source sample rate and channel count. It does not force 48 kHz stereo or fall back to MP3 transcoding. Unsupported formats show an error. Same-format tracks retain gapless boundaries; format changes may pause briefly while output reopens. Shared system output is not a bit-perfect guarantee.
+
+19. Navidrome is the only scrobbling recipient. Listening instances survive decoder restarts and restoration; actual consumed samples determine eligibility. Unsent reports may wait offline, but attempted/uncertain reports are never automatically resent. Last.fm authorization remains in Navidrome.
+20. Artist pages and artist sidebar modes share cached portraits. The page adds an expandable plain-text biography and profile link, library-derived genre chips, Popular songs and Your most played sections (five rows, expandable to ten), and up to twelve similar artists. Sections stack in narrow panes. Unowned recommendations are muted, labeled, and open Last.fm; owned artists open Sonora. Release grouping and album-based playback remain unchanged.
+
 ## Server boundary
 
 The user-entered Navidrome connection remains the source of music. A reusable login token is saved locally with owner-only file permissions; the password is not saved and Keychain is not accessed. No demonstration library, hardcoded credentials, fake waveforms, folder-management UI, or nonfunctional radio/device nodes are added. Local file tagging and MusicBee's broader plugin/device/CD features are beyond this UI adaptation.
