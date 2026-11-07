@@ -1,6 +1,7 @@
 use crate::{
     artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key},
     artwork::ArtworkQueue,
+    backdrop::{self, Backdrop},
     catalog::{Catalog, LibraryView},
     listening::ListenReport,
     lyrics::Lyrics,
@@ -52,6 +53,8 @@ pub enum Command {
     Playlist(String),
     Artwork(String),
     ArtworkFinished(String, String, Result<PathBuf, String>),
+    Backdrop(String),
+    BackdropFinished(String, String, Result<Backdrop, String>),
     Lyrics(Arc<Track>),
     LyricsLoaded(String, String, Result<Lyrics, String>),
     PlayIds(Vec<String>, usize),
@@ -90,6 +93,7 @@ pub enum Event {
     Artwork(String, PathBuf),
     ArtworkFailed(String),
     ArtworkRetrying,
+    Backdrop(String, Arc<Backdrop>),
     Lyrics(String, Result<Arc<Lyrics>, String>),
     Playback(PlaybackSnapshot),
     Status(String),
@@ -720,6 +724,30 @@ fn run(
                         }
                     }
                     artwork_queue.request(id, Instant::now());
+                }
+                Command::Backdrop(id) => {
+                    if let Some(account) = &account {
+                        let namespace = account.namespace();
+                        let art = paths
+                            .cache
+                            .join(&namespace)
+                            .join(format!("{}.art", blake3::hash(id.as_bytes()).to_hex()));
+                        let tx = tx.clone();
+                        runtime.spawn_blocking(move || {
+                            let result = backdrop::load_or_render(&art)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = tx.send(Command::BackdropFinished(namespace, id, result));
+                        });
+                    }
+                }
+                Command::BackdropFinished(namespace, id, result) => {
+                    if let Ok(backdrop) = result
+                        && account
+                            .as_ref()
+                            .is_some_and(|account| account.namespace() == namespace)
+                    {
+                        events.send(Event::Backdrop(id, Arc::new(backdrop)))?;
+                    }
                 }
                 Command::ArtworkFinished(namespace, id, result) => {
                     if account

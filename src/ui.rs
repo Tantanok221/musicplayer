@@ -11,6 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder, *};
 use sonora::{
     artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key, lastfm_url, profile_url},
+    backdrop::Backdrop,
     browser::*,
     catalog::LibraryView,
     lyrics::Lyrics,
@@ -18,6 +19,7 @@ use sonora::{
     platform::Account,
     playback::PlayerCommand,
     service::{Command, Event, Mutation, Service},
+    visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -67,6 +69,38 @@ fn rating_after_click(rating: u8, clicked: u8) -> u8 {
 }
 
 const ARTIST_SONG_COLUMN_MIN: f32 = 300.;
+const ALBUM_PREVIEW_ROWS: usize = 6;
+const BACKDROP_FADE_SECONDS: f32 = 0.7;
+const SPECTRUM_HEIGHT: f32 = 84.;
+
+/// Low and high bar colors: the album's two leading colors, lifted so they
+/// read against the scrim, or the theme accent before a palette exists.
+fn spectrum_colors(palette: Option<[u32; 3]>, accent: Hsla, dark: bool) -> (Hsla, Hsla) {
+    let vivid = |color: u32| {
+        let mut color = Hsla::from(rgb(color));
+        color.s = color.s.max(0.45);
+        color.l = if dark {
+            color.l.clamp(0.55, 0.72)
+        } else {
+            color.l.clamp(0.36, 0.5)
+        };
+        color
+    };
+    match palette {
+        Some([first, second, _]) => (vivid(first), vivid(second)),
+        None => (accent, accent),
+    }
+}
+
+fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let (from, to) = (from.to_rgb(), to.to_rgb());
+    Hsla::from(Rgba {
+        r: from.r + (to.r - from.r) * t,
+        g: from.g + (to.g - from.g) * t,
+        b: from.b + (to.b - from.b) * t,
+        a: 1.,
+    })
+}
 
 /// Wrapped line count of the artist biography at its 11px system font size.
 fn biography_lines(text: &str, width: f32, cx: &App) -> usize {
@@ -232,6 +266,15 @@ pub struct MusicApp {
     artist_origin: Workspace,
     highlight_album: Option<(String, Vec<Arc<Track>>)>,
     highlight_requested: Option<String>,
+    album_tracks_expanded: bool,
+    backdrops: HashMap<String, Arc<Backdrop>>,
+    backdrop_requested: HashSet<String>,
+    backdrop_shown: Option<String>,
+    backdrop_previous: Option<String>,
+    backdrop_changed: Instant,
+    spectrum: Spectrum,
+    spectrum_window: Box<[f32; FFT_SIZE]>,
+    spectrum_tick: Option<Instant>,
     library_open: bool,
     playlists_open: bool,
     show_playlist_editor: bool,
@@ -402,6 +445,15 @@ impl MusicApp {
             artist_origin: Workspace::Explorer,
             highlight_album: None,
             highlight_requested: None,
+            album_tracks_expanded: false,
+            backdrops: HashMap::new(),
+            backdrop_requested: HashSet::new(),
+            backdrop_shown: None,
+            backdrop_previous: None,
+            backdrop_changed: Instant::now(),
+            spectrum: Spectrum::default(),
+            spectrum_window: Box::new([0.; FFT_SIZE]),
+            spectrum_tick: None,
             library_open: true,
             playlists_open: true,
             show_playlist_editor: false,
@@ -453,6 +505,8 @@ impl MusicApp {
                     .is_some_and(|old| old.namespace() != account.namespace())
                 {
                     self.artwork.clear();
+                    self.backdrops.clear();
+                    self.backdrop_requested.clear();
                     self.artist_profiles.clear();
                     self.profile_requested.clear();
                     self.popularity_requested.clear();
@@ -609,6 +663,9 @@ impl MusicApp {
             Event::Artwork(id, path) => {
                 self.art_failures.remove(&id);
                 self.artwork.insert(id, path);
+            }
+            Event::Backdrop(id, backdrop) => {
+                self.backdrops.insert(id, backdrop);
             }
             Event::ArtworkFailed(id) => {
                 self.art_failures.insert(id);
@@ -3903,10 +3960,12 @@ impl MusicApp {
             );
         };
         let colors = ink(cx);
+        let dark = cx.theme().is_dark();
         if !track.album_id.is_empty() && self.highlight_requested.as_ref() != Some(&track.album_id)
         {
             self.highlight_requested = Some(track.album_id.clone());
             self.highlight_album = None;
+            self.album_tracks_expanded = false;
             self.service.send(Command::Album(track.album_id.clone()));
         }
         let album_artists = track.album_artist_credits();
@@ -3932,10 +3991,38 @@ impl MusicApp {
                     .collect()
             });
         let album_time = album_tracks.iter().map(|track| track.duration).sum::<f64>();
-        let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 340.);
-        let cover = self.art(&track.cover_art, cover_side, cx);
+
+        let backdrop = self.backdrop(&track.cover_art, window, cx);
+        let palette = self
+            .backdrops
+            .get(&track.cover_art)
+            .map(|backdrop| backdrop.palette);
+
+        let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 360.);
+        let cover = match self.artwork.get(&track.cover_art) {
+            Some(path) => img(path.clone())
+                .image_cache(&self.image_cache)
+                .size(px(cover_side))
+                .rounded_xl()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => self.art(&track.cover_art, cover_side, cx),
+        };
+
+        let current = album_tracks.iter().position(|item| item.id == track.id);
+        let collapsed = !self.album_tracks_expanded && album_tracks.len() > ALBUM_PREVIEW_ROWS;
+        let visible = if collapsed {
+            let start = current
+                .unwrap_or(0)
+                .saturating_sub(1)
+                .min(album_tracks.len() - ALBUM_PREVIEW_ROWS);
+            start..start + ALBUM_PREVIEW_ROWS
+        } else {
+            0..album_tracks.len()
+        };
         let mut album_list = div().flex().flex_col().gap_1();
-        for (index, item) in album_tracks.iter().enumerate() {
+        for index in visible {
+            let item = album_tracks[index].clone();
             album_list = album_list.child(self.track_row(
                 item.clone(),
                 item.track.unwrap_or(index as u32 + 1) as usize,
@@ -3945,35 +4032,74 @@ impl MusicApp {
                 cx,
             ));
         }
-        let left = div()
+        if album_tracks.len() > ALBUM_PREVIEW_ROWS {
+            album_list = album_list.child(
+                Button::new("album-tracks-toggle")
+                    .ghost()
+                    .small()
+                    .label(if self.album_tracks_expanded {
+                        "Show fewer".to_string()
+                    } else {
+                        format!("Show all {} tracks", album_tracks.len())
+                    })
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.album_tracks_expanded = !app.album_tracks_expanded;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let hero = div()
             .id("now-playing-album")
             .w(px(cover_side + 64.))
             .h_full()
             .min_h_0()
             .flex_shrink_0()
             .overflow_y_scroll()
-            .p_6()
-            .bg(colors.panel)
+            .px_8()
+            .pt_8()
+            .pb_4()
             .child(
                 div()
-                    .mb_4()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .child("NOW PLAYING"),
+                    .size(px(cover_side))
+                    .rounded_xl()
+                    .shadow_2xl()
+                    .child(cover),
             )
-            .child(cover)
             .child(
                 div()
-                    .mt_4()
+                    .mt_6()
                     .text_size(px(24.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(track.album.clone()),
+                    .line_height(px(30.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(track.title.clone()),
             )
             .child(
                 div()
                     .mt_1()
                     .text_size(px(15.))
+                    .text_color(colors.text.opacity(0.85))
+                    .child(self.artist_links(
+                        track.artist_credits(),
+                        format!("now-playing-artist-{}", track.id),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(12.))
                     .text_color(colors.muted)
+                    .child(
+                        div()
+                            .text_color(colors.text.opacity(0.8))
+                            .child(track.album.clone()),
+                    )
+                    .child("·")
                     .child(
                         self.artist_link(
                             track.album_artist_label().to_string(),
@@ -3988,7 +4114,7 @@ impl MusicApp {
             )
             .child(
                 div()
-                    .mt_2()
+                    .mt_1()
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -4009,39 +4135,6 @@ impl MusicApp {
             )
             .child(
                 div()
-                    .mt_5()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .child("CURRENT TRACK"),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .text_size(px(18.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(track.title.clone()),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_size(px(12.))
-                    .text_color(colors.muted)
-                    .child(self.artist_links(
-                        track.artist_credits(),
-                        format!("now_playing_view-artist-1-{}", track.id),
-                        cx,
-                    )),
-            )
-            .child(self.track_row(
-                track.clone(),
-                track.track.unwrap_or(1) as usize,
-                "highlight-current".into(),
-                None,
-                None,
-                cx,
-            ))
-            .child(
-                div()
                     .mt_1()
                     .text_size(px(10.))
                     .text_color(colors.muted)
@@ -4049,112 +4142,237 @@ impl MusicApp {
             )
             .child(
                 div()
-                    .mt_5()
+                    .mt_6()
                     .mb_2()
                     .text_size(px(10.))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.muted)
                     .child("ON THIS ALBUM"),
             )
             .child(album_list);
         let lyrics = self.lyrics_content(track.clone(), true, window, cx);
-        let right = div()
+        let lyrics = div()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .h_full()
-            .flex()
-            .flex_col()
-            .border_l_1()
-            .border_color(colors.line)
-            .px_6()
+            .pl_4()
+            .pr_8()
             .pt_6()
+            .child(lyrics);
+
+        let spectrum = self.spectrum_band(palette, dark, window, cx);
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(colors.background)
+            .child(backdrop)
             .child(
                 div()
-                    .mb_2()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .child("LYRICS"),
+                    .relative()
+                    .size_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when_some(
+                        self.error.clone().or_else(|| self.playback.error.clone()),
+                        |page, error| {
+                            page.child(
+                                div()
+                                    .px_8()
+                                    .py_2()
+                                    .text_size(px(11.))
+                                    .text_color(colors.accent)
+                                    .child(error),
+                            )
+                        },
+                    )
+                    .child(div().flex_1().min_h_0().flex().child(hero).child(lyrics))
+                    .child(spectrum),
+            )
+            .into_any_element()
+    }
+    /// Blurred cover layers under a theme-colored scrim, crossfading on change.
+    fn backdrop(&mut self, cover: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = ink(cx);
+        let dark = cx.theme().is_dark();
+        if !self.backdrops.contains_key(cover)
+            && self.artwork.contains_key(cover)
+            && self.backdrop_requested.insert(cover.to_string())
+        {
+            self.service.send(Command::Backdrop(cover.to_string()));
+        }
+        let ready = self
+            .backdrops
+            .contains_key(cover)
+            .then(|| cover.to_string());
+        if ready != self.backdrop_shown {
+            self.backdrop_previous = self.backdrop_shown.take();
+            self.backdrop_shown = ready;
+            self.backdrop_changed = Instant::now();
+        }
+        let progress = if cx.reduce_motion() {
+            1.
+        } else {
+            (self.backdrop_changed.elapsed().as_secs_f32() / BACKDROP_FADE_SECONDS).min(1.)
+        };
+        if progress < 1. {
+            window.request_animation_frame();
+        } else {
+            self.backdrop_previous = None;
+        }
+        let layer = |id: &Option<String>, opacity: f32| {
+            id.as_ref()
+                .and_then(|id| self.backdrops.get(id))
+                .map(|backdrop| {
+                    img(backdrop.path.clone())
+                        .image_cache(&self.image_cache)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .opacity(opacity)
+                })
+        };
+        let eased = 1. - (1. - progress).powi(3);
+        div()
+            .absolute()
+            .inset_0()
+            .children(layer(&self.backdrop_previous, 1.))
+            .children(layer(&self.backdrop_shown, eased))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(colors.background.opacity(if dark { 0.55 } else { 0.62 })),
             )
             .child(
                 div()
-                    .text_size(px(20.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(track.title.clone()),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .mb_3()
-                    .text_size(px(12.))
-                    .text_color(colors.muted)
-                    .child(self.artist_links(
-                        track.artist_credits(),
-                        format!("now_playing_view-artist-2-{}", track.id),
-                        cx,
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(220.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(colors.background.opacity(0.), 0.),
+                        linear_color_stop(colors.background.opacity(0.7), 1.),
                     )),
             )
-            .child(div().flex_1().min_h_0().child(lyrics));
-        let waveform = self.service.player.waveform();
-        let mut bars = div().flex_1().min_h_0().flex().items_center().gap(px(3.));
-        for amplitude in waveform {
+            .into_any_element()
+    }
+    fn spectrum_band(
+        &mut self,
+        palette: Option<[u32; 3]>,
+        dark: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let now = Instant::now();
+        let dt = self
+            .spectrum_tick
+            .map_or(0., |tick| now.duration_since(tick).as_secs_f32());
+        self.spectrum_tick = Some(now);
+        let rate = self
+            .service
+            .player
+            .spectrum_input(&mut self.spectrum_window);
+        let moving = self
+            .spectrum
+            .update(rate.map(|rate| (&*self.spectrum_window, rate)), dt);
+        if moving && window.is_window_active() {
+            window.request_animation_frame();
+        } else if !moving {
+            self.spectrum_tick = None;
+        }
+        let (low, high) = spectrum_colors(palette, colors.accent, dark);
+        let height = SPECTRUM_HEIGHT;
+        let mut bars = div().h(px(height)).flex().items_end().gap(px(3.));
+        let levels = self.spectrum.levels();
+        let peaks = self.spectrum.peaks();
+        for band in 0..SPECTRUM_BANDS {
+            let color = mix(low, high, band as f32 / (SPECTRUM_BANDS - 1) as f32);
+            let level = levels[band];
+            let peak = peaks[band];
             bars = bars.child(
                 div()
                     .flex_1()
-                    .h(px(2. + amplitude.sqrt() * 64.))
-                    .rounded_sm()
-                    .bg(colors.accent),
+                    .h_full()
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px((level * height).max(2.)))
+                            .rounded_t(px(2.))
+                            .bg(linear_gradient(
+                                0.,
+                                linear_color_stop(color.opacity(0.25), 0.),
+                                linear_color_stop(color.opacity(0.95), 1.),
+                            )),
+                    )
+                    .when(peak > 0.02, |band| {
+                        band.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(px(peak * height + 2.))
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(color.opacity(0.9)),
+                        )
+                    }),
             );
         }
-        let visualizer = div()
+        let mut scale = div().relative().h(px(14.)).mt_1();
+        for (hz, label) in [
+            (60., "60"),
+            (250., "250"),
+            (1_000., "1k"),
+            (4_000., "4k"),
+            (10_000., "10k"),
+        ] {
+            scale = scale.child(
+                div()
+                    .absolute()
+                    .left(relative(frequency_position(hz)))
+                    .ml(px(-8.))
+                    .w(px(16.))
+                    .flex()
+                    .justify_center()
+                    .text_size(px(9.))
+                    .text_color(colors.muted.opacity(0.8))
+                    .child(label),
+            );
+        }
+        div()
             .id("output-visualizer")
             .role(Role::Group)
-            .aria_label("Audio visualization")
-            .h(px(108.))
+            .aria_label("Audio spectrum")
             .flex_shrink_0()
-            .border_t_1()
-            .border_color(colors.line)
-            .px_6()
-            .py_3()
-            .flex()
-            .flex_col()
-            .bg(colors.panel)
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .child("AUDIO")
-                    .child(if self.playback.buffering {
-                        "Buffering…"
-                    } else if self.playback.playing {
-                        "Playing"
-                    } else {
-                        "Paused"
-                    }),
-            )
-            .child(bars);
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .bg(colors.background)
-            .when_some(
-                self.error.clone().or_else(|| self.playback.error.clone()),
-                |page, error| {
-                    page.child(
-                        div()
-                            .px_6()
-                            .py_2()
-                            .text_size(px(11.))
-                            .text_color(colors.accent)
-                            .child(error),
-                    )
-                },
-            )
-            .child(div().flex_1().min_h_0().flex().child(left).child(right))
-            .child(visualizer)
+            .relative()
+            .px_8()
+            .pt_2()
+            .pb_3()
+            .when(self.playback.buffering, |band| {
+                band.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right(px(32.))
+                        .text_size(px(10.))
+                        .text_color(colors.muted)
+                        .child("Buffering…"),
+                )
+            })
+            .child(bars)
+            .child(scale)
             .into_any_element()
     }
     fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {

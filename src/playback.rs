@@ -2,7 +2,7 @@ use crate::{
     listening::{AudibleListen, AudioProgress, ListenReport, ListenSession, ListenTracker},
     model::*,
     server::Server,
-    visualizer::{WAVEFORM_BARS, Waveform},
+    visualizer::{FFT_SIZE, SampleTap},
 };
 use anyhow::Result;
 use flume::{Receiver, Sender};
@@ -84,13 +84,15 @@ impl PlayerHandle {
     pub fn send(&self, command: PlayerCommand) {
         let _ = self.tx.send(command);
     }
-    pub fn waveform(&self) -> [f32; WAVEFORM_BARS] {
+    /// Fills `out` with the latest output window and returns its sample rate,
+    /// or `None` while nothing is audible.
+    pub fn spectrum_input(&self, out: &mut [f32; FFT_SIZE]) -> Option<u32> {
         if self.clock.playing.load(Ordering::Relaxed)
             && !self.clock.buffering.load(Ordering::Relaxed)
         {
-            self.clock.waveform.snapshot()
+            Some(self.clock.tap.latest(out)).filter(|rate| *rate > 0)
         } else {
-            [0.; WAVEFORM_BARS]
+            None
         }
     }
     pub fn start(runtime: tokio::runtime::Handle) -> (Self, Receiver<PlayerEvent>) {
@@ -125,7 +127,7 @@ struct Clock {
     buffering: AtomicBool,
     finished: AtomicBool,
     volume: AtomicU64,
-    waveform: Waveform,
+    tap: SampleTap,
 }
 impl Default for Clock {
     fn default() -> Self {
@@ -144,7 +146,7 @@ impl Default for Clock {
             buffering: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             volume: AtomicU64::new(0.7f64.to_bits()),
-            waveform: Waveform::default(),
+            tap: SampleTap::default(),
         }
     }
 }
@@ -175,8 +177,8 @@ struct BufferedAudio {
     listen_started_ms: i64,
     packet: Option<Packet>,
     offset: usize,
-    visual_samples: usize,
-    visual_peak: f32,
+    visual_sum: f32,
+    visual_channel: u16,
     visual_epoch: u64,
 }
 impl BufferedAudio {
@@ -198,8 +200,8 @@ impl BufferedAudio {
             listen_started_ms: 0,
             packet: None,
             offset: 0,
-            visual_samples: 0,
-            visual_peak: 0.,
+            visual_sum: 0.,
+            visual_channel: 0,
             visual_epoch: 0,
         }
     }
@@ -252,10 +254,10 @@ impl Iterator for BufferedAudio {
         let epoch = self.clock.epoch.load(Ordering::Acquire);
         if self.visual_epoch != epoch {
             self.visual_epoch = epoch;
-            self.visual_samples = 0;
-            self.visual_peak = 0.;
+            self.visual_sum = 0.;
+            self.visual_channel = 0;
             self.waiting_format = None;
-            self.clock.waveform.reset();
+            self.clock.tap.reset();
         }
         if self.waiting_format == Some(epoch) {
             return Some(0.);
@@ -312,6 +314,7 @@ impl Iterator for BufferedAudio {
                     self.clock.boundary.fetch_add(1, Ordering::Release);
                 }
                 self.clock.active.store(packet.index, Ordering::Release);
+                self.clock.tap.set_rate(self.format.rate.get());
                 self.packet = Some(packet);
                 self.offset = 0;
                 self.reported = 0;
@@ -326,13 +329,13 @@ impl Iterator for BufferedAudio {
             self.clock.buffering.store(false, Ordering::Relaxed);
             let volume = f64::from_bits(self.clock.volume.load(Ordering::Relaxed)) as f32;
             let output = sample * volume;
-            self.visual_peak = self.visual_peak.max(output.abs());
-            self.visual_samples += 1;
-            // Sixteen milliseconds at the source's native rate and channel count.
-            if self.visual_samples >= (self.format.samples_per_second() * 16 / 1000) as usize {
-                self.clock.waveform.push(self.visual_peak);
-                self.visual_samples = 0;
-                self.visual_peak = 0.;
+            self.visual_sum += output;
+            self.visual_channel += 1;
+            let channels = self.format.channels.get();
+            if self.visual_channel >= channels {
+                self.clock.tap.push(self.visual_sum / f32::from(channels));
+                self.visual_sum = 0.;
+                self.visual_channel = 0;
             }
             if self.offset == packet.samples.len() {
                 self.report_progress();
@@ -1584,18 +1587,23 @@ mod tests {
         })
         .unwrap();
         let mut source = test_source(clock.clone(), rx);
-        assert_eq!(clock.waveform.snapshot(), [0.; WAVEFORM_BARS]);
+        let mut window = [1.; FFT_SIZE];
+        clock.tap.latest(&mut window);
+        assert_eq!(window, [0.; FFT_SIZE]);
         source.by_ref().take(1536).for_each(drop);
-        assert_eq!(clock.waveform.snapshot()[WAVEFORM_BARS - 1], 0.4);
+        clock.tap.latest(&mut window);
+        assert_eq!(window[FFT_SIZE - 768 - 1], 0.);
+        assert_eq!(window[FFT_SIZE - 768], 0.4);
+        assert_eq!(window[FFT_SIZE - 1], 0.4);
         let (commands, _) = flume::unbounded();
         let handle = PlayerHandle {
             tx: commands,
             clock: clock.clone(),
         };
-        assert_eq!(handle.waveform()[WAVEFORM_BARS - 1], 0.4);
+        assert_eq!(handle.spectrum_input(&mut window), Some(48_000));
         clock.playing.store(false, Ordering::Relaxed);
         assert_eq!(source.next(), Some(0.));
-        assert_eq!(handle.waveform(), [0.; WAVEFORM_BARS]);
+        assert_eq!(handle.spectrum_input(&mut window), None);
         clock.playing.store(true, Ordering::Relaxed);
         clock.epoch.store(2, Ordering::Release);
         tx.send(Packet {
@@ -1609,6 +1617,7 @@ mod tests {
         })
         .unwrap();
         source.by_ref().take(1536).for_each(drop);
-        assert_eq!(handle.waveform(), [0.; WAVEFORM_BARS]);
+        assert_eq!(handle.spectrum_input(&mut window), Some(48_000));
+        assert_eq!(window, [0.; FFT_SIZE]);
     }
 }

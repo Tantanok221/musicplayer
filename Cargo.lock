@@ -6707,6 +6707,7 @@ dependencies = [
  "gpui-kit",
  "hound",
  "html-escape",
+ "image",
  "md5",
  "rand 0.9.5",
  "reqwest 0.12.28",
