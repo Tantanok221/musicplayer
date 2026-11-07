@@ -155,6 +155,7 @@ pub struct MusicApp {
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
     preferences: Preferences,
+    volume_before_mute: Option<f32>,
     account: Option<Account>,
     settings: bool,
     tracks: Vec<Arc<Track>>,
@@ -275,6 +276,7 @@ impl MusicApp {
             cx.subscribe_in(&volume, window, |app, _, event: &SliderEvent, _, _| {
                 if let SliderEvent::Change(SliderValue::Single(value)) = event {
                     app.preferences.volume = *value;
+                    app.volume_before_mute = None;
                     app.save_preferences();
                 }
             }),
@@ -317,6 +319,7 @@ impl MusicApp {
             seek,
             volume,
             preferences: Preferences::default(),
+            volume_before_mute: None,
             account: None,
             settings: false,
             tracks: vec![],
@@ -1976,8 +1979,17 @@ impl MusicApp {
             .into_any_element()
     }
     fn track_feedback(&self, track: Arc<Track>, key: String, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .child(self.favorite_button(&track, &key, cx))
+            .child(self.rating_stars(&track, &key, cx))
+            .into_any_element()
+    }
+    fn rating_stars(&self, track: &Track, key: &str, cx: &mut Context<Self>) -> Div {
         let colors = ink(cx);
-        let starred = track.starred.is_some();
         let rating = track.user_rating.unwrap_or(0);
         let mut stars = div().flex().items_center().flex_shrink_0();
         for value in 1..=5u8 {
@@ -2005,37 +2017,75 @@ impl MusicApp {
                     })),
             );
         }
+        stars
+    }
+    /// One button that opens a rating menu, for widths where five stars don't fit.
+    fn rating_menu(&self, track: &Track, key: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = ink(cx);
+        let rating = track.user_rating.unwrap_or(0);
         let id = track.id.clone();
-        div()
-            .flex()
-            .items_center()
-            .flex_shrink_0()
-            .gap(px(2.))
-            .child(
-                Button::new(SharedString::from(format!("love-{key}")))
-                    .ghost()
-                    .compact()
-                    .w(px(23.))
-                    .h(px(24.))
-                    .label(if starred { "♥" } else { "♡" })
-                    .text_color(if starred {
-                        colors.favorite
+        let weak = cx.weak_entity();
+        Button::new(SharedString::from(format!("rating-menu-{key}")))
+            .ghost()
+            .compact()
+            .h(px(24.))
+            .label(if rating == 0 {
+                "☆".to_string()
+            } else {
+                format!("★ {rating}")
+            })
+            .text_color(if rating == 0 {
+                colors.muted
+            } else {
+                colors.accent
+            })
+            .tooltip("Rating")
+            .accessibility_label(format!("Rate {}", track.title))
+            .dropdown_menu(move |mut menu, _, _| {
+                for value in (0..=5u8).rev() {
+                    let id = id.clone();
+                    let weak = weak.clone();
+                    let label = if value == 0 {
+                        "No rating".to_string()
                     } else {
-                        colors.muted
-                    })
-                    .tooltip(if starred {
-                        "Remove favorite"
-                    } else {
-                        "Favorite"
-                    })
-                    .accessibility_label(format!("Favorite {}", track.title))
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        cx.stop_propagation();
-                        app.mutate(Mutation::Favorite(id.clone(), !starred), cx);
-                    })),
-            )
-            .child(stars)
-            .into_any_element()
+                        "★".repeat(value.into())
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).checked(value == rating).on_click(
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.mutate(Mutation::Rating(id.clone(), value), cx)
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
+    }
+    fn favorite_button(&self, track: &Track, key: &str, cx: &mut Context<Self>) -> Button {
+        let colors = ink(cx);
+        let starred = track.starred.is_some();
+        let id = track.id.clone();
+        Button::new(SharedString::from(format!("love-{key}")))
+            .ghost()
+            .compact()
+            .w(px(23.))
+            .h(px(24.))
+            .label(if starred { "♥" } else { "♡" })
+            .text_color(if starred {
+                colors.favorite
+            } else {
+                colors.muted
+            })
+            .tooltip(if starred {
+                "Remove favorite"
+            } else {
+                "Favorite"
+            })
+            .accessibility_label(format!("Favorite {}", track.title))
+            .on_click(cx.listener(move |app, _, _, cx| {
+                cx.stop_propagation();
+                app.mutate(Mutation::Favorite(id.clone(), !starred), cx);
+            }))
     }
     fn track_row(
         &mut self,
@@ -4124,9 +4174,25 @@ impl MusicApp {
         let cover = track
             .as_ref()
             .map(|track| self.art(&track.cover_art, if compact { 32. } else { 40. }, cx));
-        let feedback = track
+        let favorite = track
             .as_ref()
-            .map(|track| self.track_feedback(track.clone(), "footer".into(), cx));
+            .map(|track| self.favorite_button(track, "footer", cx));
+        let rating = track.as_ref().map(|track| {
+            if compact {
+                self.rating_menu(track, "footer", cx).into_any_element()
+            } else {
+                self.rating_stars(track, "footer", cx).into_any_element()
+            }
+        });
+        let time = |seconds| {
+            div()
+                .w(px(34.))
+                .flex_shrink_0()
+                .text_size(px(10.))
+                .text_color(colors.muted)
+                .child(duration_label(seconds))
+        };
+        let muted = self.preferences.volume <= 0.;
         div()
             .id("player-bar")
             .w_full()
@@ -4139,39 +4205,10 @@ impl MusicApp {
             .bg(colors.panel)
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(if compact { 8. } else { 16. }))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap(px(2.))
-                    .child(self.player_button(
-                        "previous",
-                        Glyph::SkipBack,
-                        "Previous",
-                        PlayerCommand::Previous,
-                    ))
-                    .child(self.player_button(
-                        "play-pause",
-                        if self.playback.playing {
-                            Glyph::Pause
-                        } else {
-                            Glyph::Play
-                        },
-                        "Play / pause",
-                        PlayerCommand::Toggle,
-                    ))
-                    .child(self.player_button(
-                        "next",
-                        Glyph::SkipForward,
-                        "Next",
-                        PlayerCommand::Next,
-                    )),
-            )
-            .child(
-                div()
-                    .w(px((width * 0.18).clamp(100., 240.)))
+                    .w(px((width * 0.2).clamp(120., 260.)))
                     .flex_shrink_0()
                     .min_w_0()
                     .flex()
@@ -4182,7 +4219,18 @@ impl MusicApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_size(px(11.)).truncate().child(title))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .min_w_0()
+                                    .child(
+                                        div().min_w_0().text_size(px(11.)).truncate().child(title),
+                                    )
+                                    .when_some(favorite, |row, favorite| {
+                                        row.child(favorite.h(px(18.)))
+                                    }),
+                            )
                             .child(
                                 div()
                                     .text_size(px(10.))
@@ -4192,69 +4240,148 @@ impl MusicApp {
                             ),
                     ),
             )
-            .when_some(feedback, |bar, feedback| bar.child(feedback))
-            .child(
-                div().flex_1().min_w(px(40.)).flex().items_center().child(
-                    Slider::new(&self.seek)
-                        .flex_1()
-                        .min_w_0()
-                        .accessibility_label("Playback position"),
-                ),
-            )
             .child(
                 div()
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .text_center()
-                    .child(format!(
-                        "{} / {}",
-                        duration_label(self.playback.position),
-                        duration_label(self.playback.duration)
-                    )),
-            )
-            .child(
-                short_button("shuffle", Glyph::Shuffle, "Shuffle")
-                    .selected(self.preferences.shuffle)
-                    .on_click(cx.listener(|app, _, _, cx| {
-                        app.preferences.shuffle = !app.preferences.shuffle;
-                        app.save_preferences();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                short_button(
-                    "repeat",
-                    if self.preferences.repeat == RepeatMode::One {
-                        Glyph::Repeat1
-                    } else {
-                        Glyph::Repeat
-                    },
-                    "Repeat off / all / one",
-                )
-                .selected(self.preferences.repeat != RepeatMode::Off)
-                .on_click(cx.listener(|app, _, _, cx| {
-                    app.preferences.repeat = match app.preferences.repeat {
-                        RepeatMode::Off => RepeatMode::All,
-                        RepeatMode::All => RepeatMode::One,
-                        RepeatMode::One => RepeatMode::Off,
-                    };
-                    app.save_preferences();
-                    cx.notify();
-                })),
+                    .flex_1()
+                    .min_w(px(160.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .gap(px(2.))
+                            .child(
+                                short_button(
+                                    "shuffle",
+                                    Glyph::Shuffle,
+                                    if self.preferences.shuffle {
+                                        "Shuffle: on"
+                                    } else {
+                                        "Shuffle: off"
+                                    },
+                                )
+                                .selected(self.preferences.shuffle)
+                                .on_click(cx.listener(
+                                    |app, _, _, cx| {
+                                        app.preferences.shuffle = !app.preferences.shuffle;
+                                        app.save_preferences();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(self.player_button(
+                                "previous",
+                                Glyph::SkipBack,
+                                "Previous",
+                                PlayerCommand::Previous,
+                            ))
+                            .child(self.player_button(
+                                "play-pause",
+                                if self.playback.playing {
+                                    Glyph::Pause
+                                } else {
+                                    Glyph::Play
+                                },
+                                if self.playback.playing {
+                                    "Pause"
+                                } else {
+                                    "Play"
+                                },
+                                PlayerCommand::Toggle,
+                            ))
+                            .child(self.player_button(
+                                "next",
+                                Glyph::SkipForward,
+                                "Next",
+                                PlayerCommand::Next,
+                            ))
+                            .child(
+                                short_button(
+                                    "repeat",
+                                    if self.preferences.repeat == RepeatMode::One {
+                                        Glyph::Repeat1
+                                    } else {
+                                        Glyph::Repeat
+                                    },
+                                    match self.preferences.repeat {
+                                        RepeatMode::Off => "Repeat: off",
+                                        RepeatMode::All => "Repeat: all",
+                                        RepeatMode::One => "Repeat: one",
+                                    },
+                                )
+                                .selected(self.preferences.repeat != RepeatMode::Off)
+                                .on_click(cx.listener(
+                                    |app, _, _, cx| {
+                                        app.preferences.repeat = match app.preferences.repeat {
+                                            RepeatMode::Off => RepeatMode::All,
+                                            RepeatMode::All => RepeatMode::One,
+                                            RepeatMode::One => RepeatMode::Off,
+                                        };
+                                        app.save_preferences();
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(time(self.playback.position).text_right())
+                    .child(
+                        Slider::new(&self.seek)
+                            .flex_1()
+                            .min_w(px(40.))
+                            .accessibility_label("Playback position"),
+                    )
+                    .child(time(self.playback.duration)),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .gap_1()
-                    .child(Icon::new(Glyph::Volume2).size_3().text_color(colors.muted))
+                    .gap(px(if compact { 4. } else { 10. }))
+                    .when_some(rating, |row, rating| row.child(rating))
                     .child(
-                        Slider::new(&self.volume)
-                            .w(px(if compact { 44. } else { 76. }))
-                            .accessibility_label("Volume"),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                short_button(
+                                    "mute",
+                                    if muted {
+                                        Glyph::VolumeX
+                                    } else {
+                                        Glyph::Volume2
+                                    },
+                                    if muted { "Unmute" } else { "Mute" },
+                                )
+                                .on_click(cx.listener(
+                                    |app, _, window, cx| {
+                                        let volume = match app.volume_before_mute.take() {
+                                            Some(previous) => previous,
+                                            None if app.preferences.volume > 0. => {
+                                                app.volume_before_mute =
+                                                    Some(app.preferences.volume);
+                                                0.
+                                            }
+                                            None => Preferences::default().volume,
+                                        };
+                                        app.preferences.volume = volume;
+                                        app.volume.update(cx, |slider, cx| {
+                                            slider.set_value(volume, window, cx)
+                                        });
+                                        app.save_preferences();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Slider::new(&self.volume)
+                                    .w(px(if compact { 44. } else { 76. }))
+                                    .accessibility_label("Volume"),
+                            ),
                     ),
             )
             .into_any_element()

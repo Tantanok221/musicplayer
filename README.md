@@ -48,7 +48,7 @@ The script generates the icon, builds a release binary, and creates an ad hoc si
 - Simultaneous Queue and Details/Lyrics/Artwork panels, with an explicit Selected/Playing information source.
 - Synchronized lyrics fade into a warm active-line highlight with eased focus and scrolling during playback and seeking; click a timed line to seek. Opening Lyrics follows the playing track. Plain lyrics remain available when the server supplies no timing.
 - Resizable navigator, browser, and information panels; saved widths, visibility, view choices, and a Restore initial layout action.
-- Compact windows use horizontally scrollable workspace tabs and proportionally sized side panels to keep Search and the library visible. The player stays on one horizontal line with current-track favorite and five-star rating controls alongside transport, seek, time, and volume.
+- Compact windows use horizontally scrollable workspace tabs and proportionally sized side panels to keep Search and the library visible. The player stays on one horizontal line: current track and favorite on the left, shuffle/transport/repeat with elapsed time, seek, and total time in the center, and rating plus mute/volume on the right. Compact windows fold the stars into a rating menu.
 - Simple track lists with inline five-star ratings, favorites, duration, and play controls.
 - Local Japanese/CJK and Latin substring search, including full-width and canonically equivalent Unicode text. Artist browsing and genre/year filters are available; aliases and romanization are not generated.
 - Background paginated catalog sync. Failed or interrupted refreshes preserve existing records; stale records are removed only after a complete successful refresh when no server scan is reported.
