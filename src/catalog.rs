@@ -696,6 +696,10 @@ impl Catalog {
             "UPDATE artist_profiles SET data=json_set(data,'$.fetched_ms',0)",
             [],
         )?;
+        self.conn.execute(
+            "UPDATE state SET data=json_set(data,'$.fetched_ms',0) WHERE key LIKE 'top-songs:%' AND data!='null'",
+            [],
+        )?;
         Ok(())
     }
     pub fn save_artist_profile(&self, key: &str, profile: &ArtistProfile) -> Result<()> {

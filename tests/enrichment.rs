@@ -139,3 +139,31 @@ fn artist_rankings_include_guests_preserve_cache_and_use_fresh_server_counts() {
         "Refreshing a count must preserve the sync generation"
     );
 }
+
+#[test]
+fn album_popularity_keeps_artist_rank_and_limit() {
+    let track = |id: &str, album: &str| {
+        std::sync::Arc::new(Track {
+            id: id.into(),
+            album_id: album.into(),
+            ..Default::default()
+        })
+    };
+    let now = 1700000000000;
+    let top = TopSongs::from_tracks(
+        &[
+            track("b2", "b"),
+            track("a3", "a"),
+            track("a1", "a"),
+            track("a2", "a"),
+            track("a4", "a"),
+        ],
+        now,
+    );
+    assert_eq!(top.for_album("a", 3), ["a3", "a1", "a2"]);
+    assert_eq!(top.for_album("b", 3), ["b2"]);
+    assert!(top.for_album("c", 3).is_empty());
+    assert!(top.fresh(now + 1000));
+    assert!(!top.fresh(now + 86_400_000));
+    assert!(!TopSongs::default().fresh(now));
+}

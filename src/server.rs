@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use url::Url;
@@ -351,15 +352,18 @@ impl Server {
                 })
                 .collect();
         }
-        let mut params = vec![("artist", name.into()), ("count", "50".into())];
-        if self.extensions.contains("topSongsByArtistId") {
-            params.push(("id", id));
-        }
-        if let Ok(value) = self.request("getTopSongs", &params).await {
-            profile.popular =
-                serde_json::from_value(value["topSongs"]["song"].clone()).unwrap_or_default();
+        if let Ok(popular) = self.top_songs(name, &id).await {
+            profile.popular = popular;
         }
         Ok(profile)
+    }
+    pub async fn top_songs(&self, name: &str, id: &str) -> Result<Vec<Arc<Track>>> {
+        let mut params = vec![("artist", name.into()), ("count", "50".into())];
+        if !id.is_empty() && id != "-1" && self.extensions.contains("topSongsByArtistId") {
+            params.push(("id", id.into()));
+        }
+        let value = self.request("getTopSongs", &params).await?;
+        Ok(serde_json::from_value(value["topSongs"]["song"].clone()).unwrap_or_default())
     }
     pub async fn lyrics(&self, track: &Track) -> Result<Lyrics> {
         if let Ok(response) = self

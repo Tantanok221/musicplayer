@@ -1,5 +1,5 @@
 use crate::{
-    artists::{ArtistPageData, ArtistProfile, cache_key},
+    artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key},
     artwork::ArtworkQueue,
     catalog::{Catalog, LibraryView},
     listening::ListenReport,
@@ -44,6 +44,8 @@ pub enum Command {
     Artist(u64, String, String),
     ArtistProfile(String, String, bool),
     ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
+    TopSongs(String, String),
+    TopSongsLoaded(String, String, Result<TopSongs, String>),
     ScrobbleFinished(String, u64, Result<Option<Arc<Track>>, String>),
     GroupTracks(u64, LibraryQuery, String),
     PlayTrack(String),
@@ -81,6 +83,7 @@ pub enum Event {
     Album(String, Vec<Arc<Track>>),
     Artist(u64, ArtistPageData),
     ArtistProfile(String, Arc<ArtistProfile>),
+    TopSongs(String, Arc<TopSongs>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
@@ -269,6 +272,7 @@ fn run(
     let mut artwork_queue = ArtworkQueue::default();
     let mut profile_requests = HashSet::new();
     let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
+    let mut top_song_requests = HashSet::new();
     let mut submission_requests = HashSet::new();
     let mut published = 0;
     loop {
@@ -601,6 +605,44 @@ fn run(
                         catalog.hydrate_artist_profile(&mut profile)?;
                         catalog.save_artist_profile(&key, &profile)?;
                         events.send(Event::ArtistProfile(key, Arc::new(profile)))?;
+                    }
+                }
+                Command::TopSongs(name, id) => {
+                    let key = cache_key(&name, &id);
+                    let cached: Option<TopSongs> = catalog.state(&format!("top-songs:{key}"))?;
+                    if let Some(top) = &cached {
+                        events.send(Event::TopSongs(key.clone(), Arc::new(top.clone())))?;
+                    }
+                    let now = chrono::Utc::now().timestamp_millis();
+                    if !cached.is_some_and(|top| top.fresh(now))
+                        && let Some(server) = server.clone()
+                    {
+                        let namespace = server.account.namespace();
+                        if top_song_requests.insert((namespace.clone(), key.clone())) {
+                            let tx = tx.clone();
+                            runtime.spawn(async move {
+                                let result = server
+                                    .top_songs(&name, &id)
+                                    .await
+                                    .map(|tracks| {
+                                        TopSongs::from_tracks(
+                                            &tracks,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    })
+                                    .map_err(|error| format!("{error:#}"));
+                                let _ = tx.send(Command::TopSongsLoaded(namespace, key, result));
+                            });
+                        }
+                    }
+                }
+                Command::TopSongsLoaded(namespace, key, result) => {
+                    top_song_requests.remove(&(namespace.clone(), key.clone()));
+                    if account.as_ref().map(Account::namespace) == Some(namespace)
+                        && let Ok(top) = result
+                    {
+                        catalog.set_state(&format!("top-songs:{key}"), &Some(&top))?;
+                        events.send(Event::TopSongs(key, Arc::new(top)))?;
                     }
                 }
                 Command::Playlist(id) => {

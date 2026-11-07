@@ -24,6 +24,46 @@ pub struct SimilarArtist {
     pub portrait: String,
     pub in_library: bool,
 }
+/// Navidrome's ranked top songs for one artist, kept apart from profiles so album
+/// selection never pays for profile hydration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopSongs {
+    pub songs: Vec<TopSong>,
+    pub fetched_ms: i64,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopSong {
+    pub id: String,
+    pub album_id: String,
+}
+impl TopSongs {
+    pub fn from_tracks(tracks: &[Arc<Track>], fetched_ms: i64) -> Self {
+        Self {
+            songs: tracks
+                .iter()
+                .map(|track| TopSong {
+                    id: track.id.clone(),
+                    album_id: track.album_id.clone(),
+                })
+                .collect(),
+            fetched_ms,
+        }
+    }
+    pub fn fresh(&self, now_ms: i64) -> bool {
+        self.fetched_ms > 0 && now_ms.saturating_sub(self.fetched_ms) < 86_400_000
+    }
+    /// Track IDs from `album_id`, best-ranked first, at most `limit`.
+    pub fn for_album(&self, album_id: &str, limit: usize) -> Vec<String> {
+        self.songs
+            .iter()
+            .filter(|song| song.album_id == album_id)
+            .map(|song| song.id.clone())
+            .take(limit)
+            .collect()
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct ArtistPageData {
     pub albums: Vec<Arc<Album>>,

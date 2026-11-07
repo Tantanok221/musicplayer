@@ -10,7 +10,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 use sonora::{
-    artists::{ArtistPageData, ArtistProfile, cache_key, lastfm_url, profile_url},
+    artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key, lastfm_url, profile_url},
     browser::*,
     catalog::LibraryView,
     lyrics::Lyrics,
@@ -48,6 +48,8 @@ actions!(
     ]
 );
 
+const POPULAR_PER_ALBUM: usize = 3;
+
 #[derive(Clone, Copy)]
 struct Ink {
     background: Hsla,
@@ -56,6 +58,8 @@ struct Ink {
     text: Hsla,
     muted: Hsla,
     accent: Hsla,
+    favorite: Hsla,
+    flame: Hsla,
     selection: Hsla,
 }
 fn ink(cx: &App) -> Ink {
@@ -67,6 +71,8 @@ fn ink(cx: &App) -> Ink {
             text: rgb(0xd9dadd).into(),
             muted: rgb(0x92949c).into(),
             accent: rgb(0xe3a34c).into(),
+            favorite: rgb(0xe5484d).into(),
+            flame: rgb(0xf76b15).into(),
             selection: rgb(0x38342e).into(),
         }
     } else {
@@ -77,6 +83,8 @@ fn ink(cx: &App) -> Ink {
             text: rgb(0x27282d).into(),
             muted: rgb(0x777980).into(),
             accent: rgb(0xa76312).into(),
+            favorite: rgb(0xd1293d).into(),
+            flame: rgb(0xdc4f0b).into(),
             selection: rgb(0xefe2cf).into(),
         }
     }
@@ -179,6 +187,8 @@ pub struct MusicApp {
     artist_data: Option<ArtistPageData>,
     artist_profiles: HashMap<String, Arc<ArtistProfile>>,
     profile_requested: HashSet<String>,
+    popularity_requested: HashSet<String>,
+    top_songs: HashMap<String, Arc<TopSongs>>,
     biography_expanded: bool,
     popular_expanded: bool,
     most_played_expanded: bool,
@@ -339,6 +349,8 @@ impl MusicApp {
             artist_data: None,
             artist_profiles: HashMap::new(),
             profile_requested: HashSet::new(),
+            popularity_requested: HashSet::new(),
+            top_songs: HashMap::new(),
             biography_expanded: false,
             popular_expanded: false,
             most_played_expanded: false,
@@ -393,6 +405,8 @@ impl MusicApp {
                     self.artwork.clear();
                     self.artist_profiles.clear();
                     self.profile_requested.clear();
+                    self.popularity_requested.clear();
+                    self.top_songs.clear();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
@@ -479,6 +493,9 @@ impl MusicApp {
             Event::ArtistProfile(key, profile) => {
                 self.artist_profiles.insert(key, profile);
             }
+            Event::TopSongs(key, top) => {
+                self.top_songs.insert(key, top);
+            }
             Event::Album(id, tracks) => {
                 if self.highlight_requested.as_ref() == Some(&id) {
                     self.highlight_album = Some((id, tracks));
@@ -549,6 +566,7 @@ impl MusicApp {
             Event::ArtworkRetrying => {
                 self.art_failures.clear();
                 self.profile_requested.clear();
+                self.popularity_requested.clear();
                 if let Some(name) = &self.artist_name {
                     self.service.send(Command::ArtistProfile(
                         name.clone(),
@@ -728,11 +746,38 @@ impl MusicApp {
         let current = self.view.albums.iter().position(|a| a.id == album.id);
         self.selected_album = Some(album.clone());
         self.request_group(&album.id);
+        self.request_popularity(&album.artist_credits());
         for index in [old, current].into_iter().flatten() {
             let row = self.cover_rows().row_for_album(index);
             self.cover_list.splice(row..row + 1, 1);
         }
         cx.notify();
+    }
+    /// Popularity arrives later through `Event::TopSongs`; selection never waits for it.
+    fn request_popularity(&mut self, artists: &[NamedId]) {
+        for artist in artists {
+            if self
+                .popularity_requested
+                .insert(cache_key(&artist.name, &artist.id))
+            {
+                self.service
+                    .send(Command::TopSongs(artist.name.clone(), artist.id.clone()));
+            }
+        }
+    }
+    fn popular_tracks(&self, album_id: &str, artists: &[NamedId]) -> HashSet<String> {
+        let mut popular = HashSet::new();
+        for top in artists
+            .iter()
+            .filter_map(|artist| self.top_songs.get(&cache_key(&artist.name, &artist.id)))
+        {
+            for id in top.for_album(album_id, POPULAR_PER_ALBUM) {
+                if popular.len() < POPULAR_PER_ALBUM {
+                    popular.insert(id);
+                }
+            }
+        }
+        popular
     }
     fn request_group(&mut self, id: &str) {
         if !self.group_tracks.contains_key(id) && self.group_requested.insert(id.into()) {
@@ -1973,7 +2018,11 @@ impl MusicApp {
                     .w(px(23.))
                     .h(px(24.))
                     .label(if starred { "♥" } else { "♡" })
-                    .text_color(if starred { colors.accent } else { colors.muted })
+                    .text_color(if starred {
+                        colors.favorite
+                    } else {
+                        colors.muted
+                    })
                     .tooltip(if starred {
                         "Remove favorite"
                     } else {
@@ -1994,6 +2043,7 @@ impl MusicApp {
         number: usize,
         key: String,
         queue_index: Option<usize>,
+        popular: Option<bool>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = ink(cx);
@@ -2026,6 +2076,26 @@ impl MusicApp {
             .cursor_default()
             .when(selected, |s| s.bg(colors.selection))
             .hover(|s| s.bg(colors.panel))
+            .when_some(popular, |row, popular| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("popular-{key}")))
+                        .w(px(12.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .when(popular, |slot| {
+                            slot.child(
+                                Icon::new(Glyph::Flame)
+                                    .size(px(11.))
+                                    .text_color(colors.flame),
+                            )
+                            .tooltip(|window, cx| {
+                                tooltip::Tooltip::new("Popular on Last.fm").build(window, cx)
+                            })
+                        }),
+                )
+            })
             .child(
                 div()
                     .w(px(23.))
@@ -2193,6 +2263,7 @@ impl MusicApp {
                     )),
             );
         if let Some(tracks) = tracks {
+            let popular = self.popular_tracks(&album.id, &album.artist_credits());
             let discs = tracks
                 .iter()
                 .filter_map(|t| t.disc_number)
@@ -2212,7 +2283,8 @@ impl MusicApp {
                 }
                 let number = track.track.unwrap_or(i as u32 + 1) as usize;
                 let key = format!("group-{}-{i}", album.id);
-                right = right.child(self.track_row(track, number, key, None, cx));
+                let flame = Some(popular.contains(&track.id));
+                right = right.child(self.track_row(track, number, key, None, flame, cx));
             }
         } else {
             right = right.child(
@@ -2340,6 +2412,7 @@ impl MusicApp {
                 track.clone(),
                 i + 1,
                 format!("artist-{}-{}", personal, track.id),
+                None,
                 None,
                 cx,
             );
@@ -2881,7 +2954,7 @@ impl MusicApp {
                 range
                     .map(|index| {
                         if let Some(track) = app.tracks.get(index).cloned() {
-                            app.track_row(track, index + 1, format!("flat-{index}"), None, cx)
+                            app.track_row(track, index + 1, format!("flat-{index}"), None, None, cx)
                         } else {
                             div()
                                 .h(px(27.))
@@ -3537,6 +3610,7 @@ impl MusicApp {
                             index + 1,
                             format!("queue-main-{index}"),
                             Some(index),
+                            None,
                             cx,
                         )
                     })
@@ -3561,6 +3635,9 @@ impl MusicApp {
             self.highlight_album = None;
             self.service.send(Command::Album(track.album_id.clone()));
         }
+        let album_artists = track.album_artist_credits();
+        self.request_popularity(&album_artists);
+        let popular = self.popular_tracks(&track.album_id, &album_artists);
         let album_tracks = self
             .highlight_album
             .as_ref()
@@ -3590,6 +3667,7 @@ impl MusicApp {
                 item.track.unwrap_or(index as u32 + 1) as usize,
                 format!("highlight-album-{index}"),
                 None,
+                Some(popular.contains(&item.id)),
                 cx,
             ));
         }
@@ -3684,6 +3762,7 @@ impl MusicApp {
                 track.clone(),
                 track.track.unwrap_or(1) as usize,
                 "highlight-current".into(),
+                None,
                 None,
                 cx,
             ))
@@ -3944,6 +4023,7 @@ impl MusicApp {
                                         track,
                                         index + 1,
                                         format!("playlist-{index}"),
+                                        None,
                                         None,
                                         cx,
                                     )
