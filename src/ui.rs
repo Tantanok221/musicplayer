@@ -71,6 +71,7 @@ fn rating_after_click(rating: u8, clicked: u8) -> u8 {
 
 const ARTIST_SONG_COLUMN_MIN: f32 = 300.;
 const ALBUM_PREVIEW_ROWS: usize = 6;
+const UP_NEXT_PREVIEW_ROWS: usize = 8;
 const BACKDROP_FADE_SECONDS: f32 = 0.7;
 const SPECTRUM_HEIGHT: f32 = 84.;
 
@@ -335,6 +336,7 @@ pub struct MusicApp {
     highlight_album: Option<(String, Vec<Arc<Track>>)>,
     highlight_requested: Option<String>,
     album_tracks_expanded: bool,
+    up_next_expanded: bool,
     backdrops: HashMap<String, Arc<Backdrop>>,
     backdrop_requested: HashSet<String>,
     backdrop_shown: Option<String>,
@@ -514,6 +516,7 @@ impl MusicApp {
             highlight_album: None,
             highlight_requested: None,
             album_tracks_expanded: false,
+            up_next_expanded: false,
             backdrops: HashMap::new(),
             backdrop_requested: HashSet::new(),
             backdrop_shown: None,
@@ -4150,6 +4153,7 @@ impl MusicApp {
             );
         }
 
+        let up_next = self.up_next(&album_tracks, cx);
         let hero = div()
             .id("now-playing-album")
             .w(px(cover_side + 64.))
@@ -4250,7 +4254,8 @@ impl MusicApp {
                     .text_color(colors.muted)
                     .child("ON THIS ALBUM"),
             )
-            .child(album_list);
+            .child(album_list)
+            .children(up_next);
         let lyrics = self.lyrics_content(track.clone(), true, window, cx);
         let lyrics = div()
             .flex_1()
@@ -4294,6 +4299,70 @@ impl MusicApp {
                     .child(spectrum),
             )
             .into_any_element()
+    }
+    /// Queued tracks after the current one, unless the queue is just this album.
+    fn up_next(
+        &mut self,
+        album_tracks: &[Arc<Track>],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let queue = self.playback.queue.clone();
+        let same_as_album = queue.len() == album_tracks.len()
+            && queue.iter().zip(album_tracks).all(|(a, b)| a.id == b.id);
+        let start = self.playback.index.map_or(0, |index| index + 1);
+        if same_as_album || start >= queue.len() {
+            return None;
+        }
+        let colors = ink(cx);
+        let upcoming = queue.len() - start;
+        let shown = if self.up_next_expanded {
+            upcoming
+        } else {
+            upcoming.min(UP_NEXT_PREVIEW_ROWS)
+        };
+        let mut list = div().flex().flex_col().gap_1();
+        for index in start..start + shown {
+            list = list.child(self.track_row(
+                queue[index].clone(),
+                index + 1,
+                format!("now-up-next-{index}"),
+                Some(index),
+                None,
+                cx,
+            ));
+        }
+        if upcoming > UP_NEXT_PREVIEW_ROWS {
+            list = list.child(
+                Button::new("up-next-toggle")
+                    .ghost()
+                    .small()
+                    .label(if self.up_next_expanded {
+                        "Show fewer".to_string()
+                    } else {
+                        format!("Show all {upcoming} upcoming")
+                    })
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.up_next_expanded = !app.up_next_expanded;
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(
+            div()
+                .child(
+                    div()
+                        .mt_6()
+                        .mb_2()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(10.))
+                        .text_color(colors.muted)
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("UP NEXT"))
+                        .child(format!("{upcoming} in queue")),
+                )
+                .child(list)
+                .into_any_element(),
+        )
     }
     /// Blurred cover layers under a theme-colored scrim, crossfading on change.
     fn backdrop(&mut self, cover: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

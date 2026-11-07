@@ -37,7 +37,7 @@ The script generates the icon, builds a release binary, and creates an ad hoc si
 ## Features
 
 - Music Explorer, Queue, Playlists, and Now Playing workspace tabs. Explorer is the main library page and retains its view/search/filter state. Tabs scroll horizontally in narrow windows, with arrow buttons for mouse navigation.
-- Now Playing shows the current track over a blurred backdrop of its album art, with artwork, details, and nearby album tracks on the left and synchronized lyrics on the right. A frequency spectrum of the actual audio output runs along the bottom in colors taken from the cover, and settles to rest when paused or buffering. Backdrops are rendered once and cached beside the artwork.
+- Now Playing shows the current track over a blurred backdrop of its album art, with artwork, details, nearby album tracks, and the upcoming queue (when it differs from the album) on the left and synchronized lyrics on the right. A frequency spectrum of the actual audio output runs along the bottom in colors taken from the cover, and settles to rest when paused or buffering. Backdrops are rendered once and cached beside the artwork.
 - The lower navigator switches between Artist, Album Artist, Year, and Genre and remembers the choice. Artist matches track credits; Album Artist opens discographies; Year and Genre filter Explorer. Counts show distinct albums.
 - Album and Tracks groups artwork beside compact track lists. Album Covers emphasizes the album name with the artist as caption and expands the selected album in place; Tracks uses a simple list.
 - Album Artist thumbnail browsing and an optional Genre → Album Artist → Album column browser. Columns cascade left to right; Command-click selects multiple values.
