@@ -1,0 +1,168 @@
+use sonora::{catalog::Catalog, model::*};
+
+fn sample(id: &str, title: &str) -> Track {
+    Track {
+        id: id.into(),
+        title: title.into(),
+        album_id: "album-a".into(),
+        album: "Quiet Hours".into(),
+        artist: "青葉市子".into(),
+        duration: 180.,
+        suffix: "flac".into(),
+        year: Some(2024),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn interrupted_sync_keeps_previous_records_and_complete_sync_reconciles() {
+    let mut db = Catalog::memory().unwrap();
+    db.put_tracks(&[sample("a", "Old"), sample("b", "Keep")], 1)
+        .unwrap();
+    db.finish_sync(1).unwrap();
+    db.put_tracks(&[sample("b", "Updated")], 2).unwrap();
+    assert_eq!(
+        db.count().unwrap(),
+        2,
+        "A failed sync must not remove old tracks"
+    );
+    db.put_tracks(&[sample("b", "Updated")], 2).unwrap();
+    assert_eq!(db.count().unwrap(), 2, "Upserts must not duplicate tracks");
+    db.finish_sync(2).unwrap();
+    assert_eq!(db.count().unwrap(), 1);
+    assert_eq!(db.by_ids(&["b".into()]).unwrap()[0].title, "Updated");
+    assert!(db.by_ids(&["a".into()]).unwrap().is_empty());
+}
+
+#[test]
+fn multilingual_substrings_normalization_and_literal_search() {
+    let mut db = Catalog::memory().unwrap();
+    db.put_tracks(
+        &[
+            sample("a", "夜の散歩道"),
+            sample("b", "Ｓｏｆｔ Geometry"),
+            sample("c", r#"Café "crème""#),
+            sample("d", "100%_real"),
+            sample("e", "꽃의 노래"),
+            sample("f", "城市之光"),
+        ],
+        1,
+    )
+    .unwrap();
+    for (text, id) in [
+        ("散歩道", "a"),
+        ("の散", "a"),
+        ("soft", "b"),
+        ("ＳＯＦＴ", "b"),
+        ("Cafe\u{301}", "c"),
+        ("\"crème\"", "c"),
+        ("%_", "d"),
+        ("노래", "e"),
+        ("城市", "f"),
+    ] {
+        let query = LibraryQuery {
+            text: text.into(),
+            ..Default::default()
+        };
+        let tracks = db.tracks(&query, 0, 20).unwrap();
+        assert!(
+            tracks.iter().any(|t| t.id == id),
+            "{text:?} should match {id}"
+        );
+    }
+    assert!(
+        db.tracks(
+            &LibraryQuery {
+                text: "\" OR *".into(),
+                ..Default::default()
+            },
+            0,
+            20
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn filters_pagination_order_and_saved_state_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.sqlite");
+    {
+        let mut db = Catalog::open(&path).unwrap();
+        let mut tracks = test_tracks(1100);
+        tracks[0].user_rating = Some(5);
+        db.put_tracks(&tracks, 1).unwrap();
+        let query = LibraryQuery {
+            sort: Sort::Rating,
+            descending: true,
+            ..Default::default()
+        };
+        assert_eq!(db.tracks(&query, 0, 1).unwrap()[0].id, "test-0");
+        let page_a = db.tracks(&query, 0, 500).unwrap();
+        let page_b = db.tracks(&query, 500, 500).unwrap();
+        assert_eq!(page_a.len(), 500);
+        assert_eq!(page_b.len(), 500);
+        assert!(page_a.iter().all(|a| page_b.iter().all(|b| a.id != b.id)));
+        let favorites = LibraryQuery {
+            favorites: true,
+            ..Default::default()
+        };
+        assert!(
+            db.tracks(&favorites, 0, 1000)
+                .unwrap()
+                .iter()
+                .all(|t| t.starred.is_some())
+        );
+        let query = LibraryQuery {
+            artist: "青葉市子".into(),
+            year: Some(2016),
+            ..Default::default()
+        };
+        assert!(
+            db.tracks(&query, 0, 1000)
+                .unwrap()
+                .iter()
+                .all(|t| t.artist == "青葉市子" && t.year == Some(2016))
+        );
+        let queue = SavedQueue {
+            ids: vec!["test-0".into(), "test-1".into()],
+            index: Some(1),
+            position: 42.,
+        };
+        db.set_state("queue", &queue).unwrap();
+    }
+    let db = Catalog::open(&path).unwrap();
+    let queue: SavedQueue = db.state("queue").unwrap();
+    assert_eq!(queue.position, 42.);
+    assert_eq!(queue.index, Some(1));
+    assert_eq!(db.by_ids(&queue.ids).unwrap().len(), 2);
+}
+
+#[test]
+fn rejected_empty_id_does_not_partially_commit_batch() {
+    let mut db = Catalog::memory().unwrap();
+    assert!(
+        db.put_tracks(&[sample("a", "Valid"), sample("", "Broken")], 1)
+            .is_err()
+    );
+    assert_eq!(db.count().unwrap(), 0);
+}
+
+fn test_tracks(count: usize) -> Vec<Track> {
+    (0..count)
+        .map(|i| Track {
+            id: format!("test-{i}"),
+            title: format!("Track {i}"),
+            album_id: format!("album-{}", i / 10),
+            album: format!("Album {}", i / 10),
+            artist: "青葉市子".into(),
+            year: Some(2016),
+            track: Some((i % 10 + 1) as u32),
+            duration: 180.,
+            suffix: "flac".into(),
+            starred: (i % 17 == 0).then(|| "2026-01-01T00:00:00Z".into()),
+            ..Default::default()
+        })
+        .collect()
+}

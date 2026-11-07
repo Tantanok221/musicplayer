@@ -1,0 +1,124 @@
+mod ui;
+use anyhow::Result;
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::*;
+use sonora::{
+    platform::Paths,
+    service::{Command, Service},
+};
+use ui::*;
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("sonora-network")
+        .enable_all()
+        .build()?;
+    let paths = Paths::new()?;
+    let (service, events) = Service::start(paths, runtime.handle().clone());
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let reopen_service = service.clone();
+    let reopen_events = events.clone();
+    app.on_reopen(move |cx| {
+        if let Some(window) = cx.windows().first() {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        } else {
+            open(reopen_service.clone(), reopen_events.clone(), cx);
+        }
+    });
+    app.run(move |cx| {
+        gpui_kit::init(cx);
+        Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", OpenSettings, Some("Sonora")),
+            KeyBinding::new("cmd-f", FocusSearch, Some("Sonora")),
+            KeyBinding::new("cmd-r", Refresh, Some("Sonora")),
+            KeyBinding::new("space", TogglePlayback, Some("Sonora")),
+            KeyBinding::new("cmd-right", NextTrack, Some("Sonora")),
+            KeyBinding::new("cmd-left", PreviousTrack, Some("Sonora")),
+            KeyBinding::new("cmd-[", GoBack, Some("Sonora")),
+            KeyBinding::new("cmd-1", MusicWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-2", PlayingWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-3", PlaylistsWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-4", ExplorerWorkspace, Some("Sonora")),
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let menu = |name: &str, items| Menu {
+            name: name.into(),
+            items,
+            disabled: false,
+        };
+        cx.set_menus(vec![
+            menu(
+                "Sonora",
+                vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Sonora", Quit),
+                ],
+            ),
+            menu(
+                "File",
+                vec![
+                    MenuItem::action("Connect to Navidrome…", OpenSettings),
+                    MenuItem::action("Refresh library", Refresh),
+                ],
+            ),
+            menu("Edit", vec![MenuItem::action("Find music", FocusSearch)]),
+            menu(
+                "View",
+                vec![
+                    MenuItem::action("Music", MusicWorkspace),
+                    MenuItem::action("Now Playing", PlayingWorkspace),
+                    MenuItem::action("Playlists", PlaylistsWorkspace),
+                    MenuItem::action("Music Explorer", ExplorerWorkspace),
+                    MenuItem::separator(),
+                    MenuItem::action("Navigator", ToggleNavigator),
+                    MenuItem::action("Queue and information", ToggleInformation),
+                    MenuItem::action("Column browser", ToggleBrowser),
+                    MenuItem::separator(),
+                    MenuItem::action("Restore initial layout", RestoreLayout),
+                ],
+            ),
+            menu(
+                "Controls",
+                vec![
+                    MenuItem::action("Play / pause", TogglePlayback),
+                    MenuItem::action("Next", NextTrack),
+                    MenuItem::action("Previous", PreviousTrack),
+                ],
+            ),
+            menu("Tools", vec![MenuItem::action("Settings…", OpenSettings)]),
+        ]);
+        let shutdown = service.clone();
+        cx.on_app_quit(move |_| {
+            let (tx, rx) = flume::bounded(1);
+            shutdown.send(Command::Shutdown(tx));
+            async move {
+                let _ = rx.recv_async().await;
+            }
+        })
+        .detach();
+        open(service, events, cx);
+        cx.activate(true);
+    });
+    drop(runtime);
+    Ok(())
+}
+fn open(service: Service, events: flume::Receiver<sonora::service::Event>, cx: &mut App) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
+        window_min_size: Some(size(px(1080.), px(650.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Sonora".into()),
+            appears_transparent: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| MusicApp::new(service, events, window, cx))
+    })
+    .expect("Could not open Sonora");
+}
