@@ -296,8 +296,10 @@ pub struct LibraryQuery {
 pub enum GainMode {
     Off,
     Track,
-    #[default]
     Album,
+    /// Album gain while the whole queue is one album, otherwise track gain.
+    #[default]
+    Smart,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum RepeatMode {
@@ -321,7 +323,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             volume: 0.7,
-            gain: GainMode::Album,
+            gain: GainMode::Smart,
             shuffle: false,
             repeat: RepeatMode::Off,
             dark: None,

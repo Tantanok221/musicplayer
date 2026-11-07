@@ -698,39 +698,7 @@ impl MusicApp {
                     self.playlist = Some(playlist);
                 }
             }
-            Event::TrackUpdated(track) => {
-                if let Some(name) = self.artist_name.clone() {
-                    self.service.send(Command::Artist(
-                        self.artist_request,
-                        name,
-                        self.artist_id.clone(),
-                    ));
-                }
-                if self.selected.as_ref().is_some_and(|t| t.id == track.id) {
-                    self.selected = Some(track.clone());
-                }
-                for value in self
-                    .tracks
-                    .iter_mut()
-                    .chain(self.group_tracks.values_mut().flatten())
-                    .chain(
-                        self.highlight_album
-                            .iter_mut()
-                            .flat_map(|(_, tracks)| tracks.iter_mut()),
-                    )
-                {
-                    if value.id == track.id {
-                        *value = track.clone();
-                    }
-                }
-                if let Some(playlist) = &mut self.playlist {
-                    for value in Arc::make_mut(&mut playlist.entry) {
-                        if value.id == track.id {
-                            *value = track.clone();
-                        }
-                    }
-                }
-            }
+            Event::TrackUpdated(track) => self.apply_track_update(track),
             Event::Artwork(id, path) => {
                 self.art_failures.remove(&id);
                 self.artwork.insert(id, path);
@@ -1069,7 +1037,107 @@ impl MusicApp {
             ));
         }
     }
+    /// Replaces a track everywhere it is shown, without reloading any list.
+    fn apply_track_update(&mut self, track: Arc<Track>) {
+        if let Some(data) = &mut self.artist_data {
+            for value in &mut data.most_played {
+                if value.id == track.id {
+                    *value = track.clone();
+                }
+            }
+        }
+        for profile in self.artist_profiles.values_mut() {
+            if profile.popular.iter().any(|value| value.id == track.id) {
+                for value in &mut Arc::make_mut(profile).popular {
+                    if value.id == track.id {
+                        *value = track.clone();
+                    }
+                }
+            }
+        }
+        if self.selected.as_ref().is_some_and(|t| t.id == track.id) {
+            self.selected = Some(track.clone());
+        }
+        for value in self
+            .tracks
+            .iter_mut()
+            .chain(self.group_tracks.values_mut().flatten())
+            .chain(
+                self.highlight_album
+                    .iter_mut()
+                    .flat_map(|(_, tracks)| tracks.iter_mut()),
+            )
+        {
+            if value.id == track.id {
+                *value = track.clone();
+            }
+        }
+        if let Some(playlist) = &mut self.playlist {
+            for value in Arc::make_mut(&mut playlist.entry) {
+                if value.id == track.id {
+                    *value = track.clone();
+                }
+            }
+        }
+        if self.playback.queue.iter().any(|value| value.id == track.id) {
+            for value in Arc::make_mut(&mut self.playback.queue) {
+                if value.id == track.id {
+                    *value = track.clone();
+                }
+            }
+        }
+        if self
+            .playback
+            .track
+            .as_ref()
+            .is_some_and(|t| t.id == track.id)
+        {
+            self.playback.track = Some(track);
+        }
+    }
+    fn find_track(&self, id: &str) -> Option<Arc<Track>> {
+        self.selected
+            .iter()
+            .chain(&self.tracks)
+            .chain(self.group_tracks.values().flatten())
+            .chain(self.highlight_album.iter().flat_map(|(_, tracks)| tracks))
+            .chain(self.playback.queue.iter())
+            .chain(
+                self.playlist
+                    .iter()
+                    .flat_map(|playlist| playlist.entry.iter()),
+            )
+            .chain(self.artist_data.iter().flat_map(|data| &data.most_played))
+            .chain(
+                self.artist_profiles
+                    .values()
+                    .flat_map(|profile| &profile.popular),
+            )
+            .find(|track| track.id == id)
+            .cloned()
+    }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+        // Show ratings and favorites at once; a failed save restores the
+        // catalog value through `Event::TrackUpdated`.
+        let edited = match &mutation {
+            Mutation::Favorite(id, value) => self.find_track(id).map(|track| {
+                let mut track = (*track).clone();
+                track.starred = value.then(|| chrono::Utc::now().to_rfc3339());
+                track
+            }),
+            Mutation::Rating(id, rating) => self.find_track(id).map(|track| {
+                let mut track = (*track).clone();
+                track.user_rating = Some(*rating);
+                track
+            }),
+            _ => None,
+        };
+        if let Some(track) = edited.map(Arc::new) {
+            self.service
+                .player
+                .send(PlayerCommand::UpdateTrack(track.clone()));
+            self.apply_track_update(track);
+        }
         self.pending_mutation = Some(mutation.clone());
         self.service.send(Command::Mutate(mutation));
         cx.notify();
@@ -4752,7 +4820,13 @@ impl MusicApp {
             })))
             .child(div().pt_4().border_t_1().border_color(colors.line).font_weight(FontWeight::SEMIBOLD).child("Playback"))
             .child(div().text_size(px(11.)).text_color(colors.muted).child("ReplayGain"))
-            .child(div().flex().gap_2().children([GainMode::Off,GainMode::Track,GainMode::Album].into_iter().enumerate().map(|(i,mode)|{let label=match mode{GainMode::Off=>"Off",GainMode::Track=>"Track",GainMode::Album=>"Album"};Button::new(("gain",i)).small().label(label).selected(self.preferences.gain==mode).on_click(cx.listener(move|app,_,_,cx|{app.preferences.gain=mode.clone();app.save_preferences();cx.notify();}))})))
+            .child(div().flex().gap_2().children([GainMode::Smart,GainMode::Track,GainMode::Album,GainMode::Off].into_iter().enumerate().map(|(i,mode)|{let label=match mode{GainMode::Off=>"Off",GainMode::Track=>"Track",GainMode::Album=>"Album",GainMode::Smart=>"Smart"};Button::new(("gain",i)).small().label(label).selected(self.preferences.gain==mode).on_click(cx.listener(move|app,_,_,cx|{app.preferences.gain=mode.clone();app.save_preferences();cx.notify();}))})))
+            .child(div().text_size(px(10.)).text_color(colors.muted).child(match self.preferences.gain {
+                GainMode::Smart => "Album gain while the queue is a single album; track gain once it mixes albums.",
+                GainMode::Track => "Every track plays at the same loudness.",
+                GainMode::Album => "Albums play at the same loudness, keeping quiet and loud songs within them.",
+                GainMode::Off => "Files play at their original level.",
+            }))
             .child(div().pt_4().border_t_1().border_color(colors.line).font_weight(FontWeight::SEMIBOLD).child("Appearance"))
             .child(div().flex().gap_2().children([(None,"System"),(Some(false),"Light"),(Some(true),"Dark")].into_iter().enumerate().map(|(i,(value,label))|Button::new(("appearance",i)).small().label(label).selected(self.preferences.dark==value).on_click(cx.listener(move|app,_,window,cx|{app.preferences.dark=value;app.apply_theme(window,cx);app.save_preferences();cx.notify();})))))
             .child(Button::new("restore-layout-settings").small().label("Restore initial panel layout").on_click(cx.listener(|app,_,_,cx|{app.preferences.layout=LayoutPreferences::default();app.save_preferences();cx.notify();})))

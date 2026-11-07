@@ -371,13 +371,31 @@ impl Source for BufferedAudio {
     }
 }
 
+/// Resolves Smart mode against the queue: one album keeps its intended
+/// dynamics, while mixed queues level every track.
+pub fn effective_gain_mode(mode: &GainMode, queue: &[Arc<Track>]) -> GainMode {
+    match mode {
+        GainMode::Smart => {
+            let album = queue.first().map(|track| track.album_id.as_str());
+            if album.is_some_and(|album| {
+                !album.is_empty() && queue.iter().all(|track| track.album_id == album)
+            }) {
+                GainMode::Album
+            } else {
+                GainMode::Track
+            }
+        }
+        mode => mode.clone(),
+    }
+}
+
 pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
     let Some(gain) = gain else {
         return 1.;
     };
     let (db, peak) = match mode {
         GainMode::Off => return 1.,
-        GainMode::Track => (gain.track_gain, gain.track_peak),
+        GainMode::Track | GainMode::Smart => (gain.track_gain, gain.track_peak),
         GainMode::Album => {
             if gain.album_gain.is_some() {
                 (gain.album_gain, gain.album_peak)
@@ -626,7 +644,9 @@ fn decode_queue(
             account: server.account.namespace(),
             track: track.clone(),
         });
-        let gain = replay_gain(track.replay_gain.as_ref(), &prefs.gain);
+        // Chosen once per track so queue edits never change level mid-song.
+        let mode = effective_gain_mode(&prefs.gain, &plan.lock().unwrap().queue);
+        let gain = replay_gain(track.replay_gain.as_ref(), &mode);
         let format = AudioFormat::of(&decoded);
         final_format = Some(format);
         let mut pcm = decoded;
@@ -1786,6 +1806,38 @@ mod tests {
         };
         assert_eq!(replay_gain(Some(&hot), &GainMode::Track), 0.5);
         assert_eq!(replay_gain(None, &GainMode::Album), 1.);
+    }
+
+    #[test]
+    fn smart_gain_uses_album_gain_only_for_a_single_album_queue() {
+        let track = |id: &str, album: &str| {
+            Arc::new(Track {
+                id: id.into(),
+                album_id: album.into(),
+                ..Default::default()
+            })
+        };
+        let album = vec![track("1", "a"), track("2", "a")];
+        let mixed = vec![track("1", "a"), track("3", "b")];
+        let untagged = vec![track("4", ""), track("5", "")];
+        assert_eq!(
+            effective_gain_mode(&GainMode::Smart, &album),
+            GainMode::Album
+        );
+        assert_eq!(
+            effective_gain_mode(&GainMode::Smart, &mixed),
+            GainMode::Track
+        );
+        assert_eq!(
+            effective_gain_mode(&GainMode::Smart, &untagged),
+            GainMode::Track
+        );
+        assert_eq!(effective_gain_mode(&GainMode::Smart, &[]), GainMode::Track);
+        assert_eq!(
+            effective_gain_mode(&GainMode::Album, &mixed),
+            GainMode::Album
+        );
+        assert_eq!(effective_gain_mode(&GainMode::Off, &album), GainMode::Off);
     }
     #[test]
     fn buffered_output_has_no_inserted_samples_at_track_boundary() {

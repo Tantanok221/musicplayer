@@ -71,6 +71,7 @@ pub enum Command {
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
     Updated(Mutation),
+    MutationFailed(Mutation, String),
     PlaylistLoaded(Playlist),
     PlaylistsLoaded(Vec<Playlist>),
     Error(String),
@@ -843,14 +844,25 @@ fn run(
                                 let _ = tx.send(Command::Updated(mutation));
                             }
                             Err(error) => {
-                                let _ = tx.send(Command::Error(format!(
-                                    "Change was not saved: {error:#}. Retry when connected."
-                                )));
+                                let _ = tx.send(Command::MutationFailed(
+                                    mutation,
+                                    format!(
+                                        "Change was not saved: {error:#}. Retry when connected."
+                                    ),
+                                ));
                             }
                         }
                     });
                 }
                 Command::Updated(mutation) => {
+                    // Track edits are patched in place by the UI; a fresh view would
+                    // reload every album panel, so send one only when the edit can
+                    // change which rows appear or their order.
+                    let reshapes_view = match &mutation {
+                        Mutation::Favorite(..) => current_query.favorites,
+                        Mutation::Rating(..) => current_query.sort == Sort::Rating,
+                        _ => true,
+                    };
                     match mutation {
                         Mutation::Favorite(id, value) => {
                             if let Some(track) = catalog.by_ids(&[id])?.first() {
@@ -901,7 +913,18 @@ fn run(
                         }
                     }
                     events.send(Event::MutationDone)?;
-                    events.send(Event::View(current_request, catalog.view(&current_query)?))?;
+                    if reshapes_view {
+                        events.send(Event::View(current_request, catalog.view(&current_query)?))?;
+                    }
+                }
+                Command::MutationFailed(mutation, error) => {
+                    if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
+                        && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()
+                    {
+                        player.send(PlayerCommand::UpdateTrack(track.clone()));
+                        events.send(Event::TrackUpdated(track.clone()))?;
+                    }
+                    events.send(Event::Error(error))?;
                 }
                 Command::SyncFailed(failed, error) => {
                     failed_generations.insert(failed);
