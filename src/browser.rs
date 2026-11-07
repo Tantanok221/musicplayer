@@ -241,6 +241,8 @@ pub struct LayoutPreferences {
     pub navigator_mode: NavigatorMode,
     pub explorer_view: MainView,
     pub show_navigator: bool,
+    /// Float the navigator over the library only while the pointer is at the left edge.
+    pub navigator_auto_hide: bool,
     pub show_information: bool,
     pub explorer_browser: bool,
     pub left_width: f32,
@@ -256,6 +258,7 @@ impl Default for LayoutPreferences {
             navigator_mode: NavigatorMode::default(),
             explorer_view: MainView::AlbumCovers,
             show_navigator: true,
+            navigator_auto_hide: false,
             show_information: true,
             explorer_browser: true,
             left_width: 216.,

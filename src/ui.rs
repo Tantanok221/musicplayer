@@ -38,6 +38,7 @@ actions!(
         GoBack,
         Refresh,
         ToggleNavigator,
+        ToggleNavigatorAutoHide,
         ToggleInformation,
         ToggleBrowser,
         RestoreLayout,
@@ -49,6 +50,11 @@ actions!(
 );
 
 const POPULAR_PER_ALBUM: usize = 3;
+
+/// Clicking the current rating clears it; any other star sets that rating.
+fn rating_after_click(rating: u8, clicked: u8) -> u8 {
+    if clicked == rating { 0 } else { clicked }
+}
 
 #[derive(Clone, Copy)]
 struct Ink {
@@ -209,6 +215,9 @@ pub struct MusicApp {
     focus: FocusHandle,
     artist_scroll: UniformListScrollHandle,
     track_scroll: UniformListScrollHandle,
+    rating_hover: Option<(String, u8)>,
+    information_width: f32,
+    navigator_peek: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 impl MusicApp {
@@ -373,6 +382,9 @@ impl MusicApp {
             focus,
             artist_scroll: UniformListScrollHandle::default(),
             track_scroll: UniformListScrollHandle::default(),
+            rating_hover: None,
+            information_width: 300.,
+            navigator_peek: None,
             _subscriptions: subscriptions,
         }
     }
@@ -782,6 +794,38 @@ impl MusicApp {
         }
         popular
     }
+    fn navigator_floats(&self) -> bool {
+        self.preferences.layout.show_navigator && self.preferences.layout.navigator_auto_hide
+    }
+    /// Hide by pointer position rather than hover, so the navigator's own menus,
+    /// which render outside its element tree, don't dismiss it.
+    fn peek_navigator(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigator_peek.is_some() {
+            return;
+        }
+        self.navigator_peek = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let away = this
+                    .update_in(cx, |app, window, cx| {
+                        let away = !app.navigator_floats()
+                            || f32::from(window.mouse_position().x) > width + 12.;
+                        if away {
+                            app.navigator_peek = None;
+                            cx.notify();
+                        }
+                        away
+                    })
+                    .unwrap_or(true);
+                if away {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
     fn request_group(&mut self, id: &str) {
         if !self.group_tracks.contains_key(id) && self.group_requested.insert(id.into()) {
             self.service.send(Command::GroupTracks(
@@ -1167,6 +1211,7 @@ impl MusicApp {
                 )
             });
         let navigator = self.preferences.layout.show_navigator;
+        let auto_hide = self.preferences.layout.navigator_auto_hide;
         let info = self.preferences.layout.show_information;
         let browser = self.browser_visible();
         div()
@@ -1212,6 +1257,12 @@ impl MusicApp {
                             PopupMenuItem::new("Navigator and artist browser")
                                 .checked(navigator)
                                 .action(Box::new(ToggleNavigator)),
+                        )
+                        .item(
+                            PopupMenuItem::new("Auto-hide navigator")
+                                .checked(auto_hide)
+                                .disabled(!navigator)
+                                .action(Box::new(ToggleNavigatorAutoHide)),
                         )
                         .item(
                             PopupMenuItem::new("Queue and information")
@@ -1991,30 +2042,54 @@ impl MusicApp {
     fn rating_stars(&self, track: &Track, key: &str, cx: &mut Context<Self>) -> Div {
         let colors = ink(cx);
         let rating = track.user_rating.unwrap_or(0);
+        let preview = self
+            .rating_hover
+            .as_ref()
+            .filter(|(hovered, _)| hovered == key)
+            .map(|(_, value)| rating_after_click(rating, *value));
         let mut stars = div().flex().items_center().flex_shrink_0();
         for value in 1..=5u8 {
             let id = track.id.clone();
+            let filled = value <= preview.unwrap_or(rating);
+            let color = if filled { colors.accent } else { colors.muted };
+            let hover_key = key.to_string();
             stars = stars.child(
-                Button::new(SharedString::from(format!("rating-{key}-{value}")))
-                    .ghost()
-                    .compact()
-                    .w(px(15.))
-                    .h(px(23.))
-                    .label(if value <= rating { "★" } else { "☆" })
-                    .text_color(if value <= rating {
-                        colors.accent
-                    } else {
-                        colors.muted
-                    })
-                    .tooltip(format!("Rate {value} / 5"))
-                    .accessibility_label(format!("Rate {} {value} stars", track.title))
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        cx.stop_propagation();
-                        app.mutate(
-                            Mutation::Rating(id.clone(), if value == rating { 0 } else { value }),
-                            cx,
-                        );
-                    })),
+                div()
+                    .id(SharedString::from(format!("rating-hover-{key}-{value}")))
+                    .on_hover(cx.listener(move |app, hovered: &bool, _, cx| {
+                        let entry = (hover_key.clone(), value);
+                        if *hovered {
+                            app.rating_hover = Some(entry);
+                        } else if app.rating_hover.as_ref() == Some(&entry) {
+                            app.rating_hover = None;
+                        } else {
+                            return;
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        Button::new(SharedString::from(format!("rating-{key}-{value}")))
+                            .ghost()
+                            .compact()
+                            .w(px(15.))
+                            .h(px(23.))
+                            .label(if filled { "★" } else { "☆" })
+                            .text_color(color)
+                            .tooltip(if value == rating {
+                                "Clear rating".to_string()
+                            } else {
+                                format!("Rate {value} / 5")
+                            })
+                            .accessibility_label(format!("Rate {} {value} stars", track.title))
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                cx.stop_propagation();
+                                app.rating_hover = None;
+                                app.mutate(
+                                    Mutation::Rating(id.clone(), rating_after_click(rating, value)),
+                                    cx,
+                                );
+                            })),
+                    ),
             );
         }
         stars
@@ -3099,6 +3174,13 @@ impl MusicApp {
                             .map(|index| {
                                 let track = app.playback.queue[index].clone();
                                 let active = app.playback.index == Some(index);
+                                let key = format!("queue-side-{index}");
+                                let favorite = app.favorite_button(&track, &key, cx);
+                                let rating = if app.information_width < 300. {
+                                    app.rating_menu(&track, &key, cx).into_any_element()
+                                } else {
+                                    app.rating_stars(&track, &key, cx).into_any_element()
+                                };
                                 let select = track.clone();
                                 let service = app.service.clone();
                                 let service2 = service.clone();
@@ -3159,6 +3241,15 @@ impl MusicApp {
                                     )
                                     .child(
                                         div()
+                                            .flex()
+                                            .items_center()
+                                            .flex_shrink_0()
+                                            .child(favorite)
+                                            .child(rating),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
                                             .text_size(px(10.))
                                             .text_color(colors.muted)
                                             .child(duration_label(track.duration)),
@@ -4700,16 +4791,16 @@ impl Render for MusicApp {
             }
             self.now_playing_view(window, cx)
         } else {
+            let floating = self.navigator_floats();
+            let docked = self.preferences.layout.show_navigator && !floating;
             let (left_width, right_width) = panel_widths(
                 f32::from(window.viewport_size().width),
-                self.preferences
-                    .layout
-                    .show_navigator
-                    .then_some(self.preferences.layout.left_width),
+                docked.then_some(self.preferences.layout.left_width),
                 (self.preferences.layout.show_information && !self.settings)
                     .then_some(self.preferences.layout.right_width),
             );
-            let preferred_width = if self.preferences.layout.show_navigator {
+            self.information_width = right_width;
+            let preferred_width = if docked {
                 self.preferences.layout.left_width.clamp(140., 380.)
             } else {
                 0.
@@ -4720,25 +4811,56 @@ impl Render for MusicApp {
                 0.
             };
             let compressed = left_width + right_width < preferred_width - 0.5;
-            let left = self.navigator(cx);
+            let information = self.preferences.layout.show_information && !self.settings;
+            let float_width = self.preferences.layout.left_width.clamp(140., 380.);
+            let peeking = floating && self.navigator_peek.is_some();
+            let slide = if floating {
+                transition(
+                    "navigator-slide",
+                    if peeking { 1_f32 } else { 0_f32 },
+                    Transition::new(Duration::from_millis(180)),
+                    window,
+                    cx,
+                )
+                .clamp(0., 1.)
+            } else {
+                0.
+            };
+            let left = (docked || slide > 0.001).then(|| self.navigator(cx));
             let center = self.center_panel(cx);
-            let right = self.information_sidebar(window, cx);
-            h_resizable("musicbee-workspace")
-                .on_resize(cx.listener(
-                    |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
-                        let sizes = state.read(cx).sizes();
-                        if let Some(size) = sizes.first().filter(|size| f32::from(**size) >= 140.) {
-                            app.preferences.layout.left_width = f32::from(*size);
-                        }
-                        if let Some(size) = sizes.get(2).filter(|size| f32::from(**size) >= 180.) {
-                            app.preferences.layout.right_width = f32::from(*size);
-                        }
-                        app.save_preferences();
-                    },
-                ))
-                .child(
+            let right = information.then(|| self.information_sidebar(window, cx));
+            let (docked_left, floating_left) = if docked { (left, None) } else { (None, left) };
+            // Hidden panels keep stale sizes in a group's state and block dragging,
+            // so each arrangement gets its own group with only the panels it shows.
+            let right_ix = usize::from(docked) + 1;
+            let workspace = h_resizable(SharedString::from(format!(
+                "musicbee-workspace-{}-{}",
+                u8::from(docked),
+                u8::from(information)
+            )))
+            .on_resize(cx.listener(
+                move |app,
+                      state: &Entity<gpui_kit::component::resizable::ResizableState>,
+                      _,
+                      cx| {
+                    let sizes = state.read(cx).sizes();
+                    if docked
+                        && let Some(size) = sizes.first().filter(|size| f32::from(**size) >= 140.)
+                    {
+                        app.preferences.layout.left_width = f32::from(*size);
+                    }
+                    if information
+                        && let Some(size) =
+                            sizes.get(right_ix).filter(|size| f32::from(**size) >= 180.)
+                    {
+                        app.preferences.layout.right_width = f32::from(*size);
+                    }
+                    app.save_preferences();
+                },
+            ))
+            .when_some(docked_left, |group, left| {
+                group.child(
                     resizable_panel()
-                        .visible(self.preferences.layout.show_navigator)
                         .size(px(left_width))
                         .size_range(
                             px(140.)..px(if compressed {
@@ -4750,14 +4872,15 @@ impl Render for MusicApp {
                         .fixed()
                         .child(left),
                 )
-                .child(
+            })
+            .child(
+                resizable_panel()
+                    .size_range(px(300.)..px(2400.))
+                    .child(center),
+            )
+            .when_some(right, |group, right| {
+                group.child(
                     resizable_panel()
-                        .size_range(px(300.)..px(2400.))
-                        .child(center),
-                )
-                .child(
-                    resizable_panel()
-                        .visible(self.preferences.layout.show_information && !self.settings)
                         .size(px(right_width))
                         .size_range(
                             px(180.)..px(if compressed {
@@ -4769,6 +4892,44 @@ impl Render for MusicApp {
                         .fixed()
                         .child(right),
                 )
+            });
+            div()
+                .size_full()
+                .relative()
+                .child(workspace)
+                .when(floating && !peeking, |area| {
+                    area.child(
+                        div()
+                            .id("navigator-edge")
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(px(6.))
+                            .on_hover(cx.listener(move |app, hovered: &bool, window, cx| {
+                                if *hovered {
+                                    app.peek_navigator(float_width, window, cx);
+                                }
+                            })),
+                    )
+                })
+                .when_some(floating_left, |area, navigator| {
+                    area.child(
+                        div()
+                            .id("navigator-float")
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(-float_width * (1. - slide)))
+                            .w(px(float_width))
+                            .opacity(0.6 + 0.4 * slide)
+                            .occlude()
+                            .border_r_1()
+                            .border_color(colors.line)
+                            .shadow_lg()
+                            .child(navigator),
+                    )
+                })
                 .into_any_element()
         };
         div()
@@ -4828,6 +4989,13 @@ impl Render for MusicApp {
             }))
             .on_action(cx.listener(|app, _: &ToggleNavigator, _, cx| {
                 app.preferences.layout.show_navigator = !app.preferences.layout.show_navigator;
+                app.save_preferences();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &ToggleNavigatorAutoHide, _, cx| {
+                app.preferences.layout.navigator_auto_hide =
+                    !app.preferences.layout.navigator_auto_hide;
+                app.navigator_peek = None;
                 app.save_preferences();
                 cx.notify();
             }))

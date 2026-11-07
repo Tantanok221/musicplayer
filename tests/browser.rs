@@ -206,8 +206,10 @@ fn layout_defaults_upgrade_old_preferences_and_survive_restart() {
     assert_eq!(old.layout.explorer_view, MainView::AlbumCovers);
     assert!(old.layout.show_information);
     assert_eq!(old.layout.navigator_mode, NavigatorMode::AlbumArtist);
+    assert!(old.layout.show_navigator && !old.layout.navigator_auto_hide);
     let db = Catalog::memory().unwrap();
     let mut prefs = old;
+    prefs.layout.navigator_auto_hide = true;
     prefs.layout.explorer_view = MainView::Tracks;
     prefs.layout.navigator_mode = NavigatorMode::Genre;
     prefs.layout.left_width = 250.;
@@ -216,6 +218,7 @@ fn layout_defaults_upgrade_old_preferences_and_survive_restart() {
     db.set_state("preferences", &prefs).unwrap();
     let saved: Preferences = db.state("preferences").unwrap();
     assert_eq!(saved.layout.explorer_view, MainView::Tracks);
+    assert!(saved.layout.navigator_auto_hide);
     assert_eq!(saved.layout.navigator_mode, NavigatorMode::Genre);
     assert_eq!(saved.layout.left_width, 250.);
     assert_eq!(saved.layout.info_source, InfoSource::Playing);
