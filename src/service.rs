@@ -3,7 +3,7 @@ use crate::{
     catalog::{Catalog, LibraryView},
     lyrics::Lyrics,
     model::*,
-    platform::{self, Account, Paths},
+    platform::{Account, Paths},
     playback::{PlayerCommand, PlayerEvent, PlayerHandle},
     server::Server,
 };
@@ -18,6 +18,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+const SIGN_IN_NOTICE: &str =
+    "Sign in once to save your login locally. Sonora no longer uses Keychain.";
 
 #[derive(Clone)]
 pub enum Mutation {
@@ -36,8 +39,9 @@ pub enum Command {
     Query(u64, LibraryQuery),
     Page(u64, LibraryQuery, usize),
     Album(String),
+    Artist(String, String),
     GroupTracks(u64, LibraryQuery, String),
-    PlayQuery(LibraryQuery, String),
+    PlayTrack(String),
     Playlist(String),
     Artwork(String),
     ArtworkFinished(String, String, Result<PathBuf, String>),
@@ -65,10 +69,12 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum Event {
     Ready(Option<Account>, Preferences),
+    SignInRequired(String),
     Connected(Account, String),
     View(u64, LibraryView),
     Page(u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
+    Artist(String, Vec<Arc<Album>>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
@@ -218,9 +224,21 @@ fn run(
     ))?;
     if let Some(account) = account.clone() {
         let command_tx = tx.clone();
+        let saved = paths.credentials(&account);
+        let event_tx = events.clone();
         runtime.spawn(async move {
-            let result =
-                platform::password(&account).and_then(|password| Server::new(account, password));
+            let credentials = match saved {
+                Ok(Some(credentials)) => credentials,
+                result => {
+                    let message = match result {
+                        Err(error) => format!("{error:#}"),
+                        _ => SIGN_IN_NOTICE.into(),
+                    };
+                    let _ = event_tx.send(Event::SignInRequired(message));
+                    return;
+                }
+            };
+            let result = Server::with_credentials(account, credentials);
             match result {
                 Ok(mut server) => match server.connect().await {
                     Ok(label) => {
@@ -280,14 +298,26 @@ fn run(
                 Command::Initialize => {
                     events.send(Event::Ready(account.clone(), catalog.state("preferences")?))?;
                     events.send(Event::Playlists(catalog.playlists()?))?;
+                    if let Some(account) = &account {
+                        match paths.credentials(account) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                events.send(Event::SignInRequired(SIGN_IN_NOTICE.into()))?
+                            }
+                            Err(error) => {
+                                events.send(Event::SignInRequired(format!("{error:#}")))?
+                            }
+                        }
+                    }
                 }
                 Command::Connect(account, password) => {
                     let command_tx = tx.clone();
+                    let paths = paths.clone();
                     runtime.spawn(async move {
                         let result = async {
-                            let mut server = Server::new(account, password.clone())?;
+                            let mut server = Server::new(account, password)?;
                             let label = server.connect().await?;
-                            platform::save_password(&server.account, &password)?;
+                            paths.save_credentials(&server.account, server.credentials())?;
                             Ok::<_, anyhow::Error>((server, label))
                         }
                         .await;
@@ -415,13 +445,8 @@ fn run(
                         ))?;
                     }
                 }
-                Command::PlayQuery(query, id) => {
-                    let ids = catalog.matching_ids(&query)?;
-                    let index = ids
-                        .iter()
-                        .position(|candidate| candidate == &id)
-                        .unwrap_or(0);
-                    player.send(PlayerCommand::Replace(catalog.by_ids(&ids)?, index));
+                Command::PlayTrack(id) => {
+                    player.send(PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0));
                 }
                 Command::Album(id) => {
                     events.send(Event::Album(id.clone(), catalog.album_tracks(&id)?))?;
@@ -438,6 +463,12 @@ fn run(
                             }
                         });
                     }
+                }
+                Command::Artist(name, id) => {
+                    events.send(Event::Artist(
+                        name.clone(),
+                        catalog.artist_releases(&name, &id)?,
+                    ))?;
                 }
                 Command::Playlist(id) => {
                     if let Some(playlist) = catalog.playlists()?.into_iter().find(|p| p.id == id) {

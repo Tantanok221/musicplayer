@@ -11,6 +11,58 @@ pub struct NamedId {
     pub name: String,
 }
 
+pub fn split_artist_names(value: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    value
+        .split(['&', ',', ';', '＆', '，', '；'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| seen.insert(normalize(name)))
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn artist_credits(label: &str, structured: &[NamedId], fallback_id: &str) -> Vec<NamedId> {
+    let mut credits = Vec::<NamedId>::new();
+    for artist in structured {
+        let names = split_artist_names(&artist.name);
+        let single = names.len() == 1;
+        for name in names {
+            if !credits
+                .iter()
+                .any(|credit| normalize(&credit.name) == normalize(&name))
+            {
+                credits.push(NamedId {
+                    name,
+                    id: if single {
+                        artist.id.clone()
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+        }
+    }
+    let names = split_artist_names(label);
+    let single = names.len() == 1;
+    for name in names {
+        if !credits
+            .iter()
+            .any(|credit| normalize(&credit.name) == normalize(&name))
+        {
+            credits.push(NamedId {
+                name,
+                id: if single && structured.is_empty() {
+                    fallback_id.into()
+                } else {
+                    String::new()
+                },
+            });
+        }
+    }
+    credits
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Contributor {
@@ -72,6 +124,17 @@ pub struct Genre {
 }
 
 impl Track {
+    pub fn artist_credits(&self) -> Vec<NamedId> {
+        artist_credits(self.artist_label(), &self.artists, &self.artist_id)
+    }
+    pub fn album_artist_credits(&self) -> Vec<NamedId> {
+        let fallback = if normalize(self.album_artist_label()) == normalize(self.artist_label()) {
+            self.artist_id.as_str()
+        } else {
+            ""
+        };
+        artist_credits(self.album_artist_label(), &self.album_artists, fallback)
+    }
     pub fn artist_label(&self) -> &str {
         if self.display_artist.is_empty() {
             &self.artist
@@ -110,6 +173,7 @@ pub struct Album {
     pub name: String,
     pub artist: String,
     pub artist_id: String,
+    pub artists: Vec<NamedId>,
     pub display_artist: String,
     pub cover_art: String,
     pub year: Option<i32>,
@@ -123,6 +187,53 @@ pub struct Album {
     pub release_types: Vec<String>,
     pub original_release_date: Option<serde_json::Value>,
     pub release_date: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseCategory {
+    Album,
+    Ep,
+    Single,
+    Other,
+}
+impl ReleaseCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Album => "Albums",
+            Self::Ep => "EPs",
+            Self::Single => "Singles",
+            Self::Other => "Other releases",
+        }
+    }
+}
+impl Album {
+    pub fn artist_credits(&self) -> Vec<NamedId> {
+        artist_credits(
+            if self.display_artist.is_empty() {
+                &self.artist
+            } else {
+                &self.display_artist
+            },
+            &self.artists,
+            &self.artist_id,
+        )
+    }
+    pub fn category(&self) -> ReleaseCategory {
+        for (value, category) in [
+            ("ep", ReleaseCategory::Ep),
+            ("single", ReleaseCategory::Single),
+            ("album", ReleaseCategory::Album),
+        ] {
+            if self
+                .release_types
+                .iter()
+                .any(|kind| kind.eq_ignore_ascii_case(value))
+            {
+                return category;
+            }
+        }
+        ReleaseCategory::Other
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -168,6 +279,7 @@ pub struct LibraryQuery {
     pub text: String,
     pub selection: crate::browser::BrowserSelection,
     pub artist: String,
+    pub performer: String,
     pub genre: String,
     pub year: Option<i32>,
     pub favorites: bool,

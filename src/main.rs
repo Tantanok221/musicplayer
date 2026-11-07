@@ -34,15 +34,15 @@ fn main() -> Result<()> {
             KeyBinding::new("cmd-,", OpenSettings, Some("Sonora")),
             KeyBinding::new("cmd-f", FocusSearch, Some("Sonora")),
             KeyBinding::new("cmd-r", Refresh, Some("Sonora")),
-            KeyBinding::new("space", TogglePlayback, Some("Sonora")),
             KeyBinding::new("cmd-right", NextTrack, Some("Sonora")),
             KeyBinding::new("cmd-left", PreviousTrack, Some("Sonora")),
             KeyBinding::new("cmd-[", GoBack, Some("Sonora")),
-            KeyBinding::new("cmd-1", MusicWorkspace, Some("Sonora")),
-            KeyBinding::new("cmd-2", PlayingWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-1", ExplorerWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-2", QueueWorkspace, Some("Sonora")),
             KeyBinding::new("cmd-3", PlaylistsWorkspace, Some("Sonora")),
-            KeyBinding::new("cmd-4", ExplorerWorkspace, Some("Sonora")),
+            KeyBinding::new("cmd-4", PlayingWorkspace, Some("Sonora")),
         ]);
+        cx.bind_keys(playback_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
         let menu = |name: &str, items| Menu {
             name: name.into(),
@@ -69,10 +69,10 @@ fn main() -> Result<()> {
             menu(
                 "View",
                 vec![
-                    MenuItem::action("Music", MusicWorkspace),
+                    MenuItem::action("Music Explorer", ExplorerWorkspace),
+                    MenuItem::action("Queue", QueueWorkspace),
                     MenuItem::action("Now Playing", PlayingWorkspace),
                     MenuItem::action("Playlists", PlaylistsWorkspace),
-                    MenuItem::action("Music Explorer", ExplorerWorkspace),
                     MenuItem::separator(),
                     MenuItem::action("Navigator", ToggleNavigator),
                     MenuItem::action("Queue and information", ToggleInformation),
@@ -106,19 +106,52 @@ fn main() -> Result<()> {
     drop(runtime);
     Ok(())
 }
+
+fn playback_bindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("space", TogglePlayback, Some("Sonora")),
+        KeyBinding::new("space", NoAction, Some("Input")),
+    ]
+}
+
 fn open(service: Service, events: flume::Receiver<sonora::service::Event>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
-        window_min_size: Some(size(px(1080.), px(650.))),
+        window_min_size: Some(size(px(680.), px(540.))),
         titlebar: Some(TitlebarOptions {
             title: Some("Sonora".into()),
             appears_transparent: true,
             ..Default::default()
         }),
+        // Route clicks in our custom title bar to its controls instead of AppKit zoom/drag.
+        app_owns_titlebar_drag: true,
         ..Default::default()
     };
     gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| MusicApp::new(service, events, window, cx))
     })
     .expect("Could not open Sonora");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TogglePlayback, playback_bindings};
+    use gpui_kit::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn space_types_in_inputs_and_toggles_playback_elsewhere() {
+        let keymap = Keymap::new(playback_bindings().into());
+        let space = Keystroke::parse("space").unwrap();
+        let root = KeyContext::try_from("Sonora").unwrap();
+        let input = KeyContext::try_from("Input").unwrap();
+        let (bindings, _) =
+            keymap.bindings_for_input(std::slice::from_ref(&space), std::slice::from_ref(&root));
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].action().partial_eq(&TogglePlayback));
+        let (bindings, _) = keymap.bindings_for_input(&[space], &[root, input]);
+        assert!(
+            bindings.is_empty(),
+            "Text input must receive Space without a playback action"
+        );
+    }
 }

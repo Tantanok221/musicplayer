@@ -16,6 +16,31 @@ impl Account {
     }
 }
 
+// This reusable token grants server access. Never derive Debug or log its contents.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ServerCredentials {
+    pub(crate) salt: String,
+    pub(crate) token: String,
+}
+impl ServerCredentials {
+    pub fn from_password(password: &str) -> Result<Self> {
+        anyhow::ensure!(!password.is_empty(), "Enter your Navidrome password");
+        let salt = format!("{:032x}", rand::random::<u128>());
+        let token = format!("{:x}", md5::compute(format!("{password}{salt}")));
+        Ok(Self { salt, token })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.salt.is_empty()
+                && self.token.len() == 32
+                && self.token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Saved login is invalid. Sign in again."
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Paths {
     pub data: PathBuf,
@@ -44,41 +69,65 @@ impl Paths {
             &serde_json::to_vec_pretty(account)?,
         )
     }
+
+    fn credentials_path(&self, account: &Account) -> PathBuf {
+        self.data
+            .join("credentials")
+            .join(format!("{}.json", account.namespace()))
+    }
+
+    pub fn credentials(&self, account: &Account) -> Result<Option<ServerCredentials>> {
+        let path = self.credentials_path(account);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => anyhow::bail!("Could not read saved login. Sign in again."),
+        };
+        // Serde's detailed errors can quote input; keep credential-file errors generic.
+        let credentials: ServerCredentials = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Saved login is invalid. Sign in again."))?;
+        credentials.validate()?;
+        Ok(Some(credentials))
+    }
+
+    pub fn save_credentials(
+        &self,
+        account: &Account,
+        credentials: &ServerCredentials,
+    ) -> Result<()> {
+        credentials.validate()?;
+        let directory = self.data.join("credentials");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory)?;
+        atomic_write(
+            &self.credentials_path(account),
+            &serde_json::to_vec(credentials)?,
+        )
+        .context("Could not save login locally")
+    }
 }
 
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut file =
         tempfile::NamedTempFile::new_in(path.parent().context("Missing parent directory")?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-pub fn save_password(account: &Account, password: &str) -> Result<()> {
-    security_framework::passwords::set_generic_password(
-        "app.sonora.navidrome",
-        &account.namespace(),
-        password.as_bytes(),
-    )
-    .context("Could not save password in macOS Keychain")
-}
-#[cfg(target_os = "macos")]
-pub fn password(account: &Account) -> Result<String> {
-    let bytes = security_framework::passwords::get_generic_password(
-        "app.sonora.navidrome",
-        &account.namespace(),
-    )
-    .context("Could not read password from macOS Keychain. Sign in again.")?;
-    Ok(String::from_utf8(bytes)?)
-}
-#[cfg(not(target_os = "macos"))]
-pub fn save_password(_: &Account, _: &str) -> Result<()> {
-    anyhow::bail!("Keychain requires macOS")
-}
-#[cfg(not(target_os = "macos"))]
-pub fn password(_: &Account) -> Result<String> {
-    anyhow::bail!("Keychain requires macOS")
 }

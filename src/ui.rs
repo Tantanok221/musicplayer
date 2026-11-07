@@ -1,4 +1,5 @@
 use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::{
     button::*,
     input::{Input, InputEvent, InputState},
@@ -21,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 actions!(
@@ -38,8 +40,8 @@ actions!(
         ToggleInformation,
         ToggleBrowser,
         RestoreLayout,
-        MusicWorkspace,
         PlayingWorkspace,
+        QueueWorkspace,
         PlaylistsWorkspace,
         ExplorerWorkspace
     ]
@@ -128,13 +130,14 @@ pub struct MusicApp {
     workspace: Workspace,
     view: LibraryView,
     query: LibraryQuery,
-    music_query: LibraryQuery,
     explorer_query: LibraryQuery,
     request: u64,
     search: Entity<InputState>,
     search_text: String,
     playlist_search: String,
     queue_search: String,
+    titlebar_dragging: bool,
+    workspace_scroll: ScrollHandle,
     server_url: Entity<InputState>,
     username: Entity<InputState>,
     password: Entity<InputState>,
@@ -152,6 +155,9 @@ pub struct MusicApp {
     album_list: ListState,
     cover_list: ListState,
     cover_columns: usize,
+    alphabet_jump: Option<usize>,
+    library_width: f32,
+    library_height: f32,
     selected_album: Option<Arc<Album>>,
     selected: Option<Arc<Track>>,
     playlists: Vec<Playlist>,
@@ -164,6 +170,12 @@ pub struct MusicApp {
     lyrics_requested: HashSet<String>,
     lyrics_scroll: ScrollHandle,
     lyrics_follow: Option<(String, Option<usize>)>,
+    lyrics_scroll_motion: Option<(Instant, f32, f32)>,
+    artist_name: Option<String>,
+    artist_albums: Option<Vec<Arc<Album>>>,
+    artist_origin: Workspace,
+    highlight_album: Option<(String, Vec<Arc<Track>>)>,
+    highlight_requested: Option<String>,
     library_open: bool,
     playlists_open: bool,
     show_playlist_editor: bool,
@@ -209,14 +221,25 @@ impl MusicApp {
                     let value = app.search.read(cx).value().to_string();
                     if value != app.search_text {
                         app.search_text = value.clone();
+                        if app.artist_name.is_some() {
+                            cx.notify();
+                            return;
+                        }
                         match app.workspace {
-                            Workspace::Music | Workspace::Explorer => {
+                            Workspace::Explorer => {
                                 app.query.text = value;
                                 app.query.selection = Default::default();
                                 app.request_query(cx);
                             }
                             Workspace::Playlists => app.playlist_search = value,
-                            Workspace::NowPlaying => app.queue_search = value,
+                            Workspace::Queue => app.queue_search = value,
+                            Workspace::NowPlaying => {
+                                app.workspace = Workspace::Explorer;
+                                app.query = app.explorer_query.clone();
+                                app.query.text = value;
+                                app.query.selection = Default::default();
+                                app.request_query(cx);
+                            }
                         }
                         cx.notify();
                     }
@@ -248,25 +271,23 @@ impl MusicApp {
         })
         .detach();
         service.send(Command::Initialize);
-        let query = LibraryQuery {
-            sort: Sort::Artist,
-            ..Default::default()
-        };
+        let query = LibraryQuery::default();
         let request = service.query(query.clone());
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self {
             service,
-            workspace: Workspace::Music,
+            workspace: Workspace::Explorer,
             view: LibraryView::default(),
             query: query.clone(),
-            music_query: query.clone(),
             explorer_query: query,
             request,
             search,
             search_text: String::new(),
             playlist_search: String::new(),
             queue_search: String::new(),
+            titlebar_dragging: false,
+            workspace_scroll: ScrollHandle::new(),
             server_url,
             username,
             password,
@@ -284,6 +305,9 @@ impl MusicApp {
             album_list: ListState::new(0, ListAlignment::Top, px(300.)),
             cover_list: ListState::new(0, ListAlignment::Top, px(200.)),
             cover_columns: 4,
+            alphabet_jump: None,
+            library_height: 600.,
+            library_width: 600.,
             selected_album: None,
             selected: None,
             playlists: vec![],
@@ -296,6 +320,12 @@ impl MusicApp {
             lyrics_requested: HashSet::new(),
             lyrics_scroll: ScrollHandle::new(),
             lyrics_follow: None,
+            lyrics_scroll_motion: None,
+            artist_name: None,
+            artist_albums: None,
+            artist_origin: Workspace::Explorer,
+            highlight_album: None,
+            highlight_requested: None,
             library_open: true,
             playlists_open: true,
             show_playlist_editor: false,
@@ -329,6 +359,11 @@ impl MusicApp {
                     });
                 }
             }
+            Event::SignInRequired(message) => {
+                self.settings = true;
+                self.status = message;
+                self.error = None;
+            }
             Event::Connected(account, label) => {
                 if self
                     .account
@@ -336,6 +371,8 @@ impl MusicApp {
                     .is_some_and(|old| old.namespace() != account.namespace())
                 {
                     self.artwork.clear();
+                    self.artist_name = None;
+                    self.artist_albums = None;
                 }
                 self.account = Some(account);
                 self.settings = false;
@@ -346,6 +383,8 @@ impl MusicApp {
                 self.lyrics.clear();
                 self.lyrics_requested.clear();
                 self.lyrics_follow = None;
+                self.highlight_album = None;
+                self.highlight_requested = None;
                 self.password
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
@@ -368,9 +407,12 @@ impl MusicApp {
                     self.loading_more = false;
                     self.view = view;
                     if reset {
-                        self.album_list.reset(self.view.albums.len());
-                        self.cover_list
-                            .reset(self.view.albums.len().div_ceil(self.cover_columns));
+                        self.alphabet_jump = None;
+                        self.album_list.reset(self.album_row_count());
+                        self.cover_list.reset(
+                            self.cover_rows().row_count()
+                                + usize::from(self.alphabet_jump.is_some()),
+                        );
                     }
                     self.group_requested.clear();
                     self.group_tracks.clear();
@@ -392,12 +434,21 @@ impl MusicApp {
                     self.group_tracks.insert(id.clone(), tracks);
                     if let Some(index) = self.view.albums.iter().position(|a| a.id == id) {
                         self.album_list.splice(index..index + 1, 1);
-                        let row = index / self.cover_columns;
+                        let row = self.cover_rows().row_for_album(index);
                         self.cover_list.splice(row..row + 1, 1);
                     }
                 }
             }
-            Event::Album(_, _) => {}
+            Event::Artist(name, albums) => {
+                if self.artist_name.as_ref() == Some(&name) {
+                    self.artist_albums = Some(albums);
+                }
+            }
+            Event::Album(id, tracks) => {
+                if self.highlight_requested.as_ref() == Some(&id) {
+                    self.highlight_album = Some((id, tracks));
+                }
+            }
             Event::Playlists(playlists) => {
                 if let Some(current) = &self.playlist {
                     self.playlist = playlists.iter().find(|p| p.id == current.id).cloned();
@@ -417,6 +468,11 @@ impl MusicApp {
                     .tracks
                     .iter_mut()
                     .chain(self.group_tracks.values_mut().flatten())
+                    .chain(
+                        self.highlight_album
+                            .iter_mut()
+                            .flat_map(|(_, tracks)| tracks.iter_mut()),
+                    )
                 {
                     if value.id == track.id {
                         *value = track.clone();
@@ -504,41 +560,52 @@ impl MusicApp {
         cx.notify();
     }
     fn is_library(&self) -> bool {
-        matches!(self.workspace, Workspace::Music | Workspace::Explorer)
+        self.artist_name.is_none() && matches!(self.workspace, Workspace::Explorer)
     }
     fn main_view(&self) -> MainView {
-        if self.workspace == Workspace::Explorer {
-            self.preferences.layout.explorer_view
-        } else {
-            self.preferences.layout.music_view
-        }
+        self.preferences.layout.explorer_view
     }
     fn browser_visible(&self) -> bool {
-        self.is_library()
-            && if self.workspace == Workspace::Explorer {
-                self.preferences.layout.explorer_browser
-            } else {
-                self.preferences.layout.music_browser
-            }
+        self.is_library() && self.preferences.layout.explorer_browser
     }
     fn toggle_browser(&mut self, cx: &mut Context<Self>) {
-        if self.workspace == Workspace::Explorer {
-            self.preferences.layout.explorer_browser = !self.preferences.layout.explorer_browser;
-        } else {
-            self.preferences.layout.music_browser = !self.preferences.layout.music_browser;
-        }
+        self.preferences.layout.explorer_browser = !self.preferences.layout.explorer_browser;
         self.save_preferences();
         cx.notify();
     }
-    fn set_view(&mut self, view: MainView, cx: &mut Context<Self>) {
-        if self.workspace == Workspace::Explorer {
-            self.preferences.layout.explorer_view = view;
+    fn cover_rows(&self) -> CoverRows {
+        CoverRows::new(
+            self.view.albums.len(),
+            self.cover_columns,
+            self.alphabet_jump,
+        )
+    }
+    fn album_row_count(&self) -> usize {
+        self.view.albums.len() + usize::from(self.alphabet_jump.is_some())
+    }
+    fn jump_to_album(&mut self, index: usize) {
+        self.alphabet_jump = Some(index);
+        if self.main_view() == MainView::AlbumCovers {
+            let rows = self.cover_rows();
+            self.cover_list.reset(rows.row_count() + 1);
+            self.cover_list.scroll_to(ListOffset {
+                item_ix: rows.row_for_album(index),
+                offset_in_item: px(0.),
+            });
         } else {
-            self.preferences.layout.music_view = view;
+            self.album_list.reset(self.album_row_count());
+            self.album_list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
         }
-        self.album_list.reset(self.view.albums.len());
+    }
+    fn set_view(&mut self, view: MainView, cx: &mut Context<Self>) {
+        self.alphabet_jump = None;
+        self.preferences.layout.explorer_view = view;
+        self.album_list.reset(self.album_row_count());
         self.cover_list
-            .reset(self.view.albums.len().div_ceil(self.cover_columns));
+            .reset(self.cover_rows().row_count() + usize::from(self.alphabet_jump.is_some()));
         self.save_preferences();
         cx.notify();
     }
@@ -548,24 +615,25 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.workspace {
-            Workspace::Music => self.music_query = self.query.clone(),
-            Workspace::Explorer => self.explorer_query = self.query.clone(),
-            _ => {}
+        if self.workspace == Workspace::Explorer {
+            self.explorer_query = self.query.clone();
         }
         self.workspace = workspace;
+        if let Some(index) = Workspace::ALL.iter().position(|tab| *tab == workspace) {
+            self.workspace_scroll.scroll_to_item(index);
+        }
+        self.artist_name = None;
+        self.artist_albums = None;
+        self.lyrics_follow = None;
         self.settings = false;
         self.search_text = match workspace {
-            Workspace::Music => {
-                self.query = self.music_query.clone();
-                self.query.text.clone()
-            }
             Workspace::Explorer => {
                 self.query = self.explorer_query.clone();
                 self.query.text.clone()
             }
             Workspace::Playlists => self.playlist_search.clone(),
-            Workspace::NowPlaying => self.queue_search.clone(),
+            Workspace::Queue => self.queue_search.clone(),
+            Workspace::NowPlaying => String::new(),
         };
         self.search.update(cx, |input, cx| {
             input.set_value(self.search_text.clone(), window, cx)
@@ -598,7 +666,7 @@ impl MusicApp {
         self.selected_album = Some(album.clone());
         self.request_group(&album.id);
         for index in [old, current].into_iter().flatten() {
-            let row = index / self.cover_columns;
+            let row = self.cover_rows().row_for_album(index);
             self.cover_list.splice(row..row + 1, 1);
         }
         cx.notify();
@@ -607,7 +675,11 @@ impl MusicApp {
         if !self.group_tracks.contains_key(id) && self.group_requested.insert(id.into()) {
             self.service.send(Command::GroupTracks(
                 self.request,
-                self.query.clone(),
+                if self.artist_name.is_some() {
+                    LibraryQuery::default()
+                } else {
+                    self.query.clone()
+                },
                 id.into(),
             ));
         }
@@ -618,32 +690,210 @@ impl MusicApp {
         cx.notify();
     }
     fn play_track(&self, track: &Track) {
-        match self.workspace {
-            Workspace::Music | Workspace::Explorer => self
-                .service
-                .send(Command::PlayQuery(self.query.clone(), track.id.clone())),
-            Workspace::Playlists => {
-                if let Some(playlist) = &self.playlist {
-                    let tracks = playlist
-                        .entry
-                        .iter()
-                        .cloned()
-                        .map(Arc::new)
-                        .collect::<Vec<_>>();
-                    let index = tracks.iter().position(|t| t.id == track.id).unwrap_or(0);
-                    self.service
-                        .player
-                        .send(PlayerCommand::Replace(tracks, index));
-                }
-            }
-            Workspace::NowPlaying => {
-                if let Some(index) = self.playback.queue.iter().position(|t| t.id == track.id) {
-                    self.service
-                        .player
-                        .send(PlayerCommand::Replace(self.playback.queue.clone(), index));
-                }
-            }
+        self.service.send(Command::PlayTrack(track.id.clone()));
+    }
+    fn open_artist(
+        &mut self,
+        name: String,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if name.trim().is_empty() {
+            return;
         }
+        let origin = if self.artist_name.is_some() {
+            self.artist_origin
+        } else {
+            self.workspace
+        };
+        self.switch_workspace(Workspace::Explorer, window, cx);
+        self.artist_origin = origin;
+        self.artist_name = Some(name.clone());
+        self.artist_albums = None;
+        self.selected_album = None;
+        self.group_tracks.clear();
+        self.group_requested.clear();
+        self.search_text.clear();
+        self.search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.service.send(Command::Artist(name, id));
+        cx.notify();
+    }
+    fn open_explorer_filter(
+        &mut self,
+        filter: ExplorerFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_workspace(Workspace::Explorer, window, cx);
+        self.query = filter.query();
+        self.explorer_query = self.query.clone();
+        self.search_text.clear();
+        self.search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.request_query(cx);
+        self.focus.focus(window, cx);
+    }
+    fn metadata_link(
+        &self,
+        filter: ExplorerFilter,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = match &filter {
+            ExplorerFilter::Genre(genre) => genre.clone(),
+            ExplorerFilter::Year(year) => year.to_string(),
+        };
+        let kind = match &filter {
+            ExplorerFilter::Genre(_) => "genre",
+            ExplorerFilter::Year(_) => "year",
+        };
+        div()
+            .id(SharedString::from(key))
+            .role(Role::Button)
+            .aria_label(format!("Explore {kind}: {label}"))
+            .cursor_pointer()
+            .hover(|link| link.text_color(ink(cx).accent))
+            .child(label)
+            .on_click(cx.listener(move |app, _, window, cx| {
+                cx.stop_propagation();
+                app.open_explorer_filter(filter.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+    fn genre_links(&self, genres: &str, key: String, cx: &mut Context<Self>) -> AnyElement {
+        let mut links = div().flex().flex_wrap().min_w_0().items_center().gap_1();
+        for (index, genre) in genres
+            .split(" · ")
+            .map(str::trim)
+            .filter(|genre| !genre.is_empty())
+            .enumerate()
+        {
+            if index > 0 {
+                links = links.child("·");
+            }
+            links = links.child(self.metadata_link(
+                ExplorerFilter::Genre(genre.into()),
+                format!("{key}-{index}"),
+                cx,
+            ));
+        }
+        links.into_any_element()
+    }
+    fn year_link(&self, year: Option<i32>, key: String, cx: &mut Context<Self>) -> AnyElement {
+        year.map_or_else(
+            || div().into_any_element(),
+            |year| self.metadata_link(ExplorerFilter::Year(year), key, cx),
+        )
+    }
+    fn active_filter_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = ink(cx);
+        let mut bar = div()
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(colors.line)
+            .text_size(px(10.))
+            .text_color(colors.muted);
+        if !self.query.performer.is_empty() {
+            bar = bar.child(
+                Button::new("clear-performer-filter")
+                    .ghost()
+                    .compact()
+                    .label(format!("Artist: {} ×", self.query.performer))
+                    .accessibility_label("Clear artist filter")
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.query.performer.clear();
+                        app.request_query(cx);
+                    })),
+            );
+        }
+        if let Some(year) = self.query.year {
+            bar = bar.child(
+                Button::new("clear-year-filter")
+                    .ghost()
+                    .compact()
+                    .label(format!("Year: {year} ×"))
+                    .accessibility_label(format!("Clear year {year} filter"))
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.query.year = None;
+                        app.request_query(cx);
+                    })),
+            );
+        }
+        for (index, genre) in self.query.selection.genres.iter().enumerate() {
+            let genre = genre.clone();
+            bar = bar.child(
+                Button::new(("clear-genre-filter", index))
+                    .ghost()
+                    .compact()
+                    .label(format!("Genre: {genre} ×"))
+                    .accessibility_label(format!("Clear genre {genre} filter"))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.query.selection.genres.retain(|value| value != &genre);
+                        app.query.selection.artists.clear();
+                        app.query.selection.albums.clear();
+                        app.request_query(cx);
+                    })),
+            );
+        }
+        bar.into_any_element()
+    }
+    fn artist_link(
+        &self,
+        name: String,
+        id: String,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.artist_links(artist_credits(&name, &[], &id), key, cx)
+    }
+    fn artist_links(
+        &self,
+        credits: Vec<NamedId>,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut links = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .min_w_0()
+            .gap(px(3.));
+        if key.starts_with("footer") {
+            links = links.flex_nowrap().overflow_hidden();
+        }
+        for (index, credit) in credits.into_iter().enumerate() {
+            if index > 0 {
+                links = links.child(div().text_color(ink(cx).muted).child("·"));
+            }
+            let name = credit.name;
+            let id = credit.id;
+            links = links.child(
+                div()
+                    .id(SharedString::from(format!("{key}-{index}")))
+                    .role(Role::Button)
+                    .aria_label(format!("Open artist {name}"))
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|link| link.text_color(ink(cx).accent))
+                    .child(name.clone())
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        cx.stop_propagation();
+                        app.open_artist(name.clone(), id.clone(), window, cx);
+                    })),
+            );
+        }
+        links.into_any_element()
     }
     fn inspected_track(&self) -> Option<Arc<Track>> {
         match self.preferences.layout.info_source {
@@ -686,22 +936,33 @@ impl MusicApp {
             )
             .into_any_element()
     }
-    fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let mut tabs = div().flex().items_center().h_full().gap_1();
-        for (workspace, label) in [
-            (Workspace::Music, "MUSIC"),
-            (Workspace::NowPlaying, "NOW PLAYING"),
-            (Workspace::Playlists, "PLAYLISTS"),
-            (Workspace::Explorer, "MUSIC EXPLORER"),
-        ] {
+        let width = f32::from(window.viewport_size().width);
+        let search_width = (width * 0.3).clamp(140., 240.);
+        let tabs_width = (width - search_width - 78. - 32. - 24.).clamp(100., 440.);
+        let scroll_buttons = tabs_width < 440.;
+        let mut tabs = div()
+            .id("workspace-tabs")
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .h_full()
+            .gap_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.workspace_scroll);
+        for workspace in Workspace::ALL {
+            let label = workspace.label().to_ascii_uppercase();
             let active = self.workspace == workspace && !self.settings;
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("workspace-{label}")))
                     .role(Role::Tab)
-                    .aria_label(label)
+                    .aria_label(label.clone())
                     .aria_selected(active)
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
                     .h_full()
                     .px_3()
                     .flex()
@@ -727,10 +988,43 @@ impl MusicApp {
                     })),
             );
         }
+        let tabs = div()
+            .w(px(tabs_width))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .when(scroll_buttons, |row| {
+                row.child(
+                    short_button("tabs-left", Glyph::ChevronLeft, "Scroll tabs left").on_click(
+                        cx.listener(|app, _, _, cx| {
+                            let offset = app.workspace_scroll.offset();
+                            app.workspace_scroll
+                                .set_offset(point(offset.x + px(140.), px(0.)));
+                            cx.notify();
+                        }),
+                    ),
+                )
+            })
+            .child(tabs)
+            .when(scroll_buttons, |row| {
+                row.child(
+                    short_button("tabs-right", Glyph::ChevronRight, "Scroll tabs right").on_click(
+                        cx.listener(|app, _, _, cx| {
+                            let offset = app.workspace_scroll.offset();
+                            app.workspace_scroll
+                                .set_offset(point(offset.x - px(140.), px(0.)));
+                            cx.notify();
+                        }),
+                    ),
+                )
+            });
         let navigator = self.preferences.layout.show_navigator;
         let info = self.preferences.layout.show_information;
         let browser = self.browser_visible();
         div()
+            .w_full()
+            .min_w_0()
             .h(px(36.))
             .flex_shrink_0()
             .flex()
@@ -742,7 +1036,28 @@ impl MusicApp {
                 div().w(px(78.)).h_full().flex_shrink_0(),
             )
             .child(tabs)
-            .child(div().flex_1())
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .flex_1()
+                    .h_full()
+                    .on_double_click(|_, window, _| window.titlebar_double_click())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, _| app.titlebar_dragging = true),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, _| app.titlebar_dragging = false),
+                    )
+                    .on_mouse_down_out(cx.listener(|app, _, _, _| app.titlebar_dragging = false))
+                    .on_mouse_move(cx.listener(|app, _, window, _| {
+                        if app.titlebar_dragging {
+                            app.titlebar_dragging = false;
+                            window.start_window_move();
+                        }
+                    })),
+            )
             .child(
                 short_button("layout-menu", Glyph::PanelsTopLeft, "Configure layout")
                     .dropdown_menu(move |menu, _, _| {
@@ -768,7 +1083,7 @@ impl MusicApp {
                     }),
             )
             .child(
-                div().w(px(240.)).px_2().child(
+                div().w(px(search_width)).flex_shrink_0().px_2().child(
                     Input::new(&self.search)
                         .small()
                         .prefix(Icon::new(Glyph::Search).size_3()),
@@ -829,18 +1144,15 @@ impl MusicApp {
                     .pl_3()
                     .child(
                         self.navigation_row(
-                            "nav-music",
-                            "Music",
+                            "nav-explorer",
+                            "Music Explorer",
                             Glyph::Music,
-                            self.workspace == Workspace::Music && !self.query.favorites,
+                            self.workspace == Workspace::Explorer && !self.query.favorites,
                             cx,
                         )
                         .on_click(cx.listener(|app, _, window, cx| {
-                            app.switch_workspace(Workspace::Music, window, cx);
-                            app.query = LibraryQuery {
-                                sort: Sort::Artist,
-                                ..Default::default()
-                            };
+                            app.switch_workspace(Workspace::Explorer, window, cx);
+                            app.query = LibraryQuery::default();
                             app.search_text.clear();
                             app.search.update(cx, |s, cx| s.set_value("", window, cx));
                             app.request_query(cx);
@@ -851,20 +1163,32 @@ impl MusicApp {
                             "nav-favorites",
                             "Favorites",
                             Glyph::Heart,
-                            self.workspace == Workspace::Music && self.query.favorites,
+                            self.workspace == Workspace::Explorer && self.query.favorites,
                             cx,
                         )
                         .on_click(cx.listener(|app, _, window, cx| {
-                            app.switch_workspace(Workspace::Music, window, cx);
+                            app.switch_workspace(Workspace::Explorer, window, cx);
                             app.query.favorites = true;
                             app.request_query(cx);
                         })),
                     )
                     .child(
                         self.navigation_row(
+                            "nav-queue",
+                            "Queue",
+                            Glyph::ListMusic,
+                            self.workspace == Workspace::Queue,
+                            cx,
+                        )
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            app.switch_workspace(Workspace::Queue, window, cx)
+                        })),
+                    )
+                    .child(
+                        self.navigation_row(
                             "nav-now-playing",
                             "Now Playing",
-                            Glyph::ListMusic,
+                            Glyph::Disc3,
                             self.workspace == Workspace::NowPlaying,
                             cx,
                         )
@@ -927,22 +1251,47 @@ impl MusicApp {
                 );
             }
         }
-        let all = self.query.selection.artists.is_empty();
-        let artists = self.view.browser.artists.clone();
-        let count = artists.len();
+        let mode = self.preferences.layout.navigator_mode;
+        let values = self.view.navigator.values(mode).to_vec();
+        let count = values.len();
+        let all = match mode {
+            NavigatorMode::Artist => self.query.performer.is_empty(),
+            NavigatorMode::AlbumArtist => {
+                self.query.selection.artists.is_empty() && self.artist_name.is_none()
+            }
+            NavigatorMode::Year => self.query.year.is_none(),
+            NavigatorMode::Genre => {
+                self.query.selection.genres.is_empty() && self.query.genre.is_empty()
+            }
+        };
         let entity = cx.entity();
-        let artist_list = uniform_list("artist-browser", count, move |range, _, cx| {
+        let facet_list = uniform_list("navigator-facets", count, move |range, _, cx| {
             entity.update(cx, |app, cx| {
                 range
                     .map(|i| {
-                        let artist = artists[i].clone();
-                        let active = app.query.selection.artists.contains(&artist.id);
-                        let art = app.art(&artist.artwork, 34., cx);
-                        let id = artist.id.clone();
+                        let item = values[i].clone();
+                        let active = match mode {
+                            NavigatorMode::Artist => app.query.performer == item.id,
+                            NavigatorMode::AlbumArtist => {
+                                app.query.selection.artists.contains(&item.id)
+                                    || app.artist_name.as_ref() == Some(&item.id)
+                            }
+                            NavigatorMode::Year => {
+                                app.query.year.map(|year| year.to_string()).as_ref()
+                                    == Some(&item.id)
+                            }
+                            NavigatorMode::Genre => {
+                                app.query.selection.genres.contains(&item.id)
+                                    || app.query.genre == item.id
+                            }
+                        };
+                        let art = app.art(&item.artwork, 34., cx);
+                        let id = item.id.clone();
+                        let artist_id = item.detail.clone();
                         div()
-                            .id(("artist-item", i))
+                            .id(("navigator-facet", i))
                             .role(Role::Button)
-                            .aria_label(format!("Filter artist {}", artist.label))
+                            .aria_label(format!("Browse {}: {}", mode.label(), item.label))
                             .h(px(45.))
                             .px_2()
                             .flex()
@@ -965,28 +1314,71 @@ impl MusicApp {
                                             } else {
                                                 ink(cx).text
                                             })
-                                            .child(artist.label),
+                                            .child(item.label),
                                     )
                                     .child(
                                         div().text_size(px(10.)).text_color(ink(cx).muted).child(
                                             format!(
                                                 "{} album{}",
-                                                artist.count,
-                                                if artist.count == 1 { "" } else { "s" }
+                                                item.count,
+                                                if item.count == 1 { "" } else { "s" }
                                             ),
                                         ),
                                     ),
                             )
                             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
-                                if !app.is_library() {
-                                    app.switch_workspace(Workspace::Music, window, cx);
+                                match mode {
+                                    NavigatorMode::AlbumArtist => {
+                                        if event.modifiers().platform || event.modifiers().control {
+                                            if !app.is_library() {
+                                                app.switch_workspace(
+                                                    Workspace::Explorer,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            app.select_browser(
+                                                BrowserColumn::Artist,
+                                                Some(id.clone()),
+                                                true,
+                                                cx,
+                                            );
+                                        } else {
+                                            app.open_artist(
+                                                id.clone(),
+                                                artist_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    NavigatorMode::Artist => {
+                                        app.switch_workspace(Workspace::Explorer, window, cx);
+                                        app.query = LibraryQuery {
+                                            performer: id.clone(),
+                                            ..Default::default()
+                                        };
+                                        app.search_text.clear();
+                                        app.search.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        app.request_query(cx);
+                                    }
+                                    NavigatorMode::Year => {
+                                        if let Ok(year) = id.parse() {
+                                            app.open_explorer_filter(
+                                                ExplorerFilter::Year(year),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    NavigatorMode::Genre => app.open_explorer_filter(
+                                        ExplorerFilter::Genre(id.clone()),
+                                        window,
+                                        cx,
+                                    ),
                                 }
-                                app.select_browser(
-                                    BrowserColumn::Artist,
-                                    Some(id.clone()),
-                                    event.modifiers().platform || event.modifiers().control,
-                                    cx,
-                                );
                             }))
                     })
                     .collect::<Vec<_>>()
@@ -995,6 +1387,54 @@ impl MusicApp {
         .track_scroll(&self.artist_scroll)
         .flex_1()
         .size_full();
+        let weak = cx.weak_entity();
+        let selector = Button::new("navigator-mode")
+            .ghost()
+            .small()
+            .w_full()
+            .h(px(26.))
+            .rounded_none()
+            .text_size(px(11.))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(colors.muted)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(colors.muted)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().truncate().child(mode.label()))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .opacity(0.)
+                            .group_hover("navigator-heading", |s| s.opacity(1.))
+                            .child(Icon::new(Glyph::ChevronDown).size_3()),
+                    ),
+            )
+            .accessibility_label(format!("Browse library by {}", mode.label()))
+            .dropdown_menu(move |mut menu, _, _| {
+                for choice in NavigatorMode::ALL {
+                    let weak = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == mode)
+                            .on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.preferences.layout.navigator_mode = choice;
+                                    app.artist_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    app.save_preferences();
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
         let upper = div()
             .flex()
             .flex_col()
@@ -1013,12 +1453,20 @@ impl MusicApp {
             .flex_col()
             .size_full()
             .bg(colors.panel)
-            .child(panel_title("Album Artist", cx))
             .child(
                 div()
-                    .id("all-artists")
+                    .group("navigator-heading")
+                    .h(px(27.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(colors.line)
+                    .child(selector),
+            )
+            .child(
+                div()
+                    .id("all-navigator-values")
                     .role(Role::Button)
-                    .aria_label("All Artists")
+                    .aria_label(mode.all_label())
                     .h(px(35.))
                     .px_2()
                     .flex()
@@ -1026,18 +1474,34 @@ impl MusicApp {
                     .justify_between()
                     .cursor_pointer()
                     .when(all, |s| s.bg(colors.selection))
-                    .child("All Artists")
+                    .child(mode.all_label())
                     .child(
                         div()
                             .text_size(px(10.))
                             .text_color(colors.muted)
                             .child(count.to_string()),
                     )
-                    .on_click(cx.listener(|app, _, _, cx| {
-                        app.select_browser(BrowserColumn::Artist, None, false, cx)
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        app.switch_workspace(Workspace::Explorer, window, cx);
+                        match mode {
+                            NavigatorMode::Artist => app.query.performer.clear(),
+                            NavigatorMode::AlbumArtist => {
+                                app.query
+                                    .selection
+                                    .select(BrowserColumn::Artist, None, false)
+                            }
+                            NavigatorMode::Year => app.query.year = None,
+                            NavigatorMode::Genre => {
+                                app.query.genre.clear();
+                                app.query
+                                    .selection
+                                    .select(BrowserColumn::Genre, None, false);
+                            }
+                        }
+                        app.request_query(cx);
                     })),
             )
-            .child(artist_list);
+            .child(facet_list);
         v_resizable("left-panels")
             .child(
                 resizable_panel()
@@ -1054,14 +1518,15 @@ impl MusicApp {
     }
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let label = match self.workspace {
+        let label = self.artist_name.as_deref().unwrap_or(match self.workspace {
+            Workspace::Queue => "Queue",
             Workspace::NowPlaying => "Now Playing",
             Workspace::Playlists => self
                 .playlist
                 .as_ref()
                 .map_or("Playlists", |p| p.name.as_str()),
             _ => self.main_view().label(),
-        };
+        });
         let weak = cx.weak_entity();
         let mut left = div().flex().items_center().gap_1();
         if self.is_library() {
@@ -1097,7 +1562,7 @@ impl MusicApp {
             );
         }
         let mut alphabet = div().flex().items_center().gap(px(1.));
-        if self.is_library() && self.main_view() != MainView::Tracks {
+        if self.is_library() && self.main_view() != MainView::Tracks && self.library_width >= 700. {
             for letter in "#ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() {
                 alphabet = alphabet.child(
                     div()
@@ -1131,12 +1596,7 @@ impl MusicApp {
                                 }
                             });
                             if let Some(index) = found {
-                                if app.main_view() == MainView::AlbumCovers {
-                                    app.cover_list
-                                        .scroll_to_reveal_item(index / app.cover_columns);
-                                } else {
-                                    app.album_list.scroll_to_reveal_item(index);
-                                }
+                                app.jump_to_album(index);
                                 cx.notify();
                             }
                         })),
@@ -1174,6 +1634,10 @@ impl MusicApp {
                                 .on_click(cx.listener(|app, _, _, cx| {
                                     app.query.selection = Default::default();
                                     app.query.favorites = false;
+                                    app.query.genre.clear();
+                                    app.query.artist.clear();
+                                    app.query.performer.clear();
+                                    app.query.year = None;
                                     app.request_query(cx);
                                 })),
                         )
@@ -1271,6 +1735,7 @@ impl MusicApp {
                                 .map(|i| {
                                     let item = values[i].clone();
                                     let active = selected.contains(&item.id);
+                                    let artist_id = item.detail.clone();
                                     let id = item.id;
                                     div()
                                         .id(("browser-value", i))
@@ -1297,14 +1762,26 @@ impl MusicApp {
                                                 .child(item.count.to_string()),
                                         )
                                         .on_click(cx.listener(
-                                            move |app, event: &ClickEvent, _, cx| {
-                                                app.select_browser(
-                                                    column,
-                                                    Some(id.clone()),
-                                                    event.modifiers().platform
-                                                        || event.modifiers().control,
-                                                    cx,
-                                                )
+                                            move |app, event: &ClickEvent, window, cx| {
+                                                if column == BrowserColumn::Artist
+                                                    && !(event.modifiers().platform
+                                                        || event.modifiers().control)
+                                                {
+                                                    app.open_artist(
+                                                        id.clone(),
+                                                        artist_id.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    app.select_browser(
+                                                        column,
+                                                        Some(id.clone()),
+                                                        event.modifiers().platform
+                                                            || event.modifiers().control,
+                                                        cx,
+                                                    );
+                                                }
                                             },
                                         ))
                                 })
@@ -1343,21 +1820,8 @@ impl MusicApp {
             ))
             .into_any_element()
     }
-    fn track_row(
-        &mut self,
-        track: Arc<Track>,
-        number: usize,
-        key: String,
-        queue_index: Option<usize>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn track_feedback(&self, track: Arc<Track>, key: String, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let selected = self.selected.as_ref().is_some_and(|t| t.id == track.id);
-        let active = self
-            .playback
-            .track
-            .as_ref()
-            .is_some_and(|t| t.id == track.id);
         let starred = track.starred.is_some();
         let rating = track.user_rating.unwrap_or(0);
         let mut stars = div().flex().items_center().flex_shrink_0();
@@ -1387,6 +1851,49 @@ impl MusicApp {
             );
         }
         let id = track.id.clone();
+        div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .child(
+                Button::new(SharedString::from(format!("love-{key}")))
+                    .ghost()
+                    .compact()
+                    .w(px(23.))
+                    .h(px(24.))
+                    .label(if starred { "♥" } else { "♡" })
+                    .text_color(if starred { colors.accent } else { colors.muted })
+                    .tooltip(if starred {
+                        "Remove favorite"
+                    } else {
+                        "Favorite"
+                    })
+                    .accessibility_label(format!("Favorite {}", track.title))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        cx.stop_propagation();
+                        app.mutate(Mutation::Favorite(id.clone(), !starred), cx);
+                    })),
+            )
+            .child(stars)
+            .into_any_element()
+    }
+    fn track_row(
+        &mut self,
+        track: Arc<Track>,
+        number: usize,
+        key: String,
+        queue_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let selected = self.selected.as_ref().is_some_and(|t| t.id == track.id);
+        let active = self
+            .playback
+            .track
+            .as_ref()
+            .is_some_and(|t| t.id == track.id);
+        let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
         let play = track.clone();
         let next = track.id.clone();
@@ -1398,6 +1905,8 @@ impl MusicApp {
             .id(SharedString::from(format!("row-{key}")))
             .role(Role::Group)
             .aria_label(format!("{} · {}", track.title, track.artist_label()))
+            .w_full()
+            .min_w_0()
             .h(px(27.))
             .px_1()
             .flex()
@@ -1441,26 +1950,7 @@ impl MusicApp {
                     .text_right()
                     .child(duration_label(track.duration)),
             )
-            .child(
-                Button::new(SharedString::from(format!("love-{key}")))
-                    .ghost()
-                    .compact()
-                    .w(px(23.))
-                    .h(px(24.))
-                    .label(if starred { "♥" } else { "♡" })
-                    .text_color(if starred { colors.accent } else { colors.muted })
-                    .tooltip(if starred {
-                        "Remove favorite"
-                    } else {
-                        "Favorite"
-                    })
-                    .accessibility_label(format!("Favorite {}", track.title))
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        cx.stop_propagation();
-                        app.mutate(Mutation::Favorite(id.clone(), !starred), cx);
-                    })),
-            )
-            .child(stars)
+            .child(feedback)
             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                 app.select_track(now.clone(), cx);
                 if event.click_count() == 2 {
@@ -1515,23 +2005,31 @@ impl MusicApp {
         let Some(album) = self.view.albums.get(index).cloned() else {
             return div().into_any_element();
         };
+        let selected_panel =
+            self.main_view() == MainView::AlbumCovers || self.artist_name.is_some();
+        let new_artist =
+            !selected_panel && (index == 0 || self.view.albums[index - 1].artist != album.artist);
+        self.album_panel(album, new_artist, selected_panel, cx)
+    }
+    fn album_panel(
+        &mut self,
+        album: Arc<Album>,
+        new_artist: bool,
+        selected_panel: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.request_group(&album.id);
         let colors = ink(cx);
         let tracks = self.group_tracks.get(&album.id).cloned();
-        let new_artist = index == 0 || self.view.albums[index - 1].artist != album.artist;
         let cover = self.art(&album.cover_art, 124., cx);
         let selection = album.clone();
-        let query = {
-            let mut q = self.query.clone();
-            q.selection.albums = vec![album.id.clone()];
-            q
-        };
-        let playquery = query.clone();
+        let play_album = album.id.clone();
         let source = self.service.clone();
         let albumtitle = album.name.clone();
         let mut right = div()
             .flex_1()
             .min_w_0()
+            .when(self.library_width < 520., |column| column.w_full())
             .flex()
             .flex_col()
             .gap_1()
@@ -1557,20 +2055,30 @@ impl MusicApp {
                             "Play album",
                         )
                         .on_click(move |_, _, _| {
-                            source.send(Command::PlayQuery(playquery.clone(), String::new()))
+                            source.send(Command::PlayAlbum(play_album.clone()))
                         }),
                     ),
             )
             .child(
                 div()
                     .pb_1()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
                     .text_size(px(10.))
                     .text_color(colors.muted)
+                    .when(selected_panel, |line| {
+                        line.child(self.artist_links(
+                            album.artist_credits(),
+                            format!("album-artist-{}", album.id),
+                            cx,
+                        ))
+                    })
+                    .child(self.year_link(album.year, format!("album-year-{}", album.id), cx))
+                    .child(self.genre_links(&album.genre, format!("album-genres-{}", album.id), cx))
                     .child(format!(
-                        "{}{}{} · {} tracks",
-                        album.year.map_or(String::new(), |v| v.to_string()),
-                        if album.genre.is_empty() { "" } else { " · " },
-                        album.genre,
+                        "{} tracks",
                         tracks.as_ref().map_or(album.song_count as usize, Vec::len)
                     )),
             );
@@ -1606,6 +2114,8 @@ impl MusicApp {
             );
         }
         div()
+            .w_full()
+            .min_w_0()
             .px_3()
             .pb_4()
             .pt_2()
@@ -1622,14 +2132,21 @@ impl MusicApp {
                         .border_color(colors.line)
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(album.artist.clone()),
+                        .child(self.artist_links(
+                            album.artist_credits(),
+                            format!("group-artist-{}", album.id),
+                            cx,
+                        )),
                 )
             })
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .gap_3()
                     .items_start()
+                    .when(self.library_width < 520., |row| row.flex_col())
                     .child(
                         div()
                             .w(px(124.))
@@ -1646,13 +2163,15 @@ impl MusicApp {
                                         app.select_album(selection.clone(), cx)
                                     })),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(colors.muted)
-                                    .truncate()
-                                    .child(albumtitle),
-                            ),
+                            .when(!selected_panel, |cover| {
+                                cover.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(colors.muted)
+                                        .truncate()
+                                        .child(albumtitle),
+                                )
+                            }),
                     )
                     .child(right),
             )
@@ -1661,36 +2180,227 @@ impl MusicApp {
     fn grouped_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         list(self.album_list.clone(), move |index, _, cx| {
-            entity.update(cx, |app, cx| app.album_group(index, cx))
+            entity.update(cx, |app, cx| {
+                if index == app.view.albums.len() {
+                    // Leave room below the last album so a letter can align at the top.
+                    div().h(px(app.library_height)).into_any_element()
+                } else {
+                    app.album_group(index, cx)
+                }
+            })
         })
         .size_full()
         .into_any_element()
     }
-    fn covers_view(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let width = f32::from(window.viewport_size().width)
-            - if self.preferences.layout.show_navigator {
-                self.preferences.layout.left_width
-            } else {
-                0.
+    fn artist_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = ink(cx);
+        let name = self.artist_name.clone().unwrap_or_default();
+        let mut page = div()
+            .id("artist-page")
+            .size_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .p_4();
+        page = page.child(
+            Button::new("artist-back")
+                .ghost()
+                .small()
+                .icon(Glyph::ChevronLeft)
+                .label("Back")
+                .on_click(cx.listener(|app, _, window, cx| {
+                    let origin = app.artist_origin;
+                    app.switch_workspace(origin, window, cx);
+                })),
+        );
+        let Some(albums) = self.artist_albums.clone() else {
+            return page
+                .child(div().mt_4().child("Loading artist releases…"))
+                .into_any_element();
+        };
+        let mut hero = div().my_4().flex().items_center().gap_4();
+        if let Some(album) = albums.first() {
+            hero = hero.child(self.art(&album.cover_art, 80., cx));
+        }
+        page = page.child(
+            hero.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.muted)
+                            .child("ARTIST"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(25.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(11.))
+                            .text_color(colors.muted)
+                            .child(format!(
+                                "{} release{} in your library",
+                                albums.len(),
+                                if albums.len() == 1 { "" } else { "s" }
+                            )),
+                    ),
+            ),
+        );
+        if albums.is_empty() {
+            return page
+                .child(
+                    div()
+                        .text_color(colors.muted)
+                        .child("No releases for this artist in your library."),
+                )
+                .into_any_element();
+        }
+        if !albums
+            .iter()
+            .any(|album| normalize(&album.name).contains(&normalize(&self.search_text)))
+        {
+            return page
+                .child(
+                    div()
+                        .text_color(colors.muted)
+                        .child("No releases match your search."),
+                )
+                .into_any_element();
+        }
+        let (_, side) = cover_layout((self.library_width - 8.).max(0.));
+        for category in [
+            ReleaseCategory::Album,
+            ReleaseCategory::Ep,
+            ReleaseCategory::Single,
+            ReleaseCategory::Other,
+        ] {
+            let releases = albums
+                .iter()
+                .filter(|album| album.category() == category)
+                .filter(|album| normalize(&album.name).contains(&normalize(&self.search_text)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if releases.is_empty() {
+                continue;
             }
-            - if self.preferences.layout.show_information {
-                self.preferences.layout.right_width
-            } else {
-                0.
+            let mut section = div().mt_5().min_w_0().child(
+                div()
+                    .mb_3()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} ({})", category.label(), releases.len())),
+            );
+            let mut cards = div().flex().flex_wrap().gap_4();
+            for album in &releases {
+                let open = album.clone();
+                let selected = self
+                    .selected_album
+                    .as_ref()
+                    .is_some_and(|selected| selected.id == album.id);
+                cards = cards.child(
+                    div()
+                        .id(SharedString::from(format!("artist-release-{}", album.id)))
+                        .role(Role::Button)
+                        .aria_label(format!("Select release {}", album.name))
+                        .w(px(side))
+                        .min_w_0()
+                        .cursor_pointer()
+                        .pb_2()
+                        .border_b_2()
+                        .border_color(if selected {
+                            colors.accent
+                        } else {
+                            colors.background
+                        })
+                        .child(self.art(&album.cover_art, side, cx))
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(album.name.clone()),
+                        )
+                        .child(div().text_size(px(10.)).text_color(colors.muted).child(
+                            if let Some(year) = album.year {
+                                self.metadata_link(
+                                    ExplorerFilter::Year(year),
+                                    format!("release-year-{}", album.id),
+                                    cx,
+                                )
+                            } else {
+                                div().child("Year unknown").into_any_element()
+                            },
+                        ))
+                        .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
+                            app.select_album(open.clone(), cx);
+                            if event.click_count() == 2 {
+                                app.service.send(Command::PlayAlbum(open.id.clone()));
+                            }
+                        })),
+                );
             }
-            - 28.;
-        let columns = (width / 142.).floor().max(2.) as usize;
-        let side = ((width - (columns as f32 - 1.) * 16.) / columns as f32).clamp(90., 150.);
+            if releases.is_empty() {
+                section = section.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(colors.muted)
+                        .child("No releases in this category."),
+                );
+            } else {
+                section = section.child(cards);
+            }
+            if let Some(album) = self
+                .selected_album
+                .clone()
+                .filter(|selected| releases.iter().any(|album| album.id == selected.id))
+            {
+                section = section.child(
+                    div()
+                        .mt_3()
+                        .border_y_1()
+                        .border_color(colors.line)
+                        .child(self.album_panel(album, false, true, cx)),
+                );
+            }
+            page = page.child(section);
+        }
+        page.into_any_element()
+    }
+    fn covers_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (columns, side) = cover_layout(self.library_width);
         if columns != self.cover_columns {
             self.cover_columns = columns;
             self.cover_list
-                .reset(self.view.albums.len().div_ceil(columns));
+                .reset(self.cover_rows().row_count() + usize::from(self.alphabet_jump.is_some()));
+            if let Some(index) = self.alphabet_jump.or_else(|| {
+                self.selected_album.as_ref().and_then(|selected| {
+                    self.view
+                        .albums
+                        .iter()
+                        .position(|album| album.id == selected.id)
+                })
+            }) {
+                self.cover_list.scroll_to(ListOffset {
+                    item_ix: self.cover_rows().row_for_album(index),
+                    offset_in_item: px(0.),
+                });
+            }
         }
         let entity = cx.entity();
         list(self.cover_list.clone(), move |row, _, cx| {
             entity.update(cx, |app, cx| {
-                let mut cards = div().flex().gap_4().px_3().pt_3();
-                for index in row * columns..((row + 1) * columns).min(app.view.albums.len()) {
+                if row == app.cover_rows().row_count() {
+                    return div().h(px(app.library_height)).into_any_element();
+                }
+                let mut cards = div().w_full().min_w_0().flex().gap_4().px_3().pt_3();
+                for index in app.cover_rows().albums_in_row(row) {
                     let album = app.view.albums[index].clone();
                     let selected = app
                         .selected_album
@@ -1729,7 +2439,11 @@ impl MusicApp {
                                     .text_size(px(10.))
                                     .text_color(ink(cx).muted)
                                     .truncate()
-                                    .child(album.artist.clone()),
+                                    .child(app.artist_links(
+                                        album.artist_credits(),
+                                        format!("card-artist-{}", album.id),
+                                        cx,
+                                    )),
                             )
                             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                                 app.select_album(open.clone(), cx);
@@ -1746,7 +2460,7 @@ impl MusicApp {
                             }),
                     );
                 }
-                let mut item = div().flex().flex_col().child(cards);
+                let mut item = div().w_full().min_w_0().flex().flex_col().child(cards);
                 if let Some(index) = app
                     .selected_album
                     .as_ref()
@@ -1756,10 +2470,12 @@ impl MusicApp {
                             .iter()
                             .position(|album| album.id == selected.id)
                     })
-                    .filter(|index| index / columns == row)
+                    .filter(|index| app.cover_rows().row_for_album(*index) == row)
                 {
                     item = item.child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .mt_2()
                             .border_y_1()
                             .border_color(ink(cx).line)
@@ -1833,10 +2549,7 @@ impl MusicApp {
                         if app.account.is_none() {
                             app.settings = true;
                         } else {
-                            app.query = LibraryQuery {
-                                sort: Sort::Artist,
-                                ..Default::default()
-                            };
+                            app.query = LibraryQuery::default();
                             app.search_text.clear();
                             app.search
                                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1895,6 +2608,8 @@ impl MusicApp {
                                 let service3 = service.clone();
                                 div()
                                     .id(("queued", index))
+                                    .w_full()
+                                    .min_w_0()
                                     .role(Role::Group)
                                     .aria_label(format!("Queue {}: {}", index + 1, track.title))
                                     .h(px(37.))
@@ -1938,7 +2653,11 @@ impl MusicApp {
                                                     .text_size(px(10.))
                                                     .text_color(colors.muted)
                                                     .truncate()
-                                                    .child(track.artist_label().to_string()),
+                                                    .child(app.artist_links(
+                                                        track.artist_credits(),
+                                                        format!("queue-artist-{index}"),
+                                                        cx,
+                                                    )),
                                             ),
                                     )
                                     .child(
@@ -1990,7 +2709,7 @@ impl MusicApp {
             )
             .into_any_element()
     }
-    fn track_information(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn track_information(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let source = self.preferences.layout.info_source;
         let tab = self.preferences.layout.info_tab;
@@ -2120,18 +2839,20 @@ impl MusicApp {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(track.title.clone()),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(colors.muted)
-                                        .child(track.artist_label().to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(colors.muted)
-                                        .child(track.year.map_or(String::new(), |v| v.to_string())),
-                                ),
+                                .child(div().text_size(px(11.)).text_color(colors.muted).child(
+                                    self.artist_links(
+                                        track.artist_credits(),
+                                        format!("track_information-artist-1-{}", track.id),
+                                        cx,
+                                    ),
+                                ))
+                                .child(div().text_size(px(10.)).text_color(colors.muted).child(
+                                    self.year_link(
+                                        track.year,
+                                        format!("details-year-{}", track.id),
+                                        cx,
+                                    ),
+                                )),
                         );
                     content = content.child(summary);
                     let mut fields = vec![
@@ -2165,6 +2886,21 @@ impl MusicApp {
                     }
                     for (label, value) in fields {
                         if !value.is_empty() {
+                            let value = if label == "Album Artist" {
+                                self.artist_link(
+                                    value,
+                                    track
+                                        .album_artists
+                                        .first()
+                                        .map_or(String::new(), |artist| artist.id.clone()),
+                                    format!("details-album-artist-{}", track.id),
+                                    cx,
+                                )
+                            } else if label == "Genre" {
+                                self.genre_links(&value, format!("details-genres-{}", track.id), cx)
+                            } else {
+                                div().child(value).into_any_element()
+                            };
                             content = content.child(
                                 div()
                                     .mb_2()
@@ -2190,103 +2926,11 @@ impl MusicApp {
                         .child(div().pt_2().text_size(px(11.)).child(track.album.clone()));
                 }
                 InfoTab::Lyrics => {
-                    if !self.lyrics.contains_key(&track.id)
-                        && self.lyrics_requested.insert(track.id.clone())
-                    {
-                        self.service.send(Command::Lyrics(track.clone()));
-                    }
-                    content = content.track_scroll(&self.lyrics_scroll);
-                    match self.lyrics.get(&track.id).cloned() {
-                        Some(Ok(lyrics)) if !lyrics.is_empty() => {
-                            let is_playing = self
-                                .playback
-                                .track
-                                .as_ref()
-                                .is_some_and(|playing| playing.id == track.id);
-                            let active = is_playing
-                                .then(|| lyrics.active_line(self.playback.position))
-                                .flatten();
-                            let follow = (track.id.clone(), active);
-                            if self.lyrics_follow.as_ref() != Some(&follow) {
-                                self.lyrics_scroll
-                                    .scroll_to_top_of_item(active.unwrap_or(0).saturating_sub(2));
-                                self.lyrics_follow = Some(follow);
-                            }
-                            for (index, line) in lyrics.line.iter().enumerate() {
-                                let highlighted = lyrics.line_is_active(index, active);
-                                let seek =
-                                    is_playing.then(|| lyrics.line_position(index)).flatten();
-                                let player = self.service.player.clone();
-                                content = content.child(
-                                    div()
-                                        .id(SharedString::from(format!("lyric-{index}")))
-                                        .role(Role::Group)
-                                        .aria_label(format!(
-                                            "{}{}",
-                                            if highlighted { "Current lyric: " } else { "" },
-                                            line.value
-                                        ))
-                                        .py_2()
-                                        .px_1()
-                                        .text_size(px(13.))
-                                        .line_height(px(21.))
-                                        .text_color(if highlighted {
-                                            colors.accent
-                                        } else {
-                                            colors.muted
-                                        })
-                                        .font_weight(if highlighted {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::NORMAL
-                                        })
-                                        .child(if line.value.is_empty() {
-                                            " ".to_string()
-                                        } else {
-                                            line.value.clone()
-                                        })
-                                        .when_some(seek, |row, position| {
-                                            row.cursor_pointer().on_click(move |_, _, _| {
-                                                player.send(PlayerCommand::Seek(position));
-                                            })
-                                        }),
-                                );
-                            }
-                            if !lyrics.is_timed() {
-                                content = content.child(
-                                    div()
-                                        .mt_3()
-                                        .text_size(px(10.))
-                                        .text_color(colors.muted)
-                                        .child("Plain lyrics · no timing supplied"),
-                                );
-                            }
-                        }
-                        value => {
-                            let retry = matches!(value, Some(Err(_)));
-                            let message = match value {
-                                None => "Loading lyrics…".to_string(),
-                                Some(Ok(_)) => "No lyrics supplied by the server.".to_string(),
-                                Some(Err(error)) => error,
-                            };
-                            content = content.child(div().text_size(px(12.)).child(message));
-                            if retry {
-                                let id = track.id.clone();
-                                content = content.child(
-                                    Button::new("retry-lyrics")
-                                        .ghost()
-                                        .compact()
-                                        .label("Retry lyrics")
-                                        .on_click(cx.listener(move |app, _, _, cx| {
-                                            app.lyrics.remove(&id);
-                                            app.lyrics_requested.remove(&id);
-                                            app.lyrics_follow = None;
-                                            cx.notify();
-                                        })),
-                                );
-                            }
-                        }
-                    }
+                    content = div()
+                        .id("information-lyrics")
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.lyrics_content(track.clone(), false, window, cx));
                 }
             }
         } else {
@@ -2309,9 +2953,158 @@ impl MusicApp {
             .child(content)
             .into_any_element()
     }
-    fn information_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.workspace == Workspace::NowPlaying {
-            return self.track_information(cx);
+    fn lyrics_content(
+        &mut self,
+        track: Arc<Track>,
+        highlight: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        if !self.lyrics.contains_key(&track.id) && self.lyrics_requested.insert(track.id.clone()) {
+            self.service.send(Command::Lyrics(track.clone()));
+        }
+        let mut content = div()
+            .id("lyrics-scroll")
+            .size_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.lyrics_scroll)
+            .p_3();
+        match self.lyrics.get(&track.id).cloned() {
+            Some(Ok(lyrics)) if !lyrics.is_empty() => {
+                let is_playing = self
+                    .playback
+                    .track
+                    .as_ref()
+                    .is_some_and(|playing| playing.id == track.id);
+                let active = is_playing
+                    .then(|| lyrics.active_line(self.playback.position))
+                    .flatten();
+                let follow = (track.id.clone(), active);
+                if self.lyrics_follow.as_ref() != Some(&follow) {
+                    let index = active.unwrap_or(0).saturating_sub(2);
+                    if self
+                        .lyrics_follow
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &track.id)
+                        && let Some(bounds) = self.lyrics_scroll.bounds_for_item(index)
+                    {
+                        let target = f32::from(self.lyrics_scroll.bounds().top() - bounds.top())
+                            .clamp(-f32::from(self.lyrics_scroll.max_offset().y), 0.);
+                        self.lyrics_scroll_motion = Some((
+                            Instant::now(),
+                            f32::from(self.lyrics_scroll.offset().y),
+                            target,
+                        ));
+                    } else {
+                        self.lyrics_scroll_motion = None;
+                        self.lyrics_scroll.scroll_to_top_of_item(index);
+                    }
+                    self.lyrics_follow = Some(follow);
+                }
+                if let Some((started, from, target)) = self.lyrics_scroll_motion {
+                    let progress = (started.elapsed().as_secs_f32() / 0.4).min(1.);
+                    let eased = 1. - (1. - progress).powi(3);
+                    self.lyrics_scroll.set_offset(point(
+                        self.lyrics_scroll.offset().x,
+                        px(from + (target - from) * eased),
+                    ));
+                    if progress < 1. {
+                        window.request_animation_frame();
+                    } else {
+                        self.lyrics_scroll_motion = None;
+                    }
+                }
+                for (index, line) in lyrics.line.iter().enumerate() {
+                    let highlighted = lyrics.line_is_active(index, active);
+                    let focus = transition(
+                        SharedString::from(format!("lyric-focus-{}-{highlight}-{index}", track.id)),
+                        if highlighted { 1_f32 } else { 0_f32 },
+                        Transition::new(Duration::from_millis(320)),
+                        window,
+                        cx,
+                    )
+                    .clamp(0., 1.);
+                    let seek = is_playing.then(|| lyrics.line_position(index)).flatten();
+                    let player = self.service.player.clone();
+                    content = content.child(
+                        div()
+                            .id(SharedString::from(format!("lyric-{index}")))
+                            .role(Role::Group)
+                            .aria_label(format!(
+                                "{}{}",
+                                if highlighted { "Current lyric: " } else { "" },
+                                line.value
+                            ))
+                            .py_2()
+                            .px_2()
+                            .relative()
+                            .left(px(5. * focus))
+                            .border_l_2()
+                            .border_color(colors.accent.opacity(focus * 0.8))
+                            .bg(colors.accent.opacity(focus * 0.045))
+                            .opacity(0.82 + focus * 0.18)
+                            .text_size(px(if highlight { 19. + focus } else { 13. }))
+                            .line_height(px(if highlight { 30. } else { 21. }))
+                            .text_color(colors.muted.blend(colors.accent.opacity(focus)))
+                            .font_weight(if highlighted {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(if line.value.is_empty() {
+                                " ".to_string()
+                            } else {
+                                line.value.clone()
+                            })
+                            .when_some(seek, |row, position| {
+                                row.cursor_pointer().on_click(move |_, _, _| {
+                                    player.send(PlayerCommand::Seek(position));
+                                })
+                            }),
+                    );
+                }
+                if !lyrics.is_timed() {
+                    content = content.child(
+                        div()
+                            .mt_3()
+                            .text_size(px(10.))
+                            .text_color(colors.muted)
+                            .child("Plain lyrics · no timing supplied"),
+                    );
+                }
+            }
+            value => {
+                let retry = matches!(value, Some(Err(_)));
+                let message = match value {
+                    None => "Loading lyrics…".to_string(),
+                    Some(Ok(_)) => "No lyrics supplied by the server.".to_string(),
+                    Some(Err(error)) => error,
+                };
+                content = content.child(div().text_size(px(12.)).child(message));
+                if retry {
+                    let id = track.id.clone();
+                    content = content.child(
+                        Button::new("retry-lyrics")
+                            .ghost()
+                            .compact()
+                            .label("Retry lyrics")
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                app.lyrics.remove(&id);
+                                app.lyrics_requested.remove(&id);
+                                app.lyrics_follow = None;
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+        }
+        content.into_any_element()
+    }
+    fn information_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.workspace == Workspace::Queue {
+            return self.track_information(window, cx);
         }
         v_resizable("right-panels")
             .on_resize(cx.listener(
@@ -2331,11 +3124,11 @@ impl MusicApp {
             .child(
                 resizable_panel()
                     .size_range(px(150.)..px(2000.))
-                    .child(self.track_information(cx)),
+                    .child(self.track_information(window, cx)),
             )
             .into_any_element()
     }
-    fn now_playing_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn queue_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let values = self
             .playback
             .queue
@@ -2360,7 +3153,7 @@ impl MusicApp {
                 cx,
             );
         }
-        uniform_list("now-playing-main", count, move |range, _, cx| {
+        uniform_list("queue-main", count, move |range, _, cx| {
             entity.update(cx, |app, cx| {
                 range
                     .map(|row| {
@@ -2379,6 +3172,263 @@ impl MusicApp {
         .size_full()
         .px_3()
         .into_any_element()
+    }
+    fn now_playing_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(track) = self.playback.track.clone() else {
+            return self.empty(
+                "Play an album or track to see its artwork, details, and lyrics here.",
+                cx,
+            );
+        };
+        let colors = ink(cx);
+        if !track.album_id.is_empty() && self.highlight_requested.as_ref() != Some(&track.album_id)
+        {
+            self.highlight_requested = Some(track.album_id.clone());
+            self.highlight_album = None;
+            self.service.send(Command::Album(track.album_id.clone()));
+        }
+        let album_tracks = self
+            .highlight_album
+            .as_ref()
+            .filter(|(id, _)| id == &track.album_id)
+            .map(|(_, tracks)| tracks.clone())
+            .unwrap_or_else(|| {
+                self.playback
+                    .queue
+                    .iter()
+                    .filter(|item| {
+                        if track.album_id.is_empty() {
+                            item.id == track.id
+                        } else {
+                            item.album_id == track.album_id
+                        }
+                    })
+                    .cloned()
+                    .collect()
+            });
+        let album_time = album_tracks.iter().map(|track| track.duration).sum::<f64>();
+        let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 340.);
+        let cover = self.art(&track.cover_art, cover_side, cx);
+        let mut album_list = div().flex().flex_col().gap_1();
+        for (index, item) in album_tracks.iter().enumerate() {
+            album_list = album_list.child(self.track_row(
+                item.clone(),
+                item.track.unwrap_or(index as u32 + 1) as usize,
+                format!("highlight-album-{index}"),
+                None,
+                cx,
+            ));
+        }
+        let left = div()
+            .id("now-playing-album")
+            .w(px(cover_side + 64.))
+            .h_full()
+            .min_h_0()
+            .flex_shrink_0()
+            .overflow_y_scroll()
+            .p_6()
+            .bg(colors.panel)
+            .child(
+                div()
+                    .mb_4()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child("NOW PLAYING"),
+            )
+            .child(cover)
+            .child(
+                div()
+                    .mt_4()
+                    .text_size(px(24.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(track.album.clone()),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_size(px(15.))
+                    .text_color(colors.muted)
+                    .child(
+                        self.artist_link(
+                            track.album_artist_label().to_string(),
+                            track
+                                .album_artists
+                                .first()
+                                .map_or(String::new(), |artist| artist.id.clone()),
+                            format!("playing-album-artist-{}", track.id),
+                            cx,
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .child(self.year_link(track.year, format!("playing-year-{}", track.id), cx))
+                    .child(self.genre_links(
+                        &track.genres_label(),
+                        format!("playing-genres-{}", track.id),
+                        cx,
+                    ))
+                    .child(format!(
+                        "{} tracks · {}",
+                        album_tracks.len(),
+                        duration_label(album_time)
+                    )),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child("CURRENT TRACK"),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(track.title.clone()),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_size(px(12.))
+                    .text_color(colors.muted)
+                    .child(self.artist_links(
+                        track.artist_credits(),
+                        format!("now_playing_view-artist-1-{}", track.id),
+                        cx,
+                    )),
+            )
+            .child(self.track_row(
+                track.clone(),
+                track.track.unwrap_or(1) as usize,
+                "highlight-current".into(),
+                None,
+                cx,
+            ))
+            .child(
+                div()
+                    .mt_1()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child(technical(&track)),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .mb_2()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child("ON THIS ALBUM"),
+            )
+            .child(album_list);
+        let lyrics = self.lyrics_content(track.clone(), true, window, cx);
+        let right = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(colors.line)
+            .px_6()
+            .pt_6()
+            .child(
+                div()
+                    .mb_2()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child("LYRICS"),
+            )
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(track.title.clone()),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .mb_3()
+                    .text_size(px(12.))
+                    .text_color(colors.muted)
+                    .child(self.artist_links(
+                        track.artist_credits(),
+                        format!("now_playing_view-artist-2-{}", track.id),
+                        cx,
+                    )),
+            )
+            .child(div().flex_1().min_h_0().child(lyrics));
+        let waveform = self.service.player.waveform();
+        let mut bars = div().flex_1().min_h_0().flex().items_center().gap(px(3.));
+        for amplitude in waveform {
+            bars = bars.child(
+                div()
+                    .flex_1()
+                    .h(px(2. + amplitude.sqrt() * 64.))
+                    .rounded_sm()
+                    .bg(colors.accent),
+            );
+        }
+        let visualizer = div()
+            .id("output-visualizer")
+            .role(Role::Group)
+            .aria_label("Audio visualization")
+            .h(px(108.))
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(colors.line)
+            .px_6()
+            .py_3()
+            .flex()
+            .flex_col()
+            .bg(colors.panel)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child("AUDIO")
+                    .child(if self.playback.buffering {
+                        "Buffering…"
+                    } else if self.playback.playing {
+                        "Playing"
+                    } else {
+                        "Paused"
+                    }),
+            )
+            .child(bars);
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(colors.background)
+            .when_some(
+                self.error.clone().or_else(|| self.playback.error.clone()),
+                |page, error| {
+                    page.child(
+                        div()
+                            .px_6()
+                            .py_2()
+                            .text_size(px(11.))
+                            .text_color(colors.accent)
+                            .child(error),
+                    )
+                },
+            )
+            .child(div().flex_1().min_h_0().flex().child(left).child(right))
+            .child(visualizer)
+            .into_any_element()
     }
     fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
@@ -2581,7 +3631,7 @@ impl MusicApp {
         let colors = ink(cx);
         div().id("settings").size_full().overflow_y_scroll().p_5().child(div().max_w(px(500.)).w_full().flex().flex_col().gap_3()
             .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Navidrome connection"))
-            .child(div().text_size(px(11.)).text_color(colors.muted).child("Enter your server address and credentials. Your password is stored in macOS Keychain."))
+            .child(div().text_size(px(11.)).text_color(colors.muted).child("Enter your server address and credentials. Sonora saves a login token locally so you stay signed in. Your password is not saved. The token file is unencrypted and readable only by your macOS user."))
             .child("Server address").child(Input::new(&self.server_url).small()).child("Username").child(Input::new(&self.username).small()).child("Password").child(Input::new(&self.password).small())
             .child(div().child(Button::new("connect-library").small().label("Connect").on_click(cx.listener(|app,_,_,cx|{app.status="Connecting…".into();app.error=None;app.service.send(Command::Connect(Account{url:app.server_url.read(cx).value().to_string(),username:app.username.read(cx).value().to_string()},app.password.read(cx).value().to_string()));cx.notify();}))))
             .child(div().pt_4().border_t_1().border_color(colors.line).font_weight(FontWeight::SEMIBOLD).child("Playback"))
@@ -2602,34 +3652,46 @@ impl MusicApp {
         let player = self.service.player.clone();
         short_button(id, icon, label).on_click(move |_, _, _| player.send(command.clone()))
     }
-    fn player_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn player_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
+        let width = f32::from(window.viewport_size().width);
+        let compact = width < 1000.;
         let track = self.playback.track.clone();
         let title = track
             .as_ref()
-            .map_or("No track playing".into(), |t| t.title.clone());
-        let artist = track
+            .map_or("No track playing".into(), |track| track.title.clone());
+        let artist_caption = if self.playback.buffering {
+            div().child("Buffering…").into_any_element()
+        } else if let Some(track) = &track {
+            self.artist_links(track.artist_credits(), "footer-artists".into(), cx)
+        } else {
+            div().into_any_element()
+        };
+        let cover = track
             .as_ref()
-            .map_or(String::new(), |t| t.artist_label().to_string());
-        let info = track
+            .map(|track| self.art(&track.cover_art, if compact { 32. } else { 40. }, cx));
+        let feedback = track
             .as_ref()
-            .map_or("48 kHz stereo output".into(), |t| technical(t));
-        let cover = track.as_ref().map(|t| self.art(&t.cover_art, 40., cx));
+            .map(|track| self.track_feedback(track.clone(), "footer".into(), cx));
         div()
-            .h(px(61.))
-            .px_3()
+            .id("player-bar")
+            .w_full()
+            .min_w_0()
+            .h(px(56.))
+            .px_2()
             .flex_shrink_0()
             .border_t_1()
             .border_color(colors.line)
             .bg(colors.panel)
             .flex()
             .items_center()
-            .gap_3()
+            .gap(px(6.))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .flex_shrink_0()
+                    .gap(px(2.))
                     .child(self.player_button(
                         "previous",
                         Glyph::SkipBack,
@@ -2655,12 +3717,13 @@ impl MusicApp {
             )
             .child(
                 div()
-                    .w(px(242.))
+                    .w(px((width * 0.18).clamp(100., 240.)))
+                    .flex_shrink_0()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .when_some(cover, |s, art| s.child(art))
+                    .gap(px(6.))
+                    .when_some(cover, |row, cover| row.child(cover))
                     .child(
                         div()
                             .flex_1()
@@ -2670,52 +3733,32 @@ impl MusicApp {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(colors.muted)
-                                    .truncate()
-                                    .child(artist),
+                                    .min_w_0()
+                                    .child(artist_caption),
                             ),
                     ),
             )
+            .when_some(feedback, |bar, feedback| bar.child(feedback))
+            .child(
+                div().flex_1().min_w(px(40.)).flex().items_center().child(
+                    Slider::new(&self.seek)
+                        .flex_1()
+                        .min_w_0()
+                        .accessibility_label("Playback position"),
+                ),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Slider::new(&self.seek)
-                                    .flex_1()
-                                    .accessibility_label("Playback position"),
-                            )
-                            .child(
-                                div()
-                                    .w(px(82.))
-                                    .text_size(px(10.))
-                                    .text_color(colors.muted)
-                                    .text_right()
-                                    .child(format!(
-                                        "{} / {}",
-                                        duration_label(self.playback.position),
-                                        duration_label(self.playback.duration)
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.))
-                            .text_color(colors.muted)
-                            .truncate()
-                            .child(if self.playback.buffering {
-                                "Buffering…".into()
-                            } else {
-                                info
-                            }),
-                    ),
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .text_center()
+                    .child(format!(
+                        "{} / {}",
+                        duration_label(self.playback.position),
+                        duration_label(self.playback.duration)
+                    )),
             )
             .child(
                 short_button("shuffle", Glyph::Shuffle, "Shuffle")
@@ -2751,11 +3794,12 @@ impl MusicApp {
                 div()
                     .flex()
                     .items_center()
+                    .flex_shrink_0()
                     .gap_1()
                     .child(Icon::new(Glyph::Volume2).size_3().text_color(colors.muted))
                     .child(
                         Slider::new(&self.volume)
-                            .w(px(76.))
+                            .w(px(if compact { 44. } else { 76. }))
                             .accessibility_label("Volume"),
                     ),
             )
@@ -2779,6 +3823,10 @@ impl MusicApp {
         };
         div()
             .id("library-status")
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .bg(colors.panel)
             .role(Role::Status)
             .aria_label(format!(
                 "{library}; {}{artwork_status}. Queue: {}",
@@ -2802,7 +3850,7 @@ impl MusicApp {
                     .truncate()
                     .child(format!("{library}   |   {}{artwork_status}", self.status)),
             )
-            .child(div().ml_3().child(format!(
+            .child(div().ml_3().flex_shrink_0().child(format!(
                 "Queued: {} · {}",
                 self.playback.queue.len(),
                 duration_label(queue_time)
@@ -2822,12 +3870,15 @@ impl MusicApp {
             )
             .into_any_element()
     }
-    fn main_content(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn main_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.settings {
             return self.connection_settings(cx);
         }
-        if self.workspace == Workspace::NowPlaying {
-            return self.now_playing_view(cx);
+        if self.artist_name.is_some() {
+            return self.artist_page(cx);
+        }
+        if self.workspace == Workspace::Queue {
+            return self.queue_view(cx);
         }
         if self.workspace == Workspace::Playlists {
             return self.playlists_view(cx);
@@ -2844,15 +3895,22 @@ impl MusicApp {
         }
         match self.main_view() {
             MainView::AlbumsAndTracks => self.grouped_view(cx),
-            MainView::AlbumCovers => self.covers_view(window, cx),
+            MainView::AlbumCovers => self.covers_view(cx),
             MainView::Tracks => self.flat_tracks(cx),
         }
     }
-    fn center_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn center_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let mut center = div().size_full().min_h_0().min_w_0().flex().flex_col();
         if !self.settings {
             center = center.child(self.header(cx));
+            if self.is_library()
+                && (self.query.year.is_some()
+                    || !self.query.selection.genres.is_empty()
+                    || !self.query.performer.is_empty())
+            {
+                center = center.child(self.active_filter_bar(cx));
+            }
         }
         if let Some(error) = self.error.clone().or_else(|| self.playback.error.clone()) {
             center =
@@ -2978,7 +4036,46 @@ impl MusicApp {
                     ),
             );
         }
-        let content = self.main_content(window, cx);
+        let content = self.main_content(cx);
+        let previous_width = self.library_width;
+        let previous_height = self.library_height;
+        let weak = cx.weak_entity();
+        let content = div()
+            .relative()
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        let width = f32::from(bounds.size.width);
+                        let height = f32::from(bounds.size.height);
+                        if width > 0.
+                            && height > 0.
+                            && ((width - previous_width).abs() > 0.5
+                                || (height - previous_height).abs() > 0.5)
+                        {
+                            window.on_next_frame(move |_, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    if (app.library_width - width).abs() > 0.5
+                                        || (app.library_height - height).abs() > 0.5
+                                    {
+                                        app.library_width = width;
+                                        app.library_height = height;
+                                        app.album_list.remeasure();
+                                        app.cover_list.remeasure();
+                                        cx.notify();
+                                    }
+                                });
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(content);
         if self.browser_visible() && !self.settings {
             center = center.child(
                 v_resizable("browser-and-library")
@@ -3014,45 +4111,88 @@ impl MusicApp {
 impl Render for MusicApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = ink(cx);
-        let left = self.navigator(cx);
-        let center = self.center_panel(window, cx);
-        let right = self.information_sidebar(cx);
-        let body = h_resizable("musicbee-workspace")
-            .on_resize(cx.listener(
-                |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
-                    let sizes = state.read(cx).sizes();
-                    if let Some(size) = sizes.first().filter(|size| f32::from(**size) >= 140.) {
-                        app.preferences.layout.left_width = f32::from(*size);
-                    }
-                    if let Some(size) = sizes.get(2).filter(|size| f32::from(**size) >= 180.) {
-                        app.preferences.layout.right_width = f32::from(*size);
-                    }
-                    app.save_preferences();
-                },
-            ))
-            .child(
-                resizable_panel()
-                    .visible(self.preferences.layout.show_navigator)
-                    .size(px(self.preferences.layout.left_width))
-                    .size_range(px(150.)..px(380.))
-                    .fixed()
-                    .child(left),
-            )
-            .child(
-                resizable_panel()
-                    .size_range(px(400.)..px(2400.))
-                    .child(center),
-            )
-            .child(
-                resizable_panel()
-                    .visible(self.preferences.layout.show_information && !self.settings)
-                    .size(px(self.preferences.layout.right_width))
-                    .size_range(px(220.)..px(500.))
-                    .fixed()
-                    .child(right),
+        let body = if self.workspace == Workspace::NowPlaying && !self.settings {
+            if self.playback.playing {
+                window.request_animation_frame();
+            }
+            self.now_playing_view(window, cx)
+        } else {
+            let (left_width, right_width) = panel_widths(
+                f32::from(window.viewport_size().width),
+                self.preferences
+                    .layout
+                    .show_navigator
+                    .then_some(self.preferences.layout.left_width),
+                (self.preferences.layout.show_information && !self.settings)
+                    .then_some(self.preferences.layout.right_width),
             );
+            let preferred_width = if self.preferences.layout.show_navigator {
+                self.preferences.layout.left_width.clamp(140., 380.)
+            } else {
+                0.
+            } + if self.preferences.layout.show_information && !self.settings
+            {
+                self.preferences.layout.right_width.clamp(180., 500.)
+            } else {
+                0.
+            };
+            let compressed = left_width + right_width < preferred_width - 0.5;
+            let left = self.navigator(cx);
+            let center = self.center_panel(cx);
+            let right = self.information_sidebar(window, cx);
+            h_resizable("musicbee-workspace")
+                .on_resize(cx.listener(
+                    |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
+                        let sizes = state.read(cx).sizes();
+                        if let Some(size) = sizes.first().filter(|size| f32::from(**size) >= 140.) {
+                            app.preferences.layout.left_width = f32::from(*size);
+                        }
+                        if let Some(size) = sizes.get(2).filter(|size| f32::from(**size) >= 180.) {
+                            app.preferences.layout.right_width = f32::from(*size);
+                        }
+                        app.save_preferences();
+                    },
+                ))
+                .child(
+                    resizable_panel()
+                        .visible(self.preferences.layout.show_navigator)
+                        .size(px(left_width))
+                        .size_range(
+                            px(140.)..px(if compressed {
+                                left_width.max(141.)
+                            } else {
+                                380.
+                            }),
+                        )
+                        .fixed()
+                        .child(left),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(300.)..px(2400.))
+                        .child(center),
+                )
+                .child(
+                    resizable_panel()
+                        .visible(self.preferences.layout.show_information && !self.settings)
+                        .size(px(right_width))
+                        .size_range(
+                            px(180.)..px(if compressed {
+                                right_width.max(181.)
+                            } else {
+                                500.
+                            }),
+                        )
+                        .fixed()
+                        .child(right),
+                )
+                .into_any_element()
+        };
         div()
             .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .key_context("Sonora")
@@ -3078,16 +4218,26 @@ impl Render for MusicApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+                if app.workspace == Workspace::NowPlaying {
+                    app.switch_workspace(Workspace::Explorer, window, cx);
+                }
                 app.search.read(cx).focus_handle(cx).focus(window, cx)
             }))
             .on_action(cx.listener(|app, _: &Refresh, _, _| app.service.send(Command::Refresh)))
             .on_action(cx.listener(|app, _: &GoBack, window, cx| {
                 if app.settings {
                     app.settings = false;
+                } else if app.artist_name.is_some() {
+                    let origin = app.artist_origin;
+                    app.switch_workspace(origin, window, cx);
                 } else if app.workspace == Workspace::Playlists {
                     app.playlist = None;
                 } else {
                     app.query.selection = Default::default();
+                    app.query.genre.clear();
+                    app.query.artist.clear();
+                    app.query.performer.clear();
+                    app.query.year = None;
                     app.request_query(cx);
                 }
                 app.focus.focus(window, cx);
@@ -3107,11 +4257,11 @@ impl Render for MusicApp {
             .on_action(cx.listener(|app, _: &RestoreLayout, _, cx| {
                 app.preferences.layout = LayoutPreferences::default();
                 app.save_preferences();
-                app.album_list.reset(app.view.albums.len());
+                app.album_list.reset(app.album_row_count());
                 cx.notify();
             }))
-            .on_action(cx.listener(|app, _: &MusicWorkspace, window, cx| {
-                app.switch_workspace(Workspace::Music, window, cx)
+            .on_action(cx.listener(|app, _: &QueueWorkspace, window, cx| {
+                app.switch_workspace(Workspace::Queue, window, cx)
             }))
             .on_action(cx.listener(|app, _: &PlayingWorkspace, window, cx| {
                 app.switch_workspace(Workspace::NowPlaying, window, cx)
@@ -3122,9 +4272,16 @@ impl Render for MusicApp {
             .on_action(cx.listener(|app, _: &ExplorerWorkspace, window, cx| {
                 app.switch_workspace(Workspace::Explorer, window, cx)
             }))
-            .child(self.tabs(cx))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(self.tabs(window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(body),
+            )
             .child(self.status_bar(cx))
-            .child(self.player_bar(cx))
+            .child(self.player_bar(window, cx))
     }
 }

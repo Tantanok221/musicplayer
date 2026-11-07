@@ -15,6 +15,45 @@ fn sample(id: &str, title: &str) -> Track {
 }
 
 #[test]
+fn album_playback_stays_in_album_and_track_playback_starts_at_selected_track() {
+    let mut db = Catalog::memory().unwrap();
+    let mut tracks = Vec::new();
+    for (id, album, disc, number) in [
+        ("other", "album-b", 1, 1),
+        ("last", "album-a", 2, 2),
+        ("first", "album-a", 1, 1),
+        ("second", "album-a", 1, 2),
+        ("third", "album-a", 2, 1),
+        ("loose-a", "", 1, 1),
+        ("loose-b", "", 1, 2),
+    ] {
+        let mut track = sample(id, id);
+        track.album_id = album.into();
+        track.disc_number = Some(disc);
+        track.track = Some(number);
+        tracks.push(track);
+    }
+    db.put_tracks(&tracks, 1).unwrap();
+    let ids = |tracks: Vec<std::sync::Arc<Track>>| {
+        tracks
+            .into_iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(db.album_tracks("album-a").unwrap()),
+        ["first", "second", "third", "last"]
+    );
+    assert_eq!(
+        ids(db.album_queue_from("second").unwrap()),
+        ["second", "third", "last"]
+    );
+    assert_eq!(ids(db.album_queue_from("last").unwrap()), ["last"]);
+    assert_eq!(ids(db.album_queue_from("loose-a").unwrap()), ["loose-a"]);
+    assert!(db.album_queue_from("deleted-track").is_err());
+}
+
+#[test]
 fn interrupted_sync_keeps_previous_records_and_complete_sync_reconciles() {
     let mut db = Catalog::memory().unwrap();
     db.put_tracks(&[sample("a", "Old"), sample("b", "Keep")], 1)

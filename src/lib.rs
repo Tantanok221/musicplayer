@@ -7,3 +7,4 @@ pub mod platform;
 pub mod playback;
 pub mod server;
 pub mod service;
+pub mod visualizer;

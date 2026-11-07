@@ -1,14 +1,60 @@
 use crate::{
-    browser::{BrowserView, Facet},
+    browser::{BrowserView, Facet, NavigatorView},
     model::*,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params, params_from_iter, types::Value};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{cell::RefCell, path::Path, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
+
+#[derive(Default)]
+struct NavigatorIndex(BTreeMap<String, (Facet, HashSet<String>)>);
+impl NavigatorIndex {
+    fn add(&mut self, key: String, label: &str, detail: &str, track: &Track) {
+        if label.trim().is_empty() {
+            return;
+        }
+        let (facet, albums) = self.0.entry(key).or_insert_with(|| {
+            (
+                Facet {
+                    id: label.into(),
+                    label: label.into(),
+                    ..Default::default()
+                },
+                HashSet::new(),
+            )
+        });
+        if facet.artwork.is_empty() {
+            facet.artwork = track.cover_art.clone();
+        }
+        if facet.detail.is_empty() {
+            facet.detail = detail.into();
+        }
+        albums.insert(if track.album_id.is_empty() {
+            format!("track:{}", track.id)
+        } else {
+            format!("album:{}", track.album_id)
+        });
+    }
+    fn finish(self) -> Vec<Facet> {
+        self.0
+            .into_values()
+            .map(|(mut facet, albums)| {
+                facet.count = albums.len();
+                facet
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone)]
 struct Facets {
+    navigator: NavigatorView,
     artists: Vec<String>,
     genres: Vec<String>,
     years: Vec<i32>,
@@ -23,6 +69,7 @@ pub struct Catalog {
 pub struct LibraryView {
     pub albums: Vec<Arc<Album>>,
     pub browser: BrowserView,
+    pub navigator: NavigatorView,
     pub tracks: Vec<Arc<Track>>,
     pub track_count: usize,
     pub album_count: usize,
@@ -39,6 +86,20 @@ impl Catalog {
         Self::from_connection(Connection::open_in_memory()?)
     }
     fn from_connection(conn: Connection) -> Result<Self> {
+        conn.create_scalar_function(
+            "artist_matches",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let label = context.get::<String>(0)?;
+                let name = context.get::<String>(1)?;
+                Ok(normalize(&label) == normalize(&name)
+                    || split_artist_names(&label)
+                        .iter()
+                        .any(|part| normalize(part) == normalize(&name)))
+            },
+        )?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS tracks (
                 rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, album_id TEXT NOT NULL,
@@ -198,10 +259,17 @@ impl Catalog {
             }
         }
         if !query.artist.is_empty() {
-            sql.push_str(" AND (artist=? OR album_artist=?)");
+            sql.push_str(" AND (artist_matches(artist,?) OR artist_matches(album_artist,?))");
             values.extend([
                 Value::Text(query.artist.clone()),
                 Value::Text(query.artist.clone()),
+            ]);
+        }
+        if !query.performer.is_empty() {
+            sql.push_str(" AND (artist_matches(artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+            values.extend([
+                Value::Text(query.performer.clone()),
+                Value::Text(query.performer.clone()),
             ]);
         }
         if !query.genre.is_empty() {
@@ -225,7 +293,8 @@ impl Catalog {
                 if index > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str("album_artist=?");
+                sql.push_str("(artist_matches(album_artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+                values.push(Value::Text(artist.clone()));
                 values.push(Value::Text(artist.clone()));
             }
             sql.push(')');
@@ -311,6 +380,7 @@ impl Catalog {
         Ok(LibraryView {
             albums,
             browser: self.browser_view(query)?,
+            navigator: facets.navigator,
             tracks: self.tracks(query, 0, 500)?,
             track_count,
             album_count: facets.album_count,
@@ -352,19 +422,47 @@ impl Catalog {
             upstream.genre = query.genre.clone();
         }
         let (filter, values) = Self::filters(&upstream);
-        let mut statement=self.conn.prepare(&format!("SELECT album_artist,count(DISTINCT album_id),min(json_extract(data,'$.coverArt')) FROM tracks{filter} AND album_artist!='' GROUP BY album_artist ORDER BY album_artist COLLATE NOCASE"))?;
-        let artists = statement
-            .query_map(params_from_iter(values), |r| {
-                let name: String = r.get(0)?;
-                Ok(Facet {
-                    id: name.clone(),
-                    label: name,
-                    count: r.get(1)?,
-                    artwork: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    detail: String::new(),
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut statement = self.conn.prepare(&format!("SELECT min(data),album_id FROM tracks{filter} AND album_artist!='' GROUP BY album_artist,album_id"))?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut artist_groups =
+            std::collections::BTreeMap::<String, (Facet, std::collections::HashSet<String>)>::new();
+        for row in rows {
+            let (data, album_id) = row?;
+            let track: Track = serde_json::from_str(&data)?;
+            for credit in track.album_artist_credits() {
+                let (facet, albums) =
+                    artist_groups
+                        .entry(normalize(&credit.name))
+                        .or_insert_with(|| {
+                            (
+                                Facet {
+                                    id: credit.name.clone(),
+                                    label: credit.name.clone(),
+                                    artwork: track.cover_art.clone(),
+                                    detail: credit.id.clone(),
+                                    ..Default::default()
+                                },
+                                std::collections::HashSet::new(),
+                            )
+                        });
+                if facet.detail.is_empty() {
+                    facet.detail = credit.id;
+                }
+                if facet.artwork.is_empty() {
+                    facet.artwork = track.cover_art.clone();
+                }
+                albums.insert(album_id.clone());
+            }
+        }
+        let artists = artist_groups
+            .into_values()
+            .map(|(mut facet, albums)| {
+                facet.count = albums.len();
+                facet
+            })
+            .collect();
         upstream.selection.artists = query.selection.artists.clone();
         upstream.artist = query.artist.clone();
         let (filter, values) = Self::filters(&upstream);
@@ -397,9 +495,11 @@ impl Catalog {
         if let Some(facets) = self.facets.borrow().as_ref() {
             return Ok(facets.clone());
         }
-        let artists = self.strings(
+        let mut artists = self.strings(
             "SELECT DISTINCT artist FROM albums WHERE artist!='' ORDER BY artist COLLATE NOCASE",
-        )?;
+        )?.into_iter().flat_map(|artist| split_artist_names(&artist)).collect::<Vec<_>>();
+        artists.sort_by_key(|artist| normalize(artist));
+        artists.dedup_by(|left, right| normalize(left) == normalize(right));
         let genre_strings =
             self.strings("SELECT DISTINCT genre FROM tracks WHERE genre!='' ORDER BY genre")?;
         let mut genres = genre_strings
@@ -418,6 +518,7 @@ impl Catalog {
             .conn
             .query_row("SELECT count(*) FROM albums", [], |r| r.get(0))?;
         let facets = Facets {
+            navigator: self.navigator_view()?,
             artists,
             genres,
             years,
@@ -425,6 +526,42 @@ impl Catalog {
         };
         *self.facets.borrow_mut() = Some(facets.clone());
         Ok(facets)
+    }
+    fn navigator_view(&self) -> Result<NavigatorView> {
+        let mut artists = NavigatorIndex::default();
+        let mut album_artists = NavigatorIndex::default();
+        let mut genres = NavigatorIndex::default();
+        let mut years = NavigatorIndex::default();
+        let mut statement = self.conn.prepare("SELECT data FROM tracks ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let track: Track = serde_json::from_str(&row?)?;
+            for credit in track.artist_credits() {
+                artists.add(normalize(&credit.name), &credit.name, &credit.id, &track);
+            }
+            for credit in track.album_artist_credits() {
+                album_artists.add(normalize(&credit.name), &credit.name, &credit.id, &track);
+            }
+            for genre in track
+                .genres_label()
+                .split(" · ")
+                .filter(|name| !name.is_empty())
+            {
+                genres.add(genre.into(), genre, "", &track);
+            }
+            if let Some(year) = track.year {
+                let label = year.to_string();
+                years.add(label.clone(), &label, "", &track);
+            }
+        }
+        let mut years = years.finish();
+        years.sort_by_key(|facet| std::cmp::Reverse(facet.id.parse::<i32>().unwrap_or_default()));
+        Ok(NavigatorView {
+            artists: artists.finish(),
+            album_artists: album_artists.finish(),
+            genres: genres.finish(),
+            years,
+        })
     }
     fn strings(&self, sql: &str) -> Result<Vec<String>> {
         Ok(self
@@ -440,6 +577,38 @@ impl Catalog {
         stmt.query_map([id], |r| r.get::<_, String>(0))?
             .map(|r| Ok(Arc::new(serde_json::from_str(&r?)?)))
             .collect()
+    }
+    pub fn artist_releases(&self, name: &str, id: &str) -> Result<Vec<Arc<Album>>> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.data FROM albums a WHERE artist_matches(a.artist,?1)
+             OR (?2!='' AND json_extract(a.data,'$.artistId')=?2)
+             OR EXISTS (SELECT 1 FROM json_each(a.data,'$.artists') artist
+                WHERE (?2!='' AND json_extract(artist.value,'$.id')=?2)
+                   OR artist_matches(json_extract(artist.value,'$.name'),?1))
+             OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id=a.id AND (
+                artist_matches(t.album_artist,?1) OR EXISTS (SELECT 1 FROM json_each(t.data,'$.albumArtists') artist
+                   WHERE (?2!='' AND json_extract(artist.value,'$.id')=?2)
+                      OR artist_matches(json_extract(artist.value,'$.name'),?1))))
+             ORDER BY a.year DESC,a.name COLLATE NOCASE,a.id",
+        )?;
+        statement
+            .query_map(params![name, id], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
+            .collect()
+    }
+    pub fn album_queue_from(&self, track_id: &str) -> Result<Vec<Arc<Track>>> {
+        let Some(track) = self.by_ids(&[track_id.into()])?.into_iter().next() else {
+            anyhow::bail!("This track is no longer in the library. Refresh and try again.");
+        };
+        if track.album_id.is_empty() {
+            return Ok(vec![track]);
+        }
+        let tracks = self.album_tracks(&track.album_id)?;
+        let start = tracks
+            .iter()
+            .position(|candidate| candidate.id == track.id)
+            .context("Track is missing from its album")?;
+        Ok(tracks.into_iter().skip(start).collect())
     }
     pub fn by_ids(&self, ids: &[String]) -> Result<Vec<Arc<Track>>> {
         let mut stmt = self

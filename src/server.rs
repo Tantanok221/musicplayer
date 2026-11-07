@@ -1,4 +1,8 @@
-use crate::{lyrics::Lyrics, model::*, platform::Account};
+use crate::{
+    lyrics::Lyrics,
+    model::*,
+    platform::{Account, ServerCredentials},
+};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -13,13 +17,22 @@ use url::Url;
 pub struct Server {
     pub account: Account,
     // Never derive Debug: credentials and authenticated URLs must stay out of logs.
-    password: String,
+    credentials: ServerCredentials,
     http: reqwest::Client,
     pub extensions: HashSet<String>,
 }
 
 impl Server {
-    pub fn new(mut account: Account, password: String) -> Result<Self> {
+    pub fn new(account: Account, password: String) -> Result<Self> {
+        Self::with_credentials(account, ServerCredentials::from_password(&password)?)
+    }
+
+    pub fn credentials(&self) -> &ServerCredentials {
+        &self.credentials
+    }
+
+    pub fn with_credentials(mut account: Account, credentials: ServerCredentials) -> Result<Self> {
+        credentials.validate()?;
         let mut url = Url::parse(account.url.trim())
             .context("Enter a complete server URL, including https://")?;
         if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
@@ -35,12 +48,12 @@ impl Server {
         }
         account.url = url.to_string();
         account.username = account.username.trim().to_string();
-        if account.username.is_empty() || password.is_empty() {
+        if account.username.is_empty() {
             bail!("Enter your Navidrome username and password");
         }
         Ok(Self {
             account,
-            password,
+            credentials,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(60))
@@ -50,13 +63,11 @@ impl Server {
     }
     pub fn url(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Url> {
         let mut url = Url::parse(&self.account.url)?.join(&format!("rest/{endpoint}.view"))?;
-        let salt = format!("{:032x}", rand::random::<u128>());
-        let token = format!("{:x}", md5::compute(format!("{}{salt}", self.password)));
         url.query_pairs_mut()
             .extend_pairs([
                 ("u", self.account.username.as_str()),
-                ("t", token.as_str()),
-                ("s", salt.as_str()),
+                ("t", self.credentials.token.as_str()),
+                ("s", self.credentials.salt.as_str()),
                 ("v", "1.16.1"),
                 ("c", "Sonora"),
                 ("f", "json"),

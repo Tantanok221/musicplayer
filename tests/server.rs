@@ -68,6 +68,9 @@ async fn authentication_base_path_capabilities_and_pagination() {
     )
     .unwrap();
     assert!(server.connect().await.unwrap().contains("navidrome"));
+    let mut resumed =
+        Server::with_credentials(server.account.clone(), server.credentials().clone()).unwrap();
+    assert!(resumed.connect().await.unwrap().contains("navidrome"));
     assert!(server.extensions.contains("songLyrics"));
     assert_eq!(
         server.page("song", 500).await.unwrap()[0]["title"],

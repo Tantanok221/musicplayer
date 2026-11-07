@@ -2,4 +2,22 @@
 /dist/
 .DS_Store
 .env
+.env.*
 *.sqlite*
+
+# Local server settings, reusable login tokens, and caches
+account.json
+credentials/
+/library/
+/cache/
+*.art
+*.log
+
+# SSH keys and signing credentials
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx

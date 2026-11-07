@@ -1,4 +1,8 @@
-use crate::{model::*, server::Server};
+use crate::{
+    model::*,
+    server::Server,
+    visualizer::{WAVEFORM_BARS, Waveform},
+};
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use rand::seq::SliceRandom;
@@ -54,24 +58,36 @@ pub enum PlayerEvent {
 #[derive(Clone)]
 pub struct PlayerHandle {
     tx: Sender<PlayerCommand>,
+    clock: Arc<Clock>,
 }
 impl PlayerHandle {
     pub fn send(&self, command: PlayerCommand) {
         let _ = self.tx.send(command);
     }
+    pub fn waveform(&self) -> [f32; WAVEFORM_BARS] {
+        if self.clock.playing.load(Ordering::Relaxed)
+            && !self.clock.buffering.load(Ordering::Relaxed)
+        {
+            self.clock.waveform.snapshot()
+        } else {
+            [0.; WAVEFORM_BARS]
+        }
+    }
     pub fn start(runtime: tokio::runtime::Handle) -> (Self, Receiver<PlayerEvent>) {
         let (tx, rx) = flume::unbounded();
         let (events, event_rx) = flume::unbounded();
+        let clock = Arc::new(Clock::default());
+        let playback_clock = clock.clone();
         std::thread::Builder::new()
             .name("sonora-player".into())
             .spawn(move || {
-                if let Err(error) = run(rx, events.clone(), runtime) {
+                if let Err(error) = run(rx, events.clone(), runtime, playback_clock) {
                     let _ =
                         events.send(PlayerEvent::Error(format!("Audio unavailable: {error:#}")));
                 }
             })
             .expect("Could not start player thread");
-        (Self { tx }, event_rx)
+        (Self { tx, clock }, event_rx)
     }
 }
 
@@ -85,6 +101,7 @@ struct Clock {
     buffering: AtomicBool,
     finished: AtomicBool,
     volume: AtomicU64,
+    waveform: Waveform,
 }
 impl Default for Clock {
     fn default() -> Self {
@@ -98,6 +115,7 @@ impl Default for Clock {
             buffering: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             volume: AtomicU64::new(0.7f64.to_bits()),
+            waveform: Waveform::default(),
         }
     }
 }
@@ -113,6 +131,9 @@ struct BufferedAudio {
     rx: Receiver<Packet>,
     packet: Option<Packet>,
     offset: usize,
+    visual_samples: usize,
+    visual_peak: f32,
+    visual_epoch: u64,
 }
 impl Iterator for BufferedAudio {
     type Item = f32;
@@ -121,6 +142,12 @@ impl Iterator for BufferedAudio {
             return Some(0.);
         }
         let epoch = self.clock.epoch.load(Ordering::Acquire);
+        if self.visual_epoch != epoch {
+            self.visual_epoch = epoch;
+            self.visual_samples = 0;
+            self.visual_peak = 0.;
+            self.clock.waveform.reset();
+        }
         if self.packet.as_ref().is_some_and(|p| p.epoch != epoch) {
             self.packet = None;
             self.offset = 0;
@@ -160,7 +187,16 @@ impl Iterator for BufferedAudio {
             self.clock.samples.fetch_add(1, Ordering::Relaxed);
             self.clock.buffering.store(false, Ordering::Relaxed);
             let volume = f64::from_bits(self.clock.volume.load(Ordering::Relaxed)) as f32;
-            return Some(sample * volume);
+            let output = sample * volume;
+            self.visual_peak = self.visual_peak.max(output.abs());
+            self.visual_samples += 1;
+            // Sixteen milliseconds of interleaved stereo samples per bar.
+            if self.visual_samples >= (RATE as usize * CHANNELS as usize * 16 / 1000) {
+                self.clock.waveform.push(self.visual_peak);
+                self.visual_samples = 0;
+                self.visual_peak = 0.;
+            }
+            return Some(output);
         }
         self.clock.buffering.store(true, Ordering::Relaxed);
         Some(0.)
@@ -400,6 +436,9 @@ fn open_output(
         rx,
         packet: None,
         offset: 0,
+        visual_samples: 0,
+        visual_peak: 0.,
+        visual_epoch: 0,
     });
     Ok(output)
 }
@@ -408,8 +447,8 @@ fn run(
     commands: Receiver<PlayerCommand>,
     events: Sender<PlayerEvent>,
     runtime: tokio::runtime::Handle,
+    clock: Arc<Clock>,
 ) -> Result<()> {
-    let clock = Arc::new(Clock::default());
     let (pcm_tx, pcm_rx) = flume::bounded(96);
     let (error_tx, error_rx) = flume::unbounded();
     let (device_errors, device_error_rx) = flume::unbounded();
@@ -907,6 +946,9 @@ mod tests {
             rx,
             packet: None,
             offset: 0,
+            visual_samples: 0,
+            visual_peak: 0.,
+            visual_epoch: 0,
         };
         assert_eq!(
             source.by_ref().take(8).collect::<Vec<_>>(),
@@ -949,11 +991,64 @@ mod tests {
             rx,
             packet: None,
             offset: 0,
+            visual_samples: 0,
+            visual_peak: 0.,
+            visual_epoch: 0,
         };
         assert_eq!(source.next(), Some(0.5));
         assert_eq!(
             f64::from_bits(clock.position_base.load(Ordering::Relaxed)),
             20.
         );
+    }
+
+    #[test]
+    fn visualizer_measures_consumed_output_and_goes_quiet_when_paused() {
+        let clock = Arc::new(Clock::default());
+        clock.playing.store(true, Ordering::Relaxed);
+        clock.volume.store(0.5f64.to_bits(), Ordering::Relaxed);
+        clock.epoch.store(1, Ordering::Release);
+        let (tx, rx) = flume::bounded(8);
+        tx.send(Packet {
+            epoch: 1,
+            index: 0,
+            position: Some(0.),
+            samples: vec![0.8; 3072],
+            end: false,
+        })
+        .unwrap();
+        let mut source = BufferedAudio {
+            clock: clock.clone(),
+            rx,
+            packet: None,
+            offset: 0,
+            visual_samples: 0,
+            visual_peak: 0.,
+            visual_epoch: 0,
+        };
+        assert_eq!(clock.waveform.snapshot(), [0.; WAVEFORM_BARS]);
+        source.by_ref().take(1536).for_each(drop);
+        assert_eq!(clock.waveform.snapshot()[WAVEFORM_BARS - 1], 0.4);
+        let (commands, _) = flume::unbounded();
+        let handle = PlayerHandle {
+            tx: commands,
+            clock: clock.clone(),
+        };
+        assert_eq!(handle.waveform()[WAVEFORM_BARS - 1], 0.4);
+        clock.playing.store(false, Ordering::Relaxed);
+        assert_eq!(source.next(), Some(0.));
+        assert_eq!(handle.waveform(), [0.; WAVEFORM_BARS]);
+        clock.playing.store(true, Ordering::Relaxed);
+        clock.epoch.store(2, Ordering::Release);
+        tx.send(Packet {
+            epoch: 2,
+            index: 0,
+            position: Some(10.),
+            samples: vec![0.; 1536],
+            end: false,
+        })
+        .unwrap();
+        source.by_ref().take(1536).for_each(drop);
+        assert_eq!(handle.waveform(), [0.; WAVEFORM_BARS]);
     }
 }
