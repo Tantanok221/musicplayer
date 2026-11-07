@@ -59,7 +59,7 @@ The script generates the icon, builds a release binary, and creates an ad hoc si
 - Queue editing, play-next actions, server playlists, favorites, ratings, and scrobbling. Failed writes remain visible and can be retried.
 - Mac media keys, Now Playing text, system appearance, persistent local login, and recovery when the default audio device changes. Recovery pauses playback so you choose when to resume.
 
-Selecting music inspects it without replacing playback. Playing an album replaces the queue with that album only. Double-clicking a track or choosing **Play Now** replaces the queue with that track and the remaining tracks on its album in disc/track order, regardless of library search or filters. Playing an existing queue entry jumps within that queue. Explicit **Queue Next** and **Queue Last** actions still add music to the current queue. Ratings and favorites are inline. The save icon above Queue saves the queue as a playlist. Playlist deletion requires an in-app confirmation.
+Selecting music inspects it without replacing playback. Playing an album replaces the queue with that album only. Double-clicking a track or choosing **Play Now** replaces the queue with that track and the remaining tracks on its album in disc/track order, regardless of library search or filters. Playing an existing queue entry jumps within that queue. Right-clicking a track or album offers **Play Next**, **Play After This Album**, and **Add to End of Queue**; each option names the song or album the music will follow, and none interrupts what is playing. Ratings and favorites are inline. The save icon above Queue saves the queue as a playlist. Playlist deletion requires an in-app confirmation.
 
 | Shortcut | Action |
 | --- | --- |

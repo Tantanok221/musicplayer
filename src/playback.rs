@@ -44,13 +44,23 @@ impl AudioFormat {
 
 type HttpDecoder = Decoder<StreamDownload<TempStorageProvider>>;
 
+/// Where queued music goes relative to what is playing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Right after the current track.
+    Next,
+    /// After the last queued track of the current track's album run.
+    AfterAlbum,
+    /// At the end of the queue.
+    Last,
+}
+
 #[derive(Clone)]
 pub enum PlayerCommand {
     Server(Server),
     Replace(Vec<Arc<Track>>, usize),
     Restore(Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
-    Append(Vec<Arc<Track>>),
-    PlayNext(Vec<Arc<Track>>),
+    Insert(Vec<Arc<Track>>, Placement),
     Remove(usize),
     Move(usize, usize),
     Toggle,
@@ -488,6 +498,32 @@ impl Plan {
     }
 }
 
+fn insertion_point(queue: &[Arc<Track>], index: Option<usize>, placement: Placement) -> usize {
+    let Some(current) = index.filter(|i| *i < queue.len()) else {
+        return if placement == Placement::Last {
+            queue.len()
+        } else {
+            0
+        };
+    };
+    match placement {
+        Placement::Next => current + 1,
+        Placement::AfterAlbum => {
+            let album = &queue[current].album_id;
+            if album.is_empty() {
+                return current + 1;
+            }
+            current
+                + 1
+                + queue[current + 1..]
+                    .iter()
+                    .take_while(|track| &track.album_id == album)
+                    .count()
+        }
+        Placement::Last => queue.len(),
+    }
+}
+
 /// Restores the pre-shuffle order using the current entries, so tracks added
 /// or updated while shuffled are kept. Returns the queue and the new index of
 /// the current entry.
@@ -864,8 +900,7 @@ fn run(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
-                    | PlayerCommand::Append(..)
-                    | PlayerCommand::PlayNext(..)
+                    | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::UpdateTrack(..)
@@ -946,23 +981,17 @@ fn run(
                     restart = false;
                     started = false;
                 }
-                PlayerCommand::Append(tracks) => {
+                PlayerCommand::Insert(tracks, placement) => {
+                    let at = insertion_point(&queue, index, placement);
                     if let Some(original) = original.as_mut() {
-                        original.extend(tracks.iter().cloned());
-                    }
-                    queue.extend(tracks);
-                    if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
-                        base_position = position(&clock);
-                        restart = true;
-                    }
-                }
-                PlayerCommand::PlayNext(tracks) => {
-                    let at = index.map_or(0, |i| i + 1);
-                    if let Some(original) = original.as_mut() {
-                        let current = index.and_then(|i| queue.get(i));
-                        let after = current
-                            .and_then(|current| original.iter().position(|t| t.id == current.id))
-                            .map_or(original.len(), |i| i + 1);
+                        let after = match at.checked_sub(1).and_then(|anchor| queue.get(anchor)) {
+                            Some(anchor) if placement != Placement::Last => original
+                                .iter()
+                                .position(|t| t.id == anchor.id)
+                                .map_or(original.len(), |i| i + 1),
+                            None if placement != Placement::Last => 0,
+                            _ => original.len(),
+                        };
                         original.splice(after..after, tracks.iter().cloned());
                     }
                     queue.splice(at..at, tracks);
@@ -1587,6 +1616,33 @@ mod tests {
         reordered.swap(1, 2);
         assert!(plan.retarget(&reordered, RepeatMode::Off, Some(1), 1));
         assert_eq!(plan.next(1).map(|(_, t)| t.id.clone()), Some("1".into()));
+    }
+
+    #[test]
+    fn insertion_points_follow_the_track_album_run_or_queue_end() {
+        let album = |id: &str, album: &str| {
+            Arc::new(Track {
+                id: id.into(),
+                album_id: album.into(),
+                ..Default::default()
+            })
+        };
+        let queue = vec![
+            album("a1", "a"),
+            album("a2", "a"),
+            album("a3", "a"),
+            album("b1", "b"),
+            album("a4", "a"),
+        ];
+        assert_eq!(insertion_point(&queue, Some(1), Placement::Next), 2);
+        assert_eq!(insertion_point(&queue, Some(1), Placement::AfterAlbum), 3);
+        assert_eq!(insertion_point(&queue, Some(2), Placement::AfterAlbum), 3);
+        assert_eq!(insertion_point(&queue, Some(4), Placement::AfterAlbum), 5);
+        assert_eq!(insertion_point(&queue, Some(1), Placement::Last), 5);
+        assert_eq!(insertion_point(&queue, None, Placement::Next), 0);
+        assert_eq!(insertion_point(&queue, None, Placement::Last), 5);
+        let loose = vec![album("x", ""), album("y", "")];
+        assert_eq!(insertion_point(&loose, Some(0), Placement::AfterAlbum), 1);
     }
 
     #[test]

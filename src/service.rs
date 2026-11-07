@@ -7,7 +7,7 @@ use crate::{
     lyrics::Lyrics,
     model::*,
     platform::{Account, Paths},
-    playback::{PlayerCommand, PlayerEvent, PlayerHandle},
+    playback::{Placement, PlayerCommand, PlayerEvent, PlayerHandle},
     server::Server,
 };
 use anyhow::Result;
@@ -59,7 +59,8 @@ pub enum Command {
     LyricsLoaded(String, String, Result<Lyrics, String>),
     PlayIds(Vec<String>, usize),
     PlayAlbum(String),
-    Enqueue(Vec<String>, bool),
+    Enqueue(Vec<String>, Placement),
+    EnqueueAlbum(String, Placement),
     Mutate(Mutation),
     Preferences(Preferences),
     Player(PlayerCommand),
@@ -774,13 +775,11 @@ fn run(
                 Command::PlayAlbum(id) => {
                     player.send(PlayerCommand::Replace(catalog.album_tracks(&id)?, 0));
                 }
-                Command::Enqueue(ids, next) => {
-                    let tracks = catalog.by_ids(&ids)?;
-                    player.send(if next {
-                        PlayerCommand::PlayNext(tracks)
-                    } else {
-                        PlayerCommand::Append(tracks)
-                    });
+                Command::Enqueue(ids, placement) => {
+                    player.send(PlayerCommand::Insert(catalog.by_ids(&ids)?, placement));
+                }
+                Command::EnqueueAlbum(id, placement) => {
+                    player.send(PlayerCommand::Insert(catalog.album_tracks(&id)?, placement));
                 }
                 Command::Player(command) => player.send(command),
                 Command::Preferences(prefs) => {

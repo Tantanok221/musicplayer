@@ -3,7 +3,7 @@ use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::{
     button::*,
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     resizable::{h_resizable, resizable_panel, v_resizable},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     *,
@@ -17,13 +17,14 @@ use sonora::{
     lyrics::Lyrics,
     model::*,
     platform::Account,
-    playback::PlayerCommand,
+    playback::{Placement, PlayerCommand},
     service::{Command, Event, Mutation, Service},
     visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
 };
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -90,6 +91,73 @@ fn spectrum_colors(palette: Option<[u32; 3]>, accent: Hsla, dark: bool) -> (Hsla
         Some([first, second, _]) => (vivid(first), vivid(second)),
         None => (accent, accent),
     }
+}
+
+/// Names of the places each queue option inserts after, captured at render.
+#[derive(Default)]
+struct QueuePlaces {
+    current_track: Option<String>,
+    current_album: Option<String>,
+    last_album: Option<String>,
+}
+
+fn quoted(name: &str) -> String {
+    let short = if name.chars().count() > 32 {
+        format!("{}…", name.chars().take(31).collect::<String>().trim_end())
+    } else {
+        name.to_string()
+    };
+    format!("After “{short}”")
+}
+
+/// Play Next, Play After This Album, and Add to End of Queue, each with a
+/// second line naming what the music will follow.
+fn queue_options(
+    menu: PopupMenu,
+    places: &QueuePlaces,
+    enqueue: impl Fn(Placement) + 'static,
+) -> PopupMenu {
+    let enqueue = Rc::new(enqueue);
+    let mut options = vec![(
+        Placement::Next,
+        "Play Next",
+        places
+            .current_track
+            .as_deref()
+            .map_or_else(|| "At the start of the queue".to_string(), quoted),
+    )];
+    if let Some(album) = &places.current_album {
+        options.push((
+            Placement::AfterAlbum,
+            "Play After This Album",
+            quoted(album),
+        ));
+    }
+    options.push((
+        Placement::Last,
+        "Add to End of Queue",
+        places
+            .last_album
+            .as_deref()
+            .map_or_else(|| "The queue is empty".to_string(), quoted),
+    ));
+    options
+        .into_iter()
+        .fold(menu, |menu, (placement, title, detail)| {
+            let enqueue = enqueue.clone();
+            let detail = SharedString::from(detail);
+            menu.item(
+                PopupMenuItem::element(move |_, cx| {
+                    div().flex().flex_col().child(title).child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(ink(cx).muted)
+                            .child(detail.clone()),
+                    )
+                })
+                .on_click(move |_, _, _| enqueue(placement)),
+            )
+        })
 }
 
 fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {
@@ -1191,7 +1259,12 @@ impl MusicApp {
             .items_center()
             .min_w_0()
             .gap(px(3.));
-        if key.starts_with("footer") {
+        // Fixed-height rows must stay on one line; wrapped credits would spill
+        // into the next row.
+        if ["footer", "queue-artist", "card-artist"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
             links = links.flex_nowrap().overflow_hidden();
         }
         for (index, credit) in credits.into_iter().enumerate() {
@@ -2341,6 +2414,43 @@ impl MusicApp {
                 app.mutate(Mutation::Favorite(id.clone(), !starred), cx);
             }))
     }
+    fn queue_places(&self) -> Rc<QueuePlaces> {
+        let current = self.playback.track.as_ref();
+        Rc::new(QueuePlaces {
+            current_track: current.map(|track| track.title.clone()),
+            current_album: current
+                .filter(|track| !track.album_id.is_empty())
+                .map(|track| track.album.clone()),
+            last_album: self.playback.queue.last().map(|track| {
+                if track.album.is_empty() {
+                    track.title.clone()
+                } else {
+                    track.album.clone()
+                }
+            }),
+        })
+    }
+    /// Right-click menu for an album: play it, or queue it in one of three places.
+    fn album_menu(
+        &self,
+        album_id: String,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let places = self.queue_places();
+        let service = self.service.clone();
+        move |menu, _, _| {
+            let (play, queue) = (service.clone(), service.clone());
+            let (play_id, queue_id) = (album_id.clone(), album_id.clone());
+            let menu = menu
+                .item(
+                    PopupMenuItem::new("Play Album")
+                        .on_click(move |_, _, _| play.send(Command::PlayAlbum(play_id.clone()))),
+                )
+                .separator();
+            queue_options(menu, &places, move |placement| {
+                queue.send(Command::EnqueueAlbum(queue_id.clone(), placement))
+            })
+        }
+    }
     fn track_row(
         &mut self,
         track: Arc<Track>,
@@ -2360,10 +2470,9 @@ impl MusicApp {
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
         let play = track.clone();
-        let next = track.id.clone();
-        let last = track.id.clone();
+        let queued = track.id.clone();
         let service = self.service.clone();
-        let service2 = service.clone();
+        let places = self.queue_places();
         let weak = cx.weak_entity();
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
@@ -2450,9 +2559,7 @@ impl MusicApp {
                 let remove_weak = weak.clone();
                 let play = play.clone();
                 let service = service.clone();
-                let next = next.clone();
-                let service2 = service2.clone();
-                let last = last.clone();
+                let queued = queued.clone();
                 let menu = menu
                     .item(PopupMenuItem::new("Play Now").on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |app, _| {
@@ -2463,12 +2570,10 @@ impl MusicApp {
                             }
                         });
                     }))
-                    .item(PopupMenuItem::new("Queue Next").on_click(move |_, _, _| {
-                        service.send(Command::Enqueue(vec![next.clone()], true))
-                    }))
-                    .item(PopupMenuItem::new("Queue Last").on_click(move |_, _, _| {
-                        service2.send(Command::Enqueue(vec![last.clone()], false))
-                    }));
+                    .separator();
+                let menu = queue_options(menu, &places, move |placement| {
+                    service.send(Command::Enqueue(vec![queued.clone()], placement))
+                });
                 if let Some(index) = queue_index {
                     let weak = remove_weak.clone();
                     menu.separator()
@@ -2647,7 +2752,8 @@ impl MusicApp {
                                     .child(cover)
                                     .on_click(cx.listener(move |app, _, _, cx| {
                                         app.select_album(selection.clone(), cx)
-                                    })),
+                                    }))
+                                    .context_menu(self.album_menu(album.id.clone())),
                             )
                             .when(!selected_panel, |cover| {
                                 cover.child(
@@ -3104,7 +3210,8 @@ impl MusicApp {
                             if event.click_count() == 2 {
                                 app.service.send(Command::PlayAlbum(open.id.clone()));
                             }
-                        })),
+                        }))
+                        .context_menu(self.album_menu(album.id.clone())),
                 );
             }
             if releases.is_empty() {
@@ -3171,7 +3278,6 @@ impl MusicApp {
                     let art = app.art(&album.cover_art, side, cx);
                     let open = album.clone();
                     let id = album.id.clone();
-                    let service = app.service.clone();
                     cards = cards.child(
                         div()
                             .id(("cover", index))
@@ -3213,13 +3319,7 @@ impl MusicApp {
                                     app.service.send(Command::PlayAlbum(open.id.clone()));
                                 }
                             }))
-                            .context_menu(move |menu, _, _| {
-                                let id = id.clone();
-                                let service = service.clone();
-                                menu.item(PopupMenuItem::new("Play Album").on_click(
-                                    move |_, _, _| service.send(Command::PlayAlbum(id.clone())),
-                                ))
-                            }),
+                            .context_menu(app.album_menu(id.clone())),
                     );
                 }
                 let mut item = div().w_full().min_w_0().flex().flex_col().child(cards);
@@ -3382,6 +3482,7 @@ impl MusicApp {
                                     .role(Role::Group)
                                     .aria_label(format!("Queue {}: {}", index + 1, track.title))
                                     .h(px(37.))
+                                    .overflow_hidden()
                                     .px_2()
                                     .flex()
                                     .items_center()
