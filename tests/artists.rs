@@ -96,7 +96,8 @@ fn release_categories_follow_server_types_without_guessing_from_titles() {
         (vec!["album", "live"], ReleaseCategory::Album),
         (vec!["EP"], ReleaseCategory::Ep),
         (vec!["single", "remix"], ReleaseCategory::Single),
-        (vec![], ReleaseCategory::Other),
+        (vec![], ReleaseCategory::Album),
+        (vec![""], ReleaseCategory::Album),
         (vec!["compilation"], ReleaseCategory::Other),
     ] {
         let album = Album {

@@ -218,7 +218,12 @@ impl Album {
             &self.artist_id,
         )
     }
+    /// Untagged releases count as albums; only an explicit other type (such as
+    /// a compilation) lands in Other releases.
     pub fn category(&self) -> ReleaseCategory {
+        if self.release_types.iter().all(|kind| kind.trim().is_empty()) {
+            return ReleaseCategory::Album;
+        }
         for (value, category) in [
             ("ep", ReleaseCategory::Ep),
             ("single", ReleaseCategory::Single),

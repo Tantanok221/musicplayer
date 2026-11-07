@@ -10,7 +10,7 @@ use rand::seq::SliceRandom;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, Source};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -427,7 +427,8 @@ fn send_packet(tx: &Sender<Packet>, mut packet: Packet, clock: &Clock) -> bool {
 struct Plan {
     queue: Vec<Arc<Track>>,
     repeat: RepeatMode,
-    /// Tracks the decoder has started in this epoch, and the latest one.
+    /// Tracks the decoder has started in this epoch, and the latest one. The
+    /// player rewrites that index when it reorders the queue around it.
     begun: u64,
     decoding: Option<(usize, String)>,
     finished: bool,
@@ -479,9 +480,42 @@ impl Plan {
         if self.begun > audible_begun.max(1) {
             self.decoding == expected
         } else {
+            if let (Some(audible), Some((index, _))) = (audible, self.decoding.as_mut()) {
+                *index = audible;
+            }
             !self.finished || expected.is_none()
         }
     }
+}
+
+/// Restores the pre-shuffle order using the current entries, so tracks added
+/// or updated while shuffled are kept. Returns the queue and the new index of
+/// the current entry.
+fn unshuffle(
+    queue: Vec<Arc<Track>>,
+    original: &[Arc<Track>],
+    index: Option<usize>,
+) -> (Vec<Arc<Track>>, Option<usize>) {
+    let current = index.and_then(|i| queue.get(i)).cloned();
+    let mut pool: HashMap<&str, VecDeque<&Arc<Track>>> = HashMap::new();
+    for track in &queue {
+        pool.entry(&track.id).or_default().push_back(track);
+    }
+    let mut ordered = Vec::with_capacity(queue.len());
+    for track in original.iter().chain(&queue) {
+        if let Some(entry) = pool
+            .get_mut(track.id.as_str())
+            .and_then(VecDeque::pop_front)
+        {
+            ordered.push(entry.clone());
+        }
+    }
+    let index = current.and_then(|current| {
+        ordered
+            .iter()
+            .position(|track| Arc::ptr_eq(track, &current))
+    });
+    (ordered, index)
 }
 
 struct DecodeRequest {
@@ -598,7 +632,7 @@ fn decode_queue(
         // tell whether an edit arrived before or after this decision.
         let planned = {
             let mut plan = plan.lock().unwrap();
-            let planned = plan.next(index);
+            let planned = plan.next(plan.decoding.as_ref().map_or(index, |(at, _)| *at));
             plan.commit(
                 planned.as_ref().map_or(index, |(next, _)| *next),
                 planned.as_ref().map(|(_, track)| track),
@@ -725,6 +759,8 @@ fn run(
     let mut last_tick = Instant::now();
     let mut started = false;
     let mut plan = Plan::shared(Vec::new(), RepeatMode::Off);
+    // The queue order before shuffling, kept in step with later edits.
+    let mut original: Option<Vec<Arc<Track>>> = None;
     let mut plan_boundary = 0;
     let mut pending_output: Option<(Packet, Instant)> = None;
     let mut media = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
@@ -873,7 +909,9 @@ fn run(
                 }
                 PlayerCommand::Replace(mut tracks, at) => {
                     let at = at.min(tracks.len().saturating_sub(1));
+                    original = None;
                     if prefs.shuffle && !tracks.is_empty() {
+                        original = Some(tracks.clone());
                         let current = tracks.remove(at);
                         tracks.shuffle(&mut rand::rng());
                         tracks.insert(0, current);
@@ -901,6 +939,7 @@ fn run(
                         tracker.restore(listen);
                     }
                     queue = tracks;
+                    original = None;
                     index = (!queue.is_empty()).then_some(at.min(queue.len().saturating_sub(1)));
                     base_position = pos;
                     clock.playing.store(false, Ordering::Relaxed);
@@ -908,6 +947,9 @@ fn run(
                     started = false;
                 }
                 PlayerCommand::Append(tracks) => {
+                    if let Some(original) = original.as_mut() {
+                        original.extend(tracks.iter().cloned());
+                    }
                     queue.extend(tracks);
                     if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
                         base_position = position(&clock);
@@ -916,6 +958,13 @@ fn run(
                 }
                 PlayerCommand::PlayNext(tracks) => {
                     let at = index.map_or(0, |i| i + 1);
+                    if let Some(original) = original.as_mut() {
+                        let current = index.and_then(|i| queue.get(i));
+                        let after = current
+                            .and_then(|current| original.iter().position(|t| t.id == current.id))
+                            .map_or(original.len(), |i| i + 1);
+                        original.splice(after..after, tracks.iter().cloned());
+                    }
                     queue.splice(at..at, tracks);
                     if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
                         base_position = position(&clock);
@@ -929,7 +978,12 @@ fn run(
                         } else {
                             base_position
                         };
-                        queue.remove(at);
+                        let removed = queue.remove(at);
+                        if let Some(original) = original.as_mut()
+                            && let Some(i) = original.iter().position(|t| t.id == removed.id)
+                        {
+                            original.remove(i);
+                        }
                         if let Some(i) = index {
                             if at < i {
                                 index = Some(i - 1)
@@ -1018,9 +1072,15 @@ fn run(
                 PlayerCommand::Preferences(value) => {
                     let regain = prefs.gain != value.gain;
                     let shuffled = !prefs.shuffle && value.shuffle;
-                    let replanned = shuffled || prefs.repeat != value.repeat;
+                    let unshuffled = prefs.shuffle && !value.shuffle && original.is_some();
+                    let replanned = shuffled || unshuffled || prefs.repeat != value.repeat;
                     if shuffled && let Some(i) = index {
+                        original = Some(queue.clone());
                         queue[i + 1..].shuffle(&mut rand::rng());
+                        queue_dirty = true;
+                    }
+                    if unshuffled && let Some(order) = original.take() {
+                        (queue, index) = unshuffle(std::mem::take(&mut queue), &order, index);
                         queue_dirty = true;
                     }
                     prefs = value;
@@ -1527,6 +1587,54 @@ mod tests {
         reordered.swap(1, 2);
         assert!(plan.retarget(&reordered, RepeatMode::Off, Some(1), 1));
         assert_eq!(plan.next(1).map(|(_, t)| t.id.clone()), Some("1".into()));
+    }
+
+    #[test]
+    fn unshuffle_restores_original_order_and_keeps_later_edits() {
+        let original = tracks(5);
+        let ids = |queue: &[Arc<Track>]| queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        let mut shuffled = vec![
+            original[2].clone(),
+            original[4].clone(),
+            original[0].clone(),
+            original[3].clone(),
+        ];
+        let added = Arc::new(Track {
+            id: "added".into(),
+            ..Default::default()
+        });
+        shuffled.push(added.clone());
+        let updated = Arc::new(Track {
+            id: "4".into(),
+            title: "Updated".into(),
+            ..Default::default()
+        });
+        shuffled[1] = updated.clone();
+        // Track 1 was removed while shuffled; the added track was appended.
+        let mut order = original.clone();
+        order.remove(1);
+        order.push(added);
+        let (queue, index) = unshuffle(shuffled, &order, Some(1));
+        assert_eq!(ids(&queue), ["0", "2", "3", "4", "added"]);
+        assert_eq!(index, Some(3));
+        assert!(Arc::ptr_eq(&queue[3], &updated));
+    }
+
+    #[test]
+    fn plan_follows_the_audible_track_when_the_queue_is_reordered() {
+        let shuffled = tracks(4);
+        let plan = Plan::shared(shuffled.clone(), RepeatMode::Off);
+        let mut plan = plan.lock().unwrap();
+        plan.commit(0, shuffled.first());
+        let restored = vec![
+            shuffled[2].clone(),
+            shuffled[0].clone(),
+            shuffled[3].clone(),
+            shuffled[1].clone(),
+        ];
+        assert!(plan.retarget(&restored, RepeatMode::Off, Some(1), 1));
+        assert_eq!(plan.decoding, Some((1, "0".into())));
+        assert_eq!(plan.next(1).map(|(_, t)| t.id.clone()), Some("3".into()));
     }
 
     #[test]
