@@ -122,3 +122,34 @@ fn corrupt_saved_login_requests_sign_in_without_exposing_file_contents() {
     }
     assert!(ServerCredentials::from_password("").is_err());
 }
+
+#[test]
+fn an_empty_password_reuses_the_saved_login() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data: directory.path().into(),
+        cache: directory.path().join("cache"),
+    };
+    let account = account();
+    let first = Server::new(account.clone(), "example-password".into()).unwrap();
+    paths
+        .save_credentials(&first.account, first.credentials())
+        .unwrap();
+    let again = Server::sign_in(&paths, account.clone(), "").unwrap();
+    assert_eq!(
+        first.url("ping", &[]).unwrap(),
+        again.url("ping", &[]).unwrap()
+    );
+    let mut unnormalized = account.clone();
+    unnormalized.url = "https://music.example.com".into();
+    let reused = Server::sign_in(&paths, unnormalized, "").unwrap();
+    assert_eq!(
+        first.url("ping", &[]).unwrap(),
+        reused.url("ping", &[]).unwrap()
+    );
+    let other = Account {
+        url: "https://other.example.com/".into(),
+        ..account
+    };
+    assert!(Server::sign_in(&paths, other, "").is_err());
+}

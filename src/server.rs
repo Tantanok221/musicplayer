@@ -2,7 +2,7 @@ use crate::{
     artists::{ArtistProfile, SimilarArtist, plain_biography, profile_url},
     lyrics::Lyrics,
     model::*,
-    platform::{Account, ServerCredentials},
+    platform::{Account, Paths, ServerCredentials},
 };
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -14,6 +14,28 @@ use std::{
     time::Duration,
 };
 use url::Url;
+
+fn prepare_account(mut account: Account) -> Result<Account> {
+    let mut url = Url::parse(account.url.trim())
+        .context("Enter a complete server URL, including https://")?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
+        bail!("Use an http:// or https:// server URL");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("Enter credentials in the username and password fields");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    account.url = url.to_string();
+    account.username = account.username.trim().to_string();
+    if account.username.is_empty() {
+        bail!("Enter your Navidrome username and password");
+    }
+    Ok(account)
+}
 
 #[derive(Clone)]
 pub struct Server {
@@ -33,26 +55,9 @@ impl Server {
         &self.credentials
     }
 
-    pub fn with_credentials(mut account: Account, credentials: ServerCredentials) -> Result<Self> {
+    pub fn with_credentials(account: Account, credentials: ServerCredentials) -> Result<Self> {
         credentials.validate()?;
-        let mut url = Url::parse(account.url.trim())
-            .context("Enter a complete server URL, including https://")?;
-        if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
-            bail!("Use an http:// or https:// server URL");
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            bail!("Enter credentials in the username and password fields");
-        }
-        url.set_query(None);
-        url.set_fragment(None);
-        if !url.path().ends_with('/') {
-            url.set_path(&format!("{}/", url.path()));
-        }
-        account.url = url.to_string();
-        account.username = account.username.trim().to_string();
-        if account.username.is_empty() {
-            bail!("Enter your Navidrome username and password");
-        }
+        let account = prepare_account(account)?;
         Ok(Self {
             account,
             credentials,
@@ -64,6 +69,19 @@ impl Server {
             extensions: HashSet::new(),
         })
     }
+
+    /// A typed password replaces the saved login. An empty password reuses it.
+    pub fn sign_in(paths: &Paths, account: Account, password: &str) -> Result<Self> {
+        if password.is_empty() {
+            let account = prepare_account(account)?;
+            let credentials = paths
+                .credentials(&account)?
+                .context("Enter your Navidrome password")?;
+            return Self::with_credentials(account, credentials);
+        }
+        Self::new(account, password.to_string())
+    }
+
     pub fn url(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Url> {
         let mut url = Url::parse(&self.account.url)?.join(&format!("rest/{endpoint}.view"))?;
         url.query_pairs_mut()

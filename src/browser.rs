@@ -250,7 +250,7 @@ pub enum InfoTab {
     Lyrics,
     Artwork,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutPreferences {
     pub navigator_mode: NavigatorMode,

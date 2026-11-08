@@ -383,9 +383,11 @@ fn run(
                     let paths = paths.clone();
                     runtime.spawn(async move {
                         let result = async {
-                            let mut server = Server::new(account, password)?;
+                            let mut server = Server::sign_in(&paths, account, &password)?;
                             let label = server.connect().await?;
-                            paths.save_credentials(&server.account, server.credentials())?;
+                            if !password.is_empty() {
+                                paths.save_credentials(&server.account, server.credentials())?;
+                            }
                             Ok::<_, anyhow::Error>((server, label))
                         }
                         .await;
