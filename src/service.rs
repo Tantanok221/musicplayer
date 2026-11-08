@@ -9,6 +9,7 @@ use crate::{
     platform::{Account, Paths},
     playback::{Placement, PlayerCommand, PlayerEvent, PlayerHandle},
     server::Server,
+    sorting::{Field as SortField, Scope as SortScope},
 };
 use anyhow::Result;
 use flume::{Receiver, Sender};
@@ -40,7 +41,7 @@ pub enum Command {
     Refresh,
     Initialize,
     Query(u64, LibraryQuery),
-    Page(u64, LibraryQuery, usize),
+    Page(u64, u64, LibraryQuery, usize),
     Album(String),
     Artist(u64, String, String),
     ArtistProfile(String, String, bool),
@@ -84,7 +85,7 @@ pub enum Event {
     SignInRequired(String),
     Connected(Account, String),
     View(u64, LibraryView),
-    Page(u64, usize, Vec<Arc<Track>>),
+    Page(u64, u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
     Artist(u64, ArtistPageData),
     ArtistProfile(String, Arc<ArtistProfile>),
@@ -497,13 +498,19 @@ fn run(
                         events.send(Event::View(request, catalog.view(&current_query)?))?;
                     }
                 }
-                Command::Page(request, query, offset) => {
+                Command::Page(request, revision, query, offset) => {
                     if request == query_epoch.load(Ordering::Acquire) {
-                        events.send(Event::Page(
-                            request,
-                            offset,
-                            catalog.tracks(&query, offset, 500)?,
-                        ))?;
+                        if revision != catalog.revision() {
+                            // A sync or edit changed the ordering since the first page.
+                            events.send(Event::View(request, catalog.view(&query)?))?;
+                        } else {
+                            events.send(Event::Page(
+                                request,
+                                revision,
+                                offset,
+                                catalog.tracks(&query, offset, 500)?,
+                            ))?;
+                        }
                     }
                 }
                 Command::GroupTracks(request, query, id) => {
@@ -810,6 +817,17 @@ fn run(
                                 if let Some(track) = catalog.refresh_play_count(&fresh)? {
                                     player.send(PlayerCommand::UpdateTrack(track.clone()));
                                     events.send(Event::TrackUpdated(track))?;
+                                    if current_query.ordering.as_ref().is_some_and(|s| {
+                                        s.scope == SortScope::Tracks
+                                            && s.depends_on(SortField::Plays)
+                                    }) || (current_query.ordering.is_none()
+                                        && current_query.sort == Sort::Plays)
+                                    {
+                                        events.send(Event::View(
+                                            current_request,
+                                            catalog.view(&current_query)?,
+                                        ))?;
+                                    }
                                 }
                             }
                             Ok(None) => {}
@@ -860,7 +878,12 @@ fn run(
                     // change which rows appear or their order.
                     let reshapes_view = match &mutation {
                         Mutation::Favorite(..) => current_query.favorites,
-                        Mutation::Rating(..) => current_query.sort == Sort::Rating,
+                        Mutation::Rating(..) => current_query
+                            .ordering
+                            .as_ref()
+                            .map_or(current_query.sort == Sort::Rating, |s| {
+                                s.scope == SortScope::Tracks && s.depends_on(SortField::Rating)
+                            }),
                         _ => true,
                     };
                     match mutation {

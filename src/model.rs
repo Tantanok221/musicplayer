@@ -84,6 +84,10 @@ pub struct ReplayGain {
 pub struct Track {
     pub id: TrackId,
     pub title: String,
+    pub sort_name: String,
+    pub created: Option<String>,
+    pub original_release_date: Option<serde_json::Value>,
+    pub release_date: Option<serde_json::Value>,
     pub album: String,
     pub album_id: String,
     pub artist: String,
@@ -171,6 +175,10 @@ impl Track {
 pub struct Album {
     pub id: String,
     pub name: String,
+    pub sort_name: String,
+    pub created: Option<String>,
+    pub played: Option<String>,
+    pub is_compilation: Option<bool>,
     pub artist: String,
     pub artist_id: String,
     pub artists: Vec<NamedId>,
@@ -290,6 +298,7 @@ pub struct LibraryQuery {
     pub favorites: bool,
     pub sort: Sort,
     pub descending: bool,
+    pub ordering: Option<crate::sorting::SortSpec>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -318,6 +327,7 @@ pub struct Preferences {
     pub repeat: RepeatMode,
     pub dark: Option<bool>,
     pub layout: crate::browser::LayoutPreferences,
+    pub sorting: crate::sorting::SortingPreferences,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -328,6 +338,7 @@ impl Default for Preferences {
             repeat: RepeatMode::Off,
             dark: None,
             layout: crate::browser::LayoutPreferences::default(),
+            sorting: crate::sorting::SortingPreferences::default(),
         }
     }
 }

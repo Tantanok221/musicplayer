@@ -171,38 +171,53 @@ pub fn cover_layout(pane_width: f32) -> (usize, f32) {
 
 /// A jump starts a fresh row at its target, keeping every preceding album accessible.
 pub struct CoverRows {
-    albums: usize,
     columns: usize,
-    split: usize,
+    sections: Vec<(usize, usize, usize)>,
+    rows: usize,
 }
 impl CoverRows {
     pub fn new(albums: usize, columns: usize, jump: Option<usize>) -> Self {
+        Self::grouped(albums, columns, jump, &[])
+    }
+    pub fn grouped(albums: usize, columns: usize, jump: Option<usize>, groups: &[usize]) -> Self {
+        let columns = columns.max(1);
+        let mut starts = vec![0];
+        starts.extend(groups.iter().copied().filter(|i| *i < albums));
+        starts.extend(jump.filter(|i| *i < albums));
+        starts.push(albums);
+        starts.sort_unstable();
+        starts.dedup();
+        let mut sections = Vec::new();
+        let mut rows = 0;
+        for range in starts.windows(2) {
+            sections.push((range[0], range[1], rows));
+            rows += (range[1] - range[0]).div_ceil(columns);
+        }
         Self {
-            albums,
-            columns: columns.max(1),
-            split: jump.filter(|index| *index < albums).unwrap_or(0),
+            columns,
+            sections,
+            rows,
         }
     }
     pub fn row_count(&self) -> usize {
-        self.split.div_ceil(self.columns) + (self.albums - self.split).div_ceil(self.columns)
+        self.rows
     }
     pub fn row_for_album(&self, index: usize) -> usize {
-        if index < self.split {
-            index / self.columns
-        } else {
-            self.split.div_ceil(self.columns) + (index - self.split) / self.columns
-        }
+        self.sections
+            .iter()
+            .find(|(start, end, _)| *start <= index && index < *end)
+            .map_or(0, |(start, _, row)| row + (index - start) / self.columns)
     }
     pub fn albums_in_row(&self, row: usize) -> std::ops::Range<usize> {
-        let preceding = self.split.div_ceil(self.columns);
-        let (start, end) = if row < preceding {
-            let start = row * self.columns;
-            (start, (start + self.columns).min(self.split))
-        } else {
-            let start = self.split + (row - preceding) * self.columns;
-            (start, (start + self.columns).min(self.albums))
-        };
-        start..end
+        let section = self
+            .sections
+            .iter()
+            .rev()
+            .find(|(_, _, offset)| *offset <= row);
+        section.map_or(0..0, |(start, end, offset)| {
+            let first = start + (row - offset) * self.columns;
+            first..(first + self.columns).min(*end)
+        })
     }
 }
 

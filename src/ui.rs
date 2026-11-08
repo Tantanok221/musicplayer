@@ -9,6 +9,7 @@ use gpui_kit::component::{
     *,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
+use sonora::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
 use sonora::{
     artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key, lastfm_url, profile_url},
     backdrop::Backdrop,
@@ -28,6 +29,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+mod sorting_controls;
 
 actions!(
     sonora,
@@ -293,6 +295,7 @@ pub struct MusicApp {
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
     preferences: Preferences,
+    sort_anchor: Option<String>,
     volume_before_mute: Option<f32>,
     account: Option<Account>,
     settings: bool,
@@ -304,6 +307,7 @@ pub struct MusicApp {
     album_list: ListState,
     cover_list: ListState,
     cover_columns: usize,
+    cover_sections: Vec<usize>,
     alphabet_jump: Option<usize>,
     library_width: f32,
     library_height: f32,
@@ -473,6 +477,7 @@ impl MusicApp {
             seek,
             volume,
             preferences: Preferences::default(),
+            sort_anchor: None,
             volume_before_mute: None,
             account: None,
             settings: false,
@@ -484,6 +489,7 @@ impl MusicApp {
             album_list: ListState::new(0, ListAlignment::Top, px(300.)),
             cover_list: ListState::new(0, ListAlignment::Top, px(200.)),
             cover_columns: 4,
+            cover_sections: Vec::new(),
             alphabet_jump: None,
             library_height: 600.,
             library_width: 600.,
@@ -552,6 +558,9 @@ impl MusicApp {
                 self.account = account.clone();
                 self.settings = account.is_none();
                 self.preferences = prefs;
+                self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
+                self.explorer_query.ordering = self.query.ordering.clone();
+                self.request_query(cx);
                 self.apply_theme(window, cx);
                 self.volume.update(cx, |slider, cx| {
                     slider.set_value(self.preferences.volume, window, cx)
@@ -621,7 +630,26 @@ impl MusicApp {
                         .iter()
                         .map(|a| a.id.as_str())
                         .collect::<Vec<_>>();
-                    let reset = ids != old;
+                    let sections = self
+                        .query
+                        .ordering
+                        .as_ref()
+                        .filter(|s| s.grouping != Grouping::None)
+                        .map(|spec| {
+                            view.albums
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, a)| {
+                                    (i == 0
+                                        || spec.group_label(&view.albums[i - 1])
+                                            != spec.group_label(a))
+                                    .then_some(i)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let reset = ids != old || self.cover_sections != sections;
+                    self.cover_sections = sections;
                     self.tracks = view.tracks.clone();
                     self.track_total = view.track_count;
                     self.loading_more = false;
@@ -634,6 +662,11 @@ impl MusicApp {
                                 + usize::from(self.alphabet_jump.is_some()),
                         );
                     }
+                    if let Some(id) = self.sort_anchor.take()
+                        && let Some(index) = self.view.albums.iter().position(|a| a.id == id)
+                    {
+                        self.jump_to_album(index);
+                    }
                     self.group_requested.clear();
                     self.group_tracks.clear();
                     if self.selected_album.as_ref().is_some_and(|selected| {
@@ -643,8 +676,11 @@ impl MusicApp {
                     }
                 }
             }
-            Event::Page(request, offset, tracks) => {
-                if request == self.request && offset == self.tracks.len() {
+            Event::Page(request, revision, offset, tracks) => {
+                if request == self.request
+                    && revision == self.view.revision
+                    && offset == self.tracks.len()
+                {
                     self.tracks.extend(tracks);
                     self.loading_more = false;
                 }
@@ -779,6 +815,10 @@ impl MusicApp {
             .send(Command::Preferences(self.preferences.clone()));
     }
     fn request_query(&mut self, cx: &mut Context<Self>) {
+        if self.is_library() {
+            self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
+            self.explorer_query = self.query.clone();
+        }
         self.request = self.service.query(self.query.clone());
         self.group_requested.clear();
         self.group_tracks.clear();
@@ -801,10 +841,11 @@ impl MusicApp {
         cx.notify();
     }
     fn cover_rows(&self) -> CoverRows {
-        CoverRows::new(
+        CoverRows::grouped(
             self.view.albums.len(),
             self.cover_columns,
             self.alphabet_jump,
+            &self.cover_sections,
         )
     }
     fn album_row_count(&self) -> usize {
@@ -830,6 +871,9 @@ impl MusicApp {
     fn set_view(&mut self, view: MainView, cx: &mut Context<Self>) {
         self.alphabet_jump = None;
         self.preferences.layout.explorer_view = view;
+        self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
+        self.explorer_query.ordering = self.query.ordering.clone();
+        self.request_query(cx);
         self.album_list.reset(self.album_row_count());
         self.cover_list
             .reset(self.cover_rows().row_count() + usize::from(self.alphabet_jump.is_some()));
@@ -1436,7 +1480,8 @@ impl MusicApp {
         let colors = ink(cx);
         let width = f32::from(window.viewport_size().width);
         let search_width = (width * 0.3).clamp(140., 240.);
-        let tabs_width = (width - search_width - 78. - 32. - 24.).clamp(100., 440.);
+        let controls_inset = sonora::platform::TITLEBAR_CONTROLS_INSET;
+        let tabs_width = (width - search_width - controls_inset - 32. - 24.).clamp(100., 440.);
         let scroll_buttons = tabs_width < 440.;
         let mut tabs = div()
             .id("workspace-tabs")
@@ -1528,10 +1573,12 @@ impl MusicApp {
             .items_center()
             .border_b_1()
             .border_color(colors.line)
-            .child(
-                // The transparent macOS title bar places traffic lights in this area.
-                div().w(px(78.)).h_full().flex_shrink_0(),
-            )
+            .when(controls_inset > 0., |bar| {
+                bar.child(
+                    // The transparent macOS title bar places traffic lights in this area.
+                    div().w(px(controls_inset)).h_full().flex_shrink_0(),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -2094,7 +2141,15 @@ impl MusicApp {
             );
         }
         let mut alphabet = div().flex().items_center().gap(px(1.));
-        if self.is_library() && self.main_view() != MainView::Tracks && self.library_width >= 700. {
+        if self.is_library()
+            && self.main_view() != MainView::Tracks
+            && self.library_width >= 900.
+            && self
+                .query
+                .ordering
+                .as_ref()
+                .is_some_and(|spec| spec.alphabetical_field().is_some())
+        {
             for letter in "#ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() {
                 alphabet = alphabet.child(
                     div()
@@ -2111,21 +2166,10 @@ impl MusicApp {
                         .child(letter.to_string())
                         .on_click(cx.listener(move |app, _, _, cx| {
                             let found = app.view.albums.iter().position(|album| {
-                                let value = if app.query.sort == Sort::Artist {
-                                    &album.artist
-                                } else {
-                                    &album.name
-                                };
-                                let first = value
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.to_ascii_uppercase())
-                                    .unwrap_or('#');
-                                if letter == '#' {
-                                    !first.is_ascii_alphabetic()
-                                } else {
-                                    first == letter
-                                }
+                                app.query
+                                    .ordering
+                                    .as_ref()
+                                    .is_some_and(|spec| spec.album_letter(album) == letter)
                             });
                             if let Some(index) = found {
                                 app.jump_to_album(index);
@@ -2173,36 +2217,7 @@ impl MusicApp {
                                     app.request_query(cx);
                                 })),
                         )
-                        .child(
-                            Button::new("sort-menu")
-                                .ghost()
-                                .compact()
-                                .icon(Glyph::ArrowDownWideNarrow)
-                                .tooltip("Sort music")
-                                .dropdown_menu({
-                                    let weak = cx.weak_entity();
-                                    move |mut menu, _, _| {
-                                        for (sort, label) in [
-                                            (Sort::Artist, "Album Artist / Album"),
-                                            (Sort::Album, "Album"),
-                                            (Sort::Year, "Year"),
-                                            (Sort::Title, "Track title"),
-                                            (Sort::Rating, "Rating"),
-                                        ] {
-                                            let weak = weak.clone();
-                                            menu = menu.item(PopupMenuItem::new(label).on_click(
-                                                move |_, _, cx| {
-                                                    let _ = weak.update(cx, |app, cx| {
-                                                        app.query.sort = sort;
-                                                        app.request_query(cx);
-                                                    });
-                                                },
-                                            ));
-                                        }
-                                        menu
-                                    }
-                                }),
-                        )
+                        .child(self.sort_button(cx))
                     })
                     .child(
                         short_button("refresh-library", Glyph::RefreshCw, "Refresh library")
@@ -2667,8 +2682,13 @@ impl MusicApp {
         };
         let selected_panel =
             self.main_view() == MainView::AlbumCovers || self.artist_name.is_some();
-        let new_artist =
-            !selected_panel && (index == 0 || self.view.albums[index - 1].artist != album.artist);
+        let new_artist = !selected_panel
+            && self.query.ordering.as_ref().is_some_and(|spec| {
+                spec.grouping != Grouping::None
+                    && (index == 0
+                        || spec.group_label(&self.view.albums[index - 1])
+                            != spec.group_label(&album))
+            });
         self.album_panel(album, new_artist, selected_panel, cx)
     }
     fn album_panel(
@@ -2728,13 +2748,21 @@ impl MusicApp {
                     .gap_2()
                     .text_size(px(10.))
                     .text_color(colors.muted)
-                    .when(selected_panel, |line| {
-                        line.child(self.artist_links(
-                            album.artist_credits(),
-                            format!("album-artist-{}", album.id),
-                            cx,
-                        ))
-                    })
+                    .when(
+                        selected_panel
+                            || self
+                                .query
+                                .ordering
+                                .as_ref()
+                                .is_none_or(|spec| spec.grouping != Grouping::AlbumArtist),
+                        |line| {
+                            line.child(self.artist_links(
+                                album.artist_credits(),
+                                format!("album-artist-{}", album.id),
+                                cx,
+                            ))
+                        },
+                    )
                     .child(self.year_link(album.year, format!("album-year-{}", album.id), cx))
                     .child(self.genre_links(&album.genre, format!("album-genres-{}", album.id), cx))
                     .child(format!(
@@ -2794,11 +2822,30 @@ impl MusicApp {
                         .border_color(colors.line)
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(self.artist_links(
-                            album.artist_credits(),
-                            format!("group-artist-{}", album.id),
-                            cx,
-                        )),
+                        .child(
+                            if self
+                                .query
+                                .ordering
+                                .as_ref()
+                                .is_some_and(|spec| spec.grouping == Grouping::AlbumArtist)
+                            {
+                                self.artist_links(
+                                    album.artist_credits(),
+                                    format!("group-artist-{}", album.id),
+                                    cx,
+                                )
+                            } else {
+                                div()
+                                    .child(
+                                        self.query
+                                            .ordering
+                                            .as_ref()
+                                            .map(|spec| spec.group_label(&album))
+                                            .unwrap_or_default(),
+                                    )
+                                    .into_any_element()
+                            },
+                        ),
                 )
             })
             .child(
@@ -3393,7 +3440,24 @@ impl MusicApp {
                             .context_menu(app.album_menu(id.clone())),
                     );
                 }
-                let mut item = div().w_full().min_w_0().flex().flex_col().child(cards);
+                let first = app.cover_rows().albums_in_row(row).start;
+                let mut item = div().w_full().min_w_0().flex().flex_col();
+                if app.cover_sections.contains(&first)
+                    && let Some(spec) = &app.query.ordering
+                {
+                    item = item.child(
+                        div()
+                            .mx_3()
+                            .pt_3()
+                            .pb_1()
+                            .border_b_1()
+                            .border_color(ink(cx).line)
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(spec.group_label(&app.view.albums[first])),
+                    );
+                }
+                item = item.child(cards);
                 if let Some(index) = app
                     .selected_album
                     .as_ref()
@@ -3433,6 +3497,7 @@ impl MusicApp {
                     app.loading_more = true;
                     app.service.send(Command::Page(
                         app.request,
+                        app.view.revision,
                         app.query.clone(),
                         app.tracks.len(),
                     ));

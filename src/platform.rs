@@ -9,6 +9,8 @@ pub const UI_FONT: &str = if cfg!(target_os = "macos") {
     "sans-serif"
 };
 
+pub const TITLEBAR_CONTROLS_INSET: f32 = if cfg!(target_os = "linux") { 0. } else { 78. };
+
 pub const fn shortcut(mac: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
         mac

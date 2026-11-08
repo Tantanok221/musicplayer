@@ -3,6 +3,7 @@ use crate::{
     browser::{BrowserView, Facet, NavigatorView},
     listening::ListenReport,
     model::*,
+    sorting::{self, Scope, SortSpec},
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
@@ -65,10 +66,13 @@ struct Facets {
 pub struct Catalog {
     conn: Connection,
     facets: RefCell<Option<Facets>>,
+    revision: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LibraryView {
+    pub revision: u64,
+    pub sort_fields: Vec<sorting::Field>,
     pub albums: Vec<Arc<Album>>,
     pub browser: BrowserView,
     pub navigator: NavigatorView,
@@ -135,9 +139,11 @@ impl Catalog {
                 INSERT INTO track_search(track_search,rowid,search) VALUES('delete',old.rowid,old.search);
                 INSERT INTO track_search(rowid,search) VALUES(new.rowid,new.search); END;
             PRAGMA user_version=1;")?;
+        sorting::initialize(&conn)?;
         Ok(Self {
             conn,
             facets: RefCell::new(None),
+            revision: 0,
         })
     }
     pub fn put_tracks(&mut self, tracks: &[Track], generation: i64) -> Result<()> {
@@ -152,6 +158,7 @@ impl Catalog {
                 starred=excluded.starred,rating=excluded.rating,plays=excluded.plays,search=excluded.search,generation=excluded.generation,data=excluded.data")?;
             let mut albums = tx.prepare_cached("INSERT INTO albums(id,name,artist,year,genre,generation,data) VALUES(?1,?2,?3,?4,?5,?6,?7)
                 ON CONFLICT(id) DO UPDATE SET generation=excluded.generation")?;
+            let mut sort_album_ids = HashSet::new();
             for track in tracks {
                 if track.id.is_empty() {
                     anyhow::bail!("Server returned a track without an ID");
@@ -192,6 +199,7 @@ impl Catalog {
                     generation,
                     serde_json::to_string(track)?
                 ])?;
+                sorting::put_track(&tx, track)?;
                 if !track.album_id.is_empty() {
                     let album = Album {
                         id: track.album_id.clone(),
@@ -212,10 +220,19 @@ impl Catalog {
                         generation,
                         serde_json::to_string(&album)?
                     ])?;
+                    // Preserve authoritative album values when a track creates a placeholder.
+                    if sort_album_ids.insert(album.id.clone()) {
+                        let data: String =
+                            tx.query_row("SELECT data FROM albums WHERE id=?", [&album.id], |r| {
+                                r.get(0)
+                            })?;
+                        sorting::put_album(&tx, &serde_json::from_str(&data)?)?;
+                    }
                 }
             }
         }
         tx.commit()?;
+        self.revision += 1;
         *self.facets.borrow_mut() = None;
         Ok(())
     }
@@ -228,8 +245,10 @@ impl Catalog {
             tx.execute("INSERT INTO albums(id,name,artist,year,genre,generation,data) VALUES(?1,?2,?3,?4,?5,?6,?7)
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,artist=excluded.artist,year=excluded.year,genre=excluded.genre,generation=excluded.generation,data=excluded.data",
                 params![a.id,a.name,a.artist,a.year,a.genre,generation,serde_json::to_string(a)?])?;
+            sorting::put_album(&tx, a)?;
         }
         tx.commit()?;
+        self.revision += 1;
         *self.facets.borrow_mut() = None;
         Ok(())
     }
@@ -239,6 +258,7 @@ impl Catalog {
         tx.execute("DELETE FROM tracks WHERE generation != ?1", [generation])?;
         tx.execute("DELETE FROM albums WHERE generation != ?1", [generation])?;
         tx.commit()?;
+        self.revision += 1;
         *self.facets.borrow_mut() = None;
         Ok(())
     }
@@ -247,6 +267,9 @@ impl Catalog {
             .conn
             .query_row("SELECT count(*) FROM tracks", [], |r| r.get(0))?)
     }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     fn filters(query: &LibraryQuery) -> (String, Vec<Value>) {
         let mut sql = " WHERE 1=1".to_string();
         let mut values = Vec::new();
@@ -254,30 +277,32 @@ impl Catalog {
         if !text.is_empty() {
             if text.chars().count() >= 3 {
                 sql.push_str(
-                    " AND rowid IN (SELECT rowid FROM track_search WHERE track_search MATCH ?)",
+                    " AND tracks.rowid IN (SELECT rowid FROM track_search WHERE track_search MATCH ?)",
                 );
                 values.push(Value::Text(format!("\"{}\"", text.replace('"', "\"\""))));
             } else {
-                sql.push_str(" AND instr(search, ?) > 0");
+                sql.push_str(" AND instr(tracks.search, ?) > 0");
                 values.push(Value::Text(text));
             }
         }
         if !query.artist.is_empty() {
-            sql.push_str(" AND (artist_matches(artist,?) OR artist_matches(album_artist,?))");
+            sql.push_str(
+                " AND (artist_matches(tracks.artist,?) OR artist_matches(tracks.album_artist,?))",
+            );
             values.extend([
                 Value::Text(query.artist.clone()),
                 Value::Text(query.artist.clone()),
             ]);
         }
         if !query.performer.is_empty() {
-            sql.push_str(" AND (artist_matches(artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+            sql.push_str(" AND (artist_matches(tracks.artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
             values.extend([
                 Value::Text(query.performer.clone()),
                 Value::Text(query.performer.clone()),
             ]);
         }
         if !query.genre.is_empty() {
-            sql.push_str(" AND instr(' · ' || genre || ' · ',' · ' || ? || ' · ')>0");
+            sql.push_str(" AND instr(' · ' || tracks.genre || ' · ',' · ' || ? || ' · ')>0");
             values.push(Value::Text(query.genre.clone()));
         }
         if !query.selection.genres.is_empty() {
@@ -286,7 +311,7 @@ impl Catalog {
                 if index > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str("instr(' · ' || genre || ' · ',' · ' || ? || ' · ')>0");
+                sql.push_str("instr(' · ' || tracks.genre || ' · ',' · ' || ? || ' · ')>0");
                 values.push(Value::Text(genre.clone()));
             }
             sql.push(')');
@@ -297,43 +322,33 @@ impl Catalog {
                 if index > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str("(artist_matches(album_artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+                sql.push_str("(artist_matches(tracks.album_artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
                 values.push(Value::Text(artist.clone()));
                 values.push(Value::Text(artist.clone()));
             }
             sql.push(')');
         }
         if !query.selection.albums.is_empty() {
-            sql.push_str(" AND album_id IN (");
+            sql.push_str(" AND tracks.album_id IN (");
             sql.push_str(&vec!["?"; query.selection.albums.len()].join(","));
             sql.push(')');
             values.extend(query.selection.albums.iter().cloned().map(Value::Text));
         }
         if let Some(year) = query.year {
-            sql.push_str(" AND year=?");
+            sql.push_str(" AND tracks.year=?");
             values.push(Value::Integer(year as i64));
         }
         if query.favorites {
-            sql.push_str(" AND starred=1");
+            sql.push_str(" AND tracks.starred=1");
         }
         (sql, values)
     }
     fn order(query: &LibraryQuery) -> String {
-        let column = match query.sort {
-            Sort::Album => "album COLLATE NOCASE",
-            Sort::Artist => "artist COLLATE NOCASE",
-            Sort::Title => "title COLLATE NOCASE",
-            Sort::Year => "year",
-            Sort::Added => "rowid",
-            Sort::Duration => "duration",
-            Sort::Rating => "rating",
-            Sort::Plays => "plays",
-            Sort::Format => "format",
-        };
-        format!(
-            " ORDER BY {column} {}, album_id,disc,track,id",
-            if query.descending { "DESC" } else { "ASC" }
-        )
+        let spec = query
+            .ordering
+            .clone()
+            .unwrap_or_else(|| SortSpec::legacy(query.sort, query.descending, Scope::Tracks));
+        sorting::order(&spec, true)
     }
     pub fn tracks(
         &self,
@@ -343,7 +358,8 @@ impl Catalog {
     ) -> Result<Vec<Arc<Track>>> {
         let (filter, mut values) = Self::filters(query);
         let sql = format!(
-            "SELECT data FROM tracks{filter}{} LIMIT ? OFFSET ?",
+            "SELECT tracks.data FROM tracks{}{filter}{} LIMIT ? OFFSET ?",
+            sorting::TRACK_JOINS,
             Self::order(query)
         );
         values.push(Value::Integer(limit as i64));
@@ -356,7 +372,8 @@ impl Catalog {
     pub fn matching_ids(&self, query: &LibraryQuery) -> Result<Vec<String>> {
         let (filter, values) = Self::filters(query);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id FROM tracks{filter}{}",
+            "SELECT tracks.id FROM tracks{}{filter}{}",
+            sorting::TRACK_JOINS,
             Self::order(query)
         ))?;
         Ok(stmt
@@ -370,18 +387,26 @@ impl Catalog {
             params_from_iter(values.clone()),
             |r| r.get(0),
         )?;
-        let album_sort = match query.sort {
-            Sort::Artist => "artist COLLATE NOCASE",
-            Sort::Year => "year",
-            _ => "name COLLATE NOCASE",
-        };
-        let mut stmt = self.conn.prepare(&format!("SELECT data FROM albums WHERE id IN (SELECT DISTINCT album_id FROM tracks{filter}) ORDER BY {album_sort} {},name COLLATE NOCASE,id",if query.descending { "DESC" } else { "ASC" }))?;
+        let spec = query
+            .ordering
+            .clone()
+            .unwrap_or_else(|| SortSpec::legacy(query.sort, query.descending, Scope::Albums))
+            .validated(Scope::Albums);
+        let mut stmt = self.conn.prepare(&format!("SELECT albums.data FROM albums{} WHERE albums.id IN (SELECT DISTINCT album_id FROM tracks{filter}){}", sorting::ALBUM_JOINS, sorting::order(&spec,false)))?;
         let albums = stmt
             .query_map(params_from_iter(values), |r| r.get::<_, String>(0))?
             .map(|r| Ok(Arc::new(serde_json::from_str(&r?)?)))
             .collect::<Result<Vec<_>>>()?;
         let facets = self.facets()?;
         Ok(LibraryView {
+            revision: self.revision,
+            sort_fields: sorting::available(
+                &self.conn,
+                query
+                    .ordering
+                    .as_ref()
+                    .map_or(Scope::Albums, |spec| spec.scope),
+            )?,
             albums,
             browser: self.browser_view(query)?,
             navigator: facets.navigator,
@@ -493,6 +518,7 @@ impl Catalog {
         query.selection.albums = vec![id.into()];
         query.sort = Sort::Album;
         query.descending = false;
+        query.ordering = None;
         self.tracks(&query, 0, i64::MAX as usize)
     }
     fn facets(&self) -> Result<Facets> {
@@ -752,13 +778,14 @@ impl Catalog {
         )?;
         Ok(())
     }
-    pub fn refresh_play_count(&self, fresh: &Track) -> Result<Option<Arc<Track>>> {
+    pub fn refresh_play_count(&mut self, fresh: &Track) -> Result<Option<Arc<Track>>> {
         let Some(old) = self.by_ids(std::slice::from_ref(&fresh.id))?.pop() else {
             return Ok(None);
         };
         let mut track = (*old).clone();
         track.play_count = fresh.play_count;
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "UPDATE tracks SET plays=?1,data=?2 WHERE id=?3",
             params![
                 track.play_count.unwrap_or(0),
@@ -766,6 +793,9 @@ impl Catalog {
                 track.id
             ],
         )?;
+        sorting::put_track(&tx, &track)?;
+        tx.commit()?;
+        self.revision += 1;
         Ok(Some(Arc::new(track)))
     }
     pub fn album_queue_from(&self, track_id: &str) -> Result<Vec<Arc<Track>>> {

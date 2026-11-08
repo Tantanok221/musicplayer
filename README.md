@@ -58,6 +58,16 @@ The installer does not fetch Git changes or update dependencies. It builds the c
 
 To uninstall on Linux, remove `~/.local/bin/sonora`, the desktop entry above, and `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/512x512/apps/app.sonora.player.png`. Your account data and cache remain available for a later reinstall.
 
+## Music Explorer sorting
+
+Open the **Sort** menu in Music Explorer to choose Artist discography, Artist / Album, Album title, Release date, Recently added, Highest rated, or Most played. Artist discography groups albums by artist and orders each discography chronologically. The menu marks your current preset and offers ascending/descending choices. Under Artist discography, choose oldest or newest releases first within each artist; artist names stay in alphabetical order. Narrow panels show the sort icon; hover it for the full rule summary.
+
+Album layouts share one remembered sort; Tracks remembers its own, including separate Track artist and Album artist fields. Sorting is saved per account and survives filters, workspace changes, and restarts. It preserves the playing queue. Album contents and album-based play actions retain disc/track order regardless of the outer sort.
+
+Names use normalized Unicode and natural numeric ordering (`Volume 2` before `Volume 10`), ignoring a leading “The” in artist names. Album and track sort names supplied by the server override their display names for ordering only. Alphabet jumps follow the same keys and appear only for alphabetical album orders. This is deterministic natural ordering, not locale-specific collation or automatic romanization.
+
+Original release date falls back to edition release date, then year. Missing months/days follow more precise dates within the same year; unknown dates and unrated items sort last in either direction. Album ratings and play counts use server album values, not averages or sums of track values. Presets without cached metadata are marked **no metadata**. Refresh the library once after upgrading to populate server date-added and sort-name fields that older versions did not retain; historical dates are never inferred from local database insertion order. Existing cached records remain available while new sort keys are populated.
+
 ## Features
 
 - Music Explorer, Queue, Playlists, and Now Playing workspace tabs. Explorer is the main library page and retains its view/search/filter state. Tabs scroll horizontally in narrow windows, with arrow buttons for mouse navigation.
