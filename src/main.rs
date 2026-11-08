@@ -4,7 +4,7 @@ use anyhow::Result;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use sonora::{
-    platform::Paths,
+    platform::{Paths, shortcut},
     service::{Command, Service},
 };
 use ui::*;
@@ -31,18 +31,38 @@ fn main() -> Result<()> {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
         cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-,", OpenSettings, Some("Sonora")),
-            KeyBinding::new("cmd-f", FocusSearch, Some("Sonora")),
-            KeyBinding::new("cmd-r", Refresh, Some("Sonora")),
-            KeyBinding::new("cmd-right", NextTrack, Some("Sonora")),
-            KeyBinding::new("cmd-left", PreviousTrack, Some("Sonora")),
-            KeyBinding::new("cmd-[", GoBack, Some("Sonora")),
-            KeyBinding::new("cmd-]", GoForward, Some("Sonora")),
-            KeyBinding::new("cmd-1", ExplorerWorkspace, Some("Sonora")),
-            KeyBinding::new("cmd-2", QueueWorkspace, Some("Sonora")),
-            KeyBinding::new("cmd-3", PlaylistsWorkspace, Some("Sonora")),
-            KeyBinding::new("cmd-4", PlayingWorkspace, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-q", "ctrl-q"), Quit, None),
+            KeyBinding::new(shortcut("cmd-,", "ctrl-,"), OpenSettings, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-f", "ctrl-f"), FocusSearch, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-r", "ctrl-r"), Refresh, Some("Sonora")),
+            KeyBinding::new(
+                shortcut("cmd-right", "ctrl-right"),
+                NextTrack,
+                Some("Sonora"),
+            ),
+            KeyBinding::new(
+                shortcut("cmd-left", "ctrl-left"),
+                PreviousTrack,
+                Some("Sonora"),
+            ),
+            KeyBinding::new(shortcut("cmd-[", "ctrl-["), GoBack, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-]", "ctrl-]"), GoForward, Some("Sonora")),
+            KeyBinding::new(
+                shortcut("cmd-1", "ctrl-1"),
+                ExplorerWorkspace,
+                Some("Sonora"),
+            ),
+            KeyBinding::new(shortcut("cmd-2", "ctrl-2"), QueueWorkspace, Some("Sonora")),
+            KeyBinding::new(
+                shortcut("cmd-3", "ctrl-3"),
+                PlaylistsWorkspace,
+                Some("Sonora"),
+            ),
+            KeyBinding::new(
+                shortcut("cmd-4", "ctrl-4"),
+                PlayingWorkspace,
+                Some("Sonora"),
+            ),
         ]);
         cx.bind_keys(playback_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -121,6 +141,7 @@ fn playback_bindings() -> [KeyBinding; 2] {
 
 fn open(service: Service, events: flume::Receiver<sonora::service::Event>, cx: &mut App) {
     let options = WindowOptions {
+        app_id: Some("app.sonora.player".into()),
         window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
         window_min_size: Some(size(px(680.), px(540.))),
         titlebar: Some(TitlebarOptions {

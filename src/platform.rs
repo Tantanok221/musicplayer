@@ -3,6 +3,20 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const UI_FONT: &str = if cfg!(target_os = "macos") {
+    ".AppleSystemUIFont"
+} else {
+    "sans-serif"
+};
+
+pub const fn shortcut(mac: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        other
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub url: String,

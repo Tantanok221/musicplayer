@@ -1,10 +1,10 @@
 # Sonora
 
-A MusicBee-inspired Navidrome player for Apple Silicon Macs, written in Rust with GPUI Kit. The library uses a compact panel workspace: navigation and a selectable library browser on the left, albums with tracks in the center, and Queue plus information on the right. [UI research and interaction contract](docs/MUSICBEE_UI.md).
+A MusicBee-inspired Navidrome player for macOS and Linux, written in Rust with GPUI Kit. The library uses a compact panel workspace: navigation and a selectable library browser on the left, albums with tracks in the center, and Queue plus information on the right. [UI research and interaction contract](docs/MUSICBEE_UI.md).
 
 ## Run
 
-Requires macOS 14+, Apple Silicon, Apple Command Line Tools (`xcode-select --install`), and [Rust](https://rustup.rs/). The repository pins its toolchain; Cargo installs the required version automatically.
+On macOS, requires Apple Silicon, Apple Command Line Tools (`xcode-select --install`), and [Rust](https://rustup.rs/). See [GPUI Kit's platform requirements](https://gpui-kit.com/docs/installation/) for supported operating system versions. The repository pins its toolchain; rustup installs the required version automatically when Cargo runs. A distribution-provided Rust toolchain can also build the locked dependencies if its compiler is recent enough.
 
 ```sh
 source "$HOME/.cargo/env"
@@ -33,6 +33,30 @@ open dist/Sonora.app
 ```
 
 The script generates the icon, builds a release binary, and creates an ad hoc signed local app. Use `./scripts/bundle.sh debug` for a quicker development bundle. Public Developer ID signing, notarization, and automatic updates are not configured.
+
+## Install on Linux
+
+Requires a graphical Wayland or X11 session with a working Vulkan driver, Rust/Cargo, a C/C++ build toolchain, CMake, pkg-config, and the system development libraries required by [GPUI Kit](https://gpui-kit.com/docs/installation/). Sonora also needs ALSA for audio and D-Bus for media controls. On Arch Linux, the relevant packages include `base-devel`, `rust`, `rustfmt`, `cmake`, `fontconfig`, `libxkbcommon`, `libxcb`, `wayland`, `vulkan-icd-loader`, and `alsa-lib`, plus your GPU's Vulkan driver. Install additional dependencies identified by Cargo if needed. Keep the checked-in `Cargo.lock`.
+
+```sh
+./scripts/install-linux.sh
+```
+
+The installer builds a release binary and installs it at `~/.local/bin/sonora`. It adds **Sonora** and its icon to application launchers such as Rofi's `drun` mode, using `${XDG_DATA_HOME:-~/.local/share}/applications/app.sonora.player.desktop`. No administrator access is required. You can also run `~/.local/bin/sonora` directly. Linux uses Ctrl for the keyboard shortcuts listed below; macOS uses Command. Closing the last window quits on Linux.
+
+### Update a local installation
+
+After making changes in this checkout, rerun `./scripts/install-linux.sh`. To obtain upstream changes first, when your checkout has no uncommitted changes:
+
+```sh
+cd /path/to/musicplayer
+git pull --ff-only
+./scripts/install-linux.sh
+```
+
+The installer does not fetch Git changes or update dependencies. It builds the current checkout with locked dependencies before replacing the installed executable by rename; a failed build leaves the previous executable available. Quit and reopen Sonora to use the new version. Library data, preferences, and saved login are preserved. There is no background auto-updater. On macOS, rebuild with `./scripts/bundle.sh`, then replace your installed `Sonora.app` with `dist/Sonora.app` while the app is closed.
+
+To uninstall on Linux, remove `~/.local/bin/sonora`, the desktop entry above, and `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/512x512/apps/app.sonora.player.png`. Your account data and cache remain available for a later reinstall.
 
 ## Features
 
@@ -72,7 +96,7 @@ Selecting music inspects it without replacing playback. Playing an album replace
 | `⌘1`–`⌘4` | Music Explorer / Queue / Playlists / Now Playing |
 | `⌘Q` | Quit and save playback state |
 
-Closing the window keeps playback running; reopen from the Dock. Relaunch restores the queue paused.
+On macOS, closing the window keeps playback running; reopen from the Dock. On Linux, closing the last window quits. Relaunch restores the queue paused.
 
 ## Validation
 
@@ -88,10 +112,10 @@ The interface has been exercised with a real Navidrome collection. Physical outp
 
 ## Architecture and data
 
-One Cargo package separates the GPUI interface, SQLite catalog worker, Tokio networking tasks, playback actor/decoder, and macOS adapters. Typed commands/events connect the UI to services. Only visible artwork and track pages are requested by the renderer; SQLite and HTTP work happen off the UI thread. The output source consumes a bounded PCM channel without waiting on network or decoder work. Decoded PCM retains the source sample rate and channel count. The output opens with that exact configuration, with no alternate-rate fallback; the playback clock and visualization follow the source format. Volume and enabled ReplayGain still adjust sample levels. This is shared CoreAudio output, so downstream macOS, Bluetooth, or hardware processing may still occur; Sonora does not promise bit-perfect output.
+One Cargo package separates the GPUI interface, SQLite catalog worker, Tokio networking tasks, playback actor/decoder, and platform adapters. Typed commands/events connect the UI to services. Only visible artwork and track pages are requested by the renderer; SQLite and HTTP work happen off the UI thread. The output source consumes a bounded PCM channel without waiting on network or decoder work. Decoded PCM retains the source sample rate and channel count. The output opens with that exact configuration, with no alternate-rate fallback; the playback clock and visualization follow the source format. Volume and enabled ReplayGain still adjust sample levels. This is shared CoreAudio output, so downstream macOS, Bluetooth, or hardware processing may still occur; Sonora does not promise bit-perfect output.
 
 Navidrome remains the metadata source of truth. Sonora uses documented Subsonic/OpenSubsonic endpoints and stores optional server fields without fabricating missing credits or technical data. It does not modify music files or require a server fork. The first version supports one active server/account, with separate catalogs for each account.
 
-Data is under `~/Library/Application Support/app.Sonora.Sonora/`; artwork is under the corresponding macOS Caches directory. Paths are resolved through the `directories` crate. Artwork downloads on demand with up to four transfers at a time. Requests wait for reconnection, transient failures retry automatically up to three times, and Refresh retries exhausted requests. Artwork has a 512 MiB budget and is evicted oldest-first. Application state uses atomic file replacement or SQLite transactions. Authenticated URLs are not logged.
+Data is under `~/Library/Application Support/app.Sonora.Sonora/`; artwork is under the corresponding macOS Caches directory. On Linux, data is under `${XDG_DATA_HOME:-~/.local/share}/sonora/library/` and cache under `${XDG_CACHE_HOME:-~/.cache}/sonora/library/`. Paths are resolved through the `directories` crate. Artwork downloads on demand with up to four transfers at a time. Requests wait for reconnection, transient failures retry automatically up to three times, and Refresh retries exhausted requests. Artwork has a 512 MiB budget and is evicted oldest-first. Application state uses atomic file replacement or SQLite transactions. Authenticated URLs are not logged.
 
 Dependencies retain their own licenses, including GPUI Kit (Apache-2.0), Rodio (MIT/Apache-2.0), and Symphonia (MPL-2.0). See `Cargo.lock` for the reproducible dependency set.

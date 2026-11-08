@@ -178,7 +178,7 @@ fn biography_lines(text: &str, width: f32, cx: &App) -> usize {
     }
     let mut wrapper = cx
         .text_system()
-        .line_wrapper(font(".AppleSystemUIFont"), px(11.));
+        .line_wrapper(font(sonora::platform::UI_FONT), px(11.));
     text.lines()
         .map(|line| {
             1 + wrapper
@@ -5536,7 +5536,7 @@ impl Render for MusicApp {
             .flex_col()
             .key_context("Sonora")
             .track_focus(&self.focus)
-            .font_family(".AppleSystemUIFont")
+            .font_family(sonora::platform::UI_FONT)
             .text_size(px(12.))
             .text_color(colors.text)
             .bg(colors.background)

@@ -2,7 +2,7 @@
 name = "sonora"
 version = "0.1.0"
 edition = "2024"
-description = "An album-first Navidrome player for macOS"
+description = "An album-first Navidrome player for macOS and Linux"
 license = "MIT"
 
 [dependencies]
