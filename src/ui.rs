@@ -2574,7 +2574,7 @@ impl MusicApp {
             .text_size(px(11.))
             .cursor_default()
             .when(selected, |s| s.bg(colors.selection))
-            .hover(|s| s.bg(colors.panel))
+            .when(!selected, |s| s.hover(|s| s.bg(colors.panel)))
             .when_some(popular, |row, popular| {
                 row.child(
                     div()
