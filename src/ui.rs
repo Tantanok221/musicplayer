@@ -4922,9 +4922,37 @@ impl MusicApp {
         } else {
             div().into_any_element()
         };
-        let cover = track
-            .as_ref()
-            .map(|track| self.art(&track.cover_art, if compact { 32. } else { 40. }, cx));
+        let cover = track.as_ref().map(|track| {
+            let side = if compact { 32. } else { 40. };
+            div()
+                .id("footer-cover")
+                .group("footer-cover")
+                .relative()
+                .flex_shrink_0()
+                .size(px(side))
+                .cursor_pointer()
+                .role(Role::Button)
+                .aria_label("Open Now Playing")
+                .tooltip(|window, cx| tooltip::Tooltip::new("Open Now Playing").build(window, cx))
+                .child(self.art(&track.cover_art, side, cx))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui_kit::black().opacity(0.5))
+                        .text_color(gpui_kit::white())
+                        .opacity(0.)
+                        .group_hover("footer-cover", |overlay| overlay.opacity(1.))
+                        .child(Icon::new(Glyph::Maximize).size(px(side * 0.45))),
+                )
+                .on_click(cx.listener(|app, _, window, cx| {
+                    app.switch_workspace(Workspace::NowPlaying, window, cx);
+                    cx.notify();
+                }))
+        });
         let favorite = track
             .as_ref()
             .map(|track| self.favorite_button(track, "footer", cx));
