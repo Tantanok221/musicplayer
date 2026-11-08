@@ -32,6 +32,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+mod album_feedback;
 mod sorting_controls;
 
 actions!(
@@ -443,7 +444,6 @@ pub struct MusicApp {
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
     preferences: Preferences,
-    sort_anchor: Option<String>,
     volume_before_mute: Option<f32>,
     account: Option<Account>,
     settings: bool,
@@ -506,6 +506,7 @@ pub struct MusicApp {
     status: String,
     error: Option<String>,
     pending_mutation: Option<Mutation>,
+    album_pending: HashSet<String>,
     focus: FocusHandle,
     artist_scroll: UniformListScrollHandle,
     track_scroll: UniformListScrollHandle,
@@ -625,7 +626,6 @@ impl MusicApp {
             seek,
             volume,
             preferences: Preferences::default(),
-            sort_anchor: None,
             volume_before_mute: None,
             account: None,
             settings: false,
@@ -688,6 +688,7 @@ impl MusicApp {
             status: "Opening library…".into(),
             error: None,
             pending_mutation: None,
+            album_pending: HashSet::new(),
             focus,
             artist_scroll: UniformListScrollHandle::default(),
             track_scroll: UniformListScrollHandle::default(),
@@ -706,6 +707,7 @@ impl MusicApp {
                 self.account = account.clone();
                 self.settings = account.is_none();
                 self.preferences = prefs;
+                self.album_pending.clear();
                 self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
                 self.explorer_query.ordering = self.query.ordering.clone();
                 self.request_query(cx);
@@ -810,11 +812,6 @@ impl MusicApp {
                                 + usize::from(self.alphabet_jump.is_some()),
                         );
                     }
-                    if let Some(id) = self.sort_anchor.take()
-                        && let Some(index) = self.view.albums.iter().position(|a| a.id == id)
-                    {
-                        self.jump_to_album(index);
-                    }
                     self.group_requested.clear();
                     self.group_tracks.clear();
                     if self.selected_album.as_ref().is_some_and(|selected| {
@@ -883,6 +880,7 @@ impl MusicApp {
                 }
             }
             Event::TrackUpdated(track) => self.apply_track_update(track),
+            Event::AlbumUpdated(album) => self.apply_album_update(album),
             Event::Artwork(id, path) => {
                 self.art_failures.remove(&id);
                 self.artwork.insert(id, path);
@@ -924,11 +922,30 @@ impl MusicApp {
                 self.error = Some(error);
                 self.loading_more = false;
             }
-            Event::MutationDone => {
-                self.pending_mutation = None;
-                self.error = None;
-                self.show_playlist_editor = false;
+            Event::MutationDone(mutation) => {
+                if let Some(id) = mutation.album_feedback_id() {
+                    self.album_pending.remove(id);
+                }
+                if self.pending_mutation.as_ref() == Some(&mutation) {
+                    self.pending_mutation = None;
+                    self.error = None;
+                }
+                if matches!(
+                    mutation,
+                    Mutation::CreatePlaylist(..)
+                        | Mutation::RenamePlaylist(..)
+                        | Mutation::ReplacePlaylist(..)
+                ) {
+                    self.show_playlist_editor = false;
+                }
                 self.status = "Saved to Navidrome".into();
+            }
+            Event::MutationFailed(mutation, error) => {
+                if let Some(id) = mutation.album_feedback_id() {
+                    self.album_pending.remove(id);
+                }
+                self.pending_mutation = Some(mutation);
+                self.error = Some(error);
             }
         }
         cx.notify();
@@ -1328,9 +1345,58 @@ impl MusicApp {
             .find(|track| track.id == id)
             .cloned()
     }
+    fn find_album(&self, id: &str) -> Option<Arc<Album>> {
+        self.selected_album
+            .iter()
+            .chain(&self.view.albums)
+            .chain(self.artist_albums.iter().flatten())
+            .chain(self.artist_data.iter().flat_map(|data| &data.albums))
+            .find(|album| album.id == id)
+            .cloned()
+    }
+    fn apply_album_update(&mut self, album: Arc<Album>) {
+        if self
+            .selected_album
+            .as_ref()
+            .is_some_and(|selected| selected.id == album.id)
+        {
+            self.selected_album = Some(album.clone());
+        }
+        for value in self
+            .view
+            .albums
+            .iter_mut()
+            .chain(self.artist_albums.iter_mut().flatten())
+            .chain(
+                self.artist_data
+                    .iter_mut()
+                    .flat_map(|data| &mut data.albums),
+            )
+        {
+            if value.id == album.id {
+                *value = album.clone();
+            }
+        }
+    }
     fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
+        if let Some(id) = mutation.album_feedback_id() {
+            if !self.album_pending.insert(id.into()) {
+                return;
+            }
+            if let Some(album) = self.find_album(id) {
+                let mut edited = (*album).clone();
+                match &mutation {
+                    Mutation::AlbumFavorite(_, favorite) => {
+                        edited.starred = favorite.then(|| chrono::Utc::now().to_rfc3339())
+                    }
+                    Mutation::AlbumRating(_, rating) => edited.user_rating = Some(*rating),
+                    _ => (),
+                }
+                self.apply_album_update(Arc::new(edited));
+            }
+        }
         // Show ratings and favorites at once; a failed save restores the
-        // catalog value through `Event::TrackUpdated`.
+        // catalog value through the corresponding track/album update event.
         let edited = match &mutation {
             Mutation::Favorite(id, value) => self.find_track(id).map(|track| {
                 let mut track = (*track).clone();
@@ -1418,10 +1484,12 @@ impl MusicApp {
         let label = match &filter {
             ExplorerFilter::Genre(genre) => genre.clone(),
             ExplorerFilter::Year(year) => year.to_string(),
+            ExplorerFilter::RecordLabel(label) => label.clone(),
         };
         let kind = match &filter {
             ExplorerFilter::Genre(_) => "genre",
             ExplorerFilter::Year(_) => "year",
+            ExplorerFilter::RecordLabel(_) => "record label",
         };
         div()
             .id(SharedString::from(key))
@@ -1499,6 +1567,22 @@ impl MusicApp {
                     .accessibility_label(format!("Clear year {year} filter"))
                     .on_click(cx.listener(|app, _, _, cx| {
                         app.query.year = None;
+                        app.request_query(cx);
+                    })),
+            );
+        }
+        if !self.query.record_label.is_empty() {
+            bar = bar.child(
+                Button::new("clear-record-label-filter")
+                    .ghost()
+                    .compact()
+                    .label(format!("Label: {} ×", self.query.record_label))
+                    .accessibility_label(format!(
+                        "Clear record label {} filter",
+                        self.query.record_label
+                    ))
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.query.record_label.clear();
                         app.request_query(cx);
                     })),
             );
@@ -2382,6 +2466,7 @@ impl MusicApp {
                                     app.query.artist.clear();
                                     app.query.performer.clear();
                                     app.query.year = None;
+                                    app.query.record_label.clear();
                                     app.request_query(cx);
                                 })),
                         )
@@ -2450,7 +2535,6 @@ impl MusicApp {
                                 .map(|i| {
                                     let item = values[i].clone();
                                     let active = selected.contains(&item.id);
-                                    let artist_id = item.detail.clone();
                                     let id = item.id;
                                     div()
                                         .id(("browser-value", i))
@@ -2477,26 +2561,14 @@ impl MusicApp {
                                                 .child(item.count.to_string()),
                                         )
                                         .on_click(cx.listener(
-                                            move |app, event: &ClickEvent, window, cx| {
-                                                if column == BrowserColumn::Artist
-                                                    && !(event.modifiers().platform
-                                                        || event.modifiers().control)
-                                                {
-                                                    app.open_artist(
-                                                        id.clone(),
-                                                        artist_id.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                } else {
-                                                    app.select_browser(
-                                                        column,
-                                                        Some(id.clone()),
-                                                        event.modifiers().platform
-                                                            || event.modifiers().control,
-                                                        cx,
-                                                    );
-                                                }
+                                            move |app, event: &ClickEvent, _, cx| {
+                                                app.select_browser(
+                                                    column,
+                                                    Some(id.clone()),
+                                                    event.modifiers().platform
+                                                        || event.modifiers().control,
+                                                    cx,
+                                                );
                                             },
                                         ))
                                 })
@@ -2859,6 +2931,79 @@ impl MusicApp {
             });
         self.album_panel(album, new_artist, selected_panel, cx)
     }
+    fn album_metadata(
+        &self,
+        album: &Album,
+        show_artist: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let row = |label: &'static str, value: AnyElement| {
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .w(px(38.))
+                        .flex_shrink_0()
+                        .text_color(colors.muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(colors.text)
+                        .child(value),
+                )
+        };
+        let mut metadata = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .pb_2()
+            .min_w_0()
+            .text_size(px(10.));
+        let credits = album.artist_credits();
+        if show_artist && !credits.is_empty() {
+            metadata = metadata.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.text)
+                    .child(self.artist_links(credits, format!("album-artist-{}", album.id), cx)),
+            );
+        }
+        if album.year.is_some() {
+            metadata = metadata.child(row(
+                "Year",
+                self.year_link(album.year, format!("album-year-{}", album.id), cx),
+            ));
+        }
+        if !album.genre.trim().is_empty() {
+            metadata = metadata.child(row(
+                "Genre",
+                self.genre_links(&album.genre, format!("album-genres-{}", album.id), cx),
+            ));
+        }
+        let labels = album.record_label_names();
+        if !labels.is_empty() {
+            let mut links = div().flex().flex_wrap().items_center().min_w_0().gap_1();
+            for (index, label) in labels.into_iter().enumerate() {
+                if index > 0 {
+                    links = links.child(div().text_color(colors.muted).child("·"));
+                }
+                links = links.child(self.metadata_link(
+                    ExplorerFilter::RecordLabel(label),
+                    format!("album-label-{}-{index}", album.id),
+                    cx,
+                ));
+            }
+            metadata = metadata.child(row("Label", links.into_any_element()));
+        }
+        metadata.into_any_element()
+    }
     fn album_panel(
         &mut self,
         album: Arc<Album>,
@@ -2871,8 +3016,6 @@ impl MusicApp {
         let tracks = self.group_tracks.get(&album.id).cloned();
         let cover = self.art(&album.cover_art, 124., cx);
         let selection = album.clone();
-        let play_album = album.id.clone();
-        let source = self.service.clone();
         let albumtitle = album.name.clone();
         let mut right = div()
             .flex_1()
@@ -2889,54 +3032,25 @@ impl MusicApp {
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .text_size(px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
                             .child(album.name.clone()),
                     )
-                    .child(
-                        short_button(
-                            SharedString::from(format!("play-album-{}", album.id)),
-                            Glyph::Play,
-                            "Play album",
-                        )
-                        .on_click(move |_, _, _| {
-                            source.send(Command::PlayAlbum(play_album.clone()))
-                        }),
-                    ),
+                    .child(self.album_favorite(&album, cx)),
             )
             .child(
-                div()
-                    .pb_1()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(10.))
-                    .text_color(colors.muted)
-                    .when(
-                        selected_panel
-                            || self
-                                .query
-                                .ordering
-                                .as_ref()
-                                .is_none_or(|spec| spec.grouping != Grouping::AlbumArtist),
-                        |line| {
-                            line.child(self.artist_links(
-                                album.artist_credits(),
-                                format!("album-artist-{}", album.id),
-                                cx,
-                            ))
-                        },
-                    )
-                    .child(self.year_link(album.year, format!("album-year-{}", album.id), cx))
-                    .child(self.genre_links(&album.genre, format!("album-genres-{}", album.id), cx))
-                    .child(format!(
-                        "{} tracks",
-                        tracks.as_ref().map_or(album.song_count as usize, Vec::len)
-                    )),
+                self.album_metadata(
+                    &album,
+                    selected_panel
+                        || self
+                            .query
+                            .ordering
+                            .as_ref()
+                            .is_none_or(|spec| spec.grouping != Grouping::AlbumArtist),
+                    cx,
+                ),
             );
         if let Some(tracks) = tracks {
             let popular = self.popular_tracks(&album.id, &album.artist_credits());
@@ -3041,6 +3155,7 @@ impl MusicApp {
                                     }))
                                     .context_menu(self.album_menu(album.id.clone())),
                             )
+                            .child(self.album_rating(&album, cx))
                             .when(!selected_panel, |cover| {
                                 cover.child(
                                     div()
@@ -5761,6 +5876,7 @@ impl MusicApp {
             if self.is_library()
                 && (self.query.year.is_some()
                     || !self.query.selection.genres.is_empty()
+                    || !self.query.record_label.is_empty()
                     || !self.query.performer.is_empty())
             {
                 center = center.child(self.active_filter_bar(cx));
@@ -6170,6 +6286,7 @@ impl Render for MusicApp {
                     app.query.artist.clear();
                     app.query.performer.clear();
                     app.query.year = None;
+                    app.query.record_label.clear();
                     app.request_query(cx);
                 }
                 app.focus.focus(window, cx);

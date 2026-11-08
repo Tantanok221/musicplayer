@@ -75,6 +75,10 @@ fn metadata_links_filter_the_library_by_individual_genre_or_year() {
                 assert_eq!(query.selection.genres, [genre]);
                 assert!(query.year.is_none());
             }
+            ExplorerFilter::RecordLabel(label) => {
+                assert_eq!(query.record_label, label.trim());
+                assert!(query.year.is_none() && query.selection.is_empty());
+            }
         }
         let view = db.view(&query).unwrap();
         let mut ids = view

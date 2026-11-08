@@ -128,7 +128,7 @@ pub struct SortSpec {
 }
 impl Default for SortSpec {
     fn default() -> Self {
-        Preset::Discography.spec(Scope::Albums)
+        Preset::ArtistAlbum.spec(Scope::Albums)
     }
 }
 impl SortSpec {

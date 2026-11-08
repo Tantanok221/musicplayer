@@ -351,7 +351,7 @@ fn built_in_sort_directions_roundtrip_with_independent_view_defaults() {
     let mut prefs: Preferences = serde_json::from_value(json!({"volume":0.5})).unwrap();
     assert_eq!(
         prefs.sorting.albums,
-        Preset::Discography.spec(Scope::Albums)
+        Preset::ArtistAlbum.spec(Scope::Albums)
     );
     assert_eq!(prefs.sorting.tracks, Preset::Title.spec(Scope::Tracks));
     let mut spec = Preset::Discography.spec(Scope::Albums);
@@ -383,7 +383,7 @@ fn removed_custom_settings_load_safely_without_exposing_hidden_orders() {
     assert_eq!(prefs.volume, 0.5);
     assert_eq!(
         prefs.sorting.get(Scope::Albums),
-        Preset::Discography.spec(Scope::Albums)
+        Preset::ArtistAlbum.spec(Scope::Albums)
     );
     assert!(
         serde_json::to_value(&prefs.sorting)

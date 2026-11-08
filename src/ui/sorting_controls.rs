@@ -19,10 +19,11 @@ impl MusicApp {
         self.preferences.sorting.set(spec.clone());
         self.query.ordering = Some(spec);
         self.explorer_query.ordering = self.query.ordering.clone();
-        self.sort_anchor = self.selected_album.as_ref().map(|album| album.id.clone());
-        let selected = self.selected_album.clone();
+        self.alphabet_jump = None;
         self.request_query(cx);
-        self.selected_album = selected;
+        self.album_list.reset(self.album_row_count());
+        self.cover_list.reset(self.cover_rows().row_count());
+        self.track_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.save_preferences();
     }
     pub(super) fn sort_button(&self, cx: &mut Context<Self>) -> AnyElement {

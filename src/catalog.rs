@@ -93,6 +93,17 @@ impl Catalog {
     }
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.create_scalar_function(
+            "label_matches",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let label = context.get::<Option<String>>(0)?.unwrap_or_default();
+                let target = context.get::<String>(1)?;
+                Ok(!label.trim().is_empty() && normalize(label.trim()) == normalize(target.trim()))
+            },
+        )?;
+        conn.create_scalar_function(
             "artist_matches",
             2,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8
@@ -252,6 +263,42 @@ impl Catalog {
         *self.facets.borrow_mut() = None;
         Ok(())
     }
+    pub fn album(&self, id: &str) -> Result<Option<Arc<Album>>> {
+        self.conn
+            .query_row("SELECT data FROM albums WHERE id=?", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|data| Ok(Arc::new(serde_json::from_str(&data)?)))
+            .transpose()
+    }
+    /// Patch annotations without changing sync ownership, release metadata, or songs.
+    pub fn update_album_feedback(
+        &mut self,
+        id: &str,
+        favorite: Option<bool>,
+        rating: Option<u8>,
+    ) -> Result<Option<Arc<Album>>> {
+        let Some(old) = self.album(id)? else {
+            return Ok(None);
+        };
+        let mut album = (*old).clone();
+        if let Some(favorite) = favorite {
+            album.starred = favorite.then(|| chrono::Utc::now().to_rfc3339());
+        }
+        if let Some(rating) = rating {
+            album.user_rating = Some(rating.min(5));
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE albums SET data=?1 WHERE id=?2",
+            params![serde_json::to_string(&album)?, id],
+        )?;
+        sorting::put_album(&tx, &album)?;
+        tx.commit()?;
+        self.revision += 1;
+        Ok(Some(Arc::new(album)))
+    }
     // Only called after every required server page succeeded. Partial syncs never delete.
     pub fn finish_sync(&mut self, generation: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
@@ -338,8 +385,20 @@ impl Catalog {
             sql.push_str(" AND tracks.year=?");
             values.push(Value::Integer(year as i64));
         }
+        if !query.record_label.trim().is_empty() {
+            sql.push_str(" AND tracks.album_id IN (SELECT label_album.id FROM albums label_album WHERE EXISTS (SELECT 1 FROM json_each(label_album.data,'$.recordLabels') record_label WHERE label_matches(json_extract(record_label.value,'$.name'),?)))");
+            values.push(Value::Text(query.record_label.trim().into()));
+        }
         if query.favorites {
-            sql.push_str(" AND tracks.starred=1");
+            if query
+                .ordering
+                .as_ref()
+                .is_some_and(|sort| sort.scope == Scope::Albums)
+            {
+                sql.push_str(" AND (tracks.starred=1 OR tracks.album_id IN (SELECT id FROM albums WHERE json_extract(data,'$.starred') IS NOT NULL))");
+            } else {
+                sql.push_str(" AND tracks.starred=1");
+            }
         }
         (sql, values)
     }
@@ -515,10 +574,14 @@ impl Catalog {
     }
     pub fn album_tracks_matching(&self, query: &LibraryQuery, id: &str) -> Result<Vec<Arc<Track>>> {
         let mut query = query.clone();
+        let scope = query
+            .ordering
+            .as_ref()
+            .map_or(Scope::Tracks, |sort| sort.scope);
         query.selection.albums = vec![id.into()];
         query.sort = Sort::Album;
         query.descending = false;
-        query.ordering = None;
+        query.ordering = Some(SortSpec::legacy(Sort::Album, false, scope));
         self.tracks(&query, 0, i64::MAX as usize)
     }
     fn facets(&self) -> Result<Facets> {

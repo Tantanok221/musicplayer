@@ -26,14 +26,24 @@ use std::{
 const SIGN_IN_NOTICE: &str =
     "Sign in once to save your login locally. Sonora no longer uses Keychain.";
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
     Favorite(String, bool),
     Rating(String, u8),
+    AlbumFavorite(String, bool),
+    AlbumRating(String, u8),
     CreatePlaylist(String, Vec<String>),
     ReplacePlaylist(String, Vec<String>),
     RenamePlaylist(String, String),
     DeletePlaylist(String),
+}
+impl Mutation {
+    pub fn album_feedback_id(&self) -> Option<&str> {
+        match self {
+            Self::AlbumFavorite(id, _) | Self::AlbumRating(id, _) => Some(id),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone)]
 pub enum Command {
@@ -71,8 +81,8 @@ pub enum Command {
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
-    Updated(Mutation),
-    MutationFailed(Mutation, String),
+    Updated(String, Mutation),
+    MutationFailed(String, Mutation, String),
     PlaylistLoaded(Playlist),
     PlaylistsLoaded(Vec<Playlist>),
     Error(String),
@@ -101,7 +111,9 @@ pub enum Event {
     Playback(PlaybackSnapshot),
     Status(String),
     Error(String),
-    MutationDone,
+    MutationDone(Mutation),
+    MutationFailed(Mutation, String),
+    AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
 }
 #[derive(Clone)]
@@ -840,14 +852,24 @@ fn run(
                     }
                 }
                 Command::Mutate(mutation) => {
-                    let server = server.clone().ok_or_else(|| {
-                        anyhow::anyhow!("Connect to the server before saving changes")
-                    })?;
+                    let Some(server) = server.clone() else {
+                        tx.send(Command::MutationFailed(
+                            account.as_ref().map(Account::namespace).unwrap_or_default(),
+                            mutation,
+                            "Connect to the server before saving changes.".into(),
+                        ))?;
+                        return Ok(());
+                    };
+                    let namespace = server.account.namespace();
                     let tx = tx.clone();
                     runtime.spawn(async move {
                         let result = match &mutation {
                             Mutation::Favorite(id, value) => server.star(id, *value).await,
                             Mutation::Rating(id, rating) => server.rating(id, *rating).await,
+                            Mutation::AlbumFavorite(id, value) => {
+                                server.album_star(id, *value).await
+                            }
+                            Mutation::AlbumRating(id, rating) => server.rating(id, *rating).await,
                             Mutation::CreatePlaylist(name, ids) => {
                                 server.create_playlist(name, ids).await
                             }
@@ -861,10 +883,11 @@ fn run(
                         };
                         match result {
                             Ok(()) => {
-                                let _ = tx.send(Command::Updated(mutation));
+                                let _ = tx.send(Command::Updated(namespace, mutation));
                             }
                             Err(error) => {
                                 let _ = tx.send(Command::MutationFailed(
+                                    namespace,
                                     mutation,
                                     format!(
                                         "Change was not saved: {error:#}. Retry when connected."
@@ -874,7 +897,11 @@ fn run(
                         }
                     });
                 }
-                Command::Updated(mutation) => {
+                Command::Updated(namespace, mutation) => {
+                    if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
+                        return Ok(());
+                    }
+                    let completed = mutation.clone();
                     // Track edits are patched in place by the UI; a fresh view would
                     // reload every album panel, so send one only when the edit can
                     // change which rows appear or their order.
@@ -886,6 +913,20 @@ fn run(
                             .map_or(current_query.sort == Sort::Rating, |s| {
                                 s.scope == SortScope::Tracks && s.depends_on(SortField::Rating)
                             }),
+                        Mutation::AlbumFavorite(..) => {
+                            current_query.favorites
+                                && current_query
+                                    .ordering
+                                    .as_ref()
+                                    .is_some_and(|sort| sort.scope == SortScope::Albums)
+                        }
+                        Mutation::AlbumRating(..) => current_query.ordering.as_ref().map_or(
+                            current_query.sort == Sort::Rating,
+                            |sort| {
+                                sort.scope == SortScope::Albums
+                                    && sort.depends_on(SortField::Rating)
+                            },
+                        ),
                         _ => true,
                     };
                     match mutation {
@@ -907,6 +948,20 @@ fn run(
                                 let track = Arc::new(track);
                                 player.send(PlayerCommand::UpdateTrack(track.clone()));
                                 events.send(Event::TrackUpdated(track))?;
+                            }
+                        }
+                        Mutation::AlbumFavorite(id, favorite) => {
+                            if let Some(album) =
+                                catalog.update_album_feedback(&id, Some(favorite), None)?
+                            {
+                                events.send(Event::AlbumUpdated(album))?;
+                            }
+                        }
+                        Mutation::AlbumRating(id, rating) => {
+                            if let Some(album) =
+                                catalog.update_album_feedback(&id, None, Some(rating))?
+                            {
+                                events.send(Event::AlbumUpdated(album))?;
                             }
                         }
                         _ => {
@@ -937,19 +992,27 @@ fn run(
                             }
                         }
                     }
-                    events.send(Event::MutationDone)?;
+                    events.send(Event::MutationDone(completed))?;
                     if reshapes_view {
                         events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                     }
                 }
-                Command::MutationFailed(mutation, error) => {
+                Command::MutationFailed(namespace, mutation, error) => {
+                    if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
+                        return Ok(());
+                    }
                     if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
                         && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()
                     {
                         player.send(PlayerCommand::UpdateTrack(track.clone()));
                         events.send(Event::TrackUpdated(track.clone()))?;
                     }
-                    events.send(Event::Error(error))?;
+                    if let Some(id) = mutation.album_feedback_id()
+                        && let Some(album) = catalog.album(id)?
+                    {
+                        events.send(Event::AlbumUpdated(album))?;
+                    }
+                    events.send(Event::MutationFailed(mutation, error))?;
                 }
                 Command::SyncFailed(failed, error) => {
                     failed_generations.insert(failed);

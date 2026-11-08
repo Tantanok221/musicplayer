@@ -10,6 +10,9 @@ References:
 - Panel arrangement and playing/selected track distinction: https://musicbee.fandom.com/wiki/Layout_Preferences
 - Playback and queue behavior: https://musicbee.fandom.com/wiki/Playback
 - Album and Tracks screenshot: https://getmusicbee.com/forum/index.php?topic=37524.0
+- Album sub-header fields, including publisher: https://getmusicbee.com/forum/index.php?topic=39539.0
+- Roon's album headline metadata and separate label credits: https://help.roonlabs.com/portal/en/kb/articles/file-tag-best-practice
+- Album ratings near artwork and album-versus-track scope: https://getmusicbee.com/forum/index.php?topic=44197.0
 
 ## Interaction contract
 
@@ -26,10 +29,10 @@ References:
 11. Search double-clicks select text without zooming the window. Only the empty title-bar space owns window drag/double-click behavior.
 12. Cover columns use the actual center-panel width and reflow when side panels resize or toggle. Expanded album rows stay within that panel; narrower layouts stack artwork above the tracks.
 13. At compact window widths, workspace tabs stay on one horizontally scrollable row, with arrow buttons for mouse navigation. Selecting a workspace with a keyboard shortcut reveals its tab. Side panels share a width budget that reserves room for the library. Search remains visible. The player keeps one horizontal line in three groups: the current track with its favorite on the left; shuffle, previous, play/pause, next, and repeat beside elapsed time, seek, and total time in the center; rating and mute/volume on the right. Compact widths fold the five stars into a rating menu so seek keeps its space.
-14. Expanded album panels put the linked artist beside the year beneath the album title, without a separate artist heading or caption below the artwork. Normal Album and Tracks artist groups retain their headings.
+14. Expanded album panels put the linked artist on its own line beneath the album title, followed by separate, aligned Year, Genre, and Label rows. Missing fields are omitted, record-label names are individually linked, and the panel omits the track count. A heart beside the album title controls its favorite state, and five stars beneath the artwork control its rating without changing songs. Stars preview on hover, and clicking the current rating clears it. The header has no play button; cover double-click and the album context menu retain album playback. There is no repeated artist heading or caption below the artwork. Normal Album and Tracks artist groups retain their headings.
 15. Lyric focus fades and eases between lines with a subtle accent rail and background. Auto-follow scrolls smoothly between line boundaries and leaves manual scrolling alone between transitions.
 16. Artist credits split on ampersands, commas, and semicolons, including full-width variants. Individual names drive links, facets, counts, filters, and discography membership. Counts deduplicate shared albums; matching uses whole names rather than substrings. Combined artist IDs are not reused for each split credit.
-17. Genre and year metadata links open Music Explorer with a fresh genre or year filter. Genres are linked individually, preserving names such as R&B. Release-year clicks do not select or play their enclosing album card. Active filter chips and Clear filters remove metadata filters; playback stays unchanged.
+17. Genre, year, and record-label metadata links open Music Explorer with a fresh filter. Genres are linked individually, preserving names such as R&B. Record labels use complete normalized names, including co-release labels, without splitting commas or ampersands. Metadata clicks do not select or play their enclosing album card. Active filter chips and Clear filters remove metadata filters; playback stays unchanged.
 
 18. Playback requests original audio and opens output using the decoded source sample rate and channel count. It does not force 48 kHz stereo or fall back to MP3 transcoding. Unsupported formats show an error. Same-format tracks retain gapless boundaries; format changes may pause briefly while output reopens. Shared system output is not a bit-perfect guarantee.
 

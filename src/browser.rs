@@ -19,6 +19,7 @@ pub enum BrowserColumn {
 pub enum ExplorerFilter {
     Genre(String),
     Year(i32),
+    RecordLabel(String),
 }
 impl ExplorerFilter {
     pub fn query(&self) -> crate::model::LibraryQuery {
@@ -26,6 +27,7 @@ impl ExplorerFilter {
         match self {
             Self::Genre(genre) => query.selection.genres = vec![genre.clone()],
             Self::Year(year) => query.year = Some(*year),
+            Self::RecordLabel(label) => query.record_label = label.trim().into(),
         }
         query
     }

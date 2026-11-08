@@ -215,6 +215,15 @@ impl ReleaseCategory {
     }
 }
 impl Album {
+    pub fn record_label_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.record_labels
+            .iter()
+            .map(|label| label.name.trim())
+            .filter(|name| !name.is_empty() && seen.insert(normalize(name)))
+            .map(str::to_string)
+            .collect()
+    }
     pub fn artist_credits(&self) -> Vec<NamedId> {
         artist_credits(
             if self.display_artist.is_empty() {
@@ -295,6 +304,7 @@ pub struct LibraryQuery {
     pub performer: String,
     pub genre: String,
     pub year: Option<i32>,
+    pub record_label: String,
     pub favorites: bool,
     pub sort: Sort,
     pub descending: bool,

@@ -246,6 +246,14 @@ impl Server {
         .await?;
         Ok(())
     }
+    pub async fn album_star(&self, id: &str, starred: bool) -> Result<()> {
+        self.request(
+            if starred { "star" } else { "unstar" },
+            &[("albumId", id.into())],
+        )
+        .await?;
+        Ok(())
+    }
     pub async fn rating(&self, id: &str, rating: u8) -> Result<()> {
         self.request(
             "setRating",
