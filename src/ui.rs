@@ -14,7 +14,10 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder, *};
 use sonora::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
 use sonora::{
-    artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key, lastfm_url, profile_url},
+    artists::{
+        ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, lastfm_url, profile_url,
+        search_releases,
+    },
     backdrop::Backdrop,
     browser::*,
     catalog::LibraryView,
@@ -3415,6 +3418,111 @@ impl MusicApp {
             .child(cards)
             .into_any_element()
     }
+    fn artist_search_section(
+        &mut self,
+        category: ReleaseCategory,
+        hits: Vec<ReleaseHit>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let count = hits.len();
+        let mut section = div().mt_5().min_w_0().child(
+            div()
+                .mb_3()
+                .text_size(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("{} ({count})", category.label())),
+        );
+        for hit in hits {
+            let album = hit.album;
+            let selected = self
+                .selected_album
+                .as_ref()
+                .is_some_and(|selected| selected.id == album.id);
+            let open = album.clone();
+            let year = if let Some(year) = album.year {
+                self.metadata_link(
+                    ExplorerFilter::Year(year),
+                    format!("search-release-year-{}", album.id),
+                    cx,
+                )
+            } else {
+                div().child("Year unknown").into_any_element()
+            };
+            let mut block = div()
+                .id(SharedString::from(format!("artist-search-{}", album.id)))
+                .mb_4()
+                .min_w_0()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "artist-search-release-{}",
+                            album.id
+                        )))
+                        .role(Role::Button)
+                        .aria_label(format!("Select release {}", album.name))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .cursor_pointer()
+                        .pb_2()
+                        .border_b_2()
+                        .border_color(if selected {
+                            colors.accent
+                        } else {
+                            colors.background
+                        })
+                        .child(self.art(&album.cover_art, 56., cx))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(album.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(colors.muted)
+                                        .child(year),
+                                ),
+                        )
+                        .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
+                            app.select_album(open.clone(), cx);
+                            if event.click_count() == 2 {
+                                app.service.send(Command::PlayAlbum(open.id.clone()));
+                            }
+                        }))
+                        .context_menu(self.album_menu(album.id.clone())),
+                );
+            for (index, track) in hit.songs.iter().cloned().enumerate() {
+                let number = track.track.map_or(index + 1, |number| number as usize);
+                block = block.child(self.track_row(
+                    track,
+                    number,
+                    format!("artist-search-{}-{index}", album.id),
+                    None,
+                    None,
+                    cx,
+                ));
+            }
+            if selected {
+                block = block.child(
+                    div()
+                        .mt_2()
+                        .border_y_1()
+                        .border_color(colors.line)
+                        .child(self.album_panel(album, false, true, cx)),
+                );
+            }
+            section = section.child(block);
+        }
+        section.into_any_element()
+    }
     fn artist_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let name = self.artist_name.clone().unwrap_or_default();
@@ -3539,6 +3647,23 @@ impl MusicApp {
             }
             page = page.child(chips);
         }
+        if !self.search_text.trim().is_empty() {
+            let sections = search_releases(&albums, &data.tracks, &self.search_text);
+            if sections.is_empty() {
+                return page
+                    .child(
+                        div()
+                            .mt_5()
+                            .text_color(colors.muted)
+                            .child("No releases match your search."),
+                    )
+                    .into_any_element();
+            }
+            for (category, hits) in sections {
+                page = page.child(self.artist_search_section(category, hits, cx));
+            }
+            return page.into_any_element();
+        }
         let popular = profile
             .as_ref()
             .map(|profile| profile.popular.clone())
@@ -3576,18 +3701,6 @@ impl MusicApp {
                 )
                 .into_any_element();
         }
-        if !albums
-            .iter()
-            .any(|album| normalize(&album.name).contains(&normalize(&self.search_text)))
-        {
-            return page
-                .child(
-                    div()
-                        .text_color(colors.muted)
-                        .child("No releases match your search."),
-                )
-                .into_any_element();
-        }
         let (_, side) = cover_layout((self.library_width - 8.).max(0.));
         for category in [
             ReleaseCategory::Album,
@@ -3598,7 +3711,6 @@ impl MusicApp {
             let releases = albums
                 .iter()
                 .filter(|album| album.category() == category)
-                .filter(|album| normalize(&album.name).contains(&normalize(&self.search_text)))
                 .cloned()
                 .collect::<Vec<_>>();
             if releases.is_empty() {

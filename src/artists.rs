@@ -1,7 +1,7 @@
 //! Cached artist enrichment supplied by the connected Navidrome server.
-use crate::model::{Album, Track};
+use crate::model::{Album, ReleaseCategory, Track, normalize};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,8 +67,57 @@ impl TopSongs {
 #[derive(Clone, Debug, Default)]
 pub struct ArtistPageData {
     pub albums: Vec<Arc<Album>>,
+    pub tracks: Vec<Arc<Track>>,
     pub most_played: Vec<Arc<Track>>,
     pub genres: Vec<String>,
+}
+/// One release kept by an artist-page search, with the songs whose titles matched.
+pub struct ReleaseHit {
+    pub album: Arc<Album>,
+    pub songs: Vec<Arc<Track>>,
+}
+/// Albums and songs on this artist's releases, grouped into the page's sections.
+/// An album is included when its name matches or it contains a matching song.
+pub fn search_releases(
+    albums: &[Arc<Album>],
+    tracks: &[Arc<Track>],
+    query: &str,
+) -> Vec<(ReleaseCategory, Vec<ReleaseHit>)> {
+    let query = normalize(query.trim());
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut songs_by_album: HashMap<&str, Vec<Arc<Track>>> = HashMap::new();
+    for track in tracks {
+        if normalize(&track.title).contains(&query) {
+            songs_by_album
+                .entry(track.album_id.as_str())
+                .or_default()
+                .push(track.clone());
+        }
+    }
+    let mut sections = Vec::new();
+    for category in [
+        ReleaseCategory::Album,
+        ReleaseCategory::Ep,
+        ReleaseCategory::Single,
+        ReleaseCategory::Other,
+    ] {
+        let mut hits = Vec::new();
+        for album in albums.iter().filter(|album| album.category() == category) {
+            let songs = songs_by_album.remove(album.id.as_str()).unwrap_or_default();
+            if normalize(&album.name).contains(&query) || !songs.is_empty() {
+                hits.push(ReleaseHit {
+                    album: album.clone(),
+                    songs,
+                });
+            }
+        }
+        if !hits.is_empty() {
+            sections.push((category, hits));
+        }
+    }
+    sections
 }
 pub fn lastfm_url(name: &str) -> String {
     let mut url = url::Url::parse("https://www.last.fm/music/").unwrap();

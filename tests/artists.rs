@@ -1,4 +1,5 @@
-use sonora::{catalog::Catalog, model::*};
+use sonora::{artists::search_releases, catalog::Catalog, model::*};
+use std::sync::Arc;
 
 #[test]
 fn artist_separators_trim_deduplicate_and_do_not_reuse_combined_ids() {
@@ -201,4 +202,87 @@ fn artist_discography_includes_collaborations_and_ignores_filters_and_featured_c
             .unwrap()
             .is_empty()
     );
+    let page = db.artist_page("Main", "main").unwrap();
+    let track_ids = page
+        .tracks
+        .iter()
+        .map(|track| track.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        track_ids,
+        std::collections::HashSet::from([
+            "track-album",
+            "track-ep",
+            "track-single",
+            "track-legacy"
+        ])
+    );
+}
+
+#[test]
+fn artist_search_places_songs_in_their_release_section() {
+    let release = |id: &str, name: &str, kind: &str| {
+        Arc::new(Album {
+            id: id.into(),
+            name: name.into(),
+            release_types: vec![kind.into()],
+            ..Default::default()
+        })
+    };
+    let song = |id: &str, album_id: &str, title: &str| {
+        Arc::new(Track {
+            id: id.into(),
+            album_id: album_id.into(),
+            title: title.into(),
+            ..Default::default()
+        })
+    };
+    let albums = vec![
+        release("a", "Debut", "album"),
+        release("e", "Follow Up", "ep"),
+        release("s", "Together", "single"),
+        release("c", "Collection", "compilation"),
+    ];
+    let tracks = vec![
+        song("1", "a", "Yellow"),
+        song("2", "a", "Other"),
+        song("3", "e", "Yellow Light"),
+        song("4", "s", "Together"),
+        song("5", "missing", "Yellow"),
+    ];
+    let yellow = search_releases(&albums, &tracks, "YELLOW");
+    assert_eq!(
+        yellow
+            .iter()
+            .map(|(category, hits)| {
+                (
+                    *category,
+                    hits.iter()
+                        .map(|hit| {
+                            (
+                                hit.album.id.as_str(),
+                                hit.songs
+                                    .iter()
+                                    .map(|track| track.id.as_str())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (ReleaseCategory::Album, vec![("a", vec!["1"])]),
+            (ReleaseCategory::Ep, vec![("e", vec!["3"])]),
+        ]
+    );
+    let debut = search_releases(&albums, &tracks, "debut");
+    assert_eq!(debut.len(), 1);
+    assert_eq!(debut[0].0, ReleaseCategory::Album);
+    assert!(debut[0].1[0].songs.is_empty());
+    let together = search_releases(&albums, &tracks, "together");
+    assert_eq!(together[0].0, ReleaseCategory::Single);
+    assert_eq!(together[0].1[0].songs[0].id, "4");
+    assert!(search_releases(&albums, &tracks, "  ").is_empty());
+    assert!(search_releases(&albums, &tracks, "nope").is_empty());
 }

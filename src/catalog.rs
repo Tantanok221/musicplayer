@@ -698,8 +698,25 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
+    fn tracks_for_albums(&self, ids: &[String]) -> Result<Vec<Arc<Track>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT data FROM tracks WHERE album_id IN (SELECT value FROM json_each(?1)) ORDER BY disc,track,title,id",
+        )?;
+        statement
+            .query_map([serde_json::to_string(ids)?], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
+            .collect()
+    }
     pub fn artist_page(&self, name: &str, id: &str) -> Result<ArtistPageData> {
         let albums = self.artist_releases(name, id)?;
+        let album_ids = albums
+            .iter()
+            .map(|album| album.id.clone())
+            .collect::<Vec<_>>();
+        let tracks = self.tracks_for_albums(&album_ids)?;
         let artist_tracks = self.artist_tracks(name, id)?;
         let mut most_played = artist_tracks.clone();
         most_played.retain(|track| track.play_count.unwrap_or(0) > 0);
@@ -741,6 +758,7 @@ impl Catalog {
         genres.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(ArtistPageData {
             albums,
+            tracks,
             most_played,
             genres: genres.into_iter().take(5).map(|item| item.0).collect(),
         })
