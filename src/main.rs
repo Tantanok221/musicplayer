@@ -65,6 +65,19 @@ fn main() -> Result<()> {
             ),
         ]);
         cx.bind_keys(playback_bindings());
+        cx.bind_keys([
+            KeyBinding::new(shortcut("cmd-z", "ctrl-z"), UndoQueueEdit, Some("Queue")),
+            KeyBinding::new("backspace", RemoveQueueSelection, Some("Queue")),
+            KeyBinding::new("delete", RemoveQueueSelection, Some("Queue")),
+            KeyBinding::new("alt-up", MoveQueueEarlier, Some("Queue")),
+            KeyBinding::new("alt-down", MoveQueueLater, Some("Queue")),
+            KeyBinding::new(shortcut("cmd-a", "ctrl-a"), SelectAllQueued, Some("Queue")),
+            KeyBinding::new("up", PreviousQueueEntry, Some("Queue")),
+            KeyBinding::new("down", NextQueueEntry, Some("Queue")),
+            KeyBinding::new("shift-up", ExtendQueuePrevious, Some("Queue")),
+            KeyBinding::new("shift-down", ExtendQueueNext, Some("Queue")),
+            KeyBinding::new("enter", PlayQueueSelection, Some("Queue")),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         let menu = |name: &str, items| Menu {
             name: name.into(),

@@ -21,7 +21,7 @@ use sonora::{
     lyrics::Lyrics,
     model::*,
     platform::Account,
-    playback::{Placement, PlayerCommand},
+    playback::{Placement, PlayerCommand, QueueEdit},
     service::{Command, Event, Mutation, Service},
     visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
 };
@@ -33,6 +33,8 @@ use std::{
     time::{Duration, Instant},
 };
 mod album_feedback;
+mod queue_controls;
+use queue_controls::QueueViewState;
 mod sorting_controls;
 
 actions!(
@@ -55,7 +57,17 @@ actions!(
         PlayingWorkspace,
         QueueWorkspace,
         PlaylistsWorkspace,
-        ExplorerWorkspace
+        ExplorerWorkspace,
+        UndoQueueEdit,
+        RemoveQueueSelection,
+        MoveQueueEarlier,
+        MoveQueueLater,
+        SelectAllQueued,
+        NextQueueEntry,
+        PreviousQueueEntry,
+        ExtendQueueNext,
+        ExtendQueuePrevious,
+        PlayQueueSelection
     ]
 );
 
@@ -435,6 +447,7 @@ pub struct MusicApp {
     search_text: String,
     playlist_search: String,
     queue_search: String,
+    queue_ui: QueueViewState,
     titlebar_dragging: bool,
     workspace_scroll: ScrollHandle,
     server_url: Entity<InputState>,
@@ -460,6 +473,7 @@ pub struct MusicApp {
     library_width: f32,
     library_height: f32,
     selected_album: Option<Arc<Album>>,
+    pending_explorer_album: Option<String>,
     selected: Option<Arc<Track>>,
     playlists: Vec<Playlist>,
     playlist: Option<Playlist>,
@@ -501,7 +515,7 @@ pub struct MusicApp {
     playlists_open: bool,
     show_playlist_editor: bool,
     playlist_editor_rename: bool,
-    playlist_editor_queue: bool,
+    playlist_editor_tracks: Option<Vec<String>>,
     pending_delete: Option<String>,
     status: String,
     error: Option<String>,
@@ -617,6 +631,7 @@ impl MusicApp {
             search_text: String::new(),
             playlist_search: String::new(),
             queue_search: String::new(),
+            queue_ui: QueueViewState::new(cx),
             titlebar_dragging: false,
             workspace_scroll: ScrollHandle::new(),
             server_url,
@@ -642,6 +657,7 @@ impl MusicApp {
             library_height: 600.,
             library_width: 600.,
             selected_album: None,
+            pending_explorer_album: None,
             selected: None,
             playlists: vec![],
             playlist: None,
@@ -683,7 +699,7 @@ impl MusicApp {
             playlists_open: true,
             show_playlist_editor: false,
             playlist_editor_rename: false,
-            playlist_editor_queue: false,
+            playlist_editor_tracks: None,
             pending_delete: None,
             status: "Opening library…".into(),
             error: None,
@@ -819,6 +835,16 @@ impl MusicApp {
                     }) {
                         self.selected_album = None;
                     }
+                    if let Some(id) = self.pending_explorer_album.take()
+                        && let Some(album) = self
+                            .view
+                            .albums
+                            .iter()
+                            .find(|album| album.id == id)
+                            .cloned()
+                    {
+                        self.select_album(album, cx);
+                    }
                 }
             }
             Event::Page(request, revision, offset, tracks) => {
@@ -916,6 +942,7 @@ impl MusicApp {
                     slider.set_value(progress as f32, window, cx)
                 });
                 self.playback = snapshot;
+                self.queue_ui.retain_selection(&self.playback.queue_ids);
             }
             Event::Status(status) => self.status = status,
             Event::Error(error) => {
@@ -1000,6 +1027,7 @@ impl MusicApp {
             .send(Command::Preferences(self.preferences.clone()));
     }
     fn request_query(&mut self, cx: &mut Context<Self>) {
+        self.pending_explorer_album = None;
         if self.is_library() {
             self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
             self.explorer_query = self.query.clone();
@@ -1163,6 +1191,9 @@ impl MusicApp {
         });
         if self.is_library() {
             self.request_query(cx);
+        }
+        if workspace == Workspace::Queue {
+            self.queue_ui.focus.focus(window, cx);
         }
         cx.notify();
     }
@@ -2036,6 +2067,7 @@ impl MusicApp {
                         cx.stop_propagation();
                         app.show_playlist_editor = true;
                         app.playlist_editor_rename = false;
+                        app.playlist_editor_tracks = None;
                         cx.notify();
                     },
                 )),
@@ -2392,6 +2424,17 @@ impl MusicApp {
                     .child(label.to_string()),
             );
         }
+        if self.workspace == Workspace::Queue
+            && self.artist_name.is_none()
+            && self.library_width >= 620.
+        {
+            left = left.child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(self.queue_summary()),
+            );
+        }
         let mut alphabet = div().flex().items_center().gap(px(1.));
         if self.is_library()
             && self.main_view() != MainView::Tracks
@@ -2472,6 +2515,10 @@ impl MusicApp {
                         )
                         .child(self.sort_button(cx))
                     })
+                    .when(
+                        self.workspace == Workspace::Queue && self.artist_name.is_none(),
+                        |s| s.child(self.queue_toolbar(cx)),
+                    )
                     .child(
                         short_button("refresh-library", Glyph::RefreshCw, "Refresh library")
                             .on_click(
@@ -3871,7 +3918,8 @@ impl MusicApp {
                             .on_click(cx.listener(|app, _, _, cx| {
                                 app.show_playlist_editor = true;
                                 app.playlist_editor_rename = false;
-                                app.playlist_editor_queue = true;
+                                app.playlist_editor_tracks =
+                                    Some(app.playback.queue.iter().map(|t| t.id.clone()).collect());
                                 cx.notify();
                             })),
                     ),
@@ -4425,52 +4473,6 @@ impl MusicApp {
                     .child(self.track_information(window, cx)),
             )
             .into_any_element()
-    }
-    fn queue_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let values = self
-            .playback
-            .queue
-            .iter()
-            .enumerate()
-            .filter(|(_, track)| {
-                normalize(&format!(
-                    "{} {} {}",
-                    track.title,
-                    track.artist_label(),
-                    track.album
-                ))
-                .contains(&normalize(&self.queue_search))
-            })
-            .map(|(i, t)| (i, t.clone()))
-            .collect::<Vec<_>>();
-        let count = values.len();
-        let entity = cx.entity();
-        if count == 0 {
-            return self.empty(
-                "Queue is empty. Browse your library and choose Play Now or Queue Last.",
-                cx,
-            );
-        }
-        uniform_list("queue-main", count, move |range, _, cx| {
-            entity.update(cx, |app, cx| {
-                range
-                    .map(|row| {
-                        let (index, track) = values[row].clone();
-                        app.track_row(
-                            track,
-                            index + 1,
-                            format!("queue-main-{index}"),
-                            Some(index),
-                            None,
-                            cx,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })
-        .size_full()
-        .px_3()
-        .into_any_element()
     }
     fn now_playing_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(track) = self.playback.track.clone() else {
@@ -5986,11 +5988,8 @@ impl MusicApp {
                                         );
                                     }
                                 } else {
-                                    let ids = if app.playlist_editor_queue {
-                                        app.playback.queue.iter().map(|t| t.id.clone()).collect()
-                                    } else {
-                                        vec![]
-                                    };
+                                    let ids =
+                                        app.playlist_editor_tracks.clone().unwrap_or_default();
                                     app.mutate(Mutation::CreatePlaylist(name, ids), cx);
                                 }
                             })),
@@ -5999,7 +5998,7 @@ impl MusicApp {
                         short_button("cancel-playlist-editor", Glyph::X, "Cancel").on_click(
                             cx.listener(|app, _, _, cx| {
                                 app.show_playlist_editor = false;
-                                app.playlist_editor_queue = false;
+                                app.playlist_editor_tracks = None;
                                 cx.notify();
                             }),
                         ),

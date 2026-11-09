@@ -370,6 +370,9 @@ pub struct PlaybackSnapshot {
     pub duration: f64,
     pub index: Option<usize>,
     pub queue: Arc<Vec<Arc<Track>>>,
+    pub queue_ids: Arc<Vec<u64>>,
+    pub queue_revision: u64,
+    pub can_undo_queue: bool,
     pub error: Option<String>,
 }
 

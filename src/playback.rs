@@ -21,6 +21,9 @@ use stream_download::{Settings, StreamDownload, storage::temp::TempStorageProvid
 
 const CHUNK: usize = 2048;
 mod output;
+mod queue;
+pub use queue::QueueEdit;
+use queue::QueueEdits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioFormat {
@@ -64,6 +67,8 @@ pub enum PlayerCommand {
     Insert(Vec<Arc<Track>>, Placement),
     Remove(usize),
     Move(usize, usize),
+    EditQueue(u64, QueueEdit),
+    UndoQueue,
     Toggle,
     Play,
     Pause,
@@ -787,6 +792,7 @@ fn run(
     let mut output_id = default_output_id();
     let mut last_device_check = Instant::now();
     let mut queue: Vec<Arc<Track>> = Vec::new();
+    let mut queue_edits = QueueEdits::default();
     let mut index = None;
     let mut base_position = 0.;
     let mut server: Option<Server> = None;
@@ -911,6 +917,14 @@ fn run(
         let mut restart = false;
         for command in batch {
             revision += 1;
+            let mut reset_queue_edits = matches!(
+                &command,
+                PlayerCommand::Replace(..)
+                    | PlayerCommand::Restore(..)
+                    | PlayerCommand::Insert(..)
+                    | PlayerCommand::Remove(..)
+                    | PlayerCommand::Move(..)
+            );
             queue_dirty |= matches!(
                 &command,
                 PlayerCommand::Replace(..)
@@ -939,6 +953,7 @@ fn run(
                 }
                 PlayerCommand::Server(value) => server = Some(value),
                 PlayerCommand::UpdateTrack(track) => {
+                    queue_edits.update_track(&track);
                     for queued in &mut queue {
                         if queued.id == track.id {
                             *queued = track.clone();
@@ -1055,6 +1070,28 @@ fn run(
                         restart = started;
                     }
                 }
+                PlayerCommand::EditQueue(version, edit) => {
+                    if queue_edits.apply(version, &edit, &mut queue, &mut original, index) {
+                        queue_dirty = true;
+                        if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
+                            base_position = position(&clock);
+                            restart = true;
+                        }
+                    }
+                }
+                PlayerCommand::UndoQueue => {
+                    let previous_index = index;
+                    if queue_edits.undo(&mut queue, &mut original, &mut index) {
+                        queue_dirty = true;
+                        if started
+                            && (index != previous_index
+                                || replan(&plan, &queue, prefs.repeat, index, plan_boundary))
+                        {
+                            base_position = position(&clock);
+                            restart = true;
+                        }
+                    }
+                }
                 PlayerCommand::Toggle => {
                     let play = !clock.playing.load(Ordering::Relaxed);
                     clock.playing.store(play, Ordering::Relaxed);
@@ -1117,6 +1154,7 @@ fn run(
                     let regain = prefs.gain != value.gain;
                     let shuffled = !prefs.shuffle && value.shuffle;
                     let unshuffled = prefs.shuffle && !value.shuffle && original.is_some();
+                    reset_queue_edits = shuffled || unshuffled;
                     let replanned = shuffled || unshuffled || prefs.repeat != value.repeat;
                     if shuffled && let Some(i) = index {
                         original = Some(queue.clone());
@@ -1153,6 +1191,9 @@ fn run(
                     clock.playing.store(true, Ordering::Relaxed);
                     restart = true;
                 }
+            }
+            if reset_queue_edits {
+                queue_edits.reset(queue.len());
             }
         }
         if restart {
@@ -1344,6 +1385,9 @@ fn run(
                     position: pos,
                     index,
                     queue: published_queue.clone(),
+                    queue_ids: queue_edits.ids(),
+                    queue_revision: queue_edits.revision(),
+                    can_undo_queue: queue_edits.can_undo(),
                     error: error.clone(),
                 }));
             }
