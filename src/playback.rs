@@ -737,9 +737,14 @@ fn open_output(
     first: Packet,
 ) -> Result<rodio::MixerDeviceSink> {
     let format = first.format;
-    let mut output = rodio::DeviceSinkBuilder::from_default_device()?
+    let builder = rodio::DeviceSinkBuilder::from_default_device()?
         .with_sample_rate(format.rate)
-        .with_channels(format.channels)
+        .with_channels(format.channels);
+    // CoreAudio's device buffer also accommodates Bluetooth outputs whose maximum
+    // is smaller than Rodio's automatically selected fixed buffer.
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_buffer_size(rodio::cpal::BufferSize::Default);
+    let mut output = builder
         .with_error_callback(move |_| {
             let _ = errors.send(());
         })
