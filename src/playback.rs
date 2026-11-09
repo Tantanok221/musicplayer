@@ -20,6 +20,7 @@ use std::{
 use stream_download::{Settings, StreamDownload, storage::temp::TempStorageProvider};
 
 const CHUNK: usize = 2048;
+mod output;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioFormat {
@@ -732,31 +733,20 @@ fn default_output_id() -> Option<String> {
 fn open_output(
     clock: Arc<Clock>,
     rx: Receiver<Packet>,
-    errors: Sender<()>,
+    errors: Sender<rodio::cpal::Error>,
     format_changes: Sender<Packet>,
     first: Packet,
 ) -> Result<rodio::MixerDeviceSink> {
     let format = first.format;
-    let builder = rodio::DeviceSinkBuilder::from_default_device()?
-        .with_sample_rate(format.rate)
-        .with_channels(format.channels);
-    // CoreAudio's device buffer also accommodates Bluetooth outputs whose maximum
-    // is smaller than Rodio's automatically selected fixed buffer.
-    #[cfg(target_os = "macos")]
-    let builder = builder.with_buffer_size(rodio::cpal::BufferSize::Default);
-    let mut output = builder
-        .with_error_callback(move |_| {
-            let _ = errors.send(());
-        })
-        .open_stream()?;
+    let device = rodio::cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("No audio output device available"))?;
+    let mut output = output::open_device(&device, format, errors)?;
     output.log_on_drop(false);
-    output.mixer().add(BufferedAudio::new(
-        clock,
-        rx,
-        format_changes,
-        format,
-        Some(first),
-    ));
+    let source = BufferedAudio::new(clock, rx, format_changes, format, Some(first));
+    output
+        .mixer()
+        .add(output::adapt(source, output.config().sample_rate())?);
     Ok(output)
 }
 
@@ -1269,7 +1259,7 @@ fn run(
                         last_tick = Instant::now();
                         last_device_check = Instant::now();
                     }
-                    Err(_) => {
+                    Err(output_error) => {
                         index = Some(next_index);
                         base_position = next_position;
                         started = false;
@@ -1277,7 +1267,7 @@ fn run(
                         clock.buffering.store(false, Ordering::Relaxed);
                         clock.epoch.fetch_add(1, Ordering::AcqRel);
                         error = Some(format!(
-                            "Could not open source audio output ({} Hz, {} channels). Check the output device and retry. No conversion was applied.",
+                            "Could not open audio output for this track ({} Hz, {} channels): {output_error:#}. Check the output device and retry.",
                             format.rate, format.channels,
                         ));
                     }
@@ -1393,6 +1383,65 @@ mod tests {
     fn test_source(clock: Arc<Clock>, rx: Receiver<Packet>) -> BufferedAudio {
         let (format_changes, _) = flume::unbounded();
         BufferedAudio::new(clock, rx, format_changes, format(48_000, 2), None)
+    }
+
+    #[test]
+    fn converted_output_keeps_source_time_and_hands_off_the_next_format() {
+        let clock = Arc::new(Clock::default());
+        clock.volume.store(1f64.to_bits(), Ordering::Relaxed);
+        clock.playing.store(true, Ordering::Relaxed);
+        clock.epoch.store(1, Ordering::Release);
+        let (tx, rx) = flume::bounded(2);
+        let (changes, change_rx) = flume::unbounded();
+        for (index, audio_format, samples, position) in [
+            (0, format(96_000, 2), vec![0.1; 192_000], 2.),
+            (1, format(44_100, 1), vec![0.2; 4_410], 0.),
+        ] {
+            tx.send(Packet {
+                listen: None,
+                epoch: 1,
+                index,
+                position: Some(position),
+                format: audio_format,
+                samples,
+                end: false,
+            })
+            .unwrap();
+        }
+        let source = BufferedAudio::new(
+            clock.clone(),
+            rx.clone(),
+            changes.clone(),
+            format(96_000, 2),
+            None,
+        );
+        let mut converted = output::adapt(source, 44_100.try_into().unwrap()).unwrap();
+        for _ in 0..44_100 {
+            assert!(converted.next().unwrap().is_finite());
+        }
+        assert!(
+            (clock.position() - 2.5).abs() < 0.01,
+            "source time follows output duration, allowing the bounded conversion buffer"
+        );
+        for _ in 0..44_100 {
+            assert!(converted.next().unwrap().is_finite());
+        }
+        assert!((clock.position() - 3.).abs() < 0.000_001);
+        let next = change_rx.try_recv().unwrap();
+        assert_eq!(next.index, 1);
+        assert_eq!(
+            next.samples.len(),
+            4_410,
+            "retain the next source's entire first packet"
+        );
+        drop(converted);
+        let mut next =
+            BufferedAudio::new(clock.clone(), rx, changes, format(44_100, 1), Some(next));
+        assert_eq!(
+            next.by_ref().take(4_410).collect::<Vec<_>>(),
+            vec![0.2; 4_410]
+        );
+        assert!((clock.position() - 0.1).abs() < 0.000_001);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn original_streams_keep_native_rates_channels_and_pcm_without_transcoding() {
