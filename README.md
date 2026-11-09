@@ -60,7 +60,7 @@ To uninstall on Linux, remove `~/.local/bin/sonora`, the desktop entry above, an
 
 ## Music Explorer sorting
 
-Open the **Sort** menu in Music Explorer to choose Artist discography, Artist / Album, Album title, Release date, Recently added, Highest rated, or Most played. Selecting a sort preset or direction clears the expanded album and returns the library to the top. Artist discography groups albums by artist and orders each discography chronologically. The menu marks your current preset and offers ascending/descending choices. Under Artist discography, choose oldest or newest releases first within each artist; artist names stay in alphabetical order. Narrow panels show the sort icon; hover it for the full rule summary.
+Open the **Sort** menu in Music Explorer to choose Artist / Album, Album title, Release date, Recently added, Highest rated, or Most played. Selecting a sort preset or direction clears the expanded album and returns the library to the top. The menu marks your current preset and offers ascending/descending choices. Sort presets change ordering without grouping albums into sections. Previously saved Artist discography selections fall back to Artist / Album. Narrow panels show the sort icon; hover it for the full rule summary.
 
 Music Explorer defaults to Album Covers with Artist / Album sorting (artist A–Z, then album A–Z). Album layouts share one remembered sort; Tracks remembers its own, including separate Track artist and Album artist fields. Sorting is saved per account and survives filters, workspace changes, and restarts. It preserves the playing queue. Album contents and album-based play actions retain disc/track order regardless of the outer sort.
 

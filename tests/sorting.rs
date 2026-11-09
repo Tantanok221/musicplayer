@@ -354,13 +354,13 @@ fn built_in_sort_directions_roundtrip_with_independent_view_defaults() {
         Preset::ArtistAlbum.spec(Scope::Albums)
     );
     assert_eq!(prefs.sorting.tracks, Preset::Title.spec(Scope::Tracks));
-    let mut spec = Preset::Discography.spec(Scope::Albums);
-    spec.rules[1].descending = true;
+    let mut spec = Preset::ArtistAlbum.spec(Scope::Albums);
+    spec.rules[0].descending = true;
     prefs.sorting.set(spec.clone());
     let copy: Preferences = serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
     assert_eq!(copy.sorting.get(Scope::Albums), spec);
-    assert_eq!(spec.label(), "Artist discography");
-    assert_eq!(spec.preset(), Some(Preset::Discography));
+    assert_eq!(spec.label(), "Artist / Album");
+    assert_eq!(spec.preset(), Some(Preset::ArtistAlbum));
     assert_eq!(copy.sorting.tracks, Preset::Title.spec(Scope::Tracks));
     let mut reverse_title = Preset::Title.spec(Scope::Tracks);
     reverse_title.rules[0].descending = true;
@@ -369,6 +369,28 @@ fn built_in_sort_directions_roundtrip_with_independent_view_defaults() {
     db.set_state("preferences", &copy).unwrap();
     let loaded: Preferences = db.state("preferences").unwrap();
     assert_eq!(loaded.sorting.get(Scope::Albums), spec);
+}
+
+#[test]
+fn saved_discography_falls_back_to_an_ungrouped_album_sort() {
+    for descending in [false, true] {
+        let mut spec = Preset::Discography.spec(Scope::Albums);
+        spec.rules[1].descending = descending;
+        let prefs: Preferences = serde_json::from_value(json!({
+            "sorting": { "albums": spec }
+        }))
+        .unwrap();
+        assert_eq!(
+            prefs.sorting.get(Scope::Albums),
+            Preset::ArtistAlbum.spec(Scope::Albums)
+        );
+    }
+    assert!(
+        Preset::choices(Scope::Albums)
+            .iter()
+            .all(|preset| preset.spec(Scope::Albums).grouping == Grouping::None),
+        "Sort choices must only change ordering"
+    );
 }
 
 #[test]

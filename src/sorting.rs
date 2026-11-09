@@ -193,11 +193,6 @@ impl SortSpec {
                     base.group_descending = rule.descending;
                 }
             }
-            if *preset == Preset::Discography
-                && let Some(rule) = self.rules.get(1)
-            {
-                base.rules[1].descending = rule.descending;
-            }
             base == *self
         })
     }
@@ -295,15 +290,7 @@ impl Preset {
     pub fn choices(scope: Scope) -> &'static [Self] {
         use Preset::*;
         match scope {
-            Scope::Albums => &[
-                Discography,
-                ArtistAlbum,
-                Album,
-                ReleaseDate,
-                Added,
-                Rating,
-                Plays,
-            ],
+            Scope::Albums => &[ArtistAlbum, Album, ReleaseDate, Added, Rating, Plays],
             Scope::Tracks => &[
                 Title,
                 ArtistTitle,

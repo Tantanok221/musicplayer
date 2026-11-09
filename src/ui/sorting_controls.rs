@@ -61,18 +61,11 @@ impl MusicApp {
                         }),
                     );
                 }
-                // Discography direction changes the albums within each artist.
-                // All other presets change their primary sort field.
-                let index = if current.preset() == Some(Preset::Discography) {
-                    1
-                } else {
-                    0
-                };
-                if let Some(rule) = current.rules.get(index) {
+                if let Some(rule) = current.rules.first() {
                     menu = menu.separator();
                     for descending in [false, true] {
                         let mut spec = current.clone();
-                        spec.rules[index].descending = descending;
+                        spec.rules[0].descending = descending;
                         let weak = weak.clone();
                         menu = menu.item(
                             PopupMenuItem::new(format!(
