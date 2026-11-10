@@ -689,6 +689,16 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
+    /// MusicBrainz release IDs of every album in the library.
+    pub fn release_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT json_extract(data,'$.musicBrainzId') FROM albums
+             WHERE coalesce(json_extract(data,'$.musicBrainzId'),'')!=''",
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     pub fn artist_tracks(&self, name: &str, id: &str) -> Result<Vec<Arc<Track>>> {
         let mut statement = self.conn.prepare("SELECT data FROM tracks WHERE artist_matches(artist,?1) OR artist_matches(album_artist,?1)
             OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?1) OR (?2!='' AND json_extract(a.value,'$.id')=?2))

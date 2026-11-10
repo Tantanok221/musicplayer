@@ -130,6 +130,42 @@ impl Paths {
         )
         .context("Could not save login locally")
     }
+
+    fn slskd_key_path(&self) -> PathBuf {
+        self.data.join("credentials").join("slskd.key")
+    }
+
+    /// The slskd API key or login. It never goes in the catalog, which other
+    /// users can read. Nothing saved means slskd is contacted without a login.
+    pub fn slskd_auth(&self) -> Result<crate::slskd::SlskdAuth> {
+        let text = match std::fs::read_to_string(self.slskd_key_path()) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(crate::slskd::SlskdAuth::None);
+            }
+            Err(_) => anyhow::bail!("Could not read the saved slskd login. Enter it again."),
+        };
+        // Parse errors can quote the file; keep them generic.
+        crate::slskd::SlskdAuth::from_file(&text)
+            .map_err(|_| anyhow::anyhow!("The saved slskd login is invalid. Enter it again."))
+    }
+
+    pub fn save_slskd_auth(&self, auth: &crate::slskd::SlskdAuth) -> Result<()> {
+        let directory = self.data.join("credentials");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory)?;
+        atomic_write(&self.slskd_key_path(), auth.to_file().as_bytes())
+            .context("Could not save the slskd login")
+    }
 }
 
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {

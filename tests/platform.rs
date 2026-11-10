@@ -153,3 +153,51 @@ fn an_empty_password_reuses_the_saved_login() {
     };
     assert!(Server::sign_in(&paths, other, "").is_err());
 }
+
+#[test]
+fn slskd_key_is_saved_privately_and_rejected_when_damaged() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data: directory.path().into(),
+        cache: directory.path().join("cache"),
+    };
+    use sonora::slskd::SlskdAuth;
+    // Nothing saved is not an error: slskd is then contacted without a login.
+    assert!(matches!(paths.slskd_auth().unwrap(), SlskdAuth::None));
+    let key = SlskdAuth::from_fields("  0123456789abcdef-secret\n", "ignored", "ignored")
+        .unwrap()
+        .unwrap();
+    paths.save_slskd_auth(&key).unwrap();
+    let path = directory.path().join("credentials").join("slskd.key");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"key":"0123456789abcdef-secret"}"#
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(matches!(paths.slskd_auth().unwrap(), SlskdAuth::Key(_)));
+    let login = SlskdAuth::from_fields("", " admin ", "pass word")
+        .unwrap()
+        .unwrap();
+    paths.save_slskd_auth(&login).unwrap();
+    assert!(matches!(
+        paths.slskd_auth().unwrap(),
+        SlskdAuth::Login { username, password } if username == "admin" && password == "pass word"
+    ));
+    // Nothing typed changes nothing; half a login is refused.
+    assert!(SlskdAuth::from_fields(" ", "", "").unwrap().is_none());
+    assert!(SlskdAuth::from_fields("", "admin", "").is_err());
+    // A bare key written by an earlier version still reads.
+    std::fs::write(&path, "0123456789abcdef-secret").unwrap();
+    assert!(matches!(paths.slskd_auth().unwrap(), SlskdAuth::Key(_)));
+    std::fs::write(&path, "short").unwrap();
+    let error = paths.slskd_auth().err().unwrap().to_string();
+    assert_eq!(error, "The saved slskd login is invalid. Enter it again.");
+    assert!(!error.contains("short"));
+}

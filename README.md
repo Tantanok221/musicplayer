@@ -25,6 +25,14 @@ A listening instance survives pause/resume, seeking, output recovery, and queue 
 
 Artist profiles are cached per account for 24 hours; missing profiles use a shorter cache. Cached profiles and portraits remain usable offline. Refresh retries metadata without removing cached information. Popular songs follow Navidrome’s ranking and include only playable local tracks. Your most played uses Navidrome’s per-track counts, including artist collaborations and guest appearances. Counts refresh after confirmed submissions. Genres derive from your artist releases rather than invented Last.fm tags.
 
+## Missing releases and slskd
+
+An artist page ends with **Missing from your library**: official albums and EPs the artist has released that the library lacks, dimmed like similar artists that are not in the library. A toggle in the section header adds singles, live albums, compilations and other types. Selecting a release shows its details, a MusicBrainz link, and **Hide** for releases you do not want listed.
+
+The release list comes from MusicBrainz and is cached for a week. Artists are identified by the MusicBrainz ID on the server; without one, a name match is accepted only when exactly one candidate shares a release title with the library, so some artists get no section. A release counts as owned when a library album carries one of its MusicBrainz release IDs or has the same title once width, case, accents, bracketed notes and edition wording are ignored. Refresh once after updating to store album IDs. ListenBrainz listen counts order the list when available; otherwise it is newest first. Cover thumbnails come from the Cover Art Archive. These lookups send artist and release identifiers to those services, never your server address or login.
+
+To download a missing release, link your own [slskd](https://github.com/slskd/slskd) in Settings → Downloads with its address and either an API key that has the `readwrite` role or the username and password of its web page. Leave all three empty if your slskd has authentication turned off. The login is saved in a private file, not in the catalog. **Find on Soulseek** then runs one search with editable text and lists the folders peers offer: track count against the release, format, size, length, and whether the peer has a free slot. Pick a folder and Sonora asks slskd for the whole folder, follows its progress, and when every file has arrived asks Navidrome to scan (administrators only) and refreshes. Sonora never searches or downloads on its own, runs one search at a time, and does not move, tag or check the files; slskd must already save into a folder Navidrome scans.
+
 ## Build a Mac application
 
 ```sh

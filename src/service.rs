@@ -3,12 +3,15 @@ use crate::{
     artwork::ArtworkQueue,
     backdrop::{self, Backdrop},
     catalog::{Catalog, LibraryView},
+    discography::{self, Discography, DiscographyView},
     listening::ListenReport,
     lyrics::Lyrics,
     model::*,
+    musicbrainz::MusicBrainz,
     platform::{Account, Paths},
     playback::{Placement, PlayerCommand, PlayerEvent, PlayerHandle},
     server::Server,
+    slskd::{Candidate, DownloadJob, JobState, Slskd, SlskdAuth},
     sorting::{Field as SortField, Scope as SortScope},
 };
 use anyhow::Result;
@@ -58,6 +61,20 @@ pub enum Command {
     ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
     TopSongs(String, String),
     TopSongsLoaded(String, String, Result<TopSongs, String>),
+    /// Artist name and ID: list the releases the library lacks.
+    Discography(String, String),
+    DiscographyLoaded(String, String, String, String, Result<Discography, String>),
+    /// Artist name, artist ID, release group: stop offering this release.
+    HideRelease(String, String, String),
+    /// API key, username, password as typed; all empty keeps what is saved.
+    SlskdAuth(String, String, String),
+    SlskdTest,
+    /// Release group and search text.
+    SoulseekSearch(String, String),
+    Download(Box<DownloadRequest>),
+    DownloadUpdate(String, DownloadJob),
+    DismissDownload(String),
+    ResumeDownloads,
     ScrobbleFinished(String, u64, Result<Option<Arc<Track>>, String>),
     GroupTracks(u64, LibraryQuery, String),
     PlayTrack(String),
@@ -89,6 +106,23 @@ pub enum Command {
     SyncFailed(i64, String),
     Shutdown(Sender<()>),
 }
+#[derive(Clone)]
+pub struct DownloadRequest {
+    pub artist: String,
+    pub artist_id: String,
+    pub release: String,
+    pub title: String,
+    pub expected: Option<u32>,
+    pub candidate: Candidate,
+}
+#[derive(Clone, Debug)]
+pub enum SearchUpdate {
+    /// Responses received so far.
+    Searching(u64),
+    /// Folders on offer, best first, and the release's usual track count.
+    Results(Arc<Vec<Candidate>>, Option<u32>),
+    Failed(String),
+}
 #[derive(Clone, Debug)]
 pub enum Event {
     Ready(Option<Account>, Preferences),
@@ -100,6 +134,10 @@ pub enum Event {
     Artist(u64, ArtistPageData),
     ArtistProfile(String, Arc<ArtistProfile>),
     TopSongs(String, Arc<TopSongs>),
+    Discography(String, Arc<DiscographyView>),
+    SoulseekSearch(String, SearchUpdate),
+    Downloads(Arc<Vec<DownloadJob>>),
+    SlskdStatus(Result<String, String>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
@@ -182,6 +220,142 @@ fn catalog_path(paths: &Paths, account: Option<&Account>) -> PathBuf {
         account.map_or("unconnected".into(), Account::namespace)
     ))
 }
+const DOWNLOADS: &str = "downloads:v1";
+
+fn discography_view(
+    catalog: &Catalog,
+    name: &str,
+    id: &str,
+    loading: bool,
+) -> Result<DiscographyView> {
+    let key = cache_key(name, id);
+    let cached: Option<Discography> = catalog.state(&format!("discography:v1:{key}"))?;
+    let Some(cached) = cached else {
+        return Ok(DiscographyView {
+            loading,
+            missing: Vec::new(),
+        });
+    };
+    let albums = catalog.artist_releases(name, id)?;
+    let hidden: Vec<String> = catalog.state(&format!("discography-hidden:{key}"))?;
+    let library = discography::Library {
+        albums: &albums,
+        release_ids: catalog.release_ids()?,
+        track_titles: catalog
+            .artist_tracks(name, id)?
+            .iter()
+            .map(|track| discography::fold(&track.title))
+            .collect(),
+        hidden: hidden.into_iter().collect(),
+        downloading: catalog
+            .state::<Vec<DownloadJob>>(DOWNLOADS)?
+            .into_iter()
+            .filter(|job| job.artist == key && job.state != JobState::Downloaded)
+            .map(|job| job.release)
+            .collect(),
+    };
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    Ok(DiscographyView {
+        loading: false,
+        missing: discography::missing(&cached, &library, &today),
+    })
+}
+
+/// Shows the artist's missing releases and forgets downloads the library now holds.
+fn publish_discography(
+    catalog: &Catalog,
+    events: &Sender<Event>,
+    name: &str,
+    id: &str,
+    loading: bool,
+) -> Result<()> {
+    let key = cache_key(name, id);
+    let view = discography_view(catalog, name, id, loading)?;
+    let mut jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+    let before = jobs.len();
+    jobs.retain(|job| {
+        job.artist != key
+            || job.state != JobState::Downloaded
+            || view.loading
+            || view.missing.iter().any(|release| release.id == job.release)
+    });
+    if jobs.len() != before {
+        catalog.set_state(DOWNLOADS, &jobs)?;
+        events.send(Event::Downloads(Arc::new(jobs)))?;
+    }
+    events.send(Event::Discography(key, Arc::new(view)))?;
+    Ok(())
+}
+
+fn slskd_client(
+    cache: &mut Option<(String, Slskd)>,
+    catalog: &Catalog,
+    paths: &Paths,
+) -> Result<Slskd> {
+    let downloads = catalog.state::<Preferences>("preferences")?.downloads;
+    anyhow::ensure!(
+        downloads.enabled && !downloads.url.trim().is_empty(),
+        "Link slskd in Settings → Downloads first"
+    );
+    if let Some((url, client)) = cache
+        && *url == downloads.url
+    {
+        return Ok(client.clone());
+    }
+    let client = Slskd::new(&downloads.url, paths.slskd_auth()?)?;
+    *cache = Some((downloads.url, client.clone()));
+    Ok(client)
+}
+
+/// Follows one queued folder until every file has finished or failed.
+fn watch_download(
+    runtime: &tokio::runtime::Handle,
+    client: Slskd,
+    tx: Sender<Command>,
+    namespace: String,
+    mut job: DownloadJob,
+) {
+    runtime.spawn(async move {
+        let mut unreachable = 0;
+        // Peers can keep a folder queued for a long time; give up after a day of polling.
+        for _ in 0..17_280 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Ok(downloads) = client.downloads(&job.username).await else {
+                unreachable += 1;
+                if unreachable > 60 {
+                    break;
+                }
+                continue;
+            };
+            unreachable = 0;
+            let progress = crate::slskd::progress(&downloads, &job.files);
+            let finished = progress.finished();
+            if finished {
+                job.state = if progress.succeeded() {
+                    JobState::Downloaded
+                } else {
+                    JobState::Failed
+                };
+            }
+            if finished || progress != job.progress {
+                job.progress = progress;
+                if tx
+                    .send(Command::DownloadUpdate(namespace.clone(), job.clone()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if finished {
+                return;
+            }
+        }
+        job.state = JobState::Failed;
+        job.progress.failure = "slskd stopped reporting this download".into();
+        let _ = tx.send(Command::DownloadUpdate(namespace, job));
+    });
+}
+
 fn begin_sync(
     server: Server,
     tx: Sender<Command>,
@@ -293,6 +467,12 @@ fn run(
     let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
     let mut top_song_requests = HashSet::new();
     let mut submission_requests = HashSet::new();
+    let musicbrainz = MusicBrainz::new()?;
+    let mut discography_requests = HashSet::new();
+    let mut open_artist: Option<(u64, String, String)> = None;
+    let mut slskd: Option<(String, Slskd)> = None;
+    let mut watched: HashSet<String> = HashSet::new();
+    let _ = tx.send(Command::ResumeDownloads);
     let mut published = 0;
     loop {
         if let Some(server) = server.clone() {
@@ -434,6 +614,10 @@ fn run(
                             queue.listen,
                         ));
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
+                        slskd = None;
+                        watched.clear();
+                        open_artist = None;
+                        let _ = tx.send(Command::ResumeDownloads);
                     }
                     paths.save_account(&value.account)?;
                     account = Some(value.account.clone());
@@ -503,6 +687,24 @@ fn run(
                         } else {
                             "Server scan in progress · refresh again when complete".into()
                         }))?;
+                        // A refresh can turn a missing release into an owned one.
+                        let mut finished = catalog
+                            .state::<Vec<DownloadJob>>(DOWNLOADS)?
+                            .into_iter()
+                            .filter(|job| job.state == JobState::Downloaded)
+                            .map(|job| job.artist)
+                            .collect::<Vec<_>>();
+                        finished.dedup();
+                        for key in finished {
+                            // The key is the artist's normalised name and ID, which is all a lookup needs.
+                            if let Some((name, id)) = key.split_once('\n') {
+                                publish_discography(&catalog, &events, name, id, false)?;
+                            }
+                        }
+                        if let Some((request, name, id)) = &open_artist {
+                            events.send(Event::Artist(*request, catalog.artist_page(name, id)?))?;
+                            publish_discography(&catalog, &events, name, id, false)?;
+                        }
                     }
                 }
                 Command::Query(request, query) => {
@@ -557,7 +759,267 @@ fn run(
                 }
                 Command::Artist(request, name, id) => {
                     events.send(Event::Artist(request, catalog.artist_page(&name, &id)?))?;
+                    open_artist = Some((request, name.clone(), id.clone()));
+                    let _ = tx.send(Command::Discography(name.clone(), id.clone()));
                     let _ = tx.send(Command::ArtistProfile(name, id, true));
+                }
+                Command::Discography(name, id) => {
+                    let key = cache_key(&name, &id);
+                    let cached: Option<Discography> =
+                        catalog.state(&format!("discography:v1:{key}"))?;
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let fetch = !cached.as_ref().is_some_and(|known| known.fresh(now))
+                        && !discography::is_various_artists(&name, "");
+                    let server = server.clone().filter(|_| fetch);
+                    publish_discography(
+                        &catalog,
+                        &events,
+                        &name,
+                        &id,
+                        cached.is_none() && server.is_some(),
+                    )?;
+                    if let Some(server) = server {
+                        let namespace = server.account.namespace();
+                        if discography_requests.insert((namespace.clone(), key.clone())) {
+                            let titles: HashSet<String> = catalog
+                                .artist_releases(&name, &id)?
+                                .iter()
+                                .map(|album| discography::fold(&album.name))
+                                .collect();
+                            let tx = tx.clone();
+                            let musicbrainz = musicbrainz.clone();
+                            runtime.spawn(async move {
+                                let result = async {
+                                    let unknown = || Discography {
+                                        fetched_ms: chrono::Utc::now().timestamp_millis(),
+                                        ..Default::default()
+                                    };
+                                    let mut artist = server.artist_mbid(&id).await?;
+                                    if discography::is_various_artists(&name, &artist) {
+                                        return Ok(unknown());
+                                    }
+                                    if artist.is_empty() {
+                                        artist = musicbrainz
+                                            .resolve_artist(&name, &titles)
+                                            .await?
+                                            .unwrap_or_default();
+                                    }
+                                    if artist.is_empty() {
+                                        return Ok(unknown());
+                                    }
+                                    musicbrainz.discography(&artist).await
+                                }
+                                .await
+                                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                                let _ = tx.send(Command::DiscographyLoaded(
+                                    namespace, key, name, id, result,
+                                ));
+                            });
+                        }
+                    }
+                }
+                Command::DiscographyLoaded(namespace, key, name, id, result) => {
+                    discography_requests.remove(&(namespace.clone(), key.clone()));
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        // A failed lookup keeps whatever was cached; the section just stays as it was.
+                        if let Ok(found) = result {
+                            catalog.set_state(&format!("discography:v1:{key}"), &Some(&found))?;
+                        }
+                        publish_discography(&catalog, &events, &name, &id, false)?;
+                    }
+                }
+                Command::HideRelease(name, id, release) => {
+                    let state = format!("discography-hidden:{}", cache_key(&name, &id));
+                    let mut hidden: Vec<String> = catalog.state(&state)?;
+                    if !hidden.contains(&release) {
+                        hidden.push(release);
+                        catalog.set_state(&state, &hidden)?;
+                    }
+                    publish_discography(&catalog, &events, &name, &id, false)?;
+                }
+                Command::SlskdAuth(key, username, password) => {
+                    slskd = None;
+                    let saved = SlskdAuth::from_fields(&key, &username, &password)
+                        .and_then(|auth| auth.map_or(Ok(()), |auth| paths.save_slskd_auth(&auth)));
+                    if let Err(error) = saved {
+                        events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
+                    }
+                }
+                Command::SlskdTest => match slskd_client(&mut slskd, &catalog, &paths) {
+                    Ok(client) => {
+                        let events = events.clone();
+                        runtime.spawn(async move {
+                            let result = client.test().await.map_err(|error| format!("{error:#}"));
+                            let _ = events.send(Event::SlskdStatus(result));
+                        });
+                    }
+                    Err(error) => events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?,
+                },
+                Command::SoulseekSearch(release, query) => {
+                    match slskd_client(&mut slskd, &catalog, &paths) {
+                        Ok(client) => {
+                            let events = events.clone();
+                            let musicbrainz = musicbrainz.clone();
+                            events.send(Event::SoulseekSearch(
+                                release.clone(),
+                                SearchUpdate::Searching(0),
+                            ))?;
+                            runtime.spawn(async move {
+                                let progress = events.clone();
+                                let searching = release.clone();
+                                let (responses, expected) = tokio::join!(
+                                    client.search(&query, move |count| {
+                                        let _ = progress.send(Event::SoulseekSearch(
+                                            searching.clone(),
+                                            SearchUpdate::Searching(count),
+                                        ));
+                                    }),
+                                    musicbrainz.track_count(&release)
+                                );
+                                let expected = expected.ok().flatten();
+                                let _ = events.send(Event::SoulseekSearch(
+                                    release,
+                                    match responses {
+                                        Ok(responses) => SearchUpdate::Results(
+                                            Arc::new(crate::slskd::candidates(
+                                                &responses, expected,
+                                            )),
+                                            expected,
+                                        ),
+                                        Err(error) => SearchUpdate::Failed(format!("{error:#}")),
+                                    },
+                                ));
+                            });
+                        }
+                        Err(error) => events.send(Event::SoulseekSearch(
+                            release,
+                            SearchUpdate::Failed(format!("{error:#}")),
+                        ))?,
+                    }
+                }
+                Command::Download(request) => {
+                    let client = slskd_client(&mut slskd, &catalog, &paths)?;
+                    let namespace = account.as_ref().map(Account::namespace).unwrap_or_default();
+                    let DownloadRequest {
+                        artist,
+                        artist_id,
+                        release,
+                        title,
+                        expected,
+                        candidate,
+                    } = *request;
+                    anyhow::ensure!(
+                        watched.insert(release.clone()),
+                        "This release is already downloading"
+                    );
+                    let tx = tx.clone();
+                    let events = events.clone();
+                    let runtime_handle = runtime.clone();
+                    runtime.spawn(async move {
+                        // Search hits only cover files that matched the text; take the whole folder.
+                        let mut files = candidate.files.clone();
+                        if let Ok(listed) = client
+                            .directory(&candidate.username, &candidate.directory)
+                            .await
+                        {
+                            for file in listed {
+                                if !files.iter().any(|known| known.filename == file.filename) {
+                                    files.push(file);
+                                }
+                            }
+                        }
+                        let mut job = DownloadJob {
+                            artist: cache_key(&artist, &artist_id),
+                            release,
+                            title,
+                            username: candidate.username.clone(),
+                            expected,
+                            files: files.iter().map(|file| file.filename.clone()).collect(),
+                            ..Default::default()
+                        };
+                        job.progress.total = job.files.len() as u32;
+                        match client.enqueue(&candidate.username, &files).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(Command::DownloadUpdate(namespace.clone(), job.clone()));
+                                watch_download(&runtime_handle, client, tx, namespace, job);
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Command::DismissDownload(job.release));
+                                let _ = events
+                                    .send(Event::Error(format!("Download not started: {error:#}")));
+                            }
+                        }
+                    });
+                }
+                Command::DownloadUpdate(namespace, job) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        let mut jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+                        let finished = job.state != JobState::Active;
+                        let downloaded = job.state == JobState::Downloaded;
+                        if finished {
+                            watched.remove(&job.release);
+                        }
+                        match jobs.iter_mut().find(|known| known.release == job.release) {
+                            Some(known) => *known = job,
+                            None => jobs.push(job),
+                        }
+                        catalog.set_state(DOWNLOADS, &jobs)?;
+                        events.send(Event::Downloads(Arc::new(jobs)))?;
+                        if downloaded && let Some(server) = server.clone() {
+                            let tx = tx.clone();
+                            let events = events.clone();
+                            runtime.spawn(async move {
+                                // slskd reports success just before it moves the file into place.
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                if server.start_scan().await.is_err() {
+                                    return;
+                                }
+                                let _ = events.send(Event::Status(
+                                    "Download finished · Navidrome is scanning".into(),
+                                ));
+                                for _ in 0..200 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    if matches!(server.scan_status().await, Ok(false)) {
+                                        break;
+                                    }
+                                }
+                                let _ = tx.send(Command::Refresh);
+                            });
+                        }
+                    }
+                }
+                Command::DismissDownload(release) => {
+                    watched.remove(&release);
+                    let mut jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+                    jobs.retain(|job| job.release != release);
+                    catalog.set_state(DOWNLOADS, &jobs)?;
+                    events.send(Event::Downloads(Arc::new(jobs)))?;
+                }
+                Command::ResumeDownloads => {
+                    let jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+                    events.send(Event::Downloads(Arc::new(jobs.clone())))?;
+                    let active = jobs
+                        .into_iter()
+                        .filter(|job| job.state == JobState::Active)
+                        .collect::<Vec<_>>();
+                    if !active.is_empty()
+                        && let Ok(client) = slskd_client(&mut slskd, &catalog, &paths)
+                    {
+                        let namespace =
+                            account.as_ref().map(Account::namespace).unwrap_or_default();
+                        for job in active {
+                            if watched.insert(job.release.clone()) {
+                                watch_download(
+                                    &runtime,
+                                    client.clone(),
+                                    tx.clone(),
+                                    namespace.clone(),
+                                    job,
+                                );
+                            }
+                        }
+                    }
                 }
                 Command::ArtistProfile(name, id, full) => {
                     let key = cache_key(&name, &id);

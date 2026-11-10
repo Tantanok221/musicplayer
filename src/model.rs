@@ -195,6 +195,8 @@ pub struct Album {
     pub release_types: Vec<String>,
     pub original_release_date: Option<serde_json::Value>,
     pub release_date: Option<serde_json::Value>,
+    /// The MusicBrainz release (one edition), not the release group.
+    pub music_brainz_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +340,16 @@ pub struct Preferences {
     pub dark: Option<bool>,
     pub layout: crate::browser::LayoutPreferences,
     pub sorting: crate::sorting::SortingPreferences,
+    pub downloads: DownloadPreferences,
+    /// Show missing singles, live albums, compilations and the like on artist pages.
+    pub all_missing_releases: bool,
+}
+/// Where the user's slskd lives. Its API key is kept in a private file instead.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DownloadPreferences {
+    pub enabled: bool,
+    pub url: String,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -349,6 +361,8 @@ impl Default for Preferences {
             dark: None,
             layout: crate::browser::LayoutPreferences::default(),
             sorting: crate::sorting::SortingPreferences::default(),
+            downloads: DownloadPreferences::default(),
+            all_missing_releases: false,
         }
     }
 }

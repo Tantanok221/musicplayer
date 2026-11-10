@@ -188,6 +188,22 @@ impl Server {
             .as_bool()
             .unwrap_or(false))
     }
+    /// Asks the server to look for new files. Only administrators may.
+    pub async fn start_scan(&self) -> Result<()> {
+        self.request("startScan", &[]).await?;
+        Ok(())
+    }
+    /// The artist's MusicBrainz ID, or empty when the files carry none.
+    pub async fn artist_mbid(&self, id: &str) -> Result<String> {
+        if id.is_empty() || id == "-1" {
+            return Ok(String::new());
+        }
+        let value = self.request("getArtist", &[("id", id.into())]).await?;
+        Ok(value["artist"]["musicBrainzId"]
+            .as_str()
+            .unwrap_or_default()
+            .into())
+    }
     pub async fn album(&self, id: &str) -> Result<(Album, Vec<Track>)> {
         let data = self.request("getAlbum", &[("id", id.into())]).await?;
         let album = serde_json::from_value(data["album"].clone())?;
