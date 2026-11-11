@@ -35,7 +35,7 @@ hound = "3"
 
 [profile.release]
 # Favor fast local rebuilds: compile in parallel and reuse unchanged work.
-lto = false
+lto = "thin"
 codegen-units = 16
 incremental = true
 
