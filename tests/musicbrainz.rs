@@ -34,13 +34,24 @@ async fn releases(
     );
     assert_eq!(query["fmt"], "json");
     if let Some(group) = query.get("release-group") {
-        assert_eq!(query["inc"], "media");
         assert_eq!(group, "rg-album");
+        if query["inc"] == "media url-rels" {
+            return Ok(Json(json!({"releases": [
+                {"id": "r-first", "date": "2011-05-10", "media": [{"track-count": 11}]},
+                {"id": "r-digital", "date": "2015-01-01", "media": [{"track-count": 11}], "relations": [
+                    {"url": {"resource": "https://open.spotify.com/album/digital"}},
+                    {"url": {"resource": "https://tidal.com/album/1"}},
+                    {"url": {"resource": "https://www.amazon.com/dp/1"}}
+                ]}
+            ]})));
+        }
+        assert_eq!(query["inc"], "media");
         return Ok(Json(json!({"releases": [
-            {"media": [{"track-count": 11}]},
-            {"media": [{"track-count": 11}]},
-            {"media": [{"track-count": 11}, {"track-count": 9}]},
-            {"media": []}
+            {"id": "r-late", "date": "2012-01-01", "media": [{"track-count": 11}]},
+            {"id": "r-first", "date": "2011-05-10", "media": [{"track-count": 11}]},
+            {"id": "r-undated", "media": [{"track-count": 11}]},
+            {"id": "r-deluxe", "date": "2010-01-01", "media": [{"track-count": 11}, {"track-count": 9}]},
+            {"id": "r-empty", "date": "2009-01-01", "media": []}
         ]})));
     }
     match query["artist"].as_str() {
@@ -83,6 +94,46 @@ async fn releases(
         }
         _ => Err(StatusCode::NOT_FOUND),
     }
+}
+
+async fn release_lookup(
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    // The earliest dated edition with the usual track count is the one shown.
+    assert_eq!(id, "r-first");
+    assert_eq!(
+        query["inc"],
+        "recordings artist-credits labels url-rels release-group-level-rels genres"
+    );
+    let credit = |name: &str| json!([{"name": name, "joinphrase": ""}]);
+    Ok(Json(json!({
+        "id": "r-first",
+        "date": "2011-05-10",
+        "country": "JP",
+        "artist-credit": credit("Artist"),
+        "label-info": [{"catalog-number": "CAT-1", "label": {"name": "Label"}}],
+        "genres": [{"name": "rock", "count": 1}, {"name": "j-pop", "count": 5}],
+        "relations": [
+            {"type": "free streaming", "url": {"resource": "https://open.spotify.com/album/x"}},
+            {"type": "discogs", "url": {"resource": "https://www.discogs.com/release/1"}}
+        ],
+        "release-group": {"relations": [
+            {"type": "streaming", "url": {"resource": "https://music.apple.com/album/1"}},
+            {"type": "free streaming", "url": {"resource": "https://open.spotify.com/album/x"}}
+        ]},
+        "media": [
+            {"position": 1, "tracks": [
+                {"number": "1", "title": "Opening", "length": 61_400, "artist-credit": credit("Artist")},
+                {"number": "2", "title": "Duet", "length": null,
+                 "recording": {"length": 180_000},
+                 "artist-credit": [{"name": "Artist", "joinphrase": " feat. "}, {"name": "Guest", "joinphrase": ""}]}
+            ]},
+            {"position": 2, "tracks": [
+                {"number": "", "title": "Hidden"}
+            ]}
+        ]
+    })))
 }
 
 async fn groups(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
@@ -131,6 +182,7 @@ async fn client() -> MusicBrainz {
             listener,
             Router::new()
                 .route("/ws/2/release", get(releases))
+                .route("/ws/2/release/{id}", get(release_lookup))
                 .route("/ws/2/release-group", get(groups))
                 .route("/ws/2/artist", get(artists))
                 .route(
@@ -237,4 +289,52 @@ async fn track_count_is_the_most_common_official_edition() {
         client().await.track_count("rg-album").await.unwrap(),
         Some(11)
     );
+}
+
+#[tokio::test]
+async fn release_details_read_the_usual_edition() {
+    let details = client().await.release_details("rg-album").await.unwrap();
+    assert_eq!(details.release, "r-first");
+    assert_eq!(details.country, "JP");
+    assert_eq!(
+        (details.label.as_str(), details.catalog_number.as_str()),
+        ("Label", "CAT-1")
+    );
+    assert_eq!(details.genres, ["j-pop", "rock"]);
+    let tracks: Vec<_> = details
+        .tracks
+        .iter()
+        .map(|track| {
+            (
+                track.disc,
+                track.number.as_str(),
+                track.title.as_str(),
+                track.seconds,
+                track.artist.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tracks,
+        [
+            (1, "1", "Opening", Some(61), ""),
+            (1, "2", "Duet", Some(180), "Artist feat. Guest"),
+            (2, "1", "Hidden", None, ""),
+        ]
+    );
+    let links: Vec<_> = details
+        .links
+        .iter()
+        .map(|link| (link.service.as_str(), link.url.as_str()))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            ("Spotify", "https://open.spotify.com/album/x"),
+            ("Apple Music", "https://music.apple.com/album/1"),
+            ("Spotify", "https://open.spotify.com/album/digital"),
+            ("Tidal", "https://tidal.com/album/1"),
+        ]
+    );
+    assert!(details.fetched_ms > 0);
 }

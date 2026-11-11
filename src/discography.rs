@@ -279,3 +279,109 @@ pub fn missing(discography: &Discography, library: &Library, today: &str) -> Vec
     });
     result.into_iter().map(|(_, release)| release).collect()
 }
+
+const DETAILS_FRESH_MS: i64 = 30 * 86_400_000;
+
+/// What MusicBrainz says about one edition of a missing release.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ReleaseDetails {
+    /// The release whose track list is shown.
+    pub release: String,
+    pub date: String,
+    pub country: String,
+    pub label: String,
+    pub catalog_number: String,
+    pub genres: Vec<String>,
+    pub tracks: Vec<ReleaseTrack>,
+    /// Streaming pages MusicBrainz links to the release or its group.
+    pub links: Vec<ListenLink>,
+    pub fetched_ms: i64,
+}
+impl ReleaseDetails {
+    pub fn fresh(&self, now_ms: i64) -> bool {
+        self.fetched_ms > 0 && now_ms.saturating_sub(self.fetched_ms) < DETAILS_FRESH_MS
+    }
+    pub fn seconds(&self) -> u32 {
+        self.tracks.iter().filter_map(|track| track.seconds).sum()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ReleaseTrack {
+    pub disc: u32,
+    pub number: String,
+    pub title: String,
+    pub seconds: Option<u32>,
+    /// Set only when the track credit differs from the release credit.
+    pub artist: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ListenLink {
+    pub service: String,
+    pub url: String,
+    /// False for a search page built from the artist and title.
+    pub direct: bool,
+}
+
+/// The streaming service a link points at; other sites are not listening pages.
+pub fn listen_service(link: &str) -> Option<&'static str> {
+    let url = url::Url::parse(link).ok()?;
+    let host = url.host_str()?.trim_start_matches("www.");
+    let under = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    Some(match host {
+        "open.spotify.com" | "play.spotify.com" => "Spotify",
+        "music.apple.com" | "itunes.apple.com" | "geo.music.apple.com" => "Apple Music",
+        "music.youtube.com" => "YouTube Music",
+        "youtube.com" | "m.youtube.com" | "youtu.be" => "YouTube",
+        "deezer.com" | "deezer.page.link" => "Deezer",
+        "tidal.com" | "listen.tidal.com" => "Tidal",
+        "soundcloud.com" => "SoundCloud",
+        _ if under("bandcamp.com") => "Bandcamp",
+        _ if host.starts_with("music.amazon.") => "Amazon Music",
+        _ => return None,
+    })
+}
+
+const SEARCHES: [(&str, &str); 5] = [
+    ("Spotify", "https://open.spotify.com/search/"),
+    ("Apple Music", "https://music.apple.com/search?term="),
+    ("YouTube Music", "https://music.youtube.com/search?q="),
+    ("Deezer", "https://www.deezer.com/search/"),
+    ("Tidal", "https://listen.tidal.com/search?q="),
+];
+
+/// Direct links first, one per service, then searches for the major services
+/// that have no direct link.
+pub fn listen_links(
+    details: Option<&ReleaseDetails>,
+    artist: &str,
+    title: &str,
+) -> Vec<ListenLink> {
+    let mut links: Vec<ListenLink> = Vec::new();
+    for link in details.into_iter().flat_map(|details| &details.links) {
+        if !links.iter().any(|known| known.service == link.service) {
+            links.push(ListenLink {
+                direct: true,
+                ..link.clone()
+            });
+        }
+    }
+    let query: String =
+        url::form_urlencoded::byte_serialize(format!("{artist} {title}").trim().as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
+    for (service, base) in SEARCHES {
+        if !links.iter().any(|known| known.service == service) {
+            links.push(ListenLink {
+                service: service.into(),
+                url: format!("{base}{query}"),
+                direct: false,
+            });
+        }
+    }
+    links
+}

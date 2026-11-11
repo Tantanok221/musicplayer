@@ -3,7 +3,7 @@ use crate::{
     artwork::{ArtworkQueue, Priority},
     backdrop::{self, Backdrop},
     catalog::{Catalog, LibraryView},
-    discography::{self, Discography, DiscographyView},
+    discography::{self, Discography, DiscographyView, ReleaseDetails},
     listening::ListenReport,
     lyrics::Lyrics,
     model::*,
@@ -65,6 +65,9 @@ pub enum Command {
     /// Artist name and ID: list the releases the library lacks.
     Discography(String, String),
     DiscographyLoaded(String, String, String, String, Result<Discography, String>),
+    /// Release group: its track list and listening links.
+    ReleaseDetails(String),
+    ReleaseDetailsLoaded(String, Result<ReleaseDetails, String>),
     /// Artist name, artist ID, release group: stop offering this release.
     HideRelease(String, String, String),
     /// API key, username, password as typed; all empty keeps what is saved.
@@ -138,6 +141,7 @@ pub enum Event {
     TopSongs(String, Arc<TopSongs>),
     Discography(String, Arc<DiscographyView>),
     SoulseekSearch(String, SearchUpdate),
+    ReleaseDetails(String, Result<Arc<ReleaseDetails>, String>),
     Downloads(Arc<Vec<DownloadJob>>),
     SlskdStatus(Result<String, String>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
@@ -516,6 +520,7 @@ fn run(
     let mut submission_requests = HashSet::new();
     let musicbrainz = MusicBrainz::new()?;
     let mut discography_requests = HashSet::new();
+    let mut release_requests: HashSet<String> = HashSet::new();
     let mut open_artist: Option<(u64, String, String)> = None;
     let mut slskd: Option<(String, Slskd)> = None;
     let mut watched: HashSet<String> = HashSet::new();
@@ -875,6 +880,43 @@ fn run(
                         publish_discography(&catalog, &events, &name, &id, false)?;
                     }
                 }
+                Command::ReleaseDetails(group) => {
+                    let cached: Option<ReleaseDetails> =
+                        catalog.state(&format!("release-details:v1:{group}"))?;
+                    let now = chrono::Utc::now().timestamp_millis();
+                    if let Some(details) = cached.clone() {
+                        events.send(Event::ReleaseDetails(group.clone(), Ok(Arc::new(details))))?;
+                    }
+                    if !cached.is_some_and(|known| known.fresh(now))
+                        && release_requests.insert(group.clone())
+                    {
+                        let tx = tx.clone();
+                        let musicbrainz = musicbrainz.clone();
+                        runtime.spawn(async move {
+                            let result = musicbrainz
+                                .release_details(&group)
+                                .await
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = tx.send(Command::ReleaseDetailsLoaded(group, result));
+                        });
+                    }
+                }
+                Command::ReleaseDetailsLoaded(group, result) => {
+                    release_requests.remove(&group);
+                    let key = format!("release-details:v1:{group}");
+                    match result {
+                        Ok(details) => {
+                            catalog.set_state(&key, &Some(&details))?;
+                            events.send(Event::ReleaseDetails(group, Ok(Arc::new(details))))?;
+                        }
+                        // A failed lookup keeps what was cached and only reports when nothing was.
+                        Err(error) => {
+                            if catalog.state::<Option<ReleaseDetails>>(&key)?.is_none() {
+                                events.send(Event::ReleaseDetails(group, Err(error)))?;
+                            }
+                        }
+                    }
+                }
                 Command::HideRelease(name, id, release) => {
                     let state = format!("discography-hidden:{}", cache_key(&name, &id));
                     let mut hidden: Vec<String> = catalog.state(&state)?;
@@ -907,6 +949,12 @@ fn run(
                         Ok(client) => {
                             let events = events.clone();
                             let musicbrainz = musicbrainz.clone();
+                            let known = catalog
+                                .state::<Option<ReleaseDetails>>(&format!(
+                                    "release-details:v1:{release}"
+                                ))?
+                                .map(|details| details.tracks.len() as u32)
+                                .filter(|tracks| *tracks > 0);
                             events.send(Event::SoulseekSearch(
                                 release.clone(),
                                 SearchUpdate::Searching(0),
@@ -921,7 +969,12 @@ fn run(
                                             SearchUpdate::Searching(count),
                                         ));
                                     }),
-                                    musicbrainz.track_count(&release)
+                                    async {
+                                        match known {
+                                            Some(tracks) => Ok(Some(tracks)),
+                                            None => musicbrainz.track_count(&release).await,
+                                        }
+                                    }
                                 );
                                 let expected = expected.ok().flatten();
                                 let _ = events.send(Event::SoulseekSearch(

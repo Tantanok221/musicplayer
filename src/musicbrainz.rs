@@ -1,5 +1,7 @@
 //! Read-only MusicBrainz and ListenBrainz lookups for artist discographies.
-use crate::discography::{Discography, ReleaseGroup, fold};
+use crate::discography::{
+    Discography, ListenLink, ReleaseDetails, ReleaseGroup, ReleaseTrack, fold, listen_service,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::{
@@ -274,36 +276,207 @@ impl MusicBrainz {
         Ok(best.filter(|_| !tied).map(|(_, id)| id))
     }
 
-    /// The usual number of tracks on official editions of a release group.
-    pub async fn track_count(&self, group: &str) -> Result<Option<u32>> {
+    /// Official editions of a release group with their media.
+    async fn editions(&self, group: &str, inc: &str) -> Result<Vec<Value>> {
         let value = self
             .get(
                 "release",
                 &[
                     ("release-group", group),
-                    ("inc", "media"),
+                    ("inc", inc),
                     ("status", "official"),
                     ("limit", "100"),
                 ],
             )
             .await?;
-        let mut counts: HashMap<u32, usize> = HashMap::new();
-        for release in value["releases"].as_array().into_iter().flatten() {
-            let tracks: u64 = release["media"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|medium| medium["track-count"].as_u64())
-                .sum();
-            if tracks > 0 {
-                *counts.entry(tracks as u32).or_default() += 1;
+        Ok(value["releases"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The usual number of tracks on official editions of a release group.
+    pub async fn track_count(&self, group: &str) -> Result<Option<u32>> {
+        Ok(usual_track_count(&self.editions(group, "media").await?))
+    }
+
+    /// Track list, label and listening links of the usual edition of a release group.
+    pub async fn release_details(&self, group: &str) -> Result<ReleaseDetails> {
+        // Streaming pages usually sit on digital editions, not the one listed.
+        let editions = self.editions(group, "media url-rels").await?;
+        let usual = usual_track_count(&editions);
+        let chosen = editions
+            .iter()
+            .filter(|release| usual.is_none_or(|count| edition_tracks(release) == count))
+            .filter(|release| release["id"].as_str().is_some_and(|id| !id.is_empty()))
+            // Undated editions sort last.
+            .min_by_key(|release| {
+                let date = release["date"].as_str().unwrap_or_default();
+                (date.is_empty(), date.to_string())
+            })
+            .and_then(|release| release["id"].as_str())
+            .context("MusicBrainz lists no official edition of this release")?
+            .to_string();
+        let release = self
+            .get(
+                &format!("release/{chosen}"),
+                &[(
+                    "inc",
+                    "recordings artist-credits labels url-rels release-group-level-rels genres",
+                )],
+            )
+            .await?;
+        let mut details = parse_release(&release);
+        for link in editions
+            .iter()
+            .filter_map(|edition| edition["relations"].as_array())
+            .flatten()
+            .filter_map(|relation| relation["url"]["resource"].as_str())
+        {
+            if let Some(service) = listen_service(link)
+                && !details.links.iter().any(|known| known.url == link)
+            {
+                details.links.push(ListenLink {
+                    service: service.into(),
+                    url: link.into(),
+                    direct: true,
+                });
             }
         }
-        // Ties go to the shorter edition, which is the plain one.
-        Ok(counts
+        Ok(details)
+    }
+}
+
+fn edition_tracks(release: &Value) -> u32 {
+    release["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|medium| medium["track-count"].as_u64())
+        .sum::<u64>() as u32
+}
+
+fn usual_track_count(editions: &[Value]) -> Option<u32> {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for release in editions {
+        let tracks = edition_tracks(release);
+        if tracks > 0 {
+            *counts.entry(tracks).or_default() += 1;
+        }
+    }
+    // Ties go to the shorter edition, which is the plain one.
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(tracks, _)| tracks)
+}
+
+fn credit(value: &Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|part| {
+            format!(
+                "{}{}",
+                part["name"].as_str().unwrap_or_default(),
+                part["joinphrase"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+fn parse_release(release: &Value) -> ReleaseDetails {
+    let album_credit = credit(&release["artist-credit"]);
+    let mut tracks = Vec::new();
+    for (index, medium) in release["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let disc = medium["position"].as_u64().unwrap_or(index as u64 + 1) as u32;
+        for (position, track) in medium["tracks"]
+            .as_array()
             .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-            .map(|(tracks, _)| tracks))
+            .flatten()
+            .enumerate()
+        {
+            let artist = credit(&track["artist-credit"]);
+            tracks.push(ReleaseTrack {
+                disc,
+                number: track["number"]
+                    .as_str()
+                    .filter(|number| !number.is_empty())
+                    .map_or_else(|| (position + 1).to_string(), str::to_string),
+                title: track["title"]
+                    .as_str()
+                    .or_else(|| track["recording"]["title"].as_str())
+                    .unwrap_or_default()
+                    .into(),
+                seconds: track["length"]
+                    .as_u64()
+                    .or_else(|| track["recording"]["length"].as_u64())
+                    .map(|ms| ((ms + 500) / 1000) as u32),
+                artist: if artist.is_empty() || artist == album_credit {
+                    String::new()
+                } else {
+                    artist
+                },
+            });
+        }
+    }
+    let label = release["label-info"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|info| info["label"]["name"].as_str().is_some());
+    let mut links: Vec<ListenLink> = Vec::new();
+    let relations = release["relations"].as_array().into_iter().flatten().chain(
+        release["release-group"]["relations"]
+            .as_array()
+            .into_iter()
+            .flatten(),
+    );
+    for relation in relations {
+        let Some(url) = relation["url"]["resource"].as_str() else {
+            continue;
+        };
+        if let Some(service) = listen_service(url)
+            && !links.iter().any(|known| known.url == url)
+        {
+            links.push(ListenLink {
+                service: service.into(),
+                url: url.into(),
+                direct: true,
+            });
+        }
+    }
+    let mut genres = release["genres"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|genre| {
+            Some((
+                genre["count"].as_u64().unwrap_or(0),
+                genre["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    genres.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ReleaseDetails {
+        release: release["id"].as_str().unwrap_or_default().into(),
+        date: release["date"].as_str().unwrap_or_default().into(),
+        country: release["country"].as_str().unwrap_or_default().into(),
+        label: label
+            .and_then(|info| info["label"]["name"].as_str())
+            .unwrap_or_default()
+            .into(),
+        catalog_number: label
+            .and_then(|info| info["catalog-number"].as_str())
+            .unwrap_or_default()
+            .into(),
+        genres: genres.into_iter().take(4).map(|(_, name)| name).collect(),
+        tracks,
+        links,
+        fetched_ms: chrono::Utc::now().timestamp_millis(),
     }
 }
 

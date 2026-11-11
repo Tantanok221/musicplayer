@@ -22,7 +22,7 @@ use sonora::{
     backdrop::Backdrop,
     browser::*,
     catalog::LibraryView,
-    discography::{DiscographyView, MissingRelease},
+    discography::{DiscographyView, MissingRelease, ReleaseDetails, listen_links},
     lyrics::Lyrics,
     model::*,
     platform::Account,
@@ -546,6 +546,8 @@ pub struct MusicApp {
     discographies: HashMap<String, Arc<DiscographyView>>,
     selected_missing: Option<String>,
     missing_expanded: bool,
+    release_details: HashMap<String, Result<Arc<ReleaseDetails>, String>>,
+    release_details_requested: HashSet<String>,
     soulseek: Option<(String, SearchUpdate)>,
     soulseek_open: Option<usize>,
     downloads: Arc<Vec<DownloadJob>>,
@@ -781,6 +783,8 @@ impl MusicApp {
             slskd_status: None,
             discographies: HashMap::new(),
             selected_missing: None,
+            release_details: HashMap::new(),
+            release_details_requested: HashSet::new(),
             missing_expanded: false,
             soulseek: None,
             soulseek_open: None,
@@ -1049,6 +1053,9 @@ impl MusicApp {
                     self.soulseek = Some((release, update));
                     self.soulseek_open = None;
                 }
+            }
+            Event::ReleaseDetails(group, details) => {
+                self.release_details.insert(group, details);
             }
             Event::Downloads(jobs) => self.downloads = jobs,
             Event::SlskdStatus(status) => self.slskd_status = Some(status),
@@ -1475,6 +1482,11 @@ impl MusicApp {
                 },
                 id.into(),
             ));
+        }
+    }
+    fn request_release_details(&mut self, group: &str) {
+        if self.release_details_requested.insert(group.into()) {
+            self.service.send(Command::ReleaseDetails(group.into()));
         }
     }
     /// Replaces a track everywhere it is shown, without reloading any list.
@@ -4136,7 +4148,7 @@ impl MusicApp {
                     )
                 }),
         );
-        let mut cards = div().flex().flex_wrap().gap_4();
+        let mut tiles: Vec<(String, AnyElement)> = Vec::new();
         for release in shown.iter().take(limit) {
             let selected = self.selected_missing.as_ref() == Some(&release.id);
             let job = self
@@ -4154,7 +4166,8 @@ impl MusicApp {
             let open = release.clone();
             let artist = name.to_string();
             let art = self.art(&release.cover, side, cx);
-            cards = cards.child(
+            tiles.push((
+                release.id.clone(),
                 div()
                     .id(SharedString::from(format!(
                         "missing-release-{}",
@@ -4196,6 +4209,11 @@ impl MusicApp {
                         if app.selected_missing.as_ref() == Some(&open.id) {
                             app.selected_missing = None;
                         } else {
+                            // A lookup that failed earlier is tried again on reopening.
+                            if matches!(app.release_details.get(&open.id), Some(Err(_))) {
+                                app.release_details.remove(&open.id);
+                                app.release_details_requested.remove(&open.id);
+                            }
                             app.selected_missing = Some(open.id.clone());
                             app.selected_album = None;
                             let query = format!("{artist} {}", open.title);
@@ -4205,10 +4223,47 @@ impl MusicApp {
                         app.soulseek = None;
                         app.soulseek_open = None;
                         cx.notify();
-                    })),
-            );
+                    }))
+                    .into_any_element(),
+            ));
         }
-        section = section.child(cards);
+        // The panel opens under the row holding the picked cover, or after the
+        // last row when that cover is folded away.
+        let selected = self
+            .selected_missing
+            .as_ref()
+            .and_then(|id| shown.iter().find(|release| &release.id == id))
+            .cloned();
+        let rows = tiles.len().div_ceil(columns.max(1));
+        let panel_row = selected.as_ref().map(|release| {
+            tiles
+                .iter()
+                .position(|(id, _)| id == &release.id)
+                .map_or(rows.saturating_sub(1), |index| index / columns.max(1))
+        });
+        let mut panel = selected.map(|release| {
+            div()
+                .py_3()
+                .border_y_1()
+                .border_color(colors.line)
+                .child(self.missing_panel(name, release, cx))
+                .into_any_element()
+        });
+        let mut grid = div().flex().flex_col().gap_4().min_w_0();
+        let mut tiles = tiles.into_iter();
+        for row in 0..rows {
+            grid = grid.child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .min_w_0()
+                    .children(tiles.by_ref().take(columns.max(1)).map(|(_, tile)| tile)),
+            );
+            if panel_row == Some(row) {
+                grid = grid.children(panel.take());
+            }
+        }
+        section = section.child(grid);
         if shown.len() > columns * 2 {
             section = section.child(
                 Button::new("missing-release-more")
@@ -4226,36 +4281,22 @@ impl MusicApp {
                     })),
             );
         }
-        if let Some(release) = self
-            .selected_missing
-            .as_ref()
-            .and_then(|id| shown.iter().find(|release| &release.id == id))
-            .cloned()
-        {
-            section = section.child(
-                div()
-                    .mt_3()
-                    .py_3()
-                    .border_y_1()
-                    .border_color(colors.line)
-                    .child(self.missing_panel(name, release, cx)),
-            );
-        }
         Some(section.into_any_element())
     }
-    /// Details of one missing release and, when slskd is linked, the folders
-    /// Soulseek peers offer for it.
+    /// One missing release laid out like a library album: cover, details and
+    /// track list, places to listen to it, then the Soulseek download.
     fn missing_panel(
         &mut self,
         artist: &str,
         release: MissingRelease,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.request_release_details(&release.id);
         let colors = ink(cx);
-        let job = self
-            .downloads
-            .iter()
-            .find(|job| job.release == release.id)
+        let details = self.release_details.get(&release.id).cloned();
+        let loaded = details
+            .as_ref()
+            .and_then(|details| details.as_ref().ok())
             .cloned();
         let hide = (
             artist.to_string(),
@@ -4263,34 +4304,63 @@ impl MusicApp {
             release.id.clone(),
         );
         let page = format!("https://musicbrainz.org/release-group/{}", release.id);
-        let mut panel =
-            div().flex().flex_col().gap_2().min_w_0().child(
+        let note = |text: String| {
+            div()
+                .text_size(px(11.))
+                .text_color(colors.muted)
+                .child(text)
+        };
+        let mut facts = vec![
+            release.kind.clone(),
+            match (release.upcoming, release.year) {
+                (true, Some(year)) => format!("Upcoming, {year}"),
+                (_, Some(year)) => year.to_string(),
+                _ => "Year unknown".into(),
+            },
+        ];
+        if let Some(details) = &loaded {
+            match (details.label.is_empty(), details.catalog_number.is_empty()) {
+                (false, false) => {
+                    facts.push(format!("{} ({})", details.label, details.catalog_number))
+                }
+                (false, true) => facts.push(details.label.clone()),
+                _ => {}
+            }
+            if !details.country.is_empty() && details.country != "XW" {
+                facts.push(details.country.clone());
+            }
+            if !details.tracks.is_empty() {
+                let count = details.tracks.len();
+                facts.push(format!(
+                    "{count} {}",
+                    if count == 1 { "track" } else { "tracks" }
+                ));
+            }
+            if details.seconds() > 0 {
+                facts.push(duration_label(details.seconds() as f64));
+            }
+        }
+        let mut right = div()
+            .flex_1()
+            .min_w_0()
+            .when(self.library_width < 520., |column| column.w_full())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
                 div()
+                    .min_h(px(24.))
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(release.title.clone()),
-                            )
-                            .child(div().text_size(px(11.)).text_color(colors.muted).child(
-                                format!(
-                                    "{} · {}",
-                                    release.kind,
-                                    match (release.upcoming, release.year) {
-                                        (true, Some(year)) => format!("Upcoming, {year}"),
-                                        (_, Some(year)) => year.to_string(),
-                                        _ => "Year unknown".into(),
-                                    }
-                                ),
-                            )),
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(release.title.clone()),
                     )
                     .child(
                         Button::new("missing-open-musicbrainz")
@@ -4315,7 +4385,214 @@ impl MusicApp {
                                 cx.notify();
                             })),
                     ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(colors.muted)
+                    .child(facts.join(" · ")),
+            )
+            .when_some(
+                loaded.as_ref().filter(|details| !details.genres.is_empty()),
+                |column, details| {
+                    column.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(colors.muted)
+                            .truncate()
+                            .child(details.genres.join(", ")),
+                    )
+                },
             );
+        match &details {
+            None => {
+                right = right.child(
+                    div()
+                        .h(px(60.))
+                        .pt_2()
+                        .child(note("Loading album details…".into())),
+                );
+            }
+            Some(Err(error)) => {
+                right = right.child(
+                    div()
+                        .pt_2()
+                        .child(note(format!("Could not load the track list: {error}"))),
+                );
+            }
+            Some(Ok(details)) if details.tracks.is_empty() => {
+                right = right.child(div().pt_2().child(note(
+                    "MusicBrainz has no track list for this release.".into(),
+                )));
+            }
+            Some(Ok(details)) => {
+                let discs = details
+                    .tracks
+                    .iter()
+                    .map(|track| track.disc)
+                    .collect::<HashSet<_>>();
+                let mut last_disc = None;
+                for track in &details.tracks {
+                    if discs.len() > 1 && last_disc != Some(track.disc) {
+                        last_disc = Some(track.disc);
+                        right = right.child(
+                            div()
+                                .h(px(23.))
+                                .pt_1()
+                                .text_size(px(10.))
+                                .text_color(colors.muted)
+                                .child(format!("Disc {}", track.disc)),
+                        );
+                    }
+                    right = right.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .h(px(27.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .w(px(36.))
+                                    .flex_shrink_0()
+                                    .text_color(colors.muted)
+                                    .truncate()
+                                    .child(track.number.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_shrink(1.)
+                                            .truncate()
+                                            .child(track.title.clone()),
+                                    )
+                                    .when(!track.artist.is_empty(), |title| {
+                                        title.child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .truncate()
+                                                .text_color(colors.muted)
+                                                .child(format!("· {}", track.artist)),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(38.))
+                                    .flex_shrink_0()
+                                    .text_color(colors.muted)
+                                    .text_right()
+                                    .child(
+                                        track
+                                            .seconds
+                                            .map(|seconds| duration_label(seconds as f64))
+                                            .unwrap_or_default(),
+                                    ),
+                            ),
+                    );
+                }
+            }
+        }
+        if !release.upcoming {
+            let mut links = div().flex().flex_wrap().items_center().gap_1();
+            for (index, link) in listen_links(loaded.as_deref(), artist, &release.title)
+                .into_iter()
+                .enumerate()
+            {
+                let url = link.url.clone();
+                links = links.child(
+                    Button::new(("missing-listen", index))
+                        .ghost()
+                        .small()
+                        .label(if link.direct {
+                            link.service.clone()
+                        } else {
+                            format!("Search {}", link.service)
+                        })
+                        .tooltip(if link.direct {
+                            format!("Open this release on {}", link.service)
+                        } else {
+                            format!("Search {} for this release", link.service)
+                        })
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            right = right.child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.muted)
+                            .child("Listen on"),
+                    )
+                    .child(links),
+            );
+        }
+        right = right.child(
+            div()
+                .mt_3()
+                .pt_2()
+                .border_t_1()
+                .border_color(colors.line)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.muted)
+                        .child("Download from Soulseek"),
+                )
+                .child(self.soulseek_block(artist, release.clone(), cx)),
+        );
+        div()
+            .w_full()
+            .min_w_0()
+            .px_3()
+            .flex()
+            .gap_3()
+            .items_start()
+            .when(self.library_width < 520., |row| row.flex_col())
+            .child(
+                div()
+                    .w(px(124.))
+                    .flex_shrink_0()
+                    .child(self.art(&release.cover, 124., cx)),
+            )
+            .child(right)
+            .into_any_element()
+    }
+    /// The Soulseek half of a missing release: its download, or a search for
+    /// the folders peers offer when slskd is linked.
+    fn soulseek_block(
+        &mut self,
+        artist: &str,
+        release: MissingRelease,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let job = self
+            .downloads
+            .iter()
+            .find(|job| job.release == release.id)
+            .cloned();
+        let mut block = div().flex().flex_col().gap_2().min_w_0();
         let note = |text: String| {
             div()
                 .text_size(px(11.))
@@ -4323,12 +4600,12 @@ impl MusicApp {
                 .child(text)
         };
         if release.upcoming {
-            return panel
+            return block
                 .child(note("This release is not out yet.".into()))
                 .into_any_element();
         }
         if !self.preferences.downloads.enabled {
-            return panel
+            return block
                 .child(note(
                     "Link slskd in Settings → Downloads to look for this release on Soulseek."
                         .into(),
@@ -4337,7 +4614,7 @@ impl MusicApp {
         }
         if let Some(job) = job {
             let dismiss = job.release.clone();
-            return panel
+            return block
                 .child(
                     div()
                         .flex()
@@ -4374,7 +4651,7 @@ impl MusicApp {
             .map(|(_, update)| update.clone());
         let searching = matches!(search, Some(SearchUpdate::Searching(_)));
         let id = release.id.clone();
-        panel = panel.child(
+        block = block.child(
             div()
                 .flex()
                 .items_center()
@@ -4407,20 +4684,20 @@ impl MusicApp {
         match search {
             None => {}
             Some(SearchUpdate::Searching(count)) => {
-                panel = panel.child(note(format!(
+                block = block.child(note(format!(
                     "Searching Soulseek… {count} {} so far",
                     if count == 1 { "response" } else { "responses" }
                 )));
             }
-            Some(SearchUpdate::Failed(message)) => panel = panel.child(note(message)),
+            Some(SearchUpdate::Failed(message)) => block = block.child(note(message)),
             Some(SearchUpdate::Results(candidates, expected)) => {
                 if candidates.is_empty() {
-                    panel = panel.child(note(
+                    block = block.child(note(
                         "No folders found. The Soulseek server hides some names; try different search text."
                             .into(),
                     ));
                 } else {
-                    panel = panel.child(note(format!(
+                    block = block.child(note(format!(
                         "{} {} · best matches first{}",
                         candidates.len(),
                         if candidates.len() == 1 {
@@ -4433,14 +4710,14 @@ impl MusicApp {
                         ))
                     )));
                     for (index, candidate) in candidates.iter().take(40).enumerate() {
-                        panel = panel.child(
+                        block = block.child(
                             self.candidate_row(artist, &release, index, candidate, expected, cx),
                         );
                     }
                 }
             }
         }
-        panel.into_any_element()
+        block.into_any_element()
     }
     fn candidate_row(
         &self,

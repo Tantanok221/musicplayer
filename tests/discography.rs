@@ -1,5 +1,8 @@
 use sonora::{
-    discography::{Discography, Library, ReleaseGroup, fold, is_various_artists, missing},
+    discography::{
+        Discography, Library, ListenLink, ReleaseDetails, ReleaseGroup, fold, is_various_artists,
+        listen_links, listen_service, missing,
+    },
     model::Album,
 };
 use std::sync::Arc;
@@ -206,4 +209,89 @@ fn freshness_and_various_artists() {
         "89ad4ac3-39f7-470e-963a-56509c546377"
     ));
     assert!(!is_various_artists("Mili", ""));
+}
+
+#[test]
+fn listen_service_keeps_streaming_sites_only() {
+    let cases = [
+        ("https://open.spotify.com/album/abc", Some("Spotify")),
+        ("https://music.apple.com/jp/album/x/1", Some("Apple Music")),
+        ("https://itunes.apple.com/album/id1", Some("Apple Music")),
+        ("https://www.deezer.com/album/1", Some("Deezer")),
+        ("https://tidal.com/browse/album/1", Some("Tidal")),
+        (
+            "https://music.youtube.com/playlist?list=x",
+            Some("YouTube Music"),
+        ),
+        ("https://www.youtube.com/watch?v=x", Some("YouTube")),
+        ("https://artist.bandcamp.com/album/x", Some("Bandcamp")),
+        ("https://soundcloud.com/a/sets/b", Some("SoundCloud")),
+        ("https://music.amazon.co.jp/albums/x", Some("Amazon Music")),
+        ("https://www.wikidata.org/wiki/Q1", None),
+        ("https://www.discogs.com/master/1", None),
+        ("not a url", None),
+    ];
+    for (url, service) in cases {
+        assert_eq!(listen_service(url), service, "{url}");
+    }
+}
+
+#[test]
+fn listen_links_prefer_direct_pages_and_search_for_the_rest() {
+    let link = |service: &str, url: &str| ListenLink {
+        service: service.into(),
+        url: url.into(),
+        direct: true,
+    };
+    let details = ReleaseDetails {
+        links: vec![
+            link("Spotify", "https://open.spotify.com/album/one"),
+            link("Spotify", "https://open.spotify.com/album/two"),
+            link("Bandcamp", "https://a.bandcamp.com/album/x"),
+        ],
+        ..Default::default()
+    };
+    let links = listen_links(Some(&details), "ヨルシカ", "盗作 & More");
+    let services: Vec<_> = links
+        .iter()
+        .map(|link| (link.service.as_str(), link.direct))
+        .collect();
+    assert_eq!(
+        services,
+        [
+            ("Spotify", true),
+            ("Bandcamp", true),
+            ("Apple Music", false),
+            ("YouTube Music", false),
+            ("Deezer", false),
+            ("Tidal", false),
+        ]
+    );
+    assert_eq!(links[0].url, "https://open.spotify.com/album/one");
+    let apple = &links[2].url;
+    assert!(apple.starts_with("https://music.apple.com/search?term="));
+    assert!(apple.contains("%E3%83%A8") && apple.contains("%26") && apple.contains("%20"));
+    assert!(!apple.contains(' ') && !apple.contains('+'));
+    // Without details, every major service gets a search.
+    assert!(listen_links(None, "A", "B").iter().all(|link| !link.direct));
+    assert_eq!(listen_links(None, "A", "B").len(), 5);
+}
+
+#[test]
+fn release_details_freshness_and_length() {
+    let details = ReleaseDetails {
+        fetched_ms: 1_000,
+        tracks: vec![
+            sonora::discography::ReleaseTrack {
+                seconds: Some(200),
+                ..Default::default()
+            },
+            sonora::discography::ReleaseTrack::default(),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(details.seconds(), 200);
+    assert!(details.fresh(1_000 + 86_400_000));
+    assert!(!details.fresh(1_000 + 31 * 86_400_000));
+    assert!(!ReleaseDetails::default().fresh(1_000));
 }
