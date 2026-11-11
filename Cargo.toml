@@ -34,8 +34,10 @@ axum = "0.8"
 hound = "3"
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+# Favor fast local rebuilds: compile in parallel and reuse unchanged work.
+lto = false
+codegen-units = 16
+incremental = true
 
 [[bin]]
 name = "sonora"
