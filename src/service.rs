@@ -316,7 +316,11 @@ fn watch_download(
     mut job: DownloadJob,
 ) {
     runtime.spawn(async move {
+        // A request the peer dropped is asked for again after this long without change.
+        const STALLED: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        const MAX_REQUEUES: u32 = 3;
         let mut unreachable = 0;
+        let mut changed = std::time::Instant::now();
         // Peers can keep a folder queued for a long time; give up after a day of polling.
         for _ in 0..17_280 {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -336,6 +340,28 @@ fn watch_download(
                 } else {
                     JobState::Failed
                 };
+            }
+            if progress != job.progress {
+                changed = std::time::Instant::now();
+            } else if !finished
+                && progress.active == 0
+                && changed.elapsed() >= STALLED
+                && job.requeued < MAX_REQUEUES
+            {
+                changed = std::time::Instant::now();
+                let lost = crate::slskd::waiting(&downloads, &job.files);
+                if !lost.is_empty()
+                    && matches!(client.peer_idle(&job.username).await, Ok(true))
+                    && client.requeue(&job.username, &lost).await.is_ok()
+                {
+                    job.requeued += 1;
+                    if tx
+                        .send(Command::DownloadUpdate(namespace.clone(), job.clone()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
             if finished || progress != job.progress {
                 job.progress = progress;

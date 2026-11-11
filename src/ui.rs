@@ -418,6 +418,17 @@ fn download_caption(job: &DownloadJob) -> String {
             Some(place) => format!("Queued · position {place}"),
             None => "Queued on the peer".into(),
         },
+        JobState::Active if progress.active == 0 && progress.queued > 0 => format!(
+            "{}/{} downloaded · {} waiting in the peer's queue{}",
+            progress.done,
+            progress.total,
+            progress.queued,
+            if job.requeued > 0 {
+                format!(", asked again {}×", job.requeued)
+            } else {
+                String::new()
+            }
+        ),
         JobState::Active => format!("Downloading {}/{}", progress.done, progress.total),
     }
 }

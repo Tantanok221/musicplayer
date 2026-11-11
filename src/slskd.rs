@@ -302,6 +302,8 @@ pub struct Progress {
     /// Why the first failed file failed, in slskd's words.
     pub failure: String,
     pub queued: u32,
+    /// Files being sent right now.
+    pub active: u32,
     pub place: Option<u32>,
 }
 impl Progress {
@@ -313,8 +315,7 @@ impl Progress {
     }
 }
 
-/// Reads one peer's downloads for the files of one job. Files slskd no longer
-/// lists are not counted either way.
+/// Reads one peer's downloads for the files of one job.
 pub fn progress(downloads: &Value, files: &[String]) -> Progress {
     let mut states: HashMap<&str, (&str, Option<u64>)> = HashMap::new();
     for directory in downloads["directories"].as_array().into_iter().flatten() {
@@ -335,8 +336,10 @@ pub fn progress(downloads: &Value, files: &[String]) -> Progress {
         total: files.len() as u32,
         ..Default::default()
     };
+    let mut gone = 0;
     for file in files {
         let Some((state, place)) = states.get(file.as_str()) else {
+            gone += 1;
             continue;
         };
         if state.contains("Succeeded") {
@@ -351,6 +354,8 @@ pub fn progress(downloads: &Value, files: &[String]) -> Progress {
                     .unwrap_or("Errored")
                     .to_lowercase();
             }
+        } else if state.contains("InProgress") || state.contains("Initializing") {
+            progress.active += 1;
         } else if state.contains("Queued") || *state == "Requested" {
             progress.queued += 1;
             if let Some(place) = place {
@@ -359,7 +364,51 @@ pub fn progress(downloads: &Value, files: &[String]) -> Progress {
             }
         }
     }
+    // slskd drops a transfer from its list only after it has ended, and finished
+    // ones can be cleared at any time. Once nothing is waiting or moving, those
+    // files arrived; while anything is, they are left uncounted.
+    if progress.queued == 0 && progress.active == 0 {
+        progress.done += gone;
+    }
     progress
+}
+
+/// A file the peer has accepted into its queue but reports no place for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Waiting {
+    pub id: String,
+    pub filename: String,
+    pub size: u64,
+}
+
+/// Files of a job sitting in the peer's queue with no reported position.
+/// Combined with a peer that says it has a free slot and an empty queue, this
+/// means the peer lost the request; slskd itself never asks again.
+pub fn waiting(downloads: &Value, files: &[String]) -> Vec<Waiting> {
+    let mut found: HashMap<&str, Option<Waiting>> = HashMap::new();
+    for directory in downloads["directories"].as_array().into_iter().flatten() {
+        for transfer in directory["files"].as_array().into_iter().flatten() {
+            let Some(name) = transfer["filename"].as_str() else {
+                continue;
+            };
+            let state = transfer["state"].as_str().unwrap_or_default();
+            // The last entry for a file is current, as in `progress`.
+            found.insert(
+                name,
+                (state == "Queued, Remotely" && transfer["placeInQueue"].as_u64().is_none())
+                    .then(|| Waiting {
+                        id: transfer["id"].as_str().unwrap_or_default().to_string(),
+                        filename: name.to_string(),
+                        size: transfer["size"].as_u64().unwrap_or(0),
+                    })
+                    .filter(|waiting| !waiting.id.is_empty()),
+            );
+        }
+    }
+    files
+        .iter()
+        .filter_map(|file| found.remove(file.as_str()).flatten())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +431,8 @@ pub struct DownloadJob {
     pub title: String,
     pub username: String,
     pub files: Vec<String>,
+    /// Times files the peer had silently dropped were asked for again.
+    pub requeued: u32,
     /// How many tracks the release usually has, when MusicBrainz knows.
     pub expected: Option<u32>,
     pub progress: Progress,
@@ -438,7 +489,19 @@ impl Slskd {
         path: &[&str],
         body: Option<&Value>,
     ) -> Result<(u16, Value)> {
-        let url = self.endpoint(path)?;
+        self.send_query(method, path, &[], body).await
+    }
+    async fn send_query(
+        &self,
+        method: reqwest::Method,
+        path: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<(u16, Value)> {
+        let mut url = self.endpoint(path)?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
         // A session token can expire or be revoked by a restart; sign in again once.
         for renew in [false, true] {
             let mut request = self.http.request(method.clone(), url.clone());
@@ -670,6 +733,41 @@ impl Slskd {
             429 => bail!("slskd is busy. Try again in a moment."),
             status => bail!("slskd returned HTTP {status}"),
         }
+    }
+
+    /// Whether the peer says it could start sending right now.
+    pub async fn peer_idle(&self, username: &str) -> Result<bool> {
+        let info = self
+            .ok(reqwest::Method::GET, &["users", username, "info"], None)
+            .await?;
+        Ok(info["hasFreeUploadSlot"].as_bool().unwrap_or(false)
+            && info["queueLength"].as_u64().unwrap_or(1) == 0)
+    }
+
+    /// Cancels files the peer lost track of and asks for them again.
+    pub async fn requeue(&self, username: &str, files: &[Waiting]) -> Result<()> {
+        for file in files {
+            let (status, _) = self
+                .send_query(
+                    reqwest::Method::DELETE,
+                    &["transfers", "downloads", username, &file.id],
+                    &[("remove", "true")],
+                    None,
+                )
+                .await?;
+            if !(200..300).contains(&status) && status != 404 {
+                bail!("slskd returned HTTP {status}");
+            }
+        }
+        let files = files
+            .iter()
+            .map(|file| RemoteFile {
+                filename: file.filename.clone(),
+                size: file.size,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        self.enqueue(username, &files).await
     }
 
     pub async fn downloads(&self, username: &str) -> Result<Value> {

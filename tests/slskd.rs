@@ -6,8 +6,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sonora::slskd::{
-    Completeness, Progress, RemoteFile, SearchResponse, Slskd, SlskdAuth, SlskdKey, candidates,
-    progress,
+    Completeness, Progress, RemoteFile, SearchResponse, Slskd, SlskdAuth, SlskdKey, Waiting,
+    candidates, progress, waiting,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -155,6 +155,7 @@ fn progress_counts_each_file_once_by_its_latest_state() {
             total: 4,
             done: 1,
             queued: 1,
+            active: 1,
             place: Some(7),
             ..Default::default()
         }
@@ -172,6 +173,18 @@ fn progress_counts_each_file_once_by_its_latest_state() {
     assert!(failed.finished() && !failed.succeeded());
     assert_eq!(failed.failure, "timedout");
     assert!(!progress(&Value::Null, &[]).finished());
+    // slskd had already cleared the folder's finished files when the last one arrived.
+    let cleared = progress(
+        &json!({"directories": [{"files": [{"filename": "d", "state": "Completed, Succeeded"}]}]}),
+        &files,
+    );
+    assert!(cleared.succeeded());
+    // While a file is still moving, cleared files are not assumed to have arrived.
+    let moving = progress(
+        &json!({"directories": [{"files": [{"filename": "d", "state": "InProgress"}]}]}),
+        &files,
+    );
+    assert_eq!((moving.done, moving.finished()), (0, false));
 }
 
 #[derive(Clone, Default)]
@@ -444,5 +457,79 @@ async fn no_login_is_sent_when_none_is_saved() {
     assert_eq!(
         error,
         "slskd asks for a login. Enter its API key, or its web username and password."
+    );
+}
+
+#[test]
+fn only_files_the_peer_lists_without_a_place_count_as_lost() {
+    let files = ["a", "b", "c", "d"].map(String::from);
+    let downloads = json!({"directories": [{"files": [
+        {"id": "1", "filename": "a", "size": 5, "state": "Queued, Remotely"},
+        {"id": "2", "filename": "b", "size": 6, "state": "Queued, Remotely", "placeInQueue": 3},
+        {"id": "3", "filename": "c", "size": 7, "state": "Completed, Succeeded"},
+        {"id": "4", "filename": "d", "size": 8, "state": "Queued, Remotely"},
+        {"id": "5", "filename": "d", "size": 8, "state": "InProgress"},
+        {"id": "6", "filename": "other", "size": 9, "state": "Queued, Remotely"}
+    ]}]});
+    assert_eq!(
+        waiting(&downloads, &files),
+        [Waiting {
+            id: "1".into(),
+            filename: "a".into(),
+            size: 5
+        }]
+    );
+}
+
+#[tokio::test]
+async fn lost_requests_are_cancelled_and_asked_for_again() {
+    let log = Log::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/api/v0/users/{user}/info",
+            get(|Path(user): Path<String>| async move {
+                Json(json!({"hasFreeUploadSlot": user == "idle", "queueLength": 0}))
+            }),
+        )
+        .route(
+            "/api/v0/transfers/downloads/{user}/{id}",
+            axum::routing::delete(
+                |State(log): State<Log>,
+                 Path((user, id)): Path<(String, String)>,
+                 axum::extract::RawQuery(query): axum::extract::RawQuery| async move {
+                    log.push(format!("cancel {user} {id} {}", query.unwrap_or_default()));
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        )
+        .route(
+            "/api/v0/transfers/downloads/batches",
+            post(
+                |State(log): State<Log>, Json(body): Json<Value>| async move {
+                    let file = &body["files"][0];
+                    log.push(format!("enqueue {} {}", file["filename"], file["size"]));
+                    StatusCode::CREATED
+                },
+            ),
+        )
+        .with_state(log.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = client(&format!("http://{address}"));
+    assert!(client.peer_idle("idle").await.unwrap());
+    assert!(!client.peer_idle("busy").await.unwrap());
+    let lost = [Waiting {
+        id: "t1".into(),
+        filename: r"@@x\Album\09.flac".into(),
+        size: 42,
+    }];
+    client.requeue("idle", &lost).await.unwrap();
+    assert_eq!(
+        log.take(),
+        [
+            "cancel idle t1 remove=true",
+            r#"enqueue "@@x\\Album\\09.flac" 42"#
+        ]
     );
 }
