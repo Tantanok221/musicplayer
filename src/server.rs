@@ -471,28 +471,63 @@ impl Server {
             bail!("Artwork too large");
         }
         crate::platform::atomic_write(&path, &bytes)?;
-        // A bounded FIFO cache; reads don't touch mtime or block the renderer.
-        let mut entries = std::fs::read_dir(&dir)?
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                e.metadata()
-                    .ok()
-                    .map(|m| (e.path(), m.len(), m.modified().ok()))
-            })
-            .collect::<Vec<_>>();
-        let mut total: u64 = entries.iter().map(|e| e.1).sum();
-        if total > 512 * 1024 * 1024 {
-            entries.sort_by_key(|e| e.2);
-            for (candidate, len, _) in entries {
-                if total <= 480 * 1024 * 1024 {
-                    break;
-                }
-                if candidate != path && std::fs::remove_file(candidate).is_ok() {
-                    total = total.saturating_sub(len);
-                }
-            }
+        // Listing the whole cache costs a stat per file, so only check the size now and then.
+        static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if WRITES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
+            let keep = path.clone();
+            tokio::task::spawn_blocking(move || prune_artwork(&dir, &keep));
         }
         Ok(path)
+    }
+}
+
+/// A bounded FIFO cache; reads don't touch mtime or block the renderer.
+/// Covers are evicted together with the copies derived from them.
+fn prune_artwork(dir: &Path, keep: &Path) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let files = listing
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.metadata()
+                .ok()
+                .map(|m| (e.path(), m.len(), m.modified().ok()))
+        })
+        .collect::<Vec<_>>();
+    let mut total: u64 = files.iter().map(|e| e.1).sum();
+    if total <= 512 * 1024 * 1024 {
+        return;
+    }
+    let sizes = files
+        .iter()
+        .map(|(path, len, _)| (path.clone(), *len))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut covers = files
+        .into_iter()
+        .filter(|(path, _, _)| path.extension().is_some_and(|ext| ext == "art"))
+        .collect::<Vec<_>>();
+    covers.sort_by_key(|e| e.2);
+    for (cover, _, _) in covers {
+        if total <= 480 * 1024 * 1024 {
+            break;
+        }
+        if cover == keep {
+            continue;
+        }
+        let mut group = crate::thumbnail::derived(&cover);
+        group.push(crate::backdrop::backdrop_path(&cover));
+        group.push(cover);
+        for path in group {
+            if let Some(len) = sizes.get(&path)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                total = total.saturating_sub(*len);
+            }
+        }
     }
 }
 

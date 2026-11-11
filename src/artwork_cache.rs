@@ -2,8 +2,10 @@
 use gpui_kit::*;
 use std::{collections::HashMap, sync::Arc};
 
-const BYTE_BUDGET: usize = 64 * 1024 * 1024;
-const ENTRY_BUDGET: usize = 128;
+/// Lists and grids use small copies (64-400 KB decoded), so this still holds ~80 grid covers.
+const BYTE_BUDGET: usize = 32 * 1024 * 1024;
+/// Mostly small list and grid copies now, so more fit within the byte budget.
+const ENTRY_BUDGET: usize = 256;
 struct Entry {
     item: ImageCacheItem,
     frame: u64,
@@ -97,7 +99,7 @@ mod tests {
     }
     #[test]
     fn pending_loads_are_bounded_even_without_decoded_bytes() {
-        let entries = (0..130).map(|i| (i, i, 0)).collect();
-        assert_eq!(eviction_keys(entries, 129), [0, 1]);
+        let entries = (0..258).map(|i| (i, i, 0)).collect();
+        assert_eq!(eviction_keys(entries, 257), [0, 1]);
     }
 }

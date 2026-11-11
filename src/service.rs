@@ -1,6 +1,6 @@
 use crate::{
     artists::{ArtistPageData, ArtistProfile, TopSongs, cache_key},
-    artwork::ArtworkQueue,
+    artwork::{ArtworkQueue, Priority},
     backdrop::{self, Backdrop},
     catalog::{Catalog, LibraryView},
     discography::{self, Discography, DiscographyView},
@@ -13,6 +13,7 @@ use crate::{
     server::Server,
     slskd::{Candidate, DownloadJob, JobState, Slskd, SlskdAuth},
     sorting::{Field as SortField, Scope as SortScope},
+    thumbnail,
 };
 use anyhow::Result;
 use flume::{Receiver, Sender};
@@ -79,7 +80,8 @@ pub enum Command {
     GroupTracks(u64, LibraryQuery, String),
     PlayTrack(String),
     Playlist(String),
-    Artwork(String),
+    /// Finds a cover in the disk cache; with a priority, downloads it when missing.
+    Artwork(String, Option<Priority>),
     ArtworkFinished(String, String, Result<PathBuf, String>),
     Backdrop(String),
     BackdropFinished(String, String, Result<Backdrop, String>),
@@ -141,7 +143,8 @@ pub enum Event {
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
-    Artwork(String, PathBuf),
+    /// A cover on disk, and whether its small copies exist beside it.
+    Artwork(String, PathBuf, bool),
     ArtworkFailed(String),
     ArtworkRetrying,
     Backdrop(String, Arc<Backdrop>),
@@ -416,6 +419,24 @@ fn begin_sync(
             Err(error)=>{let _=tx.send_async(Command::SyncFailed(generation,format!("Refresh incomplete: {error:#}. Cached music is still available."))).await;}}
     });
 }
+/// Sends a cover once its small copies exist, making them off this thread when missing.
+fn publish_artwork(
+    runtime: &tokio::runtime::Handle,
+    events: &Sender<Event>,
+    id: String,
+    path: PathBuf,
+) {
+    if thumbnail::ready(&path) {
+        let _ = events.send(Event::Artwork(id, path, true));
+        return;
+    }
+    let events = events.clone();
+    runtime.spawn_blocking(move || {
+        let thumbs = thumbnail::ensure(&path).is_ok();
+        let _ = events.send(Event::Artwork(id, path, thumbs));
+    });
+}
+
 fn run(
     paths: Paths,
     runtime: tokio::runtime::Handle,
@@ -1223,18 +1244,20 @@ fn run(
                         events.send(Event::Lyrics(id, result.map(Arc::new)))?;
                     }
                 }
-                Command::Artwork(id) => {
+                Command::Artwork(id, fetch) => {
                     if let Some(account) = &account {
                         let path = paths
                             .cache
                             .join(account.namespace())
                             .join(format!("{}.art", blake3::hash(id.as_bytes()).to_hex()));
                         if path.exists() {
-                            events.send(Event::Artwork(id.clone(), path))?;
+                            publish_artwork(&runtime, &events, id, path);
                             return Ok(());
                         }
                     }
-                    artwork_queue.request(id, Instant::now());
+                    if let Some(priority) = fetch {
+                        artwork_queue.request(id, Instant::now(), priority);
+                    }
                 }
                 Command::Backdrop(id) => {
                     if let Some(account) = &account {
@@ -1268,7 +1291,7 @@ fn run(
                         match result {
                             Ok(path) => {
                                 artwork_queue.finished(&id, true, Instant::now());
-                                events.send(Event::Artwork(id, path))?;
+                                publish_artwork(&runtime, &events, id, path);
                             }
                             Err(_) => {
                                 if artwork_queue.finished(&id, false, Instant::now()) {

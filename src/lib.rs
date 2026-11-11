@@ -14,4 +14,5 @@ pub mod server;
 pub mod service;
 pub mod slskd;
 pub mod sorting;
+pub mod thumbnail;
 pub mod visualizer;

@@ -18,6 +18,7 @@ use sonora::{
         ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, lastfm_url, profile_url,
         search_releases,
     },
+    artwork::Priority,
     backdrop::Backdrop,
     browser::*,
     catalog::LibraryView,
@@ -28,6 +29,7 @@ use sonora::{
     playback::{Placement, PlayerCommand, QueueEdit},
     service::{Command, DownloadRequest, Event, Mutation, SearchUpdate, Service},
     slskd::{Candidate, Completeness, DownloadJob, JobState},
+    thumbnail,
     visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
 };
 use std::{
@@ -100,6 +102,15 @@ const SPECTRUM_HEIGHT: f32 = 84.;
 /// Fraction of the lyrics viewport height where the current line rests.
 const LYRIC_ANCHOR: f32 = 0.4;
 const LYRIC_SCROLL_SECONDS: f32 = 0.6;
+/// How often a cover that is still on screen re-asks to move to the front of the download queue.
+const ART_REPRIORITIZE: Duration = Duration::from_millis(750);
+/// A cover must stay on screen this long before it is downloaded, so fast scrolling
+/// doesn't fill the download slots with covers that are already gone.
+const ART_SETTLE: Duration = Duration::from_millis(120);
+/// Rows of covers above and below the viewport downloaded ahead of scrolling.
+const PREFETCH_ROWS: usize = 2;
+/// Albums above and below the top of the album-and-tracks list downloaded ahead.
+const PREFETCH_ALBUMS: std::ops::Range<isize> = -3..8;
 /// The spectrum redraws at 60 fps; display rate (up to 120 Hz) costs twice the CPU for no visible gain.
 const SPECTRUM_FRAME: Duration = Duration::from_micros(16_667);
 
@@ -563,7 +574,18 @@ pub struct MusicApp {
     playlist: Option<Playlist>,
     playback: PlaybackSnapshot,
     artwork: HashMap<String, PathBuf>,
-    art_requested: HashSet<String>,
+    /// When each missing cover was last asked for; repeats keep visible covers first in line.
+    art_requested: HashMap<String, Instant>,
+    /// First and last time each missing cover was on screen, to skip downloads for fly-bys.
+    art_seen: HashMap<String, (Instant, Instant)>,
+    /// A missing cover is waiting to settle, so render again shortly to request it.
+    art_wake: bool,
+    /// When each neighboring cover was last queued for download ahead of scrolling.
+    art_prefetched: HashMap<String, Instant>,
+    /// Covers whose small copies exist, so tiles can skip decoding the full image.
+    art_thumbs: HashSet<String>,
+    /// The list and top row being prefetched around, and since when it has been still.
+    prefetch_anchor: Option<(&'static str, usize, Instant)>,
     art_failures: HashSet<String>,
     lyrics: HashMap<String, Result<Arc<Lyrics>, String>>,
     lyrics_requested: HashSet<String>,
@@ -788,7 +810,12 @@ impl MusicApp {
             playlist: None,
             playback: PlaybackSnapshot::default(),
             artwork: HashMap::new(),
-            art_requested: HashSet::new(),
+            art_requested: HashMap::new(),
+            art_seen: HashMap::new(),
+            art_wake: false,
+            art_prefetched: HashMap::new(),
+            art_thumbs: HashSet::new(),
+            prefetch_anchor: None,
             art_failures: HashSet::new(),
             lyrics: HashMap::new(),
             lyrics_requested: HashSet::new(),
@@ -899,6 +926,9 @@ impl MusicApp {
                 self.status = label;
                 self.error = None;
                 self.art_requested.clear();
+                self.art_seen.clear();
+                self.art_prefetched.clear();
+                self.art_thumbs.clear();
                 self.art_failures.clear();
                 self.lyrics.clear();
                 self.lyrics_requested.clear();
@@ -1051,8 +1081,11 @@ impl MusicApp {
             }
             Event::TrackUpdated(track) => self.apply_track_update(track),
             Event::AlbumUpdated(album) => self.apply_album_update(album),
-            Event::Artwork(id, path) => {
+            Event::Artwork(id, path, thumbs) => {
                 self.art_failures.remove(&id);
+                if thumbs {
+                    self.art_thumbs.insert(id.clone());
+                }
                 self.artwork.insert(id, path);
             }
             Event::Backdrop(id, backdrop) => {
@@ -1875,14 +1908,50 @@ impl MusicApp {
             .unwrap_or_else(|| fallback.into());
         self.art(&portrait, side, cx)
     }
+    /// Queues covers just outside the viewport once scrolling pauses, so they are
+    /// already downloaded when they scroll in. Covers on screen still go first.
+    fn prefetch_art(&mut self, list: &'static str, top: usize, covers: Vec<String>) {
+        let now = Instant::now();
+        match self.prefetch_anchor {
+            Some((anchor, row, since)) if anchor == list && row == top => {
+                if now.duration_since(since) < ART_SETTLE {
+                    self.art_wake = true;
+                    return;
+                }
+            }
+            _ => {
+                self.prefetch_anchor = Some((list, top, now));
+                self.art_wake = true;
+                return;
+            }
+        }
+        for id in covers {
+            if id.is_empty() || self.artwork.contains_key(&id) || self.art_failures.contains(&id) {
+                continue;
+            }
+            if self
+                .art_prefetched
+                .get(&id)
+                .is_none_or(|sent| now.duration_since(*sent) >= ART_REPRIORITIZE)
+            {
+                self.art_prefetched.insert(id.clone(), now);
+                self.service
+                    .send(Command::Artwork(id, Some(Priority::Nearby)));
+            }
+        }
+    }
     fn art(&mut self, id: &str, side: f32, cx: &App) -> AnyElement {
         if let Some(path) = self.artwork.get(id) {
+            let path = match thumbnail::size_for(side).filter(|_| self.art_thumbs.contains(id)) {
+                Some(size) => thumbnail::thumb_path(path, size),
+                None => path.clone(),
+            };
             return div()
                 .size(px(side))
                 .flex_shrink_0()
                 .overflow_hidden()
                 .child(
-                    img(path.clone())
+                    img(path)
                         .image_cache(&self.image_cache)
                         .size_full()
                         .aspect_square()
@@ -1890,8 +1959,30 @@ impl MusicApp {
                 )
                 .into_any_element();
         }
-        if !id.is_empty() && self.art_requested.insert(id.into()) {
-            self.service.send(Command::Artwork(id.into()));
+        if !id.is_empty() && !self.art_failures.contains(id) {
+            let now = Instant::now();
+            // Covers already on disk show at once; only downloads wait for the tile to settle.
+            let (first, last) = self.art_seen.entry(id.to_string()).or_insert((now, now));
+            let fresh = *first == now;
+            if now.duration_since(*last) > ART_SETTLE {
+                *first = now;
+            }
+            *last = now;
+            let settled = now.duration_since(*first) >= ART_SETTLE;
+            if fresh {
+                self.service.send(Command::Artwork(id.into(), None));
+            }
+            if !settled {
+                self.art_wake = true;
+            } else if self
+                .art_requested
+                .get(id)
+                .is_none_or(|sent| now.duration_since(*sent) >= ART_REPRIORITIZE)
+            {
+                self.art_requested.insert(id.into(), now);
+                self.service
+                    .send(Command::Artwork(id.into(), Some(Priority::Visible)));
+            }
         }
         div()
             .size(px(side))
@@ -3386,6 +3477,13 @@ impl MusicApp {
             .into_any_element()
     }
     fn grouped_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let top = self.album_list.logical_scroll_top().item_ix;
+        let nearby = PREFETCH_ALBUMS
+            .filter_map(|delta| top.checked_add_signed(delta))
+            .filter_map(|index| self.view.albums.get(index))
+            .map(|album| album.cover_art.clone())
+            .collect();
+        self.prefetch_art("albums", top, nearby);
         let entity = cx.entity();
         list(self.album_list.clone(), move |index, _, cx| {
             entity.update(cx, |app, cx| {
@@ -4478,6 +4576,18 @@ impl MusicApp {
                 });
             }
         }
+        let rows = self.cover_rows().row_count();
+        let top = self.cover_list.logical_scroll_top().item_ix.min(rows);
+        // Card height is the square cover plus its two text lines and padding.
+        let visible = (self.library_height / (side + 56.)).ceil() as usize + 1;
+        let below = top + visible;
+        let nearby = (top.saturating_sub(PREFETCH_ROWS)..top)
+            .chain(below..(below + PREFETCH_ROWS).min(rows))
+            .flat_map(|row| self.cover_rows().albums_in_row(row))
+            .filter_map(|index| self.view.albums.get(index))
+            .map(|album| album.cover_art.clone())
+            .collect();
+        self.prefetch_art("covers", top, nearby);
         let entity = cx.entity();
         list(self.cover_list.clone(), move |row, _, cx| {
             entity.update(cx, |app, cx| {
@@ -7293,6 +7403,9 @@ impl Render for MusicApp {
                 })
                 .into_any_element()
         };
+        if std::mem::take(&mut self.art_wake) {
+            self.request_frame_after(ART_SETTLE, window, cx);
+        }
         div()
             .size_full()
             .min_w_0()
