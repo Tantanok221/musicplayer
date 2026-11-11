@@ -262,6 +262,8 @@ pub struct LayoutPreferences {
     pub navigator_auto_hide: bool,
     pub show_information: bool,
     pub explorer_browser: bool,
+    /// The frequency bars along the bottom of Now Playing.
+    pub show_spectrum: bool,
     pub left_width: f32,
     pub right_width: f32,
     pub browser_height: f32,
@@ -278,6 +280,7 @@ impl Default for LayoutPreferences {
             navigator_auto_hide: false,
             show_information: true,
             explorer_browser: true,
+            show_spectrum: true,
             left_width: 216.,
             right_width: 300.,
             browser_height: 156.,

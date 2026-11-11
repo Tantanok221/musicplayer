@@ -97,9 +97,39 @@ const ALBUM_PREVIEW_ROWS: usize = 6;
 const UP_NEXT_PREVIEW_ROWS: usize = 8;
 const BACKDROP_FADE_SECONDS: f32 = 0.7;
 const SPECTRUM_HEIGHT: f32 = 84.;
+/// Fraction of the lyrics viewport height where the current line rests.
+const LYRIC_ANCHOR: f32 = 0.4;
+const LYRIC_SCROLL_SECONDS: f32 = 0.6;
+/// The spectrum redraws at 60 fps; display rate (up to 120 Hz) costs twice the CPU for no visible gain.
+const SPECTRUM_FRAME: Duration = Duration::from_micros(16_667);
 
 /// Low and high bar colors: the album's two leading colors, lifted so they
 /// read against the scrim, or the theme accent before a palette exists.
+/// Three breathing dots marking an instrumental break in timed lyrics.
+fn lyric_gap(index: usize, text_size: f32, leading: f32, color: Hsla) -> impl IntoElement {
+    let side = (text_size * 0.32).round();
+    div()
+        .h(px(leading))
+        .flex()
+        .items_center()
+        .gap(px(side * 0.8))
+        .children((0..3).map(move |dot| {
+            div()
+                .size(px(side))
+                .rounded_full()
+                .bg(color)
+                .with_animation(
+                    SharedString::from(format!("lyric-gap-{index}-{dot}")),
+                    Animation::new(Duration::from_millis(1600)).repeat(),
+                    move |element, t| {
+                        let phase = (t - dot as f32 * 0.16).rem_euclid(1.);
+                        let wave = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+                        element.opacity(0.25 + 0.75 * wave)
+                    },
+                )
+        }))
+}
+
 fn spectrum_colors(palette: Option<[u32; 3]>, accent: Hsla, dark: bool) -> (Hsla, Hsla) {
     let vivid = |color: u32| {
         let mut color = Hsla::from(rgb(color));
@@ -539,7 +569,16 @@ pub struct MusicApp {
     lyrics_requested: HashSet<String>,
     lyrics_scroll: ScrollHandle,
     lyrics_follow: Option<(String, Option<usize>)>,
-    lyrics_scroll_motion: Option<(Instant, f32, f32)>,
+    /// Start time, start offset, and line index of an in-flight follow scroll.
+    lyrics_scroll_motion: Option<(Instant, f32, usize)>,
+    /// Frames left to re-anchor without animation once fresh layout is known.
+    lyrics_snap: u8,
+    /// Wakes the UI exactly when the next timed lyric line starts.
+    lyrics_wake: Option<(usize, Task<()>)>,
+    /// When the last playback snapshot arrived, to extrapolate position between them.
+    playback_at: Instant,
+    /// A pending paced redraw for animations that don't need display rate.
+    frame_timer: Option<Task<()>>,
     artist_name: Option<String>,
     artist_id: String,
     artist_request: u64,
@@ -626,7 +665,12 @@ impl MusicApp {
                 .step(0.01)
                 .default_value(0.7)
         });
+        let view = cx.entity().downgrade();
         let subscriptions = vec![
+            // Animation stops while hidden, so resume it when the window is shown again.
+            window.observe_window_visibility(move |_, _, cx| {
+                view.update(cx, |_, cx| cx.notify()).ok();
+            }),
             cx.subscribe_in(&search, window, |app, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = app.search.read(cx).value().to_string();
@@ -751,6 +795,10 @@ impl MusicApp {
             lyrics_scroll: ScrollHandle::new(),
             lyrics_follow: None,
             lyrics_scroll_motion: None,
+            lyrics_snap: 0,
+            lyrics_wake: None,
+            playback_at: Instant::now(),
+            frame_timer: None,
             artist_name: None,
             artist_id: String::new(),
             artist_request: 0,
@@ -1038,6 +1086,7 @@ impl MusicApp {
                     slider.set_value(progress as f32, window, cx)
                 });
                 self.playback = snapshot;
+                self.playback_at = Instant::now();
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
             }
             Event::Status(status) => self.status = status,
@@ -5018,6 +5067,72 @@ impl MusicApp {
             .child(content)
             .into_any_element()
     }
+    /// Playback position extrapolated from the last snapshot, which arrives every ~200ms.
+    fn live_position(&self) -> f64 {
+        let mut position = self.playback.position;
+        if self.playback.playing && !self.playback.buffering {
+            position += self.playback_at.elapsed().as_secs_f64().min(0.5);
+        }
+        if self.playback.duration > 0. {
+            position = position.min(self.playback.duration);
+        }
+        position
+    }
+    /// Redraws once the next timed line is due, so lyrics stay on the beat without a frame loop.
+    fn schedule_lyric_wake(
+        &mut self,
+        lyrics: &Lyrics,
+        following: bool,
+        now: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = following
+            .then(|| {
+                (0..lyrics.line.len())
+                    .filter_map(|index| Some((index, lyrics.line_position(index)?)))
+                    .filter(|(_, start)| *start > now)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+            })
+            .flatten()
+            .filter(|(_, start)| start - now < 0.4);
+        let Some((index, start)) = next else {
+            self.lyrics_wake = None;
+            return;
+        };
+        if self
+            .lyrics_wake
+            .as_ref()
+            .is_some_and(|(due, _)| *due == index)
+        {
+            return;
+        }
+        let delay = Duration::from_secs_f64(start - now + 0.004);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        });
+        self.lyrics_wake = Some((index, task));
+    }
+    /// Redraws after `interval`, coalescing requests, for animations that don't need display rate.
+    fn request_frame_after(
+        &mut self,
+        interval: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.frame_timer.is_some() {
+            return;
+        }
+        self.frame_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(interval).await;
+            this.update(cx, |app, cx| {
+                app.frame_timer = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
     fn lyrics_content(
         &mut self,
         track: Arc<Track>,
@@ -5029,13 +5144,28 @@ impl MusicApp {
         if !self.lyrics.contains_key(&track.id) && self.lyrics_requested.insert(track.id.clone()) {
             self.service.send(Command::Lyrics(track.clone()));
         }
+        let dark = cx.theme().is_dark();
+        let reduce_motion = cx.reduce_motion();
+        let scroll = self.lyrics_scroll.clone();
+        let viewport = scroll.bounds();
+        let height = f32::from(viewport.size.height);
+        let (text_size, leading, row_y, row_x, fade, weight) = if highlight {
+            (28., 36., 9., 14., 120., FontWeight::BOLD)
+        } else {
+            (15., 22., 6., 8., 56., FontWeight::SEMIBOLD)
+        };
+        // The large view sits on a tinted backdrop where pure white reads best.
+        let ink_color = if highlight && dark {
+            gpui_kit::white()
+        } else {
+            colors.text
+        };
         let mut content = div()
             .id("lyrics-scroll")
             .size_full()
             .min_h_0()
             .overflow_y_scroll()
-            .track_scroll(&self.lyrics_scroll)
-            .p_3();
+            .track_scroll(&scroll);
         match self.lyrics.get(&track.id).cloned() {
             Some(Ok(lyrics)) if !lyrics.is_empty() => {
                 let is_playing = self
@@ -5043,97 +5173,151 @@ impl MusicApp {
                     .track
                     .as_ref()
                     .is_some_and(|playing| playing.id == track.id);
-                let active = is_playing
-                    .then(|| lyrics.active_line(self.playback.position))
-                    .flatten();
+                let following = is_playing && lyrics.is_timed();
+                let now = self.live_position();
+                self.schedule_lyric_wake(&lyrics, following, now, window, cx);
+                let active = is_playing.then(|| lyrics.active_line(now)).flatten();
+                // Padding lets the first and last lines reach the anchor.
+                content = if following && height > 0. {
+                    content
+                        .px_3()
+                        .pt(px(height * LYRIC_ANCHOR))
+                        .pb(px(height * (1. - LYRIC_ANCHOR)))
+                } else {
+                    content.p_3()
+                };
+                let target = |index: usize| -> Option<f32> {
+                    if !following {
+                        return Some(0.);
+                    }
+                    let item = scroll.bounds_for_item(index)?;
+                    let anchor = viewport.top() + viewport.size.height * LYRIC_ANCHOR;
+                    Some(
+                        f32::from(anchor - item.center().y)
+                            .clamp(-f32::from(scroll.max_offset().y), 0.),
+                    )
+                };
+                let focus_index = active.unwrap_or(0);
                 let follow = (track.id.clone(), active);
                 if self.lyrics_follow.as_ref() != Some(&follow) {
-                    let index = active.unwrap_or(0).saturating_sub(2);
-                    if self
+                    let same_track = self
                         .lyrics_follow
                         .as_ref()
-                        .is_some_and(|(id, _)| id == &track.id)
-                        && let Some(bounds) = self.lyrics_scroll.bounds_for_item(index)
-                    {
-                        let target = f32::from(self.lyrics_scroll.bounds().top() - bounds.top())
-                            .clamp(-f32::from(self.lyrics_scroll.max_offset().y), 0.);
-                        self.lyrics_scroll_motion = Some((
-                            Instant::now(),
-                            f32::from(self.lyrics_scroll.offset().y),
-                            target,
-                        ));
+                        .is_some_and(|(id, _)| id == &track.id);
+                    if same_track && following && !reduce_motion {
+                        self.lyrics_scroll_motion =
+                            Some((Instant::now(), f32::from(scroll.offset().y), focus_index));
                     } else {
+                        // Layout for new lyrics lands a frame later, so settle over a few.
                         self.lyrics_scroll_motion = None;
-                        self.lyrics_scroll.scroll_to_top_of_item(index);
+                        self.lyrics_snap = 3;
                     }
                     self.lyrics_follow = Some(follow);
                 }
-                if let Some((started, from, target)) = self.lyrics_scroll_motion {
-                    let progress = (started.elapsed().as_secs_f32() / 0.4).min(1.);
-                    let eased = 1. - (1. - progress).powi(3);
-                    self.lyrics_scroll.set_offset(point(
-                        self.lyrics_scroll.offset().x,
-                        px(from + (target - from) * eased),
-                    ));
+                if let Some((started, from, index)) = self.lyrics_scroll_motion {
+                    let progress = (started.elapsed().as_secs_f32() / LYRIC_SCROLL_SECONDS).min(1.);
+                    let eased = 1. - (1. - progress).powi(4);
+                    // Re-read the target each frame so late layout changes are absorbed.
+                    if let Some(target) = target(index) {
+                        scroll.set_offset(point(
+                            scroll.offset().x,
+                            px(from + (target - from) * eased),
+                        ));
+                    }
                     if progress < 1. {
                         window.request_animation_frame();
                     } else {
                         self.lyrics_scroll_motion = None;
                     }
+                } else if self.lyrics_snap > 0 {
+                    self.lyrics_snap -= 1;
+                    match target(focus_index) {
+                        Some(target) => scroll.set_offset(point(scroll.offset().x, px(target))),
+                        None => scroll.scroll_to_top_of_item(focus_index),
+                    }
+                    window.request_animation_frame();
                 }
+                let offset_y = scroll.offset().y;
                 for (index, line) in lyrics.line.iter().enumerate() {
                     let highlighted = lyrics.line_is_active(index, active);
-                    let focus = transition(
-                        SharedString::from(format!("lyric-focus-{}-{highlight}-{index}", track.id)),
-                        if highlighted { 1_f32 } else { 0_f32 },
-                        Transition::new(Duration::from_millis(320)),
+                    // Sung lines recede most; upcoming lines dim with distance.
+                    let rest = match active {
+                        _ if !following => 0.86,
+                        None => 0.55,
+                        Some(current) if index < current => 0.3,
+                        Some(current) => (0.6 - 0.06 * (index - current) as f32).max(0.34),
+                    };
+                    let alpha = transition(
+                        SharedString::from(format!("lyric-alpha-{}-{highlight}-{index}", track.id)),
+                        if highlighted { 1_f32 } else { rest },
+                        Transition::new(Duration::from_millis(420)),
                         window,
                         cx,
                     )
                     .clamp(0., 1.);
+                    // Lines dissolve toward the viewport edges instead of being clipped.
+                    let edge = if following && height > 0. {
+                        scroll.bounds_for_item(index).map_or(1., |item| {
+                            let center = f32::from(item.center().y + offset_y - viewport.top());
+                            let t = (center.min(height - center) / fade).clamp(0., 1.);
+                            t * t * (3. - 2. * t)
+                        })
+                    } else {
+                        1.
+                    };
+                    let shade = alpha * edge;
+                    let empty = line.value.trim().is_empty();
                     let seek = is_playing.then(|| lyrics.line_position(index)).flatten();
                     let player = self.service.player.clone();
-                    content = content.child(
-                        div()
-                            .id(SharedString::from(format!("lyric-{index}")))
-                            .role(Role::Group)
-                            .aria_label(format!(
-                                "{}{}",
-                                if highlighted { "Current lyric: " } else { "" },
-                                line.value
-                            ))
-                            .py_2()
-                            .px_2()
-                            .relative()
-                            .left(px(5. * focus))
-                            .border_l_2()
-                            .border_color(colors.accent.opacity(focus * 0.8))
-                            .bg(colors.accent.opacity(focus * 0.045))
-                            .opacity(0.82 + focus * 0.18)
-                            .text_size(px(if highlight { 19. + focus } else { 13. }))
-                            .line_height(px(if highlight { 30. } else { 21. }))
-                            .text_color(colors.muted.blend(colors.accent.opacity(focus)))
-                            .font_weight(if highlighted {
-                                FontWeight::SEMIBOLD
+                    let mut row = div()
+                        .id(SharedString::from(format!("lyric-{index}")))
+                        .role(Role::Group)
+                        .aria_label(format!(
+                            "{}{}",
+                            if highlighted { "Current lyric: " } else { "" },
+                            if empty && highlighted && following {
+                                "Instrumental"
                             } else {
-                                FontWeight::NORMAL
+                                line.value.as_str()
+                            }
+                        ))
+                        .max_w(px(if highlight { 880. } else { 640. }))
+                        .px(px(row_x))
+                        .py(px(row_y))
+                        .rounded_lg()
+                        .text_size(px(text_size))
+                        .line_height(px(leading))
+                        .font_weight(weight)
+                        .text_color(ink_color.opacity(shade));
+                    row = if empty && highlighted && following {
+                        row.child(lyric_gap(
+                            index,
+                            text_size,
+                            leading,
+                            ink_color.opacity(edge),
+                        ))
+                    } else if empty {
+                        row.child(" ")
+                    } else {
+                        row.child(line.value.clone())
+                    };
+                    content = content.child(row.when_some(seek, |row, position| {
+                        row.cursor_pointer()
+                            .hover(|style| {
+                                style
+                                    .bg(ink_color.opacity(0.07 * edge))
+                                    .text_color(ink_color.opacity(shade.max(0.8 * edge)))
                             })
-                            .child(if line.value.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line.value.clone()
+                            .on_click(move |_, _, _| {
+                                player.send(PlayerCommand::Seek(position));
                             })
-                            .when_some(seek, |row, position| {
-                                row.cursor_pointer().on_click(move |_, _, _| {
-                                    player.send(PlayerCommand::Seek(position));
-                                })
-                            }),
-                    );
+                    }));
                 }
                 if !lyrics.is_timed() {
                     content = content.child(
                         div()
                             .mt_3()
+                            .px(px(row_x))
                             .text_size(px(10.))
                             .text_color(colors.muted)
                             .child("Plain lyrics · no timing supplied"),
@@ -5147,7 +5331,13 @@ impl MusicApp {
                     Some(Ok(_)) => "No lyrics supplied by the server.".to_string(),
                     Some(Err(error)) => error,
                 };
-                content = content.child(div().text_size(px(12.)).child(message));
+                content = content.p_3().child(
+                    div()
+                        .px(px(row_x))
+                        .text_size(px(if highlight { 15. } else { 12. }))
+                        .text_color(colors.muted)
+                        .child(message),
+                );
                 if retry {
                     let id = track.id.clone();
                     content = content.child(
@@ -5404,7 +5594,11 @@ impl MusicApp {
             .pt_6()
             .child(lyrics);
 
-        let spectrum = self.spectrum_band(palette, dark, window, cx);
+        let spectrum = self
+            .preferences
+            .layout
+            .show_spectrum
+            .then(|| self.spectrum_band(palette, dark, window, cx));
         div()
             .relative()
             .size_full()
@@ -5433,7 +5627,7 @@ impl MusicApp {
                         },
                     )
                     .child(div().flex_1().min_h_0().flex().child(hero).child(lyrics))
-                    .child(spectrum),
+                    .children(spectrum),
             )
             .into_any_element()
     }
@@ -5590,53 +5784,63 @@ impl MusicApp {
         let moving = self
             .spectrum
             .update(rate.map(|rate| (&*self.spectrum_window, rate)), dt);
-        if moving && window.is_window_active() {
-            window.request_animation_frame();
+        if moving && window.is_visible() {
+            self.request_frame_after(SPECTRUM_FRAME, window, cx);
         } else if !moving {
             self.spectrum_tick = None;
         }
         let (low, high) = spectrum_colors(palette, colors.accent, dark);
         let height = SPECTRUM_HEIGHT;
-        let mut bars = div().h(px(height)).flex().items_end().gap(px(3.));
-        let levels = self.spectrum.levels();
-        let peaks = self.spectrum.peaks();
-        for band in 0..SPECTRUM_BANDS {
-            let color = mix(low, high, band as f32 / (SPECTRUM_BANDS - 1) as f32);
-            let level = levels[band];
-            let peak = peaks[band];
-            bars = bars.child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .relative()
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .h(px((level * height).max(2.)))
-                            .rounded_t(px(2.))
-                            .bg(linear_gradient(
+        let levels = *self.spectrum.levels();
+        let peaks = *self.spectrum.peaks();
+        // One canvas instead of ~100 positioned divs keeps per-frame layout cheap.
+        let bars = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let gap = 3.;
+                let width = f32::from(bounds.size.width);
+                let bar =
+                    ((width - gap * (SPECTRUM_BANDS - 1) as f32) / SPECTRUM_BANDS as f32).max(1.);
+                let bottom = f32::from(bounds.bottom());
+                for band in 0..SPECTRUM_BANDS {
+                    let color = mix(low, high, band as f32 / (SPECTRUM_BANDS - 1) as f32);
+                    let left = f32::from(bounds.left()) + band as f32 * (bar + gap);
+                    let level = (levels[band] * height).max(2.);
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(
+                                point(px(left), px(bottom - level)),
+                                size(px(bar), px(level)),
+                            ),
+                            linear_gradient(
                                 0.,
                                 linear_color_stop(color.opacity(0.25), 0.),
                                 linear_color_stop(color.opacity(0.95), 1.),
-                            )),
-                    )
-                    .when(peak > 0.02, |band| {
-                        band.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom(px(peak * height + 2.))
-                                .h(px(2.))
-                                .rounded_full()
-                                .bg(color.opacity(0.9)),
+                            ),
                         )
-                    }),
-            );
-        }
+                        .corner_radii(Corners {
+                            top_left: px(2.),
+                            top_right: px(2.),
+                            bottom_left: px(0.),
+                            bottom_right: px(0.),
+                        }),
+                    );
+                    let peak = peaks[band];
+                    if peak > 0.02 {
+                        let top = bottom - peak * height - 4.;
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(point(px(left), px(top)), size(px(bar), px(2.))),
+                                color.opacity(0.9),
+                            )
+                            .corner_radii(px(1.)),
+                        );
+                    }
+                }
+            },
+        )
+        .w_full()
+        .h(px(height));
         let mut scale = div().relative().h(px(14.)).mt_1();
         for (hz, label) in [
             (60., "60"),
@@ -6252,6 +6456,24 @@ impl MusicApp {
                             |layout, value| layout.explorer_browser = value,
                         )
                         .keywords(["filter", "genre"]),
+                    )
+                    .item(
+                        layout_switch(
+                            app.clone(),
+                            "Spectrum visualizer",
+                            "Frequency bars in Now Playing. Turn off to save energy.",
+                            true,
+                            false,
+                            |layout| layout.show_spectrum,
+                            |layout, value| layout.show_spectrum = value,
+                        )
+                        .keywords([
+                            "visualizer",
+                            "spectrum",
+                            "cpu",
+                            "battery",
+                            "now playing",
+                        ]),
                     ),
             )
             .group(
@@ -6928,9 +7150,6 @@ impl Render for MusicApp {
             .update(cx, |cache, cx| cache.begin_frame(window, cx));
         let colors = ink(cx);
         let body = if self.workspace == Workspace::NowPlaying && !self.settings {
-            if self.playback.playing && window.is_window_active() {
-                window.request_animation_frame();
-            }
             self.now_playing_view(window, cx)
         } else {
             let floating = self.navigator_floats();

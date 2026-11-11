@@ -7,6 +7,7 @@ use sonora::{
     platform::{Paths, shortcut},
     service::{Command, Service},
 };
+use std::time::Duration;
 use ui::*;
 
 fn main() -> Result<()> {
@@ -164,6 +165,8 @@ fn open(service: Service, events: flume::Receiver<sonora::service::Event>, cx: &
         }),
         // Route clicks in our custom title bar to its controls instead of AppKit zoom/drag.
         app_owns_titlebar_drag: true,
+        // Stay smooth while another app has focus, capped at 60 fps to save power.
+        inactive_frame_interval: Some(Duration::from_micros(16_667)),
         ..Default::default()
     };
     gpui_kit::open_window(options, cx, move |window, cx| {
