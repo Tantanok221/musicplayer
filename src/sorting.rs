@@ -25,6 +25,8 @@ pub enum Field {
     Duration,
     Format,
     ReleaseType,
+    /// A shuffle that holds still for one seed.
+    Random,
 }
 impl Field {
     pub fn choices(scope: Scope) -> &'static [Self] {
@@ -40,6 +42,7 @@ impl Field {
                 Plays,
                 Duration,
                 ReleaseType,
+                Random,
             ],
             Scope::Tracks => &[
                 Title,
@@ -70,6 +73,7 @@ impl Field {
             Self::Duration => "Duration",
             Self::Format => "Format",
             Self::ReleaseType => "Release type",
+            Self::Random => "Random",
         }
     }
     pub fn direction_label(self, descending: bool) -> &'static str {
@@ -125,6 +129,8 @@ pub struct SortSpec {
     pub grouping: Grouping,
     pub group_descending: bool,
     pub ignore_the: bool,
+    /// Picks the order of a random sort; a new seed reshuffles.
+    pub seed: u64,
 }
 impl Default for SortSpec {
     fn default() -> Self {
@@ -187,6 +193,7 @@ impl SortSpec {
     pub fn preset(&self) -> Option<Preset> {
         Preset::choices(self.scope).iter().copied().find(|preset| {
             let mut base = preset.spec(self.scope);
+            base.seed = self.seed;
             if let Some(rule) = self.rules.first() {
                 base.rules[0].descending = rule.descending;
                 if base.grouping == Grouping::AlbumArtist {
@@ -241,6 +248,20 @@ impl SortSpec {
             Grouping::ReleaseType => release_label(release_rank(&album.release_types)).into(),
         }
     }
+    pub fn is_random(&self) -> bool {
+        self.rules
+            .first()
+            .is_some_and(|rule| rule.field == Field::Random)
+    }
+    /// A random album order that differs from the last one.
+    pub fn shuffled(scope: Scope) -> Self {
+        let mut spec = Preset::Random.spec(scope);
+        spec.seed = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .unsigned_abs();
+        spec
+    }
     pub fn depends_on(&self, field: Field) -> bool {
         self.rules.iter().any(|r| r.field == field)
     }
@@ -268,6 +289,7 @@ impl SortSpec {
             grouping: Grouping::None,
             group_descending: false,
             ignore_the: true,
+            seed: 0,
         }
         .validated(scope)
     }
@@ -285,12 +307,21 @@ pub enum Preset {
     Title,
     ArtistTitle,
     Duration,
+    Random,
 }
 impl Preset {
     pub fn choices(scope: Scope) -> &'static [Self] {
         use Preset::*;
         match scope {
-            Scope::Albums => &[ArtistAlbum, Album, ReleaseDate, Added, Rating, Plays],
+            Scope::Albums => &[
+                ArtistAlbum,
+                Album,
+                ReleaseDate,
+                Added,
+                Rating,
+                Plays,
+                Random,
+            ],
             Scope::Tracks => &[
                 Title,
                 ArtistTitle,
@@ -314,6 +345,7 @@ impl Preset {
             Self::Title => "Track title",
             Self::ArtistTitle => "Track artist / Title",
             Self::Duration => "Duration",
+            Self::Random => "Random",
         }
     }
     pub fn spec(self, scope: Scope) -> SortSpec {
@@ -329,6 +361,7 @@ impl Preset {
             Self::Title => vec![(Title, false), (Artist, false)],
             Self::ArtistTitle => vec![(Artist, false), (Title, false)],
             Self::Duration => vec![(Duration, false), (Title, false)],
+            Self::Random => vec![(Random, false)],
         };
         SortSpec {
             scope,
@@ -340,6 +373,7 @@ impl Preset {
             },
             group_descending: false,
             ignore_the: true,
+            seed: 0,
         }
     }
 }
@@ -683,6 +717,17 @@ fn expression(field: Field, spec: &SortSpec, tracks: bool) -> Vec<String> {
         Field::Duration => vec![format!("{alias}.duration")],
         Field::Format => vec!["s.format".into()],
         Field::ReleaseType => vec!["a.release_type".into()],
+        // The seed is a number, so it is safe to place in the SQL. Tracks follow
+        // their album so a shuffled album still plays in order.
+        Field::Random => vec![format!(
+            "shuffle_key({},{})",
+            spec.seed as i64,
+            if tracks {
+                "tracks.album_id"
+            } else {
+                "albums.id"
+            }
+        )],
     }
 }
 
@@ -731,4 +776,20 @@ pub(crate) fn order(spec: &SortSpec, tracks: bool) -> String {
         terms.extend(["a.album_artist ASC", "a.title ASC", "albums.id ASC"].map(str::to_string));
     }
     format!(" ORDER BY {}", terms.join(","))
+}
+
+/// A well-mixed position for `id` within the shuffle chosen by `seed`.
+pub fn shuffle_key(seed: u64, id: &str) -> i64 {
+    // FNV-1a, then a SplitMix64 finish so similar IDs land far apart.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash as i64
 }

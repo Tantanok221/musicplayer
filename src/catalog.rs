@@ -104,6 +104,17 @@ impl Catalog {
             },
         )?;
         conn.create_scalar_function(
+            "shuffle_key",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let seed = context.get::<i64>(0)? as u64;
+                let id = context.get::<Option<String>>(1)?.unwrap_or_default();
+                Ok(sorting::shuffle_key(seed, &id))
+            },
+        )?;
+        conn.create_scalar_function(
             "artist_matches",
             2,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8

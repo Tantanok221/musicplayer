@@ -450,3 +450,48 @@ fn invalid_or_duplicate_saved_rules_are_validated_for_the_view() {
     assert_eq!(validated.rules, [Rule::new(Field::Album, false)]);
     assert_eq!(validated.grouping, Grouping::None);
 }
+
+#[test]
+fn random_sort_is_stable_per_seed_and_keeps_album_tracks_together() {
+    let mut db = Catalog::memory().unwrap();
+    let list = (0..30)
+        .map(|n| album(&format!("al-{n:02}"), &format!("Album {n}"), "Artist", None))
+        .collect::<Vec<_>>();
+    seed(&mut db, &list);
+    let extra = (2..4)
+        .map(|n| track(&format!("al-05-extra-{n}"), &list[5], n))
+        .collect::<Vec<_>>();
+    db.put_tracks(&extra, 2).unwrap();
+    let shuffle = |seed| SortSpec {
+        seed,
+        ..Preset::Random.spec(Scope::Albums)
+    };
+    let first = albums(&db, shuffle(1));
+    let sorted = albums(&db, Preset::Album.spec(Scope::Albums));
+    assert_eq!(first.len(), 30);
+    assert_eq!(first, albums(&db, shuffle(1)));
+    assert_ne!(first, albums(&db, shuffle(2)));
+    assert_ne!(first, sorted);
+    let mut every = first.clone();
+    every.sort();
+    let mut expected = sorted.clone();
+    expected.sort();
+    assert_eq!(every, expected);
+    // Tracks follow the shuffled albums and an album plays in its own order.
+    let ids = tracks(&db, shuffle(1));
+    let at = ids.iter().position(|id| id == "track-al-05").unwrap();
+    assert_eq!(
+        &ids[at..at + 3],
+        ["track-al-05", "al-05-extra-2", "al-05-extra-3"]
+    );
+    // The seed does not stop a saved random sort from counting as the preset.
+    let spec = shuffle(42);
+    assert_eq!(spec.preset(), Some(Preset::Random));
+    assert!(spec.is_random() && spec.alphabetical_field().is_none());
+    let mut saved = Preferences::default();
+    saved.sorting.set(spec.clone());
+    assert_eq!(saved.sorting.get(Scope::Albums), spec);
+    assert_ne!(SortSpec::shuffled(Scope::Albums).seed, 0);
+    // Random is an album order only.
+    assert!(!Preset::choices(Scope::Tracks).contains(&Preset::Random));
+}

@@ -42,7 +42,12 @@ impl MusicApp {
             .tooltip(format!("Sort: {name}\n{}", current.summary()))
             .dropdown_menu(move |mut menu, _, _| {
                 for preset in Preset::choices(scope) {
-                    let spec = preset.spec(scope);
+                    // Picking Random, even again, deals a fresh order.
+                    let spec = if *preset == Preset::Random {
+                        SortSpec::shuffled(scope)
+                    } else {
+                        preset.spec(scope)
+                    };
                     let enabled = spec
                         .rules
                         .first()
@@ -61,7 +66,18 @@ impl MusicApp {
                         }),
                     );
                 }
-                if let Some(rule) = current.rules.first() {
+                if current.is_random() {
+                    let weak = weak.clone();
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Shuffle again").on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.apply_sort(SortSpec::shuffled(scope), cx)
+                                });
+                            }),
+                        );
+                } else if let Some(rule) = current.rules.first() {
                     menu = menu.separator();
                     for descending in [false, true] {
                         let mut spec = current.clone();
