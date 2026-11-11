@@ -7,7 +7,7 @@ use gpui_kit::component::{
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     radio::{Radio, RadioGroup},
     resizable::{h_resizable, resizable_panel, v_resizable},
-    setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     *,
 };
@@ -57,7 +57,6 @@ actions!(
         GoForward,
         Refresh,
         ToggleNavigator,
-        ToggleNavigatorAutoHide,
         ToggleInformation,
         ToggleBrowser,
         RestoreLayout,
@@ -328,6 +327,22 @@ fn credential_field(
         None => item,
     }
 }
+/// Position of the Layout page among the settings pages.
+const LAYOUT_SETTINGS_PAGE: usize = 4;
+
+/// The navigator as one choice: docked, sliding in from the edge, or gone.
+fn navigator_key(layout: &LayoutPreferences) -> &'static str {
+    match (layout.show_navigator, layout.navigator_auto_hide) {
+        (false, _) => "disabled",
+        (true, true) => "auto",
+        (true, false) => "show",
+    }
+}
+fn set_navigator(layout: &mut LayoutPreferences, key: &str) {
+    layout.show_navigator = key != "disabled";
+    layout.navigator_auto_hide = key == "auto";
+}
+
 fn layout_switch(
     app: WeakEntity<MusicApp>,
     title: &'static str,
@@ -350,6 +365,7 @@ fn layout_switch(
             move |value, cx: &mut App| {
                 let _ = app.update(cx, |app, cx| {
                     set(&mut app.preferences.layout, value);
+                    app.settings_page = LAYOUT_SETTINGS_PAGE;
                     app.save_preferences();
                     cx.notify();
                 });
@@ -389,6 +405,7 @@ fn layout_choice<const N: usize>(
                     };
                     let _ = app.update(cx, |app, cx| {
                         apply(&mut app.preferences.layout, key);
+                        app.settings_page = LAYOUT_SETTINGS_PAGE;
                         app.save_preferences();
                         cx.notify();
                     });
@@ -400,6 +417,7 @@ fn layout_choice<const N: usize>(
             move |_, cx| {
                 let _ = app.update(cx, |app, cx| {
                     apply(&mut app.preferences.layout, default_key);
+                    app.settings_page = LAYOUT_SETTINGS_PAGE;
                     app.save_preferences();
                     cx.notify();
                 });
@@ -557,6 +575,9 @@ pub struct MusicApp {
     volume_before_mute: Option<f32>,
     account: Option<Account>,
     settings: bool,
+    /// The settings page to reopen when the settings view is rebuilt, as it
+    /// is when the navigator is docked or undocked.
+    settings_page: usize,
     tracks: Vec<Arc<Track>>,
     track_total: usize,
     loading_more: bool,
@@ -795,6 +816,7 @@ impl MusicApp {
             volume_before_mute: None,
             account: None,
             settings: false,
+            settings_page: 0,
             tracks: vec![],
             track_total: 0,
             loading_more: false,
@@ -2096,8 +2118,8 @@ impl MusicApp {
                     ),
                 )
             });
-        let navigator = self.preferences.layout.show_navigator;
-        let auto_hide = self.preferences.layout.navigator_auto_hide;
+        let navigator = navigator_key(&self.preferences.layout);
+        let weak = cx.weak_entity();
         let info = self.preferences.layout.show_information;
         let browser = self.browser_visible();
         div()
@@ -2158,32 +2180,42 @@ impl MusicApp {
             )
             .child(
                 short_button("layout-menu", Glyph::PanelsTopLeft, "Configure layout")
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.item(
-                            PopupMenuItem::new("Navigator and artist browser")
-                                .checked(navigator)
-                                .action(Box::new(ToggleNavigator)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Auto-hide navigator")
-                                .checked(auto_hide)
-                                .disabled(!navigator)
-                                .action(Box::new(ToggleNavigatorAutoHide)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Queue and information")
-                                .checked(info)
-                                .action(Box::new(ToggleInformation)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Column browser")
-                                .checked(browser)
-                                .action(Box::new(ToggleBrowser)),
-                        )
-                        .separator()
-                        .menu("Restore initial layout", Box::new(RestoreLayout))
-                        .separator()
-                        .menu("Settings…", Box::new(OpenSettings))
+                    .dropdown_menu(move |mut menu, _, _| {
+                        menu = menu.label("Navigator and artist browser");
+                        for (key, label) in [
+                            ("show", "Show"),
+                            ("auto", "Auto-hide"),
+                            ("disabled", "Disabled"),
+                        ] {
+                            let weak = weak.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(label)
+                                    .checked(navigator == key)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |app, cx| {
+                                            set_navigator(&mut app.preferences.layout, key);
+                                            app.navigator_peek = None;
+                                            app.save_preferences();
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        menu.separator()
+                            .item(
+                                PopupMenuItem::new("Queue and information")
+                                    .checked(info)
+                                    .action(Box::new(ToggleInformation)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Column browser")
+                                    .checked(browser)
+                                    .action(Box::new(ToggleBrowser)),
+                            )
+                            .separator()
+                            .menu("Restore initial layout", Box::new(RestoreLayout))
+                            .separator()
+                            .menu("Settings…", Box::new(OpenSettings))
                     }),
             )
             .child(
@@ -6476,10 +6508,15 @@ impl MusicApp {
             .child(
                 Settings::new("sonora-settings")
                     .small()
+                    .default_selected_index(SelectIndex {
+                        page_ix: self.settings_page,
+                        group_ix: None,
+                    })
                     .page(self.library_settings(app.clone()))
                     .page(self.playback_settings(app.clone()))
                     .page(self.download_settings(app.clone()))
                     .page(self.appearance_settings(app.clone()))
+                    // Keep the Layout page at LAYOUT_SETTINGS_PAGE.
                     .page(self.layout_settings(app)),
             )
             .into_any_element()
@@ -6797,28 +6834,20 @@ impl MusicApp {
                 SettingGroup::new()
                     .title("Panels")
                     .item(
-                        layout_switch(
+                        layout_choice(
                             app.clone(),
                             "Navigator and artist browser",
-                            "The library list on the left.",
-                            true,
-                            false,
-                            |layout| layout.show_navigator,
-                            |layout, value| layout.show_navigator = value,
+                            "The library list on the left. Auto-hide keeps it out of the way until the pointer reaches the left edge.",
+                            [
+                                ("show", "Show"),
+                                ("auto", "Auto-hide"),
+                                ("disabled", "Disabled"),
+                            ],
+                            "show",
+                            navigator_key(&layout),
+                            set_navigator,
                         )
-                        .keywords(["sidebar"]),
-                    )
-                    .item(
-                        layout_switch(
-                            app.clone(),
-                            "Auto-hide navigator",
-                            "Stays hidden until the pointer reaches the left edge.",
-                            false,
-                            !layout.show_navigator,
-                            |layout| layout.navigator_auto_hide,
-                            |layout, value| layout.navigator_auto_hide = value,
-                        )
-                        .keywords(["hover"]),
+                        .keywords(["sidebar", "hover", "auto-hide", "hide"]),
                     )
                     .item(
                         layout_switch(
@@ -7536,6 +7565,9 @@ impl Render for MusicApp {
         self.image_cache
             .update(cx, |cache, cx| cache.begin_frame(window, cx));
         let colors = ink(cx);
+        if !self.settings {
+            self.settings_page = 0;
+        }
         let body = if self.workspace == Workspace::NowPlaying && !self.settings {
             self.now_playing_view(window, cx)
         } else {
@@ -7747,13 +7779,6 @@ impl Render for MusicApp {
             }))
             .on_action(cx.listener(|app, _: &ToggleNavigator, _, cx| {
                 app.preferences.layout.show_navigator = !app.preferences.layout.show_navigator;
-                app.save_preferences();
-                cx.notify();
-            }))
-            .on_action(cx.listener(|app, _: &ToggleNavigatorAutoHide, _, cx| {
-                app.preferences.layout.navigator_auto_hide =
-                    !app.preferences.layout.navigator_auto_hide;
-                app.navigator_peek = None;
                 app.save_preferences();
                 cx.notify();
             }))
