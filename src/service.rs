@@ -293,7 +293,9 @@ fn discography_view(
         downloading: catalog
             .state::<Vec<DownloadJob>>(DOWNLOADS)?
             .into_iter()
-            .filter(|job| job.artist == key && job.state != JobState::Downloaded)
+            // Only a running download keeps its release listed; a failed one that the
+            // library holds anyway (e.g. most files arrived) counts as owned.
+            .filter(|job| job.artist == key && job.state == JobState::Active)
             .map(|job| job.release)
             .collect(),
     };
@@ -304,7 +306,8 @@ fn discography_view(
     })
 }
 
-/// Shows the artist's missing releases and forgets downloads the library now holds.
+/// Shows the artist's missing releases and forgets finished or failed downloads
+/// the library now holds.
 fn publish_discography(
     catalog: &Catalog,
     events: &Sender<Event>,
@@ -318,7 +321,7 @@ fn publish_discography(
     let before = jobs.len();
     jobs.retain(|job| {
         job.artist != key
-            || job.state != JobState::Downloaded
+            || job.state == JobState::Active
             || view.loading
             || view.missing.iter().any(|release| release.id == job.release)
     });
@@ -817,9 +820,10 @@ fn run(
                         let mut finished = catalog
                             .state::<Vec<DownloadJob>>(DOWNLOADS)?
                             .into_iter()
-                            .filter(|job| job.state == JobState::Downloaded)
+                            .filter(|job| job.state != JobState::Active)
                             .map(|job| job.artist)
                             .collect::<Vec<_>>();
+                        finished.sort();
                         finished.dedup();
                         for key in finished {
                             // The key is the artist's normalised name and ID, which is all a lookup needs.
@@ -1114,6 +1118,7 @@ fn run(
                         }
                         let mut job = DownloadJob {
                             artist: cache_key(&artist, &artist_id),
+                            artist_name: artist.clone(),
                             release,
                             title,
                             username: candidate.username.clone(),
@@ -1727,4 +1732,80 @@ fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discography::ReleaseGroup;
+
+    fn job(release: &str, state: JobState) -> DownloadJob {
+        DownloadJob {
+            artist: cache_key("ONE OK ROCK", "artist-id"),
+            release: release.into(),
+            state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_downloads_the_library_now_holds_are_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open(&dir.path().join("library.sqlite")).unwrap();
+        let key = cache_key("ONE OK ROCK", "artist-id");
+        let group = |id: &str, title: &str| ReleaseGroup {
+            id: id.into(),
+            title: title.into(),
+            primary: "Album".into(),
+            date: "2010-01-01".into(),
+            official: true,
+            ..Default::default()
+        };
+        catalog
+            .set_state(
+                &format!("discography:v1:{key}"),
+                &Discography {
+                    artist: "artist-id".into(),
+                    groups: vec![
+                        group("owned-failed", "Skyfall"),
+                        group("missing-failed", "Luxury Disease"),
+                        group("owned-active", "Eye of the Storm"),
+                    ],
+                    fetched_ms: 1,
+                },
+            )
+            .unwrap();
+        // Most files of each owned release reached the library.
+        let album = |name: &str| Album {
+            id: name.into(),
+            name: name.into(),
+            artist: "ONE OK ROCK".into(),
+            artist_id: "artist-id".into(),
+            ..Default::default()
+        };
+        catalog
+            .put_albums(&[album("Skyfall"), album("Eye of the Storm")], 1)
+            .unwrap();
+        catalog
+            .set_state(
+                DOWNLOADS,
+                &vec![
+                    job("owned-failed", JobState::Failed),
+                    job("missing-failed", JobState::Failed),
+                    job("owned-active", JobState::Active),
+                ],
+            )
+            .unwrap();
+        let (events, received) = flume::unbounded();
+        publish_discography(&catalog, &events, "one ok rock", "artist-id", false).unwrap();
+        let kept: Vec<DownloadJob> = catalog.state(DOWNLOADS).unwrap();
+        let kept: Vec<_> = kept.iter().map(|job| job.release.as_str()).collect();
+        // A failed release still absent stays to pick another folder; a running one stays.
+        assert_eq!(kept, ["missing-failed", "owned-active"]);
+        assert!(
+            received
+                .try_iter()
+                .any(|event| matches!(event, Event::Downloads(jobs) if jobs.len() == 2))
+        );
+    }
 }

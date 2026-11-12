@@ -426,6 +426,8 @@ pub enum JobState {
 pub struct DownloadJob {
     /// Cache key of the artist page the release was picked from.
     pub artist: String,
+    /// The artist as displayed; empty for jobs saved before it was kept.
+    pub artist_name: String,
     /// MusicBrainz release group.
     pub release: String,
     pub title: String,

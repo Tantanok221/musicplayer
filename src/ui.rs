@@ -40,6 +40,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod album_feedback;
+mod downloads;
 mod queue_controls;
 use queue_controls::QueueViewState;
 mod sorting_controls;
@@ -469,6 +470,10 @@ struct DownloadStart {
     /// The search result that was clicked.
     candidate: usize,
     username: String,
+    title: String,
+    /// The artist page's cache key and the artist as displayed.
+    artist_key: String,
+    artist_name: String,
     /// Why slskd refused; the results stay so another folder can be picked.
     failure: Option<String>,
 }
@@ -2471,6 +2476,8 @@ impl MusicApp {
                             .id(("navigator-facet", i))
                             .role(Role::Button)
                             .aria_label(format!("Browse {}: {}", mode.label(), item.label))
+                            // List rows shrink to their text unless told to fill.
+                            .w_full()
                             .h(px(45.))
                             .px_2()
                             .flex()
@@ -2835,6 +2842,7 @@ impl MusicApp {
                         self.workspace == Workspace::Queue && self.artist_name.is_none(),
                         |s| s.child(self.queue_toolbar(cx)),
                     )
+                    .children(self.downloads_button(cx))
                     .child(
                         short_button("refresh-library", Glyph::RefreshCw, "Refresh library")
                             .on_click(
@@ -2903,6 +2911,8 @@ impl MusicApp {
                                         .id(("browser-value", i))
                                         .role(Role::Button)
                                         .aria_label(format!("Filter {label}: {}", item.label))
+                                        // List rows shrink to their text unless told to fill.
+                                        .w_full()
                                         .h(px(22.))
                                         .px_2()
                                         .flex()
@@ -4041,7 +4051,8 @@ impl MusicApp {
                 )
                 .into_any_element();
         }
-        let (_, side) = cover_layout((self.library_width - 8.).max(0.));
+        let (columns, side) = cover_layout((self.library_width - 8.).max(0.));
+        let columns = columns.max(1);
         for category in [
             ReleaseCategory::Album,
             ReleaseCategory::Ep,
@@ -4063,14 +4074,14 @@ impl MusicApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(format!("{} ({})", category.label(), releases.len())),
             );
-            let mut cards = div().flex().flex_wrap().gap_4();
+            let mut cards = Vec::with_capacity(releases.len());
             for album in &releases {
                 let open = album.clone();
                 let selected = self
                     .selected_album
                     .as_ref()
                     .is_some_and(|selected| selected.id == album.id);
-                cards = cards.child(
+                cards.push(
                     div()
                         .id(SharedString::from(format!("artist-release-{}", album.id)))
                         .role(Role::Button)
@@ -4111,32 +4122,40 @@ impl MusicApp {
                                 app.service.send(Command::PlayAlbum(open.id.clone()));
                             }
                         }))
-                        .context_menu(self.album_menu(album.id.clone())),
+                        .context_menu(self.album_menu(album.id.clone()))
+                        .into_any_element(),
                 );
             }
-            if releases.is_empty() {
-                section = section.child(
+            // The album panel opens right under the row holding the picked cover.
+            let selected = self.selected_album.clone().and_then(|selected| {
+                releases
+                    .iter()
+                    .position(|album| album.id == selected.id)
+                    .map(|index| (index / columns, selected))
+            });
+            let mut panel = selected.as_ref().map(|(_, album)| {
+                div()
+                    .border_y_1()
+                    .border_color(colors.line)
+                    .child(self.album_panel(album.clone(), false, true, cx))
+                    .into_any_element()
+            });
+            let panel_row = selected.map(|(row, _)| row);
+            let mut grid = div().flex().flex_col().gap_4().min_w_0();
+            let mut cards = cards.into_iter();
+            for row in 0..releases.len().div_ceil(columns) {
+                grid = grid.child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(colors.muted)
-                        .child("No releases in this category."),
+                        .flex()
+                        .gap_4()
+                        .min_w_0()
+                        .children(cards.by_ref().take(columns)),
                 );
-            } else {
-                section = section.child(cards);
+                if panel_row == Some(row) {
+                    grid = grid.children(panel.take());
+                }
             }
-            if let Some(album) = self
-                .selected_album
-                .clone()
-                .filter(|selected| releases.iter().any(|album| album.id == selected.id))
-            {
-                section = section.child(
-                    div()
-                        .mt_3()
-                        .border_y_1()
-                        .border_color(colors.line)
-                        .child(self.album_panel(album, false, true, cx)),
-                );
-            }
+            section = section.child(grid);
             page = page.child(section);
         }
         let missing = self.missing_releases(&name, cx);
@@ -4937,6 +4956,9 @@ impl MusicApp {
                                     release: request.release.clone(),
                                     candidate: index,
                                     username: request.candidate.username.clone(),
+                                    title: request.title.clone(),
+                                    artist_key: cache_key(&request.artist, &request.artist_id),
+                                    artist_name: request.artist.clone(),
                                     failure: None,
                                 });
                                 app.service
@@ -7418,12 +7440,6 @@ impl MusicApp {
     }
     fn status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let downloads = self
-            .downloads
-            .iter()
-            .filter(|job| job.state != JobState::Failed)
-            .map(|job| format!(" · {}: {}", job.title, download_caption(job)))
-            .collect::<String>();
         let queue_time = self.playback.queue.iter().map(|t| t.duration).sum::<f64>();
         let library = format!(
             "{} tracks · {} albums",
@@ -7437,9 +7453,9 @@ impl MusicApp {
             .filter(|id| !id.starts_with("remote:https://coverartarchive.org/"))
             .count();
         let artwork_status = if failed_covers == 0 {
-            downloads
+            String::new()
         } else {
-            format!("{downloads} · {failed_covers} covers failed; Refresh to retry")
+            format!(" · {failed_covers} covers failed; Refresh to retry")
         };
         div()
             .id("library-status")
