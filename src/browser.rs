@@ -294,9 +294,311 @@ impl Default for LayoutPreferences {
     }
 }
 
+/// One page of the app: what a tab shows and what Back and Forward return to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Page {
+    pub workspace: Workspace,
+    /// Artist name and ID when an artist page is open.
+    pub artist: Option<(String, String)>,
+    /// The music explorer's filters, sort and search.
+    pub query: crate::model::LibraryQuery,
+    /// Playlist ID and name when a playlist is open.
+    pub playlist: Option<(String, String)>,
+    /// Search text of the queue or playlists page.
+    pub search: String,
+}
+impl Page {
+    pub fn of(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            ..Default::default()
+        }
+    }
+    pub fn title(&self) -> String {
+        if let Some((name, _)) = &self.artist {
+            return name.clone();
+        }
+        match self.workspace {
+            Workspace::Explorer if self.query.favorites => "Favorites".into(),
+            Workspace::Playlists => self
+                .playlist
+                .as_ref()
+                .map_or_else(|| "Playlists".into(), |(_, name)| name.clone()),
+            workspace => workspace.label().into(),
+        }
+    }
+}
+
+/// A top-bar tab. With no page it is an empty "New Tab".
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tab {
+    pub id: u64,
+    pub page: Option<Page>,
+    /// Locked tabs cannot be closed, but can still be navigated.
+    pub locked: bool,
+    /// The page a locked tab was locked on. The tab keeps its name while the
+    /// user browses elsewhere in it, and clicking the tab returns here.
+    pub home: Option<Page>,
+}
+impl Tab {
+    pub fn title(&self) -> String {
+        self.home_page()
+            .or(self.page.as_ref())
+            .map_or_else(|| "New Tab".into(), Page::title)
+    }
+    /// Where a locked tab returns when clicked; unlocked tabs have no home.
+    pub fn home_page(&self) -> Option<&Page> {
+        self.locked.then_some(()).and(self.home.as_ref())
+    }
+}
+
+/// The user's tabs, kept in preferences so they survive restarts and new builds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tabs {
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+}
+impl Default for Tabs {
+    fn default() -> Self {
+        Self {
+            tabs: Workspace::ALL
+                .into_iter()
+                .zip(1..)
+                .map(|(workspace, id)| Tab {
+                    id,
+                    page: Some(Page::of(workspace)),
+                    ..Default::default()
+                })
+                .collect(),
+            active: 0,
+        }
+    }
+}
+impl Tabs {
+    /// Repairs a saved list: never empty, unique IDs, and a valid active tab.
+    pub fn normalized(mut self) -> Self {
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab {
+                id: 1,
+                ..Default::default()
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut next = self.tabs.iter().map(|tab| tab.id).max().unwrap_or(0) + 1;
+        for tab in &mut self.tabs {
+            if tab.id == 0 || !seen.insert(tab.id) {
+                tab.id = next;
+                seen.insert(next);
+                next += 1;
+            }
+            // Tabs locked before homes existed keep the page they show.
+            if !tab.locked {
+                tab.home = None;
+            } else if tab.home.is_none() {
+                tab.home = tab.page.clone();
+            }
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        self
+    }
+    pub fn active(&self) -> &Tab {
+        &self.tabs[self.active.min(self.tabs.len() - 1)]
+    }
+    pub fn active_mut(&mut self) -> &mut Tab {
+        let ix = self.active.min(self.tabs.len() - 1);
+        &mut self.tabs[ix]
+    }
+    fn next_id(&self) -> u64 {
+        self.tabs.iter().map(|tab| tab.id).max().unwrap_or(0) + 1
+    }
+    /// Adds an empty tab after the active one and makes it active.
+    pub fn new_tab(&mut self) -> u64 {
+        let id = self.next_id();
+        let at = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(
+            at,
+            Tab {
+                id,
+                ..Default::default()
+            },
+        );
+        self.active = at;
+        id
+    }
+    /// Closes an unlocked tab. Closing the active tab activates its right
+    /// neighbour, or the left one at the end; the last tab becomes empty.
+    pub fn close(&mut self, ix: usize) -> bool {
+        if self.tabs.get(ix).is_none_or(|tab| tab.locked) {
+            return false;
+        }
+        if self.tabs.len() == 1 {
+            let id = self.tabs[0].id;
+            self.tabs[0] = Tab {
+                id,
+                ..Default::default()
+            };
+            return true;
+        }
+        self.tabs.remove(ix);
+        if ix < self.active || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        true
+    }
+    /// Puts a closed tab back where it was and makes it active. A lone empty
+    /// tab, as closing the last tab leaves, is replaced rather than kept.
+    /// Returns the tab's ID, which changes if another tab has taken it.
+    pub fn reopen(&mut self, ix: usize, mut tab: Tab) -> u64 {
+        if self.tabs.len() == 1 && self.tabs[0].page.is_none() && !self.tabs[0].locked {
+            self.tabs[0] = tab;
+            self.active = 0;
+            return self.tabs[0].id;
+        }
+        if tab.id == 0 || self.tabs.iter().any(|other| other.id == tab.id) {
+            tab.id = self.next_id();
+        }
+        let ix = ix.min(self.tabs.len());
+        let id = tab.id;
+        self.tabs.insert(ix, tab);
+        self.active = ix;
+        id
+    }
+    /// Moves a tab, keeping the same tab active.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let active = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active)
+            .unwrap_or(0);
+    }
+    pub fn toggle_lock(&mut self, ix: usize) {
+        if let Some(tab) = self.tabs.get_mut(ix) {
+            tab.locked = !tab.locked;
+            tab.home = if tab.locked { tab.page.clone() } else { None };
+        }
+    }
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_tabs_are_the_four_workspaces() {
+        let tabs = Tabs::default();
+        let titles: Vec<_> = tabs.tabs.iter().map(Tab::title).collect();
+        assert_eq!(
+            titles,
+            ["Music Explorer", "Queue", "Playlists", "Now Playing"]
+        );
+        assert_eq!(tabs.active, 0);
+        assert!(tabs.tabs.iter().all(|tab| !tab.locked));
+    }
+    #[test]
+    fn closing_respects_locks_neighbours_and_the_last_tab() {
+        let mut tabs = Tabs {
+            active: 1,
+            ..Default::default()
+        };
+        tabs.toggle_lock(1);
+        assert!(!tabs.close(1), "a locked tab stays");
+        tabs.toggle_lock(1);
+        assert!(tabs.close(1));
+        assert_eq!(
+            tabs.active().title(),
+            "Playlists",
+            "the right neighbour takes over"
+        );
+        tabs.active = 2;
+        assert!(tabs.close(2));
+        assert_eq!(
+            tabs.active().title(),
+            "Playlists",
+            "at the end the left one does"
+        );
+        assert!(tabs.close(0));
+        assert_eq!(tabs.active, 0);
+        assert!(tabs.close(0));
+        assert_eq!(tabs.tabs.len(), 1);
+        assert!(tabs.tabs[0].page.is_none(), "the last tab becomes empty");
+    }
+    #[test]
+    fn new_tabs_open_empty_after_the_active_one() {
+        let mut tabs = Tabs::default();
+        let id = tabs.new_tab();
+        assert_eq!(tabs.active, 1);
+        assert_eq!(tabs.active().id, id);
+        assert_eq!(tabs.active().title(), "New Tab");
+        assert_eq!(tabs.tabs.len(), 5);
+    }
+    #[test]
+    fn moving_keeps_the_active_tab_and_reset_restores_defaults() {
+        let mut tabs = Tabs {
+            active: 2,
+            ..Default::default()
+        };
+        tabs.move_tab(2, 0);
+        assert_eq!(tabs.active, 0);
+        assert_eq!(tabs.active().title(), "Playlists");
+        tabs.move_tab(3, 1);
+        assert_eq!(tabs.active().title(), "Playlists");
+        tabs.toggle_lock(0);
+        tabs.reset();
+        assert_eq!(tabs, Tabs::default());
+    }
+    #[test]
+    fn page_titles_name_what_the_tab_shows() {
+        let artist = Page {
+            artist: Some(("ONE OK ROCK".into(), "id".into())),
+            ..Page::of(Workspace::Explorer)
+        };
+        assert_eq!(artist.title(), "ONE OK ROCK");
+        let mut favorites = Page::of(Workspace::Explorer);
+        favorites.query.favorites = true;
+        assert_eq!(favorites.title(), "Favorites");
+        let playlist = Page {
+            playlist: Some(("p".into(), "Road trip".into())),
+            ..Page::of(Workspace::Playlists)
+        };
+        assert_eq!(playlist.title(), "Road trip");
+        assert_eq!(Page::of(Workspace::Queue).title(), "Queue");
+    }
+    #[test]
+    fn saved_tabs_round_trip_and_repair() {
+        let mut tabs = Tabs::default();
+        tabs.toggle_lock(2);
+        tabs.active = 3;
+        let json = serde_json::to_string(&tabs).unwrap();
+        assert_eq!(serde_json::from_str::<Tabs>(&json).unwrap(), tabs);
+        let broken = Tabs {
+            tabs: vec![Tab::default(), Tab::default()],
+            active: 9,
+        }
+        .normalized();
+        assert_eq!(broken.active, 1);
+        assert_ne!(broken.tabs[0].id, broken.tabs[1].id);
+        assert!(
+            Tabs {
+                tabs: vec![],
+                active: 0
+            }
+            .normalized()
+            .tabs
+            .len()
+                == 1
+        );
+    }
     #[test]
     fn upstream_changes_reset_only_downstream_columns() {
         let mut selected = BrowserSelection {
@@ -323,5 +625,40 @@ mod tests {
         assert_eq!(selected.genres, ["Ambient"]);
         selected.select(BrowserColumn::Genre, None, false);
         assert!(selected.is_empty());
+    }
+    #[test]
+    fn a_locked_tab_keeps_its_home_while_browsing() {
+        let mut tabs = Tabs::default();
+        tabs.toggle_lock(0);
+        tabs.tabs[0].page = Some(Page {
+            artist: Some(("Dove Cameron".into(), "a1".into())),
+            ..Page::of(Workspace::Explorer)
+        });
+        assert_eq!(tabs.tabs[0].title(), "Music Explorer");
+        assert_eq!(
+            tabs.tabs[0].home_page(),
+            Some(&Page::of(Workspace::Explorer))
+        );
+        tabs.toggle_lock(0);
+        assert_eq!(tabs.tabs[0].title(), "Dove Cameron");
+        assert_eq!(tabs.tabs[0].home_page(), None);
+    }
+    #[test]
+    fn reopening_puts_a_tab_back_in_place() {
+        let mut tabs = Tabs::default();
+        let closed = tabs.tabs[1].clone();
+        assert!(tabs.close(1));
+        let id = tabs.reopen(1, closed.clone());
+        assert_eq!(id, closed.id);
+        assert_eq!((tabs.active, tabs.tabs[1].title()), (1, "Queue".into()));
+        // A clashing ID is replaced, and the lone empty tab gives way.
+        let mut lone = Tabs::default();
+        for _ in 0..4 {
+            lone.close(0);
+        }
+        assert_eq!(lone.tabs.len(), 1);
+        lone.reopen(0, closed);
+        assert_eq!(lone.tabs.len(), 1);
+        assert_eq!(lone.tabs[0].title(), "Queue");
     }
 }

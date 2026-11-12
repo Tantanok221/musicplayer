@@ -346,6 +346,8 @@ pub struct Preferences {
     /// Show missing singles, live albums, compilations and the like on artist pages.
     pub all_missing_releases: bool,
     pub favorites: FavoritesFilter,
+    /// The top-bar tabs and the page each one shows.
+    pub tabs: crate::browser::Tabs,
 }
 /// What counts as a favorite on the Favorites page.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -403,6 +405,7 @@ impl Default for Preferences {
             downloads: DownloadPreferences::default(),
             all_missing_releases: false,
             favorites: FavoritesFilter::default(),
+            tabs: crate::browser::Tabs::default(),
         }
     }
 }

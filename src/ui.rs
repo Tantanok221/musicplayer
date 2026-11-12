@@ -42,6 +42,7 @@ use std::{
 mod album_feedback;
 mod downloads;
 mod queue_controls;
+mod tabs;
 use queue_controls::QueueViewState;
 mod sorting_controls;
 
@@ -65,6 +66,19 @@ actions!(
         QueueWorkspace,
         PlaylistsWorkspace,
         ExplorerWorkspace,
+        NewTab,
+        CloseTab,
+        ReopenClosedTab,
+        ResetTabs,
+        SelectTab1,
+        SelectTab2,
+        SelectTab3,
+        SelectTab4,
+        SelectTab5,
+        SelectTab6,
+        SelectTab7,
+        SelectTab8,
+        SelectTab9,
         UndoQueueEdit,
         RemoveQueueSelection,
         MoveQueueEarlier,
@@ -80,13 +94,6 @@ actions!(
 
 const POPULAR_PER_ALBUM: usize = 3;
 
-/// A page Back and Forward can return to.
-#[derive(Clone, PartialEq)]
-struct Location {
-    workspace: Workspace,
-    artist: Option<(String, String)>,
-    query: LibraryQuery,
-}
 const HISTORY_LIMIT: usize = 50;
 
 /// Clicking the current rating clears it; any other star sets that rating.
@@ -504,6 +511,37 @@ fn download_caption(job: &DownloadJob) -> String {
         JobState::Active => format!("Downloading {}/{}", progress.done, progress.total),
     }
 }
+/// A tab's Back and Forward pages.
+type TabHistory = (Vec<Option<Page>>, Vec<Option<Page>>);
+
+/// A spot at one end of the tab strip for a scroll arrow, covering the tabs beneath.
+/// A short fade on its inner side lets the covered tab slip out of view.
+fn edge(background: Hsla, left: bool) -> Div {
+    let clear = background.opacity(0.);
+    let fade = div().absolute().top_0().bottom_0().w(px(20.));
+    let fade = if left {
+        fade.right(px(-20.)).bg(linear_gradient(
+            90.,
+            linear_color_stop(background, 0.),
+            linear_color_stop(clear, 1.),
+        ))
+    } else {
+        fade.left(px(-20.)).bg(linear_gradient(
+            90.,
+            linear_color_stop(clear, 0.),
+            linear_color_stop(background, 1.),
+        ))
+    };
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .bg(background)
+        .child(fade)
+}
+
 fn short_button(id: impl Into<ElementId>, icon: Glyph, label: impl Into<SharedString>) -> Button {
     let label = label.into();
     Button::new(id)
@@ -687,8 +725,18 @@ pub struct MusicApp {
     rating_hover: Option<(String, u8)>,
     information_width: f32,
     navigator_peek: Option<Task<()>>,
-    history_back: Vec<Location>,
-    history_forward: Vec<Location>,
+    /// The active tab's history; other tabs keep theirs in `histories`.
+    /// `None` stands for the empty page a new tab starts on.
+    history_back: Vec<Option<Page>>,
+    history_forward: Vec<Option<Page>>,
+    histories: HashMap<u64, TabHistory>,
+    /// The active tab is a new, empty tab waiting for a page from the navigator.
+    blank: bool,
+    /// Tabs are only saved once the stored preferences have been loaded.
+    prefs_loaded: bool,
+    tab_save: Option<Task<()>>,
+    /// Closed tabs for Cmd-Shift-T, newest last: position, tab and history.
+    closed_tabs: Vec<(usize, sonora::browser::Tab, TabHistory)>,
     restoring_location: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -739,11 +787,15 @@ impl MusicApp {
             window.observe_window_visibility(move |_, _, cx| {
                 view.update(cx, |_, cx| cx.notify()).ok();
             }),
-            cx.subscribe_in(&search, window, |app, _, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&search, window, |app, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = app.search.read(cx).value().to_string();
                     if value != app.search_text {
                         app.search_text = value.clone();
+                        if app.blank {
+                            app.switch_workspace(Workspace::Explorer, window, cx);
+                            app.search_text = value.clone();
+                        }
                         if app.artist_name.is_some() {
                             cx.notify();
                             return;
@@ -922,6 +974,11 @@ impl MusicApp {
             navigator_peek: None,
             history_back: vec![],
             history_forward: vec![],
+            histories: HashMap::new(),
+            blank: false,
+            prefs_loaded: false,
+            tab_save: None,
+            closed_tabs: Vec::new(),
             restoring_location: false,
             _subscriptions: subscriptions,
         }
@@ -936,6 +993,11 @@ impl MusicApp {
                     self.layout_generation += 1;
                 }
                 self.preferences = prefs;
+                self.preferences.tabs = std::mem::take(&mut self.preferences.tabs).normalized();
+                self.prefs_loaded = true;
+                self.histories.clear();
+                self.history_back.clear();
+                self.history_forward.clear();
                 self.album_pending.clear();
                 self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
                 self.explorer_query.ordering = self.query.ordering.clone();
@@ -955,6 +1017,8 @@ impl MusicApp {
                         input.set_value(account.username, window, cx)
                     });
                 }
+                // Reopen the saved tabs on the page the active one was showing.
+                self.show_active_tab(window, cx);
             }
             Event::SignInRequired(message) => {
                 self.settings = true;
@@ -1374,8 +1438,8 @@ impl MusicApp {
         self.save_preferences();
         cx.notify();
     }
-    fn location(&self) -> Location {
-        Location {
+    fn location(&self) -> Page {
+        Page {
             workspace: self.workspace,
             artist: self
                 .artist_name
@@ -1386,6 +1450,18 @@ impl MusicApp {
             } else {
                 LibraryQuery::default()
             },
+            playlist: if self.workspace == Workspace::Playlists {
+                self.playlist
+                    .as_ref()
+                    .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
+            } else {
+                None
+            },
+            search: match self.workspace {
+                Workspace::Queue => self.queue_search.clone(),
+                Workspace::Playlists => self.playlist_search.clone(),
+                _ => String::new(),
+            },
         }
     }
     /// Record the current page before navigating away from it.
@@ -1393,7 +1469,8 @@ impl MusicApp {
         if self.restoring_location {
             return;
         }
-        let location = self.location();
+        // An empty tab is remembered too, so Back can return to it.
+        let location = (!self.blank).then(|| self.location());
         if self.history_back.last() != Some(&location) {
             self.history_back.push(location);
             if self.history_back.len() > HISTORY_LIMIT {
@@ -1404,35 +1481,70 @@ impl MusicApp {
     }
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(location) = self.history_back.pop() {
-            self.history_forward.push(self.location());
-            self.restore_location(location, window, cx);
+            let current = (!self.blank).then(|| self.location());
+            self.history_forward.push(current);
+            self.open_history_page(location, window, cx);
         }
     }
     fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(location) = self.history_forward.pop() {
-            self.history_back.push(self.location());
-            self.restore_location(location, window, cx);
+            let current = (!self.blank).then(|| self.location());
+            self.history_back.push(current);
+            self.open_history_page(location, window, cx);
         }
     }
-    fn restore_location(
+    fn open_history_page(
         &mut self,
-        location: Location,
+        location: Option<Page>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match location {
+            Some(location) => {
+                self.blank = false;
+                self.restore_location(location, window, cx);
+            }
+            None => self.empty_active_tab(window, cx),
+        }
+    }
+    fn restore_location(&mut self, location: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.restoring_location = true;
         if let Some((name, id)) = location.artist {
             self.open_artist(name, id, window, cx);
         } else {
+            // switch_workspace puts these searches back into the search box.
+            match location.workspace {
+                Workspace::Queue => self.queue_search = location.search.clone(),
+                Workspace::Playlists => self.playlist_search = location.search.clone(),
+                _ => {}
+            }
             self.switch_workspace(location.workspace, window, cx);
-            if location.workspace == Workspace::Explorer {
-                self.search_text = location.query.text.clone();
-                self.search.update(cx, |input, cx| {
-                    input.set_value(self.search_text.clone(), window, cx)
-                });
-                self.explorer_query = location.query.clone();
-                self.query = location.query;
-                self.request_query(cx);
+            match location.workspace {
+                Workspace::Explorer => {
+                    self.search_text = location.query.text.clone();
+                    self.search.update(cx, |input, cx| {
+                        input.set_value(self.search_text.clone(), window, cx)
+                    });
+                    self.explorer_query = location.query.clone();
+                    self.query = location.query;
+                    self.request_query(cx);
+                }
+                Workspace::Playlists => {
+                    let current = self.playlist.as_ref().map(|p| p.id.clone());
+                    if current.as_ref() != location.playlist.as_ref().map(|(id, _)| id) {
+                        self.selected = None;
+                        // The full list arrives with the loaded playlist.
+                        self.playlist = location.playlist.map(|(id, name)| {
+                            self.service.send(Command::Playlist(id.clone()));
+                            Playlist {
+                                id,
+                                name,
+                                ..Default::default()
+                            }
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         self.restoring_location = false;
@@ -1444,16 +1556,14 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if workspace != self.workspace || self.artist_name.is_some() {
+        if workspace != self.workspace || self.artist_name.is_some() || self.blank {
             self.remember_location();
         }
+        self.blank = false;
         if self.workspace == Workspace::Explorer {
             self.explorer_query = self.query.clone();
         }
         self.workspace = workspace;
-        if let Some(index) = Workspace::ALL.iter().position(|tab| *tab == workspace) {
-            self.workspace_scroll.scroll_to_item(index);
-        }
         self.artist_name = None;
         self.artist_albums = None;
         self.lyrics_follow = None;
@@ -1535,8 +1645,11 @@ impl MusicApp {
         }
         popular
     }
+    /// An empty tab always docks the navigator, since that is where pages are picked.
     fn navigator_floats(&self) -> bool {
-        self.preferences.layout.show_navigator && self.preferences.layout.navigator_auto_hide
+        self.preferences.layout.show_navigator
+            && self.preferences.layout.navigator_auto_hide
+            && !self.blank
     }
     /// Hide by pointer position rather than hover, so the navigator's own menus,
     /// which render outside its element tree, don't dismiss it.
@@ -1753,6 +1866,7 @@ impl MusicApp {
             return;
         }
         self.remember_location();
+        self.blank = false;
         let origin = if self.artist_name.is_some() {
             self.artist_origin
         } else {
@@ -2111,10 +2225,15 @@ impl MusicApp {
     fn tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let width = f32::from(window.viewport_size().width);
-        let search_width = (width * 0.3).clamp(140., 240.);
+        let search_width = (width * 0.22).clamp(120., 240.);
         let controls_inset = sonora::platform::TITLEBAR_CONTROLS_INSET;
-        let tabs_width = (width - search_width - controls_inset - 32. - 24.).clamp(100., 440.);
-        let scroll_buttons = tabs_width < 440.;
+        // Everything left after Back/Forward, the layout button, a drag area and search.
+        let tabs_width = (width - search_width - controls_inset - 64. - 36. - 24. - 16.).max(100.);
+        // Offer an arrow only toward tabs that are out of view, as of the last layout.
+        let scrolled = -f32::from(self.workspace_scroll.offset().x);
+        let max_scroll = f32::from(self.workspace_scroll.max_offset().x);
+        let scroll_left = scrolled > 1.;
+        let scroll_right = scrolled < max_scroll - 1.;
         let mut tabs = div()
             .id("workspace-tabs")
             .flex()
@@ -2124,73 +2243,44 @@ impl MusicApp {
             .h_full()
             .gap_1()
             .overflow_x_scroll()
-            .track_scroll(&self.workspace_scroll);
-        for workspace in Workspace::ALL {
-            let label = workspace.label().to_ascii_uppercase();
-            let active = self.workspace == workspace && !self.settings;
-            tabs = tabs.child(
-                div()
-                    .id(SharedString::from(format!("workspace-{label}")))
-                    .role(Role::Tab)
-                    .aria_label(label.clone())
-                    .aria_selected(active)
-                    .flex_shrink_0()
-                    .whitespace_nowrap()
-                    .h_full()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .border_b_2()
-                    .border_color(if active {
-                        colors.accent
-                    } else {
-                        colors.background
-                    })
-                    .text_color(if active { colors.accent } else { colors.muted })
-                    .text_size(px(11.))
-                    .font_weight(if active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .cursor_pointer()
-                    .hover(|s| s.bg(colors.panel))
-                    .child(label)
-                    .on_click(cx.listener(move |app, _, window, cx| {
-                        app.switch_workspace(workspace, window, cx)
-                    })),
-            );
-        }
+            .track_scroll(&self.workspace_scroll)
+            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()));
+        tabs = tabs.children(self.tab_items(cx));
         let tabs = div()
-            .w(px(tabs_width))
+            .max_w(px(tabs_width))
+            .min_w_0()
             .h_full()
-            .flex_shrink_0()
+            .flex_shrink(1.)
+            .relative()
             .flex()
             .items_center()
-            .when(scroll_buttons, |row| {
-                row.child(
+            .child(tabs)
+            // The arrows float over the strip's ends so the tabs never shift
+            // when one appears or disappears.
+            .when(scroll_left, |row| {
+                row.child(edge(colors.background, true).left_0().pr_1().child(
                     short_button("tabs-left", Glyph::ChevronLeft, "Scroll tabs left").on_click(
                         cx.listener(|app, _, _, cx| {
                             let offset = app.workspace_scroll.offset();
-                            app.workspace_scroll
-                                .set_offset(point(offset.x + px(140.), px(0.)));
+                            let x = (offset.x + px(140.)).min(px(0.));
+                            app.workspace_scroll.set_offset(point(x, px(0.)));
                             cx.notify();
                         }),
                     ),
-                )
+                ))
             })
-            .child(tabs)
-            .when(scroll_buttons, |row| {
-                row.child(
+            .when(scroll_right, |row| {
+                row.child(edge(colors.background, false).right_0().pl_1().child(
                     short_button("tabs-right", Glyph::ChevronRight, "Scroll tabs right").on_click(
                         cx.listener(|app, _, _, cx| {
                             let offset = app.workspace_scroll.offset();
-                            app.workspace_scroll
-                                .set_offset(point(offset.x - px(140.), px(0.)));
+                            let max = app.workspace_scroll.max_offset().x;
+                            let x = (offset.x - px(140.)).max(-max);
+                            app.workspace_scroll.set_offset(point(x, px(0.)));
                             cx.notify();
                         }),
                     ),
-                )
+                ))
             });
         let navigator = navigator_key(&self.preferences.layout);
         let weak = cx.weak_entity();
@@ -2234,6 +2324,7 @@ impl MusicApp {
                 div()
                     .id("titlebar-drag")
                     .flex_1()
+                    .min_w(px(24.))
                     .h_full()
                     .on_double_click(|_, window, _| window.titlebar_double_click())
                     .on_mouse_down(
@@ -2309,6 +2400,8 @@ impl MusicApp {
         active: bool,
         cx: &App,
     ) -> Stateful<Div> {
+        // An empty tab shows no page, so nothing in the navigator is current.
+        let active = active && !self.blank;
         let colors = ink(cx);
         let label: SharedString = label.into();
         div()
@@ -6021,7 +6114,7 @@ impl MusicApp {
         content.into_any_element()
     }
     fn information_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.workspace == Workspace::Queue {
+        if self.workspace == Workspace::Queue && !self.blank {
             return self.track_information(window, cx);
         }
         v_resizable(SharedString::from(format!(
@@ -7666,6 +7759,9 @@ impl MusicApp {
     }
     fn center_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
+        if self.blank && !self.settings {
+            return self.empty_tab_page(cx);
+        }
         let mut center = div().size_full().min_h_0().min_w_0().flex().flex_col();
         if !self.settings {
             center = center.child(self.header(cx));
@@ -7877,15 +7973,16 @@ impl Render for MusicApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.image_cache
             .update(cx, |cache, cx| cache.begin_frame(window, cx));
+        self.sync_active_tab(window, cx);
         let colors = ink(cx);
         if !self.settings {
             self.settings_page = 0;
         }
-        let body = if self.workspace == Workspace::NowPlaying && !self.settings {
+        let body = if self.workspace == Workspace::NowPlaying && !self.settings && !self.blank {
             self.now_playing_view(window, cx)
         } else {
             let floating = self.navigator_floats();
-            let docked = self.preferences.layout.show_navigator && !floating;
+            let docked = (self.preferences.layout.show_navigator || self.blank) && !floating;
             let (left_width, right_width) = panel_widths(
                 f32::from(window.viewport_size().width),
                 docked.then_some(self.preferences.layout.left_width),
@@ -8069,11 +8166,33 @@ impl Render for MusicApp {
                 app.go_forward(window, cx);
                 app.focus.focus(window, cx);
             }))
+            .on_action(cx.listener(|app, _: &NewTab, window, cx| app.new_tab(window, cx)))
+            .on_action(cx.listener(|app, _: &CloseTab, window, cx| {
+                let ix = app.preferences.tabs.active;
+                app.close_tab(ix, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &ResetTabs, window, cx| app.reset_tabs(window, cx)))
+            .on_action(
+                cx.listener(|app, _: &ReopenClosedTab, window, cx| {
+                    app.reopen_closed_tab(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|app, _: &SelectTab1, w, cx| app.select_tab_number(1, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab2, w, cx| app.select_tab_number(2, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab3, w, cx| app.select_tab_number(3, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab4, w, cx| app.select_tab_number(4, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab5, w, cx| app.select_tab_number(5, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab6, w, cx| app.select_tab_number(6, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab7, w, cx| app.select_tab_number(7, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab8, w, cx| app.select_tab_number(8, w, cx)))
+            .on_action(cx.listener(|app, _: &SelectTab9, w, cx| app.select_tab_number(9, w, cx)))
             .on_action(cx.listener(|app, _: &GoBack, window, cx| {
                 if app.settings {
                     app.settings = false;
                 } else if !app.history_back.is_empty() {
                     app.go_back(window, cx);
+                } else if app.blank {
+                    // An empty tab has nowhere to go back to.
                 } else if app.artist_name.is_some() {
                     let origin = app.artist_origin;
                     app.switch_workspace(origin, window, cx);

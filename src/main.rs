@@ -49,22 +49,22 @@ fn main() -> Result<()> {
             ),
             KeyBinding::new(shortcut("cmd-[", "ctrl-["), GoBack, Some("Sonora")),
             KeyBinding::new(shortcut("cmd-]", "ctrl-]"), GoForward, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-t", "ctrl-t"), NewTab, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-w", "ctrl-w"), CloseTab, Some("Sonora")),
             KeyBinding::new(
-                shortcut("cmd-1", "ctrl-1"),
-                ExplorerWorkspace,
+                shortcut("cmd-shift-t", "ctrl-shift-t"),
+                ReopenClosedTab,
                 Some("Sonora"),
             ),
-            KeyBinding::new(shortcut("cmd-2", "ctrl-2"), QueueWorkspace, Some("Sonora")),
-            KeyBinding::new(
-                shortcut("cmd-3", "ctrl-3"),
-                PlaylistsWorkspace,
-                Some("Sonora"),
-            ),
-            KeyBinding::new(
-                shortcut("cmd-4", "ctrl-4"),
-                PlayingWorkspace,
-                Some("Sonora"),
-            ),
+            KeyBinding::new(shortcut("cmd-1", "ctrl-1"), SelectTab1, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-2", "ctrl-2"), SelectTab2, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-3", "ctrl-3"), SelectTab3, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-4", "ctrl-4"), SelectTab4, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-5", "ctrl-5"), SelectTab5, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-6", "ctrl-6"), SelectTab6, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-7", "ctrl-7"), SelectTab7, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-8", "ctrl-8"), SelectTab8, Some("Sonora")),
+            KeyBinding::new(shortcut("cmd-9", "ctrl-9"), SelectTab9, Some("Sonora")),
         ]);
         cx.bind_keys(playback_bindings());
         cx.bind_keys([
@@ -98,6 +98,11 @@ fn main() -> Result<()> {
             menu(
                 "File",
                 vec![
+                    MenuItem::action("New Tab", NewTab),
+                    MenuItem::action("Close Tab", CloseTab),
+                    MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
+                    MenuItem::action("Reset Tabs", ResetTabs),
+                    MenuItem::separator(),
                     MenuItem::action("Connect to Navidrome…", OpenSettings),
                     MenuItem::action("Refresh library", Refresh),
                 ],
