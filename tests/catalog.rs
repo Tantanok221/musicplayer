@@ -269,3 +269,68 @@ fn summary_refresh_keeps_cached_songs_and_only_reconciles_complete_lists() {
     assert!(catalog.playlist("missing").unwrap().is_none());
     assert_eq!(catalog.playlist("kept").unwrap().unwrap().entry.len(), 1);
 }
+
+#[test]
+fn favorites_filter_combines_hearts_and_ratings() {
+    let mut db = Catalog::memory().unwrap();
+    let track = |id: &str, hearted: bool, rating: u8| Track {
+        user_rating: (rating > 0).then_some(rating),
+        starred: hearted.then(|| "2026-01-01T00:00:00Z".into()),
+        ..sample(id, id)
+    };
+    db.put_tracks(
+        &[
+            track("hearted", true, 0),
+            track("rated-4", false, 4),
+            track("rated-2", false, 2),
+            track("both", true, 5),
+            track("neither", false, 0),
+        ],
+        1,
+    )
+    .unwrap();
+    let ids = |favorite_filter: FavoritesFilter| {
+        let mut ids = db
+            .tracks(
+                &LibraryQuery {
+                    favorites: true,
+                    favorite_filter,
+                    ..Default::default()
+                },
+                0,
+                10,
+            )
+            .unwrap()
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(FavoritesFilter::default()), ["both", "hearted"]);
+    let rated = FavoritesFilter {
+        hearted: false,
+        min_rating: 4,
+        match_all: false,
+    };
+    assert_eq!(ids(rated.clone()), ["both", "rated-4"]);
+    let either = FavoritesFilter {
+        hearted: true,
+        ..rated.clone()
+    };
+    assert_eq!(ids(either.clone()), ["both", "hearted", "rated-4"]);
+    assert_eq!(either.summary(), "Hearted or 4+ stars");
+    let every = FavoritesFilter {
+        match_all: true,
+        ..either
+    };
+    assert_eq!(ids(every.clone()), ["both"]);
+    assert_eq!(every.summary(), "Hearted and 4+ stars");
+    // With every rule off, hearts still apply rather than listing the whole library.
+    let none = FavoritesFilter {
+        hearted: false,
+        min_rating: 0,
+        match_all: false,
+    };
+    assert_eq!(ids(none), ["both", "hearted"]);
+}

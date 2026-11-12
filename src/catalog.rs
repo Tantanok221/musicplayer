@@ -401,15 +401,33 @@ impl Catalog {
             values.push(Value::Text(query.record_label.trim().into()));
         }
         if query.favorites {
-            if query
+            let albums = query
                 .ordering
                 .as_ref()
-                .is_some_and(|sort| sort.scope == Scope::Albums)
-            {
-                sql.push_str(" AND (tracks.starred=1 OR tracks.album_id IN (SELECT id FROM albums WHERE json_extract(data,'$.starred') IS NOT NULL))");
-            } else {
-                sql.push_str(" AND tracks.starred=1");
+                .is_some_and(|sort| sort.scope == Scope::Albums);
+            let filter = &query.favorite_filter;
+            let mut rules = Vec::new();
+            // With no rule enabled, hearts alone keep the page from listing everything.
+            if filter.hearted || filter.min_rating == 0 {
+                rules.push(if albums {
+                    "(tracks.starred=1 OR tracks.album_id IN (SELECT id FROM albums WHERE json_extract(data,'$.starred') IS NOT NULL))"
+                } else {
+                    "tracks.starred=1"
+                });
             }
+            if filter.min_rating > 0 {
+                let rating = i64::from(filter.min_rating.min(5));
+                if albums {
+                    rules.push("(tracks.rating>=? OR tracks.album_id IN (SELECT id FROM albums WHERE coalesce(json_extract(data,'$.userRating'),0)>=?))");
+                    values.extend([Value::Integer(rating), Value::Integer(rating)]);
+                } else {
+                    rules.push("tracks.rating>=?");
+                    values.push(Value::Integer(rating));
+                }
+            }
+            sql.push_str(" AND (");
+            sql.push_str(&rules.join(if filter.match_all { " AND " } else { " OR " }));
+            sql.push(')');
         }
         (sql, values)
     }

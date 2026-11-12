@@ -1271,6 +1271,7 @@ impl MusicApp {
     }
     fn request_query(&mut self, cx: &mut Context<Self>) {
         self.pending_explorer_album = None;
+        self.query.favorite_filter = self.preferences.favorites.clone();
         if self.is_library() {
             self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
             self.explorer_query = self.query.clone();
@@ -2702,6 +2703,79 @@ impl MusicApp {
             )
             .into_any_element()
     }
+    /// What the Favorites page lists: hearts, a minimum rating, or both. Kept in
+    /// preferences so it survives restarts and new builds.
+    fn favorites_filter_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let filter = self.preferences.favorites.clone();
+        let weak = cx.weak_entity();
+        let update =
+            move |weak: &WeakEntity<Self>, cx: &mut App, change: &dyn Fn(&mut FavoritesFilter)| {
+                let _ = weak.update(cx, |app, cx| {
+                    change(&mut app.preferences.favorites);
+                    app.save_preferences();
+                    app.request_query(cx);
+                });
+            };
+        let update = std::rc::Rc::new(update);
+        Button::new("favorites-filter")
+            .ghost()
+            .small()
+            .icon(Glyph::SlidersHorizontal)
+            .label(filter.summary())
+            .text_color(ink(cx).muted)
+            .tooltip("Choose what counts as a favorite")
+            .dropdown_menu(move |menu, _, _| {
+                let item =
+                    |label: &str, checked: bool, change: Box<dyn Fn(&mut FavoritesFilter)>| {
+                        let (weak, update) = (weak.clone(), update.clone());
+                        PopupMenuItem::new(label.to_string())
+                            .checked(checked)
+                            .on_click(move |_, _, cx| update(&weak, cx, &*change))
+                    };
+                let mut menu = menu
+                    .label("Include")
+                    .item(item(
+                        "Hearted",
+                        filter.hearted || filter.min_rating == 0,
+                        Box::new(|filter| filter.hearted = !filter.hearted),
+                    ))
+                    .separator()
+                    .label("Minimum rating")
+                    .item(item(
+                        "Any rating",
+                        filter.min_rating == 0,
+                        Box::new(|filter| {
+                            filter.min_rating = 0;
+                            filter.hearted = true;
+                        }),
+                    ));
+                for stars in 1..=5u8 {
+                    let label = format!(
+                        "{}{}",
+                        "★".repeat(stars as usize),
+                        if stars < 5 { " and up" } else { "" }
+                    );
+                    menu = menu.item(item(
+                        &label,
+                        filter.min_rating == stars,
+                        Box::new(move |filter| filter.min_rating = stars),
+                    ));
+                }
+                menu.separator()
+                    .label("When both are on")
+                    .item(item(
+                        "Match either",
+                        !filter.match_all,
+                        Box::new(|filter| filter.match_all = false),
+                    ))
+                    .item(item(
+                        "Match both",
+                        filter.match_all,
+                        Box::new(|filter| filter.match_all = true),
+                    ))
+            })
+            .into_any_element()
+    }
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let label = self.artist_name.as_deref().unwrap_or(match self.workspace {
@@ -2746,6 +2820,9 @@ impl MusicApp {
                     .font_weight(FontWeight::MEDIUM)
                     .child(label.to_string()),
             );
+        }
+        if self.is_library() && self.query.favorites {
+            left = left.child(self.favorites_filter_menu(cx));
         }
         if self.workspace == Workspace::Queue
             && self.artist_name.is_none()

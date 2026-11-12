@@ -308,6 +308,8 @@ pub struct LibraryQuery {
     pub year: Option<i32>,
     pub record_label: String,
     pub favorites: bool,
+    /// The rules the Favorites page applies when `favorites` is set.
+    pub favorite_filter: FavoritesFilter,
     pub sort: Sort,
     pub descending: bool,
     pub ordering: Option<crate::sorting::SortSpec>,
@@ -343,6 +345,43 @@ pub struct Preferences {
     pub downloads: DownloadPreferences,
     /// Show missing singles, live albums, compilations and the like on artist pages.
     pub all_missing_releases: bool,
+    pub favorites: FavoritesFilter,
+}
+/// What counts as a favorite on the Favorites page.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(default)]
+pub struct FavoritesFilter {
+    /// Hearted tracks, and in album views hearted albums.
+    pub hearted: bool,
+    /// Tracks, or in album views albums, rated at least this many stars; 0 is off.
+    pub min_rating: u8,
+    /// Require every enabled rule instead of any one of them.
+    pub match_all: bool,
+}
+impl Default for FavoritesFilter {
+    fn default() -> Self {
+        Self {
+            hearted: true,
+            min_rating: 0,
+            match_all: false,
+        }
+    }
+}
+impl FavoritesFilter {
+    /// A short description such as "Hearted or 4+ stars".
+    pub fn summary(&self) -> String {
+        let mut rules = Vec::new();
+        if self.hearted || self.min_rating == 0 {
+            rules.push("Hearted".to_string());
+        }
+        if self.min_rating > 0 {
+            rules.push(match self.min_rating {
+                5 => "5 stars".to_string(),
+                n => format!("{n}+ stars"),
+            });
+        }
+        rules.join(if self.match_all { " and " } else { " or " })
+    }
 }
 /// Where the user's slskd lives. Its API key is kept in a private file instead.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -363,6 +402,7 @@ impl Default for Preferences {
             sorting: crate::sorting::SortingPreferences::default(),
             downloads: DownloadPreferences::default(),
             all_missing_releases: false,
+            favorites: FavoritesFilter::default(),
         }
     }
 }
