@@ -640,6 +640,11 @@ pub struct MusicApp {
     playback_at: Instant,
     /// A pending paced redraw for animations that don't need display rate.
     frame_timer: Option<Task<()>>,
+    /// Saves the window frame once a move or resize settles.
+    window_save: Option<Task<()>>,
+    /// Part of every resizable group's ID. Panels keep the size they first
+    /// rendered at, so a new value rebuilds them at the saved sizes.
+    layout_generation: u64,
     artist_name: Option<String>,
     artist_id: String,
     artist_request: u64,
@@ -729,6 +734,7 @@ impl MusicApp {
         });
         let view = cx.entity().downgrade();
         let subscriptions = vec![
+            cx.observe_window_bounds(window, |app, window, cx| app.remember_window(window, cx)),
             // Animation stops while hidden, so resume it when the window is shown again.
             window.observe_window_visibility(move |_, _, cx| {
                 view.update(cx, |_, cx| cx.notify()).ok();
@@ -870,6 +876,8 @@ impl MusicApp {
             lyrics_wake: None,
             playback_at: Instant::now(),
             frame_timer: None,
+            window_save: None,
+            layout_generation: 0,
             artist_name: None,
             artist_id: String::new(),
             artist_request: 0,
@@ -923,6 +931,10 @@ impl MusicApp {
             Event::Ready(account, prefs) => {
                 self.account = account.clone();
                 self.settings = account.is_none();
+                // The first frame drew panels at default sizes before these arrived.
+                if self.preferences.layout != prefs.layout {
+                    self.layout_generation += 1;
+                }
                 self.preferences = prefs;
                 self.album_pending.clear();
                 self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
@@ -1261,9 +1273,34 @@ impl MusicApp {
     }
     fn restore_layout(&mut self, cx: &mut Context<Self>) {
         self.preferences.layout = LayoutPreferences::default();
+        self.layout_generation += 1;
         self.save_preferences();
         self.album_list.reset(self.album_row_count());
         cx.notify();
+    }
+    /// Saves the window frame after it has been still for a moment, so a drag
+    /// writes once instead of every frame.
+    fn remember_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (bounds, maximized, fullscreen) = match window.window_bounds() {
+            WindowBounds::Windowed(bounds) => (bounds, false, false),
+            WindowBounds::Maximized(bounds) => (bounds, true, false),
+            WindowBounds::Fullscreen(bounds) => (bounds, false, true),
+        };
+        let frame = sonora::platform::WindowFrame {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            maximized,
+            fullscreen,
+        };
+        self.window_save = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            this.update(cx, |app, _| app.service.send(Command::SaveWindow(frame)))
+                .ok();
+        }));
     }
     fn save_preferences(&self) {
         self.service
@@ -2689,19 +2726,30 @@ impl MusicApp {
                     })),
             )
             .child(facet_list);
-        v_resizable("left-panels")
-            .child(
-                resizable_panel()
-                    .size(px(236.))
-                    .size_range(px(100.)..px(600.))
-                    .child(upper),
-            )
-            .child(
-                resizable_panel()
-                    .size_range(px(100.)..px(2000.))
-                    .child(lower),
-            )
-            .into_any_element()
+        v_resizable(SharedString::from(format!(
+            "left-panels-{}",
+            self.layout_generation
+        )))
+        .on_resize(cx.listener(
+            |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
+                if let Some(size) = state.read(cx).sizes().first() {
+                    app.preferences.layout.navigator_height = f32::from(*size);
+                    app.save_preferences();
+                }
+            },
+        ))
+        .child(
+            resizable_panel()
+                .size(px(self.preferences.layout.navigator_height))
+                .size_range(px(100.)..px(600.))
+                .child(upper),
+        )
+        .child(
+            resizable_panel()
+                .size_range(px(100.)..px(2000.))
+                .child(lower),
+        )
+        .into_any_element()
     }
     /// What the Favorites page lists: hearts, a minimum rating, or both. Kept in
     /// preferences so it survives restarts and new builds.
@@ -5976,27 +6024,30 @@ impl MusicApp {
         if self.workspace == Workspace::Queue {
             return self.track_information(window, cx);
         }
-        v_resizable("right-panels")
-            .on_resize(cx.listener(
-                |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
-                    if let Some(size) = state.read(cx).sizes().first() {
-                        app.preferences.layout.queue_height = f32::from(*size);
-                        app.save_preferences();
-                    }
-                },
-            ))
-            .child(
-                resizable_panel()
-                    .size(px(self.preferences.layout.queue_height))
-                    .size_range(px(100.)..px(1200.))
-                    .child(self.playing_tracks(cx)),
-            )
-            .child(
-                resizable_panel()
-                    .size_range(px(150.)..px(2000.))
-                    .child(self.track_information(window, cx)),
-            )
-            .into_any_element()
+        v_resizable(SharedString::from(format!(
+            "right-panels-{}",
+            self.layout_generation
+        )))
+        .on_resize(cx.listener(
+            |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
+                if let Some(size) = state.read(cx).sizes().first() {
+                    app.preferences.layout.queue_height = f32::from(*size);
+                    app.save_preferences();
+                }
+            },
+        ))
+        .child(
+            resizable_panel()
+                .size(px(self.preferences.layout.queue_height))
+                .size_range(px(100.)..px(1200.))
+                .child(self.playing_tracks(cx)),
+        )
+        .child(
+            resizable_panel()
+                .size_range(px(150.)..px(2000.))
+                .child(self.track_information(window, cx)),
+        )
+        .into_any_element()
     }
     fn now_playing_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(track) = self.playback.track.clone() else {
@@ -7792,29 +7843,29 @@ impl MusicApp {
             .child(content);
         if self.browser_visible() && !self.settings {
             center = center.child(
-                v_resizable("browser-and-library")
-                    .on_resize(cx.listener(
-                        |app,
-                         state: &Entity<gpui_kit::component::resizable::ResizableState>,
-                         _,
-                         cx| {
-                            if let Some(size) = state.read(cx).sizes().first() {
-                                app.preferences.layout.browser_height = f32::from(*size);
-                                app.save_preferences();
-                            }
-                        },
-                    ))
-                    .child(
-                        resizable_panel()
-                            .size(px(self.preferences.layout.browser_height))
-                            .size_range(px(90.)..px(400.))
-                            .child(self.column_browser(cx)),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size_range(px(160.)..px(2000.))
-                            .child(content),
-                    ),
+                v_resizable(SharedString::from(format!(
+                    "browser-and-library-{}",
+                    self.layout_generation
+                )))
+                .on_resize(cx.listener(
+                    |app, state: &Entity<gpui_kit::component::resizable::ResizableState>, _, cx| {
+                        if let Some(size) = state.read(cx).sizes().first() {
+                            app.preferences.layout.browser_height = f32::from(*size);
+                            app.save_preferences();
+                        }
+                    },
+                ))
+                .child(
+                    resizable_panel()
+                        .size(px(self.preferences.layout.browser_height))
+                        .size_range(px(90.)..px(400.))
+                        .child(self.column_browser(cx)),
+                )
+                .child(
+                    resizable_panel()
+                        .size_range(px(160.)..px(2000.))
+                        .child(content),
+                ),
             );
         } else {
             center = center.child(div().flex_1().min_h_0().min_w_0().child(content));
@@ -7876,9 +7927,10 @@ impl Render for MusicApp {
             // so each arrangement gets its own group with only the panels it shows.
             let right_ix = usize::from(docked) + 1;
             let workspace = h_resizable(SharedString::from(format!(
-                "musicbee-workspace-{}-{}",
+                "musicbee-workspace-{}-{}-{}",
                 u8::from(docked),
-                u8::from(information)
+                u8::from(information),
+                self.layout_generation
             )))
             .on_resize(cx.listener(
                 move |app,

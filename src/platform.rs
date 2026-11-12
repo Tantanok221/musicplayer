@@ -57,6 +57,19 @@ impl ServerCredentials {
     }
 }
 
+/// The main window's last frame, kept outside any library so it survives
+/// rebuilds and account changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowFrame {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+    pub fullscreen: bool,
+}
+
 #[derive(Clone)]
 pub struct Paths {
     pub data: PathBuf,
@@ -78,6 +91,19 @@ impl Paths {
             return Ok(None);
         }
         Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
+    }
+    /// The saved window frame; a missing or unreadable file means the default.
+    pub fn window_frame(&self) -> Option<WindowFrame> {
+        let bytes = std::fs::read(self.data.join("window.json")).ok()?;
+        serde_json::from_slice::<WindowFrame>(&bytes)
+            .ok()
+            .filter(|frame| frame.width > 0. && frame.height > 0.)
+    }
+    pub fn save_window_frame(&self, frame: &WindowFrame) -> Result<()> {
+        atomic_write(
+            &self.data.join("window.json"),
+            &serde_json::to_vec_pretty(frame)?,
+        )
     }
     pub fn save_account(&self, account: &Account) -> Result<()> {
         atomic_write(

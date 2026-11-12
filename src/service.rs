@@ -111,6 +111,7 @@ pub enum Command {
     SyncFailed(i64, String),
     /// Pings the server when a check is due; `true` checks right away.
     CheckConnection(bool),
+    SaveWindow(crate::platform::WindowFrame),
     /// Account namespace and whether its server answered.
     ConnectionChecked(String, Result<(), String>),
     Shutdown(Sender<()>),
@@ -1680,6 +1681,7 @@ fn run(
                         let _ = tx.send(Command::CheckConnection(true));
                     }
                 }
+                Command::SaveWindow(frame) => paths.save_window_frame(&frame)?,
                 Command::CheckConnection(now) => {
                     if !checking && (now || last_check.elapsed() >= connection.check_interval()) {
                         if let Some(server) = server.clone() {

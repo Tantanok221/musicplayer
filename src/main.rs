@@ -4,7 +4,7 @@ use anyhow::Result;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use sonora::{
-    platform::{Paths, shortcut},
+    platform::{Paths, WindowFrame, shortcut},
     service::{Command, Service},
 };
 use std::time::Duration;
@@ -17,6 +17,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let paths = Paths::new()?;
+    let frame = paths.window_frame();
     let (service, events) = Service::start(paths, runtime.handle().clone());
     let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
     let reopen_service = service.clone();
@@ -25,7 +26,7 @@ fn main() -> Result<()> {
         if let Some(window) = cx.windows().first() {
             let _ = window.update(cx, |_, window, _| window.activate_window());
         } else {
-            open(reopen_service.clone(), reopen_events.clone(), cx);
+            open(reopen_service.clone(), reopen_events.clone(), frame, cx);
         }
     });
     app.run(move |cx| {
@@ -139,7 +140,7 @@ fn main() -> Result<()> {
             }
         })
         .detach();
-        open(service, events, cx);
+        open(service, events, frame, cx);
         cx.activate(true);
     });
     drop(runtime);
@@ -153,10 +154,39 @@ fn playback_bindings() -> [KeyBinding; 2] {
     ]
 }
 
-fn open(service: Service, events: flume::Receiver<sonora::service::Event>, cx: &mut App) {
+/// The saved window frame, if it still lands on a connected display.
+fn restored_bounds(frame: Option<WindowFrame>, cx: &App) -> Option<WindowBounds> {
+    let frame = frame?;
+    let bounds = Bounds::new(
+        point(px(frame.x), px(frame.y)),
+        size(px(frame.width.max(680.)), px(frame.height.max(540.))),
+    );
+    // A display that was unplugged would leave the window out of reach.
+    let visible = cx.displays().iter().any(|display| {
+        let area = display.bounds().intersect(&bounds);
+        f32::from(area.size.width) >= 100. && f32::from(area.size.height) >= 100.
+    });
+    visible.then_some(if frame.fullscreen {
+        WindowBounds::Fullscreen(bounds)
+    } else if frame.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    })
+}
+
+fn open(
+    service: Service,
+    events: flume::Receiver<sonora::service::Event>,
+    frame: Option<WindowFrame>,
+    cx: &mut App,
+) {
     let options = WindowOptions {
         app_id: Some("app.sonora.player".into()),
-        window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
+        window_bounds: Some(
+            restored_bounds(frame, cx)
+                .unwrap_or_else(|| WindowBounds::centered(size(px(1440.), px(900.)), cx)),
+        ),
         window_min_size: Some(size(px(680.), px(540.))),
         titlebar: Some(TitlebarOptions {
             title: Some("Sonora".into()),

@@ -268,6 +268,8 @@ pub struct LayoutPreferences {
     pub right_width: f32,
     pub browser_height: f32,
     pub queue_height: f32,
+    /// Height of the navigator tree above the artist and genre list.
+    pub navigator_height: f32,
     pub info_source: InfoSource,
     pub info_tab: InfoTab,
 }
@@ -285,6 +287,7 @@ impl Default for LayoutPreferences {
             right_width: 300.,
             browser_height: 156.,
             queue_height: 280.,
+            navigator_height: 236.,
             info_source: InfoSource::Selected,
             info_tab: InfoTab::Details,
         }
