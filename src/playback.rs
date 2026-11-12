@@ -20,6 +20,12 @@ use std::{
 use stream_download::{Settings, StreamDownload, storage::temp::TempStorageProvider};
 
 const CHUNK: usize = 2048;
+/// How long playback may sit buffering with no audio before it stops with an error.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// After this much buffering, pressing Play reconnects instead of waiting on the stalled stream.
+const STALL_RECONNECT: Duration = Duration::from_secs(4);
+/// The longest wait for the server to start sending a track.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 mod output;
 mod queue;
 pub use queue::QueueEdit;
@@ -129,6 +135,7 @@ impl PlayerHandle {
     }
 }
 
+type CancelDownload = Box<dyn Fn() + Send>;
 struct Clock {
     listen_tx: Sender<AudioProgress>,
     listen_rx: Receiver<AudioProgress>,
@@ -144,6 +151,9 @@ struct Clock {
     finished: AtomicBool,
     volume: AtomicU64,
     tap: SampleTap,
+    /// Cancels each HTTP download by the epoch that opened it. A stalled download
+    /// blocks its decoder's reads, so stale ones must be cancelled to release them.
+    downloads: Mutex<Vec<(u64, CancelDownload)>>,
 }
 impl Default for Clock {
     fn default() -> Self {
@@ -163,6 +173,7 @@ impl Default for Clock {
             finished: AtomicBool::new(false),
             volume: AtomicU64::new(0.7f64.to_bits()),
             tap: SampleTap::default(),
+            downloads: Mutex::default(),
         }
     }
 }
@@ -171,6 +182,43 @@ impl Clock {
         f64::from_bits(self.position_base.load(Ordering::Relaxed))
             + self.samples.load(Ordering::Relaxed) as f64
                 / self.samples_per_second.load(Ordering::Relaxed).max(1) as f64
+    }
+    fn track_download(&self, epoch: u64, source: &StreamDownload<TempStorageProvider>) {
+        let token = source.cancellation_token();
+        let mut downloads = self.downloads.lock().unwrap();
+        // Checked under the lock, so a concurrent `cancel_stale_downloads` cannot miss it.
+        if self.epoch.load(Ordering::Acquire) == epoch {
+            downloads.push((epoch, Box::new(move || token.cancel())));
+        } else {
+            token.cancel();
+        }
+    }
+    /// Unblocks decoders from earlier epochs, which may be waiting on a dead connection.
+    fn cancel_stale_downloads(&self) {
+        let mut downloads = self.downloads.lock().unwrap();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        downloads.retain(|(started, cancel)| {
+            let current = *started == epoch;
+            if !current {
+                cancel();
+            }
+            current
+        });
+    }
+}
+/// Resolves once the player has moved on from `epoch`.
+async fn superseded(clock: Arc<Clock>, epoch: u64) {
+    while clock.epoch.load(Ordering::Acquire) == epoch {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+/// Aborts a prefetch when the decoder exits early; a finished download is dropped and cancelled.
+struct Prefetch(Option<tokio::task::JoinHandle<Result<StreamDownload<TempStorageProvider>>>>);
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 struct Packet {
@@ -420,16 +468,19 @@ pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
 async fn stream(server: &Server, track: &Track) -> Result<StreamDownload<TempStorageProvider>> {
     let params = [("id", track.id.clone()), ("format", "raw".into())];
     let url = server.url("stream", &params)?;
-    StreamDownload::new_http(
+    let open = StreamDownload::new_http(
         url,
         TempStorageProvider::with_prefix("sonora-audio-"),
         Settings::default()
             .prefetch_bytes(128 * 1024)
             .retry_timeout(Duration::from_secs(15)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Cannot buffer this track. Check the connection and retry."))
+    );
+    match tokio::time::timeout(OPEN_TIMEOUT, open).await {
+        Ok(Ok(source)) => Ok(source),
+        Ok(Err(_)) | Err(_) => Err(anyhow::anyhow!(UNREACHABLE)),
+    }
 }
+const UNREACHABLE: &str = "Cannot reach the server";
 fn decoder(source: StreamDownload<TempStorageProvider>, suffix: &str) -> Result<HttpDecoder> {
     let mut builder = Decoder::builder()
         .with_seekable(true)
@@ -604,9 +655,7 @@ fn decode_queue(
         epoch,
     } = request;
     // Start the next HTTP buffer while the current decoder still has queued PCM.
-    let mut prefetched: Option<
-        tokio::task::JoinHandle<Result<StreamDownload<TempStorageProvider>>>,
-    > = None;
+    let mut prefetched = Prefetch(None);
     let mut final_format = None;
     let mut current = {
         let mut plan = plan.lock().unwrap();
@@ -619,15 +668,40 @@ fn decode_queue(
             return;
         }
         let next = plan.lock().unwrap().next(index);
-        let source_result = if let Some(task) = prefetched.take() {
-            runtime
-                .block_on(task)
-                .map_err(anyhow::Error::from)
-                .and_then(|v| v)
-        } else {
-            runtime.block_on(stream(&server, &track))
+        let prefetch = prefetched.0.take();
+        // Waiting for the server must not outlive a pause, skip, or seek.
+        let opened = runtime.block_on(async {
+            tokio::select! {
+                source = async {
+                    match prefetch {
+                        Some(task) => task.await.map_err(anyhow::Error::from).and_then(|v| v),
+                        None => stream(&server, &track).await,
+                    }
+                } => Some(source),
+                () = superseded(clock.clone(), epoch) => None,
+            }
+        });
+        let Some(opened) = opened else {
+            return;
         };
-        let decoded = source_result.and_then(|source| decoder(source, &track.suffix));
+        let source = match opened {
+            Ok(source) => source,
+            Err(_) => {
+                let _ = errors.send((
+                    epoch,
+                    format!(
+                        "Cannot reach the server to play “{}”. Check your internet connection, then press Retry.",
+                        track.title
+                    ),
+                ));
+                return;
+            }
+        };
+        clock.track_download(epoch, &source);
+        let decoded = decoder(source, &track.suffix);
+        if clock.epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
         let mut decoded = match decoded {
             Ok(d) => d,
             Err(_) => {
@@ -643,7 +717,7 @@ fn decode_queue(
         }
         if let Some((_, track)) = next.clone() {
             let server = server.clone();
-            prefetched = Some(runtime.spawn(async move { stream(&server, &track).await }));
+            prefetched.0 = Some(runtime.spawn(async move { stream(&server, &track).await }));
         }
         let listen = Arc::new(AudibleListen {
             id: listen_id,
@@ -659,9 +733,6 @@ fn decode_queue(
         let mut first = true;
         loop {
             if clock.epoch.load(Ordering::Acquire) != epoch {
-                if let Some(task) = prefetched {
-                    task.abort();
-                }
                 return;
             }
             let samples = pcm
@@ -670,6 +741,10 @@ fn decode_queue(
                 .map(|v| v * gain)
                 .collect::<Vec<_>>();
             if samples.is_empty() {
+                // A cancelled download ends the decoder early; that is not the end of the track.
+                if clock.epoch.load(Ordering::Acquire) != epoch {
+                    return;
+                }
                 break;
             }
             if !send_packet(
@@ -702,7 +777,7 @@ fn decode_queue(
             planned
         };
         if planned.as_ref().map(|(_, track)| &track.id) != next.as_ref().map(|(_, track)| &track.id)
-            && let Some(task) = prefetched.take()
+            && let Some(task) = prefetched.0.take()
         {
             task.abort();
         }
@@ -820,6 +895,8 @@ fn run(
     let mut original: Option<Vec<Arc<Track>>> = None;
     let mut plan_boundary = 0;
     let mut pending_output: Option<(Packet, Instant)> = None;
+    // When the current stream started waiting for audio; cleared once samples flow.
+    let mut stalled_since: Option<Instant> = None;
     let mut media = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
         dbus_name: "sonora",
         display_name: "Sonora",
@@ -1067,7 +1144,7 @@ fn run(
                         let track = queue.remove(from);
                         queue.insert(to, track);
                         index = current.and_then(|id| queue.iter().position(|t| t.id == id));
-                        restart = started;
+                        restart |= started;
                     }
                 }
                 PlayerCommand::EditQueue(version, edit) => {
@@ -1092,14 +1169,18 @@ fn run(
                         }
                     }
                 }
-                PlayerCommand::Toggle => {
-                    let play = !clock.playing.load(Ordering::Relaxed);
+                PlayerCommand::Toggle | PlayerCommand::Play => {
+                    let play = matches!(command, PlayerCommand::Play)
+                        || !clock.playing.load(Ordering::Relaxed);
                     clock.playing.store(play, Ordering::Relaxed);
-                    restart = play && !started;
-                }
-                PlayerCommand::Play => {
-                    clock.playing.store(true, Ordering::Relaxed);
-                    restart = !started;
+                    // A stream stuck buffering reconnects when Play is pressed again.
+                    let stalled =
+                        stalled_since.is_some_and(|since| since.elapsed() >= STALL_RECONNECT);
+                    if play && started && stalled {
+                        base_position = position(&clock);
+                    }
+                    // Never clear a restart an earlier command in this batch asked for.
+                    restart |= play && (!started || stalled);
                 }
                 PlayerCommand::Pause => {
                     clock.playing.store(false, Ordering::Relaxed);
@@ -1197,6 +1278,7 @@ fn run(
             }
         }
         if restart {
+            stalled_since = None;
             let epoch = clock.epoch.fetch_add(1, Ordering::AcqRel) + 1;
             clock.finished.store(false, Ordering::Relaxed);
             clock.buffering.store(true, Ordering::Relaxed);
@@ -1327,6 +1409,26 @@ fn run(
                 drop(output.take());
             }
         }
+        if !(started && clock.buffering.load(Ordering::Relaxed)) {
+            stalled_since = None;
+        } else if clock.playing.load(Ordering::Relaxed) {
+            let since = *stalled_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STALL_TIMEOUT {
+                stalled_since = None;
+                base_position = position(&clock);
+                started = false;
+                pending_output = None;
+                error = Some(
+                    "Lost connection to the server while buffering. Check your internet connection, then press Retry."
+                        .into(),
+                );
+                clock.playing.store(false, Ordering::Relaxed);
+                clock.buffering.store(false, Ordering::Relaxed);
+                clock.epoch.fetch_add(1, Ordering::AcqRel);
+                drop(output.take());
+            }
+        }
+        clock.cancel_stale_downloads();
         if clock.finished.swap(false, Ordering::AcqRel) {
             clock.playing.store(false, Ordering::Relaxed);
             clock.buffering.store(false, Ordering::Relaxed);
@@ -1707,6 +1809,80 @@ mod tests {
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         assert!(error.contains("No transcoding was applied"));
         assert!(pcm.try_recv().is_err());
+        http.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_stream_releases_its_decoder_when_playback_moves_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Sends headers and a few bytes, then goes silent like a dropped connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http = tokio::spawn(async move {
+            let mut open = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nContent-Length: 10000000\r\n\r\nfLaC")
+                    .await;
+                open.push(socket);
+            }
+        });
+        let clock = Arc::new(Clock::default());
+        clock.epoch.store(1, Ordering::Release);
+        let request = DecodeRequest {
+            listen_id: 1,
+            plan: Plan::shared(
+                vec![Arc::new(Track {
+                    id: "stalled".into(),
+                    suffix: "flac".into(),
+                    ..Default::default()
+                })],
+                RepeatMode::Off,
+            ),
+            index: 0,
+            position: 0.,
+            prefs: Preferences::default(),
+            epoch: 1,
+            server: Server::new(
+                crate::platform::Account {
+                    url: format!("http://{address}"),
+                    username: "fixture-user".into(),
+                },
+                "fixture-password".into(),
+            )
+            .unwrap(),
+        };
+        let (tx, _pcm) = flume::bounded(96);
+        let (errors, error_rx) = flume::unbounded();
+        let runtime = tokio::runtime::Handle::current();
+        let decoder_clock = clock.clone();
+        let (done, finished) = flume::bounded(1);
+        std::thread::spawn(move || {
+            decode_queue(request, tx, decoder_clock, errors, runtime);
+            let _ = done.send(());
+        });
+        // Wait until the decoder holds the download and is blocked reading it.
+        while clock.downloads.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            finished.try_recv().is_err(),
+            "the read is blocked on the stall"
+        );
+        clock.epoch.fetch_add(1, Ordering::AcqRel);
+        clock.cancel_stale_downloads();
+        tokio::time::timeout(Duration::from_secs(5), finished.recv_async())
+            .await
+            .expect("a superseded decoder exits instead of hanging")
+            .unwrap();
+        assert!(clock.downloads.lock().unwrap().is_empty());
+        assert!(
+            error_rx.try_recv().is_err(),
+            "a superseded stream reports nothing"
+        );
         http.abort();
     }
     fn tracks(count: usize) -> Vec<Arc<Track>> {

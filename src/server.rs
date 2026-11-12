@@ -138,6 +138,13 @@ impl Server {
             response.get(key).cloned().unwrap_or_else(|| json!({})),
         )?)
     }
+    /// A quick reachability check that fails within seconds when the server is gone.
+    pub async fn ping(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(8), self.request("ping", &[]))
+            .await
+            .map_err(|_| anyhow::anyhow!("The server did not respond"))??;
+        Ok(())
+    }
     pub async fn connect(&mut self) -> Result<String> {
         let info = self.request("ping", &[]).await?;
         if let Ok(response) = self.request("getOpenSubsonicExtensions", &[]).await

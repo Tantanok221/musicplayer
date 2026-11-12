@@ -27,7 +27,7 @@ use sonora::{
     model::*,
     platform::Account,
     playback::{Placement, PlayerCommand, QueueEdit},
-    service::{Command, DownloadRequest, Event, Mutation, SearchUpdate, Service},
+    service::{Command, Connection, DownloadRequest, Event, Mutation, SearchUpdate, Service},
     slskd::{Candidate, Completeness, DownloadJob, JobState},
     thumbnail,
     visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
@@ -464,6 +464,14 @@ fn size_label(bytes: u64) -> String {
         format!("{:.0} kB", bytes / 1e3)
     }
 }
+struct DownloadStart {
+    release: String,
+    /// The search result that was clicked.
+    candidate: usize,
+    username: String,
+    /// Why slskd refused; the results stay so another folder can be picked.
+    failure: Option<String>,
+}
 fn download_caption(job: &DownloadJob) -> String {
     let progress = &job.progress;
     match job.state {
@@ -568,6 +576,9 @@ pub struct MusicApp {
     release_details_requested: HashSet<String>,
     soulseek: Option<(String, SearchUpdate)>,
     soulseek_open: Option<usize>,
+    /// A Download click slskd has not answered yet. Asking the peer for the
+    /// whole folder and queueing it can take up to a minute.
+    download_start: Option<DownloadStart>,
     downloads: Arc<Vec<DownloadJob>>,
     seek: Entity<SliderState>,
     volume: Entity<SliderState>,
@@ -656,6 +667,7 @@ pub struct MusicApp {
     playlist_editor_tracks: Option<Vec<String>>,
     pending_delete: Option<String>,
     status: String,
+    connection: Connection,
     error: Option<String>,
     pending_mutation: Option<Mutation>,
     album_pending: HashSet<String>,
@@ -809,6 +821,7 @@ impl MusicApp {
             missing_expanded: false,
             soulseek: None,
             soulseek_open: None,
+            download_start: None,
             downloads: Arc::default(),
             seek,
             volume,
@@ -884,6 +897,7 @@ impl MusicApp {
             playlist_editor_tracks: None,
             pending_delete: None,
             status: "Opening library…".into(),
+            connection: Connection::None,
             error: None,
             pending_mutation: None,
             album_pending: HashSet::new(),
@@ -1079,7 +1093,23 @@ impl MusicApp {
             Event::ReleaseDetails(group, details) => {
                 self.release_details.insert(group, details);
             }
-            Event::Downloads(jobs) => self.downloads = jobs,
+            Event::Downloads(jobs) => {
+                if self.download_start.as_ref().is_some_and(|start| {
+                    start.failure.is_none() && jobs.iter().any(|job| job.release == start.release)
+                }) {
+                    self.download_start = None;
+                }
+                self.downloads = jobs;
+            }
+            Event::DownloadNotStarted(release, reason) => {
+                if let Some(start) = self
+                    .download_start
+                    .as_mut()
+                    .filter(|start| start.release == release)
+                {
+                    start.failure = Some(reason);
+                }
+            }
             Event::SlskdStatus(status) => self.slskd_status = Some(status),
             Event::Album(id, tracks) => {
                 if self.highlight_requested.as_ref() == Some(&id) {
@@ -1152,6 +1182,7 @@ impl MusicApp {
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
             }
             Event::Status(status) => self.status = status,
+            Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {
                 self.error = Some(error);
                 self.loading_more = false;
@@ -4682,6 +4713,11 @@ impl MusicApp {
             .filter(|(id, _)| id == &release.id)
             .map(|(_, update)| update.clone());
         let searching = matches!(search, Some(SearchUpdate::Searching(_)));
+        let start = self
+            .download_start
+            .as_ref()
+            .filter(|start| start.release == release.id);
+        let starting = start.is_some_and(|start| start.failure.is_none());
         let id = release.id.clone();
         block = block.child(
             div()
@@ -4703,16 +4739,56 @@ impl MusicApp {
                         } else {
                             "Find on Soulseek"
                         })
-                        .disabled(searching)
+                        .disabled(searching || starting)
                         .on_click(cx.listener(move |app, _, _, cx| {
                             let query = app.soulseek_query.read(cx).value().to_string();
                             app.soulseek = Some((id.clone(), SearchUpdate::Searching(0)));
                             app.soulseek_open = None;
+                            app.download_start = None;
                             app.service.send(Command::SoulseekSearch(id.clone(), query));
                             cx.notify();
                         })),
                 ),
         );
+        if let Some(start) = start {
+            let failed = start.failure.is_some();
+            let tint = colors.accent;
+            let message = match &start.failure {
+                Some(reason) => format!(
+                    "Download not started. {reason} Pick another folder below, or try again."
+                ),
+                None => format!(
+                    "Starting download from {}… asking for the full folder and adding it to the queue. This can take up to a minute.",
+                    start.username
+                ),
+            };
+            block = block.child(
+                div()
+                    .id("download-start")
+                    .role(if failed { Role::Alert } else { Role::Status })
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_l_2()
+                    .border_color(tint)
+                    .bg(colors.panel)
+                    .text_size(px(11.))
+                    .child(
+                        Icon::new(if failed {
+                            Glyph::CircleAlert
+                        } else {
+                            Glyph::LoaderCircle
+                        })
+                        .size(px(13.))
+                        .flex_shrink_0()
+                        .text_color(tint),
+                    )
+                    .child(div().flex_1().min_w_0().child(message)),
+            );
+        }
         match search {
             None => {}
             Some(SearchUpdate::Searching(count)) => {
@@ -4786,6 +4862,12 @@ impl MusicApp {
         if candidate.locked > 0 {
             facts.push(format!("{} locked files left out", candidate.locked));
         }
+        let start = self
+            .download_start
+            .as_ref()
+            .filter(|start| start.release == release.id && start.failure.is_none());
+        let starting = start.is_some();
+        let clicked = start.is_some_and(|start| start.candidate == index);
         let request = DownloadRequest {
             artist: artist.to_string(),
             artist_id: self.artist_id.clone(),
@@ -4839,9 +4921,24 @@ impl MusicApp {
                     .child(
                         Button::new(("soulseek-download", index))
                             .small()
-                            .label("Download")
+                            .label(if clicked { "Starting…" } else { "Download" })
+                            .loading(clicked)
+                            .disabled(starting && !clicked)
                             .on_click(cx.listener(move |app, _, _, cx| {
-                                app.soulseek = None;
+                                if app
+                                    .download_start
+                                    .as_ref()
+                                    .is_some_and(|start| start.failure.is_none())
+                                {
+                                    return;
+                                }
+                                // Keep the results until slskd accepts, so a refusal can pick another.
+                                app.download_start = Some(DownloadStart {
+                                    release: request.release.clone(),
+                                    candidate: index,
+                                    username: request.candidate.username.clone(),
+                                    failure: None,
+                                });
                                 app.service
                                     .send(Command::Download(Box::new(request.clone())));
                                 cx.notify();
@@ -7250,6 +7347,75 @@ impl MusicApp {
                 && artists.iter().any(|artist| job.artist.starts_with(artist))
         })
     }
+    /// Server reachability at the start of the status bar, in the same quiet dot style
+    /// for every state; offline adds amber text and retries on click.
+    fn connection_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let dot = |color: u32| {
+            div()
+                .size(px(7.))
+                .rounded_full()
+                .flex_shrink_0()
+                .bg(rgb(color))
+        };
+        let quiet = |id: &'static str, color: u32, label: &'static str, hint: &'static str| {
+            div()
+                .id(id)
+                .mr_2()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .child(dot(color))
+                .child(label)
+                .tooltip(move |window, cx| tooltip::Tooltip::new(hint).build(window, cx))
+                .into_any_element()
+        };
+        match &self.connection {
+            Connection::None => None,
+            Connection::Online => Some(quiet(
+                "server-online",
+                0x3fa45b,
+                "Online",
+                "Connected to your Navidrome server",
+            )),
+            Connection::Connecting => Some(quiet(
+                "server-connecting",
+                0xd99a2b,
+                "Connecting…",
+                "Contacting your Navidrome server",
+            )),
+            Connection::Offline(reason) => {
+                let reason: SharedString =
+                    format!("{reason}\n\nRetrying automatically. Click to retry now.").into();
+                Some(
+                    div()
+                        .id("server-offline")
+                        .mr_2()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1()
+                        .text_color(ink(cx).accent)
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .hover(|label| label.underline())
+                        .role(Role::Alert)
+                        .aria_label("Server offline. Click to retry now.")
+                        .child(dot(0xd99a2b))
+                        .child("Server offline · Retry")
+                        .tooltip(move |window, cx| {
+                            tooltip::Tooltip::new(reason.clone()).build(window, cx)
+                        })
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.connection = Connection::Connecting;
+                            app.service.send(Command::CheckConnection(true));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+            }
+        }
+    }
     fn status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let downloads = self
@@ -7297,6 +7463,7 @@ impl MusicApp {
             .border_color(colors.line)
             .text_size(px(10.))
             .text_color(colors.muted)
+            .children(self.connection_indicator(cx))
             .child(
                 div()
                     .min_w_0()
@@ -7380,6 +7547,8 @@ impl MusicApp {
                         } else {
                             rgb(0xf8e9d7)
                         })
+                        .id("error-banner")
+                        .role(Role::Alert)
                         .flex()
                         .items_start()
                         .gap_2()

@@ -24,7 +24,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const SIGN_IN_NOTICE: &str =
@@ -109,8 +109,34 @@ pub enum Command {
     PlaylistsLoaded(Vec<Playlist>),
     Error(String),
     SyncFailed(i64, String),
+    /// Pings the server when a check is due; `true` checks right away.
+    CheckConnection(bool),
+    /// Account namespace and whether its server answered.
+    ConnectionChecked(String, Result<(), String>),
     Shutdown(Sender<()>),
 }
+
+/// Whether the saved Navidrome server is reachable, shown in the status bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Connection {
+    /// No server account is saved or signed in.
+    #[default]
+    None,
+    Connecting,
+    Online,
+    /// The server did not answer; the reason is for the tooltip.
+    Offline(String),
+}
+impl Connection {
+    /// How long to wait between automatic checks in this state.
+    fn check_interval(&self) -> Duration {
+        match self {
+            Self::Online => Duration::from_secs(30),
+            _ => Duration::from_secs(10),
+        }
+    }
+}
+const CONNECTION_TICK: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct DownloadRequest {
     pub artist: String,
@@ -143,6 +169,8 @@ pub enum Event {
     SoulseekSearch(String, SearchUpdate),
     ReleaseDetails(String, Result<Arc<ReleaseDetails>, String>),
     Downloads(Arc<Vec<DownloadJob>>),
+    /// Release ID and why slskd did not accept the download, shown beside the search results.
+    DownloadNotStarted(String, String),
     SlskdStatus(Result<String, String>),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
@@ -155,6 +183,7 @@ pub enum Event {
     Lyrics(String, Result<Arc<Lyrics>, String>),
     Playback(PlaybackSnapshot),
     Status(String),
+    Connection(Connection),
     Error(String),
     MutationDone(Mutation),
     MutationFailed(Mutation, String),
@@ -183,9 +212,16 @@ impl Service {
         std::thread::Builder::new()
             .name("sonora-player-events".into())
             .spawn(move || {
+                let mut playback_failed = false;
                 while let Ok(event) = player_events.recv() {
                     match event {
                         PlayerEvent::Snapshot(snapshot) => {
+                            // A new playback error is often the first sign the server went away.
+                            let failed = snapshot.error.is_some();
+                            if failed && !playback_failed {
+                                let _ = command_tx.send(Command::CheckConnection(true));
+                            }
+                            playback_failed = failed;
                             let _ = event_tx.send(Event::Playback(snapshot));
                         }
                         PlayerEvent::Persist(queue) => {
@@ -441,6 +477,49 @@ fn publish_artwork(
     });
 }
 
+fn set_connection(current: &mut Connection, next: Connection, events: &Sender<Event>) {
+    if *current != next {
+        *current = next.clone();
+        let _ = events.send(Event::Connection(next));
+    }
+}
+
+/// Connects with the saved login. Returns false when there is no login to use.
+fn reconnect(
+    account: Account,
+    paths: &Paths,
+    runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
+    events: &Sender<Event>,
+) -> bool {
+    let credentials = match paths.credentials(&account) {
+        Ok(Some(credentials)) => credentials,
+        result => {
+            let message = match result {
+                Err(error) => format!("{error:#}"),
+                _ => SIGN_IN_NOTICE.into(),
+            };
+            let _ = events.send(Event::SignInRequired(message));
+            return false;
+        }
+    };
+    let namespace = account.namespace();
+    let tx = tx.clone();
+    runtime.spawn(async move {
+        let result = async {
+            let mut server = Server::with_credentials(account, credentials)?;
+            let label = server.connect().await?;
+            Ok::<_, anyhow::Error>((server, label))
+        }
+        .await;
+        let _ = tx.send(match result {
+            Ok((server, label)) => Command::Connected(server, label),
+            Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
+        });
+    });
+    true
+}
+
 fn run(
     paths: Paths,
     runtime: tokio::runtime::Handle,
@@ -475,34 +554,26 @@ fn run(
         }
         .into(),
     ))?;
+    let mut connection = Connection::None;
+    let mut checking = false;
+    let mut last_check = Instant::now();
     if let Some(account) = account.clone() {
-        let command_tx = tx.clone();
-        let saved = paths.credentials(&account);
-        let event_tx = events.clone();
+        checking = reconnect(account, &paths, &runtime, &tx, &events);
+        if checking {
+            set_connection(&mut connection, Connection::Connecting, &events);
+        }
+    }
+    {
+        let ticker = tx.clone();
         runtime.spawn(async move {
-            let credentials = match saved {
-                Ok(Some(credentials)) => credentials,
-                result => {
-                    let message = match result {
-                        Err(error) => format!("{error:#}"),
-                        _ => SIGN_IN_NOTICE.into(),
-                    };
-                    let _ = event_tx.send(Event::SignInRequired(message));
-                    return;
-                }
-            };
-            let result = Server::with_credentials(account, credentials);
-            match result {
-                Ok(mut server) => match server.connect().await {
-                    Ok(label) => {
-                        let _ = command_tx.send(Command::Connected(server, label));
-                    }
-                    Err(error) => {
-                        let _ = command_tx.send(Command::Error(format!("Offline · {error:#}")));
-                    }
-                },
-                Err(error) => {
-                    let _ = command_tx.send(Command::Error(format!("Offline · {error:#}")));
+            loop {
+                tokio::time::sleep(CONNECTION_TICK).await;
+                if ticker
+                    .send_async(Command::CheckConnection(false))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -673,6 +744,9 @@ fn run(
                     }
                     paths.save_account(&value.account)?;
                     account = Some(value.account.clone());
+                    checking = false;
+                    last_check = Instant::now();
+                    set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
                     server = Some(value.clone());
                     artwork_queue.retry_failed(Instant::now());
@@ -998,7 +1072,6 @@ fn run(
                     }
                 }
                 Command::Download(request) => {
-                    let client = slskd_client(&mut slskd, &catalog, &paths)?;
                     let namespace = account.as_ref().map(Account::namespace).unwrap_or_default();
                     let DownloadRequest {
                         artist,
@@ -1008,10 +1081,21 @@ fn run(
                         expected,
                         candidate,
                     } = *request;
-                    anyhow::ensure!(
-                        watched.insert(release.clone()),
-                        "This release is already downloading"
-                    );
+                    let client = match slskd_client(&mut slskd, &catalog, &paths) {
+                        Ok(client) => client,
+                        Err(error) => {
+                            events
+                                .send(Event::DownloadNotStarted(release, format!("{error:#}")))?;
+                            return Ok(());
+                        }
+                    };
+                    if !watched.insert(release.clone()) {
+                        events.send(Event::DownloadNotStarted(
+                            release,
+                            "This release is already downloading.".into(),
+                        ))?;
+                        return Ok(());
+                    }
                     let tx = tx.clone();
                     let events = events.clone();
                     let runtime_handle = runtime.clone();
@@ -1045,9 +1129,14 @@ fn run(
                                 watch_download(&runtime_handle, client, tx, namespace, job);
                             }
                             Err(error) => {
-                                let _ = tx.send(Command::DismissDownload(job.release));
-                                let _ = events
-                                    .send(Event::Error(format!("Download not started: {error:#}")));
+                                let _ = tx.send(Command::DismissDownload(job.release.clone()));
+                                let _ = events.send(Event::DownloadNotStarted(
+                                    job.release,
+                                    format!(
+                                        "{} did not accept the request: {error:#}",
+                                        candidate.username
+                                    ),
+                                ));
                             }
                         }
                     });
@@ -1583,6 +1672,47 @@ fn run(
                     if failed == generation {
                         syncing = false;
                         events.send(Event::Error(error))?;
+                        let _ = tx.send(Command::CheckConnection(true));
+                    }
+                }
+                Command::CheckConnection(now) => {
+                    if !checking && (now || last_check.elapsed() >= connection.check_interval()) {
+                        if let Some(server) = server.clone() {
+                            checking = true;
+                            last_check = Instant::now();
+                            let tx = tx.clone();
+                            runtime.spawn(async move {
+                                let result =
+                                    server.ping().await.map_err(|error| format!("{error:#}"));
+                                let _ = tx.send(Command::ConnectionChecked(
+                                    server.account.namespace(),
+                                    result,
+                                ));
+                            });
+                        } else if let Some(account) = account.clone()
+                            && matches!(connection, Connection::Offline(_))
+                        {
+                            // The first connection failed; connecting again also starts a sync.
+                            last_check = Instant::now();
+                            checking = reconnect(account, &paths, &runtime, &tx, &events);
+                            if !checking {
+                                set_connection(&mut connection, Connection::None, &events);
+                            }
+                        }
+                    }
+                }
+                Command::ConnectionChecked(namespace, result) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        checking = false;
+                        last_check = Instant::now();
+                        set_connection(
+                            &mut connection,
+                            match result {
+                                Ok(()) => Connection::Online,
+                                Err(reason) => Connection::Offline(reason),
+                            },
+                            &events,
+                        );
                     }
                 }
                 Command::Error(error) => {
