@@ -249,6 +249,15 @@ impl MusicApp {
             .into_any_element()
     }
 
+    /// The right-click menu for the top bar outside the tabs: the active tab's options.
+    pub(super) fn bar_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let tabs = &self.preferences.tabs;
+        self.tab_menu(tabs.active, tabs.active().locked, cx)
+    }
+
     /// Lock, close, new and reset, for a tab's right-click menu.
     fn tab_menu(
         &self,
@@ -406,26 +415,13 @@ impl MusicApp {
                 .on_click(cx.listener(|app, _, window, cx| app.new_tab(window, cx)))
                 .into_any_element(),
         );
-        let weak = cx.weak_entity();
         items.push(
             div()
                 .id("tab-strip-space")
                 .flex_1()
                 .min_w(px(24.))
                 .h_full()
-                .context_menu(move |menu, _, _| {
-                    let (add, reset) = (weak.clone(), weak.clone());
-                    menu.item(
-                        PopupMenuItem::new("New tab").on_click(move |_, window, cx| {
-                            let _ = add.update(cx, |app, cx| app.new_tab(window, cx));
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Reset all tabs").on_click(move |_, window, cx| {
-                            let _ = reset.update(cx, |app, cx| app.reset_tabs(window, cx));
-                        }),
-                    )
-                })
+                .context_menu(self.bar_menu(cx))
                 .into_any_element(),
         );
         items

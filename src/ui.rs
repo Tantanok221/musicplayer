@@ -516,7 +516,7 @@ type TabHistory = (Vec<Option<Page>>, Vec<Option<Page>>);
 
 /// A spot at one end of the tab strip for a scroll arrow, covering the tabs beneath.
 /// A short fade on its inner side lets the covered tab slip out of view.
-fn edge(background: Hsla, left: bool) -> Div {
+fn edge(id: &'static str, background: Hsla, left: bool) -> Stateful<Div> {
     let clear = background.opacity(0.);
     let fade = div().absolute().top_0().bottom_0().w(px(20.));
     let fade = if left {
@@ -533,6 +533,7 @@ fn edge(background: Hsla, left: bool) -> Div {
         ))
     };
     div()
+        .id(id)
         .absolute()
         .top_0()
         .bottom_0()
@@ -2258,29 +2259,39 @@ impl MusicApp {
             // The arrows float over the strip's ends so the tabs never shift
             // when one appears or disappears.
             .when(scroll_left, |row| {
-                row.child(edge(colors.background, true).left_0().pr_1().child(
-                    short_button("tabs-left", Glyph::ChevronLeft, "Scroll tabs left").on_click(
-                        cx.listener(|app, _, _, cx| {
-                            let offset = app.workspace_scroll.offset();
-                            let x = (offset.x + px(140.)).min(px(0.));
-                            app.workspace_scroll.set_offset(point(x, px(0.)));
-                            cx.notify();
-                        }),
-                    ),
-                ))
+                row.child(
+                    edge("tabs-left-edge", colors.background, true)
+                        .left_0()
+                        .pr_1()
+                        .child(
+                            short_button("tabs-left", Glyph::ChevronLeft, "Scroll tabs left")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    let offset = app.workspace_scroll.offset();
+                                    let x = (offset.x + px(140.)).min(px(0.));
+                                    app.workspace_scroll.set_offset(point(x, px(0.)));
+                                    cx.notify();
+                                })),
+                        )
+                        .context_menu(self.bar_menu(cx)),
+                )
             })
             .when(scroll_right, |row| {
-                row.child(edge(colors.background, false).right_0().pl_1().child(
-                    short_button("tabs-right", Glyph::ChevronRight, "Scroll tabs right").on_click(
-                        cx.listener(|app, _, _, cx| {
-                            let offset = app.workspace_scroll.offset();
-                            let max = app.workspace_scroll.max_offset().x;
-                            let x = (offset.x - px(140.)).max(-max);
-                            app.workspace_scroll.set_offset(point(x, px(0.)));
-                            cx.notify();
-                        }),
-                    ),
-                ))
+                row.child(
+                    edge("tabs-right-edge", colors.background, false)
+                        .right_0()
+                        .pl_1()
+                        .child(
+                            short_button("tabs-right", Glyph::ChevronRight, "Scroll tabs right")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    let offset = app.workspace_scroll.offset();
+                                    let max = app.workspace_scroll.max_offset().x;
+                                    let x = (offset.x - px(140.)).max(-max);
+                                    app.workspace_scroll.set_offset(point(x, px(0.)));
+                                    cx.notify();
+                                })),
+                        )
+                        .context_menu(self.bar_menu(cx)),
+                )
             });
         let navigator = navigator_key(&self.preferences.layout);
         let weak = cx.weak_entity();
@@ -2298,11 +2309,18 @@ impl MusicApp {
             .when(controls_inset > 0., |bar| {
                 bar.child(
                     // The transparent macOS title bar places traffic lights in this area.
-                    div().w(px(controls_inset)).h_full().flex_shrink_0(),
+                    div()
+                        .id("titlebar-controls")
+                        .w(px(controls_inset))
+                        .h_full()
+                        .flex_shrink_0()
+                        .context_menu(self.bar_menu(cx)),
                 )
             })
             .child(
                 div()
+                    .id("history-buttons")
+                    .h_full()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -2317,7 +2335,8 @@ impl MusicApp {
                         short_button("history-forward", Glyph::ChevronRight, "Forward")
                             .disabled(self.history_forward.is_empty())
                             .on_click(cx.listener(|app, _, window, cx| app.go_forward(window, cx))),
-                    ),
+                    )
+                    .context_menu(self.bar_menu(cx)),
             )
             .child(tabs)
             .child(
@@ -2341,7 +2360,8 @@ impl MusicApp {
                             app.titlebar_dragging = false;
                             window.start_window_move();
                         }
-                    })),
+                    }))
+                    .context_menu(self.bar_menu(cx)),
             )
             .child(
                 short_button("layout-menu", Glyph::PanelsTopLeft, "Configure layout")
