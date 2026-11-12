@@ -189,6 +189,53 @@ impl Server {
             .map(Value::Array)
             .unwrap_or_else(|| json!([])))
     }
+    /// Fetches every page of `kind` and hands each to `handle` in order, keeping
+    /// up to `ahead` requests in flight so the library syncs without waiting on
+    /// one round trip at a time. Requests ahead assume full pages; a short page
+    /// drops them and carries on from where it ended, as a one-by-one sync would.
+    pub async fn each_page<F, Fut>(&self, kind: &str, ahead: usize, mut handle: F) -> Result<()>
+    where
+        F: FnMut(Vec<Value>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        const PAGE: usize = 500;
+        let ahead = ahead.max(1);
+        let mut pending = std::collections::VecDeque::new();
+        let mut next = 0;
+        let request = |offset: usize| {
+            let (server, kind) = (self.clone(), kind.to_string());
+            tokio::spawn(async move { server.page(&kind, offset).await })
+        };
+        loop {
+            while pending.len() < ahead {
+                pending.push_back((next, request(next)));
+                next += PAGE;
+            }
+            let (offset, task) = pending.pop_front().expect("a request is in flight");
+            let page = match task.await {
+                Ok(page) => page,
+                Err(error) => Err(error.into()),
+            };
+            let page = match page {
+                Ok(Value::Array(items)) => items,
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    pending.iter().for_each(|(_, task)| task.abort());
+                    return Err(error);
+                }
+            };
+            let count = page.len();
+            if count < PAGE {
+                pending.iter().for_each(|(_, task)| task.abort());
+                pending.clear();
+                next = offset + count;
+            }
+            if count == 0 {
+                return Ok(());
+            }
+            handle(page).await?;
+        }
+    }
     pub async fn scan_status(&self) -> Result<bool> {
         let response = self.request("getScanStatus", &[]).await?;
         Ok(response["scanStatus"]["scanning"]

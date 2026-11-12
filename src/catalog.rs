@@ -84,6 +84,85 @@ pub struct LibraryView {
     pub years: Vec<i32>,
 }
 
+/// Remembers whether an artist label credits a name. A library has far fewer
+/// distinct labels than tracks, and a view checks every track several times.
+#[derive(Default)]
+struct ArtistMatcher(std::sync::Mutex<std::collections::HashMap<(String, String), bool>>);
+impl ArtistMatcher {
+    fn matches(&self, label: &str, name: &str) -> bool {
+        let mut known = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (label.to_string(), name.to_string());
+        if let Some(&hit) = known.get(&key) {
+            return hit;
+        }
+        let target = normalize(name);
+        let hit = normalize(label) == target
+            || split_artist_names(label)
+                .iter()
+                .any(|part| normalize(part) == target);
+        if known.len() >= 50_000 {
+            known.clear();
+        }
+        known.insert(key, hit);
+        hit
+    }
+}
+/// The fields of a stored track that the navigator reads. Skipping the rest
+/// (paths, contributors, comments and so on) makes building it much cheaper.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NavigatorTrack {
+    id: String,
+    album_id: String,
+    artist: String,
+    artist_id: String,
+    album_artist: String,
+    display_album_artist: String,
+    display_artist: String,
+    artists: Vec<NamedId>,
+    album_artists: Vec<NamedId>,
+    genre: String,
+    genres: Vec<Genre>,
+    year: Option<i32>,
+    cover_art: String,
+}
+impl From<NavigatorTrack> for Track {
+    fn from(track: NavigatorTrack) -> Self {
+        Track {
+            id: track.id,
+            album_id: track.album_id,
+            artist: track.artist,
+            artist_id: track.artist_id,
+            album_artist: track.album_artist,
+            display_album_artist: track.display_album_artist,
+            display_artist: track.display_artist,
+            artists: track.artists,
+            album_artists: track.album_artists,
+            genre: track.genre,
+            genres: track.genres,
+            year: track.year,
+            cover_art: track.cover_art,
+            ..Default::default()
+        }
+    }
+}
+
+/// Just the artist credits of a stored track or album.
+#[derive(serde::Deserialize)]
+struct Credits {
+    #[serde(default)]
+    artists: Option<Vec<Credit>>,
+    #[serde(default, rename = "albumArtists")]
+    album_artists: Option<Vec<Credit>>,
+}
+#[derive(serde::Deserialize)]
+struct Credit {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
@@ -114,21 +193,58 @@ impl Catalog {
                 Ok(sorting::shuffle_key(seed, &id))
             },
         )?;
+        let matcher = Arc::new(ArtistMatcher::default());
+        let names = matcher.clone();
         conn.create_scalar_function(
             "artist_matches",
             2,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8
                 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |context| {
+            move |context| {
                 let label = context.get::<String>(0)?;
                 let name = context.get::<String>(1)?;
-                Ok(normalize(&label) == normalize(&name)
-                    || split_artist_names(&label)
-                        .iter()
-                        .any(|part| normalize(part) == normalize(&name)))
+                Ok(names.matches(&label, &name))
+            },
+        )?;
+        // credits_match(data, which, name, id): whether a track or album's
+        // `artists` (which=1), `albumArtists` (2) or either (3) credit `name`, or
+        // the artist ID `id` when it is not empty. Reads only those lists, which
+        // is much cheaper than SQLite's json_each over the whole document.
+        conn.create_scalar_function(
+            "credits_match",
+            4,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            move |context| {
+                let data = context.get_raw(0).as_str().unwrap_or_default();
+                let which = context.get::<i64>(1)?;
+                let name = context.get::<String>(2)?;
+                let id = context.get::<String>(3)?;
+                let Ok(credits) = serde_json::from_str::<Credits>(data) else {
+                    return Ok(false);
+                };
+                let lists = [
+                    (which & 1 != 0).then_some(credits.artists),
+                    (which & 2 != 0).then_some(credits.album_artists),
+                ];
+                Ok(lists
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .any(|credit| {
+                        (!id.is_empty() && credit.id.as_deref() == Some(id.as_str()))
+                            || credit
+                                .name
+                                .as_deref()
+                                .is_some_and(|label| matcher.matches(label, &name))
+                    }))
             },
         )?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+            -- Sorts and GROUP BYs stay in memory instead of spilling to temp files, and
+            -- reads come straight from the OS file cache rather than through pread.
+            PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456;
             CREATE TABLE IF NOT EXISTS tracks (
                 rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, album_id TEXT NOT NULL,
                 title TEXT NOT NULL, artist TEXT NOT NULL, album_artist TEXT NOT NULL,
@@ -143,6 +259,8 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist);
             CREATE INDEX IF NOT EXISTS tracks_year ON tracks(year);
             CREATE INDEX IF NOT EXISTS tracks_starred ON tracks(starred);
+            -- Lets the album browser pick each album's cover without parsing every track's JSON.
+            CREATE INDEX IF NOT EXISTS tracks_cover ON tracks(album_id,json_extract(data,'$.coverArt'));
             CREATE TABLE IF NOT EXISTS albums (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, artist TEXT NOT NULL,
                 year INTEGER, genre TEXT NOT NULL, generation INTEGER NOT NULL, data TEXT NOT NULL);
@@ -353,7 +471,9 @@ impl Catalog {
             ]);
         }
         if !query.performer.is_empty() {
-            sql.push_str(" AND (artist_matches(tracks.artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+            sql.push_str(
+                " AND (artist_matches(tracks.artist,?) OR credits_match(tracks.data,1,?,''))",
+            );
             values.extend([
                 Value::Text(query.performer.clone()),
                 Value::Text(query.performer.clone()),
@@ -380,7 +500,9 @@ impl Catalog {
                 if index > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str("(artist_matches(tracks.album_artist,?) OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?)))");
+                sql.push_str(
+                    "(artist_matches(tracks.album_artist,?) OR credits_match(tracks.data,2,?,''))",
+                );
                 values.push(Value::Text(artist.clone()));
                 values.push(Value::Text(artist.clone()));
             }
@@ -444,7 +566,17 @@ impl Catalog {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Arc<Track>>> {
-        let (filter, mut values) = Self::filters(query);
+        let (filter, values) = Self::filters(query);
+        self.tracks_where(query, &filter, values, offset, limit)
+    }
+    fn tracks_where(
+        &self,
+        query: &LibraryQuery,
+        filter: &str,
+        mut values: Vec<Value>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Arc<Track>>> {
         let sql = format!(
             "SELECT tracks.data FROM tracks{}{filter}{} LIMIT ? OFFSET ?",
             sorting::TRACK_JOINS,
@@ -468,8 +600,36 @@ impl Catalog {
             .query_map(params_from_iter(values), |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    pub fn view(&self, query: &LibraryQuery) -> Result<LibraryView> {
+    /// Filters that call back into Rust or parse each track's JSON. A view runs
+    /// its filter in several queries, so these are worked out once up front.
+    fn costly(query: &LibraryQuery) -> bool {
+        !query.artist.is_empty()
+            || !query.performer.is_empty()
+            || !query.selection.artists.is_empty()
+            || !query.record_label.trim().is_empty()
+    }
+    /// Stores the tracks matching `query` in a temporary in-memory table and
+    /// returns a filter that reads from it.
+    fn materialize(&self, query: &LibraryQuery) -> Result<(String, Vec<Value>)> {
         let (filter, values) = Self::filters(query);
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS view_rows(id INTEGER PRIMARY KEY); DELETE FROM temp.view_rows;",
+        )?;
+        self.conn.execute(
+            &format!("INSERT INTO temp.view_rows SELECT tracks.rowid FROM tracks{filter}"),
+            params_from_iter(values),
+        )?;
+        Ok((
+            " WHERE tracks.rowid IN (SELECT id FROM temp.view_rows)".into(),
+            Vec::new(),
+        ))
+    }
+    pub fn view(&self, query: &LibraryQuery) -> Result<LibraryView> {
+        let (filter, values) = if Self::costly(query) {
+            self.materialize(query)?
+        } else {
+            Self::filters(query)
+        };
         let track_count = self.conn.query_row(
             &format!("SELECT count(*) FROM tracks{filter}"),
             params_from_iter(values.clone()),
@@ -482,10 +642,12 @@ impl Catalog {
             .validated(Scope::Albums);
         let mut stmt = self.conn.prepare(&format!("SELECT albums.data FROM albums{} WHERE albums.id IN (SELECT DISTINCT album_id FROM tracks{filter}){}", sorting::ALBUM_JOINS, sorting::order(&spec,false)))?;
         let albums = stmt
-            .query_map(params_from_iter(values), |r| r.get::<_, String>(0))?
+            .query_map(params_from_iter(values.clone()), |r| r.get::<_, String>(0))?
             .map(|r| Ok(Arc::new(serde_json::from_str(&r?)?)))
             .collect::<Result<Vec<_>>>()?;
         let facets = self.facets()?;
+        let browser = self.browser_view_with(query, Some((&filter, &values)))?;
+        let tracks = self.tracks_where(query, &filter, values.clone(), 0, 500)?;
         Ok(LibraryView {
             revision: self.revision,
             sort_fields: sorting::available(
@@ -496,9 +658,9 @@ impl Catalog {
                     .map_or(Scope::Albums, |spec| spec.scope),
             )?,
             albums,
-            browser: self.browser_view(query)?,
+            browser,
             navigator: facets.navigator,
-            tracks: self.tracks(query, 0, 500)?,
+            tracks,
             track_count,
             album_count: facets.album_count,
             artists: facets.artists,
@@ -507,6 +669,15 @@ impl Catalog {
         })
     }
     pub fn browser_view(&self, query: &LibraryQuery) -> Result<BrowserView> {
+        self.browser_view_with(query, None)
+    }
+    /// `matching` is the filter for `query` itself when the caller already has
+    /// it. The album column uses the same filter unless albums are selected.
+    fn browser_view_with(
+        &self,
+        query: &LibraryQuery,
+        matching: Option<(&str, &[Value])>,
+    ) -> Result<BrowserView> {
         let mut upstream = query.clone();
         upstream.selection = Default::default();
         upstream.artist.clear();
@@ -539,7 +710,9 @@ impl Catalog {
             upstream.genre = query.genre.clone();
         }
         let (filter, values) = Self::filters(&upstream);
-        let mut statement = self.conn.prepare(&format!("SELECT min(data),album_id FROM tracks{filter} AND album_artist!='' GROUP BY album_artist,album_id"))?;
+        // One track per album artist and album: the one with the smallest ID, read
+        // through the ID index instead of comparing whole JSON documents.
+        let mut statement = self.conn.prepare(&format!("SELECT picked.data,groups.album_id FROM (SELECT min(tracks.id) AS id,tracks.album_artist AS album_artist,tracks.album_id AS album_id FROM tracks{filter} AND tracks.album_artist!='' GROUP BY tracks.album_artist,tracks.album_id) groups JOIN tracks picked ON picked.id=groups.id ORDER BY groups.album_artist,groups.album_id"))?;
         let rows = statement.query_map(params_from_iter(values), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -582,7 +755,12 @@ impl Catalog {
             .collect();
         upstream.selection.artists = query.selection.artists.clone();
         upstream.artist = query.artist.clone();
-        let (filter, values) = Self::filters(&upstream);
+        let (filter, values) = match matching {
+            Some((filter, values)) if query.selection.albums.is_empty() => {
+                (filter.to_string(), values.to_vec())
+            }
+            _ => Self::filters(&upstream),
+        };
         let mut statement=self.conn.prepare(&format!("SELECT album_id,album,count(*),min(json_extract(data,'$.coverArt')),album_artist FROM tracks{filter} GROUP BY album_id ORDER BY album COLLATE NOCASE"))?;
         let albums = statement
             .query_map(params_from_iter(values), |r| {
@@ -656,13 +834,20 @@ impl Catalog {
         let mut years = NavigatorIndex::default();
         let mut statement = self.conn.prepare("SELECT data FROM tracks ORDER BY id")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        // The same few hundred names recur across thousands of tracks.
+        let mut keys = std::collections::HashMap::<String, String>::new();
+        let mut key = |name: &str| {
+            keys.entry(name.to_string())
+                .or_insert_with(|| normalize(name))
+                .clone()
+        };
         for row in rows {
-            let track: Track = serde_json::from_str(&row?)?;
+            let track: Track = serde_json::from_str::<NavigatorTrack>(&row?)?.into();
             for credit in track.artist_credits() {
-                artists.add(normalize(&credit.name), &credit.name, &credit.id, &track);
+                artists.add(key(&credit.name), &credit.name, &credit.id, &track);
             }
             for credit in track.album_artist_credits() {
-                album_artists.add(normalize(&credit.name), &credit.name, &credit.id, &track);
+                album_artists.add(key(&credit.name), &credit.name, &credit.id, &track);
             }
             for genre in track
                 .genres_label()
@@ -704,13 +889,9 @@ impl Catalog {
         let mut statement = self.conn.prepare(
             "SELECT a.data FROM albums a WHERE artist_matches(a.artist,?1)
              OR (?2!='' AND json_extract(a.data,'$.artistId')=?2)
-             OR EXISTS (SELECT 1 FROM json_each(a.data,'$.artists') artist
-                WHERE (?2!='' AND json_extract(artist.value,'$.id')=?2)
-                   OR artist_matches(json_extract(artist.value,'$.name'),?1))
+             OR credits_match(a.data,1,?1,?2)
              OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id=a.id AND (
-                artist_matches(t.album_artist,?1) OR EXISTS (SELECT 1 FROM json_each(t.data,'$.albumArtists') artist
-                   WHERE (?2!='' AND json_extract(artist.value,'$.id')=?2)
-                      OR artist_matches(json_extract(artist.value,'$.name'),?1))))
+                artist_matches(t.album_artist,?1) OR credits_match(t.data,2,?1,?2)))
              ORDER BY a.year DESC,a.name COLLATE NOCASE,a.id",
         )?;
         statement
@@ -730,8 +911,7 @@ impl Catalog {
     }
     pub fn artist_tracks(&self, name: &str, id: &str) -> Result<Vec<Arc<Track>>> {
         let mut statement = self.conn.prepare("SELECT data FROM tracks WHERE artist_matches(artist,?1) OR artist_matches(album_artist,?1)
-            OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.artists') a WHERE artist_matches(json_extract(a.value,'$.name'),?1) OR (?2!='' AND json_extract(a.value,'$.id')=?2))
-            OR EXISTS (SELECT 1 FROM json_each(tracks.data,'$.albumArtists') a WHERE artist_matches(json_extract(a.value,'$.name'),?1) OR (?2!='' AND json_extract(a.value,'$.id')=?2))")?;
+            OR credits_match(tracks.data,3,?1,?2)")?;
         statement
             .query_map(params![name, id], |row| row.get::<_, String>(0))?
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))

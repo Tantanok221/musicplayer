@@ -138,6 +138,8 @@ impl Connection {
     }
 }
 const CONNECTION_TICK: Duration = Duration::from_secs(5);
+/// Library pages requested at once while syncing.
+const SYNC_REQUESTS_AHEAD: usize = 4;
 #[derive(Clone)]
 pub struct DownloadRequest {
     pub artist: String,
@@ -441,19 +443,25 @@ fn begin_sync(
             let scanning_before=server.scan_status().await?;
             for kind in ["song","album"] {
                 let mut offset=0;let mut seen=HashSet::new();
-                loop {
-                    let page=server.page(kind,offset).await?;
-                    let count=page.as_array().map_or(0,Vec::len);
-                    if count==0{break;}
-                    for item in page.as_array().unwrap(){
-                        let id=item["id"].as_str().unwrap_or_default();
-                        if id.is_empty()||!seen.insert(id.to_string()){anyhow::bail!("Library changed during sync. Refresh again after the server scan finishes.");}
+                // A few pages in flight at once: syncing is bound by round trips, not the server.
+                server.each_page(kind,SYNC_REQUESTS_AHEAD,|page| {
+                    let result=(|| {
+                        for item in &page{
+                            let id=item["id"].as_str().unwrap_or_default();
+                            if id.is_empty()||!seen.insert(id.to_string()){anyhow::bail!("Library changed during sync. Refresh again after the server scan finishes.");}
+                        }
+                        offset+=page.len();
+                        let page=serde_json::Value::Array(page);
+                        Ok(if kind=="song"{Command::Tracks(generation,serde_json::from_value(page)?)}else{Command::Albums(generation,serde_json::from_value(page)?)})
+                    })();
+                    let (tx,events)=(tx.clone(),events.clone());
+                    let status=format!("Syncing {} · {offset:} indexed",if kind=="song"{"tracks"}else{"albums"});
+                    async move {
+                        tx.send_async(result?).await?;
+                        let _=events.send(Event::Status(status));
+                        Ok(())
                     }
-                    if kind=="song"{tx.send_async(Command::Tracks(generation,serde_json::from_value(page)?)).await?;}
-                    else{tx.send_async(Command::Albums(generation,serde_json::from_value(page)?)).await?;}
-                    offset+=count;
-                    let _=events.send(Event::Status(format!("Syncing {} · {offset:} indexed",if kind=="song"{"tracks"}else{"albums"})));
-                }
+                }).await?;
             }
             let playlists=server.playlists().await?;
             let scanning_after=server.scan_status().await?;
