@@ -45,6 +45,8 @@ mod context_menu;
 use context_menu::{menu_row, menu_row_detail};
 mod downloads;
 mod queue_controls;
+mod sections;
+use sections::{Part, style};
 mod tabs;
 use queue_controls::QueueViewState;
 mod sorting_controls;
@@ -728,7 +730,12 @@ pub struct MusicApp {
     /// When the last playback snapshot arrived, to extrapolate position between them.
     playback_at: Instant,
     /// A pending paced redraw for animations that don't need display rate.
-    frame_timer: Option<Task<()>>,
+    /// Pending redraws, one per view, for animations below display rate.
+    frame_timers: HashMap<EntityId, Task<()>>,
+    /// The window's cached parts; see `sections`.
+    sections: HashMap<Part, Entity<sections::Section>>,
+    /// Set when the app itself changed, so this frame redraws every part.
+    full_frame: bool,
     /// Saves the window frame once a move or resize settles.
     window_save: Option<Task<()>>,
     /// Part of every resizable group's ID. Panels keep the size they first
@@ -839,7 +846,7 @@ impl MusicApp {
                 .default_value(0.7)
         });
         let view = cx.entity().downgrade();
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe_window_bounds(window, |app, window, cx| app.remember_window(window, cx)),
             // Animation stops while hidden, so resume it when the window is shown again.
             window.observe_window_visibility(move |_, _, cx| {
@@ -998,7 +1005,9 @@ impl MusicApp {
             lyrics_snap: 0,
             lyrics_wake: None,
             playback_at: Instant::now(),
-            frame_timer: None,
+            frame_timers: HashMap::new(),
+            sections: HashMap::new(),
+            full_frame: true,
             window_save: None,
             layout_generation: 0,
             artist_name: None,
@@ -1055,7 +1064,10 @@ impl MusicApp {
             tab_save: None,
             closed_tabs: Vec::new(),
             restoring_location: false,
-            _subscriptions: subscriptions,
+            _subscriptions: {
+                subscriptions.push(cx.observe_self(|app, _| app.full_frame = true));
+                subscriptions
+            },
         }
     }
     fn event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
@@ -1325,6 +1337,18 @@ impl MusicApp {
                 self.lyrics.insert(id, text);
             }
             Event::Playback(snapshot) => {
+                // Snapshots arrive about five times a second while playing; when
+                // only the position moved, redraw just what shows it.
+                let previous = &self.playback;
+                let position_only = snapshot.track.as_ref().map(|track| &track.id)
+                    == previous.track.as_ref().map(|track| &track.id)
+                    && snapshot.playing == previous.playing
+                    && snapshot.buffering == previous.buffering
+                    && snapshot.duration == previous.duration
+                    && snapshot.index == previous.index
+                    && snapshot.queue_revision == previous.queue_revision
+                    && snapshot.can_undo_queue == previous.can_undo_queue
+                    && snapshot.error == previous.error;
                 let progress = if snapshot.duration > 0. {
                     snapshot.position / snapshot.duration * 1000.
                 } else {
@@ -1338,6 +1362,14 @@ impl MusicApp {
                 self.playback = snapshot;
                 self.playback_at = Instant::now();
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
+                if position_only {
+                    self.notify_part(Part::Player, cx);
+                    if self.workspace == Workspace::Queue && !self.blank {
+                        // The playing queue row shows elapsed time.
+                        self.notify_part(Part::Center, cx);
+                    }
+                    return;
+                }
             }
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
@@ -5364,7 +5396,30 @@ impl MusicApp {
             )
             .into_any_element()
     }
-    fn track_information(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Track information, as a header part above a content part, so lyric
+    /// animations redraw only the content.
+    fn track_information(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(ink(cx).panel)
+            .child(
+                self.part(
+                    Part::InfoHeader,
+                    style()
+                        .w_full()
+                        .h(px(sections::INFO_HEADER_HEIGHT))
+                        .flex_shrink_0(),
+                    cx,
+                ),
+            )
+            .child(self.part(Part::InfoBody, style().w_full().flex_1().min_h_0(), cx))
+            .into_any_element()
+    }
+    /// Track information's title row with its source switch, and its tabs.
+    fn track_information_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let source = self.preferences.layout.info_source;
         let tab = self.preferences.layout.info_tab;
@@ -5455,6 +5510,24 @@ impl MusicApp {
                     })),
             );
         }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(colors.panel)
+            .child(header)
+            .child(tabs)
+            .into_any_element()
+    }
+    /// Details, lyrics or artwork for the selected or playing track.
+    fn track_information_body(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let source = self.preferences.layout.info_source;
+        let tab = self.preferences.layout.info_tab;
         let mut content = div()
             .id("information-scroll")
             .flex_1()
@@ -5603,8 +5676,6 @@ impl MusicApp {
             .flex()
             .flex_col()
             .bg(colors.panel)
-            .child(header)
-            .child(tabs)
             .child(content)
             .into_any_element()
     }
@@ -5649,30 +5720,41 @@ impl MusicApp {
             return;
         }
         let delay = Duration::from_secs_f64(start - now + 0.004);
+        // Only the lyrics change on the beat, so only their part redraws.
+        let view = window.current_view();
         let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            this.update(cx, |_, cx| cx.notify()).ok();
+            this.update(cx, |_, cx| {
+                let cx: &mut App = cx;
+                cx.notify(view);
+            })
+            .ok();
         });
         self.lyrics_wake = Some((index, task));
     }
-    /// Redraws after `interval`, coalescing requests, for animations that don't need display rate.
+    /// Redraws the view being rendered after `interval`, coalescing requests,
+    /// for animations that don't need display rate. Only that view redraws,
+    /// so a part's animation leaves the rest of the window cached.
     fn request_frame_after(
         &mut self,
         interval: Duration,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.frame_timer.is_some() {
+        let view = window.current_view();
+        if self.frame_timers.contains_key(&view) {
             return;
         }
-        self.frame_timer = Some(cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(interval).await;
             this.update(cx, |app, cx| {
-                app.frame_timer = None;
-                cx.notify();
+                app.frame_timers.remove(&view);
+                let cx: &mut App = cx;
+                cx.notify(view);
             })
             .ok();
-        }));
+        });
+        self.frame_timers.insert(view, task);
     }
     fn lyrics_content(
         &mut self,
@@ -5898,9 +5980,9 @@ impl MusicApp {
         }
         content.into_any_element()
     }
-    fn information_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn information_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.workspace == Workspace::Queue && !self.blank {
-            return self.track_information(window, cx);
+            return self.track_information(cx);
         }
         v_resizable(SharedString::from(format!(
             "right-panels-{}",
@@ -5918,37 +6000,26 @@ impl MusicApp {
             resizable_panel()
                 .size(px(self.preferences.layout.queue_height))
                 .size_range(px(100.)..px(1200.))
-                .child(self.playing_tracks(cx)),
+                .child(self.part(Part::SidebarQueue, style().size_full(), cx)),
         )
         .child(
             resizable_panel()
                 .size_range(px(150.)..px(2000.))
-                .child(self.track_information(window, cx)),
+                .child(self.track_information(cx)),
         )
         .into_any_element()
     }
-    fn now_playing_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The cover, track and album details, album tracks and Up Next.
+    fn now_playing_details(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(track) = self.playback.track.clone() else {
-            return self.empty(
-                "Play an album or track to see its artwork, details, and lyrics here.",
-                cx,
-            );
+            return div().into_any_element();
         };
         let theme_dark = cx.theme().is_dark();
-        let theme = theme_ink(theme_dark);
         let legible = self.backdrop_ink(&track.cover_art, theme_dark);
-        // The backdrop keeps the theme's scrim; everything after it uses
-        // colors chosen to read on this album's art.
-        let backdrop = self.backdrop(
-            &track.cover_art,
-            legible.map_or(theme.background, |(ink, _)| ink.background),
-            window,
-            cx,
-        );
+        // Colors chosen to read on this album's art; see `backdrop_ink`.
         let _scope = legible.map(|(ink, _)| InkScope::new(ink));
         let plates = legible.map_or([0.; 2], |(_, plates)| plates);
         let colors = ink(cx);
-        let dark = colors.dark;
         if !track.album_id.is_empty() && self.highlight_requested.as_ref() != Some(&track.album_id)
         {
             self.highlight_requested = Some(track.album_id.clone());
@@ -5979,11 +6050,6 @@ impl MusicApp {
                     .collect()
             });
         let album_time = album_tracks.iter().map(|track| track.duration).sum::<f64>();
-
-        let palette = self
-            .backdrops
-            .get(&track.cover_art)
-            .map(|backdrop| backdrop.palette);
 
         let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 360.);
         let cover = match self.artwork.get(&track.cover_art) {
@@ -6143,32 +6209,86 @@ impl MusicApp {
             )
             .child(album_list)
             .children(up_next);
-        let lyrics = self.lyrics_content(track.clone(), true, window, cx);
-        let lyrics = div()
-            .flex_1()
+        hero.into_any_element()
+    }
+    /// The blurred cover behind Now Playing, crossfading between albums.
+    fn now_playing_backdrop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(track) = self.playback.track.clone() else {
+            return div().into_any_element();
+        };
+        let theme_dark = cx.theme().is_dark();
+        let fade = self
+            .backdrop_ink(&track.cover_art, theme_dark)
+            .map_or(theme_ink(theme_dark).background, |(ink, _)| ink.background);
+        self.backdrop(&track.cover_art, fade, window, cx)
+    }
+    /// Now Playing's synchronized lyrics.
+    fn now_playing_lyrics(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(track) = self.playback.track.clone() else {
+            return div().into_any_element();
+        };
+        let legible = self.backdrop_ink(&track.cover_art, cx.theme().is_dark());
+        let _scope = legible.map(|(ink, _)| InkScope::new(ink));
+        let plate = legible.map_or(0., |(_, plates)| plates[1]);
+        let colors = ink(cx);
+        let lyrics = self.lyrics_content(track, true, window, cx);
+        div()
+            .size_full()
             .min_w_0()
             .min_h_0()
-            .h_full()
             .pl_4()
             .pr_8()
             .pt_6()
-            .when(plates[1] > 0., |lyrics| {
-                lyrics.bg(colors.background.opacity(plates[1]))
+            .when(plate > 0., |lyrics| {
+                lyrics.bg(colors.background.opacity(plate))
             })
-            .child(lyrics);
-
-        let spectrum = self
-            .preferences
-            .layout
-            .show_spectrum
-            .then(|| self.spectrum_band(palette, dark, window, cx));
+            .child(lyrics)
+            .into_any_element()
+    }
+    /// The output spectrum along the bottom of Now Playing.
+    fn now_playing_spectrum(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(track) = self.playback.track.clone() else {
+            return div().into_any_element();
+        };
+        let legible = self.backdrop_ink(&track.cover_art, cx.theme().is_dark());
+        let _scope = legible.map(|(ink, _)| InkScope::new(ink));
+        let palette = self
+            .backdrops
+            .get(&track.cover_art)
+            .map(|backdrop| backdrop.palette);
+        let dark = ink(cx).dark;
+        self.spectrum_band(palette, dark, window, cx)
+    }
+    /// Arranges Now Playing's parts, each cached separately so the spectrum
+    /// and lyric animations redraw only themselves.
+    fn now_playing_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(track) = self.playback.track.clone() else {
+            return self.empty(
+                "Play an album or track to see its artwork, details, and lyrics here.",
+                cx,
+            );
+        };
+        let theme_dark = cx.theme().is_dark();
+        let legible = self.backdrop_ink(&track.cover_art, theme_dark);
+        let accent = legible.map_or(theme_ink(theme_dark).accent, |(ink, _)| ink.accent);
+        let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 360.);
+        let spectrum = self.preferences.layout.show_spectrum.then(|| {
+            self.part(
+                Part::Spectrum,
+                style()
+                    .w_full()
+                    .h(px(sections::SPECTRUM_BAND_HEIGHT))
+                    .flex_shrink_0(),
+                cx,
+            )
+        });
         div()
             .relative()
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .bg(theme.background)
-            .child(backdrop)
+            .bg(theme_ink(theme_dark).background)
+            .child(self.part(Part::NowBackdrop, style().absolute().inset_0(), cx))
             .child(
                 div()
                     .relative()
@@ -6184,12 +6304,27 @@ impl MusicApp {
                                     .px_8()
                                     .py_2()
                                     .text_size(px(11.))
-                                    .text_color(colors.accent)
+                                    .text_color(accent)
                                     .child(error),
                             )
                         },
                     )
-                    .child(div().flex_1().min_h_0().flex().child(hero).child(lyrics))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(self.part(
+                                Part::NowDetails,
+                                style().w(px(cover_side + 64.)).h_full().flex_shrink_0(),
+                                cx,
+                            ))
+                            .child(self.part(
+                                Part::NowLyrics,
+                                style().flex_1().min_w_0().min_h_0().h_full(),
+                                cx,
+                            )),
+                    )
                     .children(spectrum),
             )
             .into_any_element()
@@ -7859,8 +7994,13 @@ impl MusicApp {
 }
 impl Render for MusicApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.image_cache
-            .update(cx, |cache, cx| cache.begin_frame(window, cx));
+        // The cache keeps covers drawn in the last full frame. Animation frames
+        // reuse cached parts without drawing their covers, so they must not
+        // advance it, or visible covers could be evicted.
+        if std::mem::take(&mut self.full_frame) {
+            self.image_cache
+                .update(cx, |cache, cx| cache.begin_frame(window, cx));
+        }
         self.sync_active_tab(window, cx);
         let colors = ink(cx);
         if !self.settings {
@@ -7904,9 +8044,10 @@ impl Render for MusicApp {
             } else {
                 0.
             };
-            let left = (docked || slide > 0.001).then(|| self.navigator(cx));
-            let center = self.center_panel(cx);
-            let right = information.then(|| self.information_sidebar(window, cx));
+            let left = (docked || slide > 0.001)
+                .then(|| self.part(Part::Navigator, style().size_full(), cx));
+            let center = self.part(Part::Center, style().size_full(), cx);
+            let right = information.then(|| self.information_sidebar(cx));
             let (docked_left, floating_left) = if docked { (left, None) } else { (None, left) };
             // Hidden panels keep stale sizes in a group's state and block dragging,
             // so each arrangement gets its own group with only the panels it shows.
@@ -8011,9 +8152,24 @@ impl Render for MusicApp {
                 })
                 .into_any_element()
         };
-        if std::mem::take(&mut self.art_wake) {
-            self.request_frame_after(ART_SETTLE, window, cx);
-        }
+        let tabs = self.part(
+            Part::Tabs,
+            style()
+                .w_full()
+                .h(px(sections::TABS_HEIGHT))
+                .flex_shrink_0(),
+            cx,
+        );
+        let status = self.part(
+            Part::Status,
+            style().w_full().h(px(21.)).flex_shrink_0(),
+            cx,
+        );
+        let player = self.part(
+            Part::Player,
+            style().w_full().h(px(56.)).flex_shrink_0(),
+            cx,
+        );
         div()
             .size_full()
             .min_w_0()
@@ -8122,7 +8278,7 @@ impl Render for MusicApp {
             .on_action(cx.listener(|app, _: &ExplorerWorkspace, window, cx| {
                 app.switch_workspace(Workspace::Explorer, window, cx)
             }))
-            .child(self.tabs(window, cx))
+            .child(tabs)
             .child(
                 div()
                     .flex_1()
@@ -8131,8 +8287,8 @@ impl Render for MusicApp {
                     .overflow_hidden()
                     .child(body),
             )
-            .child(self.status_bar(cx))
-            .child(self.player_bar(window, cx))
+            .child(status)
+            .child(player)
     }
 }
 
