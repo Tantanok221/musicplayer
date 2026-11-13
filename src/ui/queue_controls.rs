@@ -155,9 +155,19 @@ impl Render for QueueDragPreview {
 }
 
 impl MusicApp {
-    fn open_queue_album(&mut self, track: &Track, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the track's album, selected and expanded, in Music Explorer.
+    pub(super) fn open_queue_album(
+        &mut self,
+        track: &Track,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if track.album_id.is_empty() {
             return;
+        }
+        // Switching workspaces records history itself, but not within Explorer.
+        if self.workspace == Workspace::Explorer && self.artist_name.is_none() && !self.blank {
+            self.remember_location();
         }
         self.switch_workspace(Workspace::Explorer, window, cx);
         self.query = LibraryQuery {
@@ -369,6 +379,7 @@ impl MusicApp {
         );
         self.show_playlist_editor = true;
         self.playlist_editor_rename = false;
+        self.playlist_editor_album = None;
         cx.notify();
     }
     pub(super) fn queue_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -709,9 +720,8 @@ impl MusicApp {
         let remove_weak = weak.clone();
         let earlier_weak = weak.clone();
         let later_weak = weak.clone();
-        let artist_weak = weak.clone();
-        let album_track = track.clone();
-        let artist = track.artist_label().to_string();
+        let menu_track = track.clone();
+        let menu_state = self.menu_state(cx);
         let mut row = div()
             .id(SharedString::from(format!("queue-entry-{id}")))
             .role(Role::Group)
@@ -823,94 +833,82 @@ impl MusicApp {
                     app.service.player.send(PlayerCommand::JumpTo(index));
                 }
             }));
-        let context_menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+        let context_menu = move |menu: PopupMenu,
+                                 window: &mut Window,
+                                 cx: &mut Context<PopupMenu>| {
             let play = play_weak.clone();
             let next = next_weak.clone();
             let next_indices = move_next.clone();
             let remove = remove_weak.clone();
             let earlier = earlier_weak.clone();
             let later = later_weak.clone();
-            let artist_weak = artist_weak.clone();
-            let artist = artist.clone();
-            let album_weak = weak.clone();
-            let album_track = album_track.clone();
-            menu.item(
-                PopupMenuItem::new("Play from here").on_click(move |_, _, cx| {
-                    let _ = play.update(cx, |app, _| {
-                        app.service.player.send(PlayerCommand::JumpTo(index))
-                    });
-                }),
-            )
-            .item(
-                PopupMenuItem::new("Move to next")
-                    .disabled(!upcoming)
-                    .on_click(move |_, _, cx| {
-                        let _ = next.update(cx, |app, _| {
-                            app.queue_edit_at(
-                                revision,
-                                QueueEdit::Move {
-                                    indices: next_indices.clone(),
-                                    before: next_index(&app.playback),
-                                },
-                            )
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("Move earlier")
-                    .disabled(!upcoming)
-                    .on_click(move |_, _, cx| {
-                        let _ = earlier.update(cx, |app, _| {
-                            app.queue_edit_at(
-                                revision,
-                                QueueEdit::Move {
-                                    indices: vec![index],
-                                    before: index.saturating_sub(1).max(next_index(&app.playback)),
-                                },
-                            )
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("Move later")
-                    .disabled(!upcoming)
-                    .on_click(move |_, _, cx| {
-                        let _ = later.update(cx, |app, _| {
-                            app.queue_edit_at(
-                                revision,
-                                QueueEdit::Move {
-                                    indices: vec![index],
-                                    before: (index + 2).min(app.playback.queue.len()),
-                                },
-                            )
-                        });
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("Go to album").on_click(move |_, window, cx| {
-                    let _ = album_weak.update(cx, |app, cx| {
-                        app.open_queue_album(&album_track, window, cx);
-                    });
-                }),
-            )
-            .item(
-                PopupMenuItem::new("Go to artist").on_click(move |_, window, cx| {
-                    let _ = artist_weak.update(cx, |app, cx| {
-                        app.open_artist(artist.clone(), String::new(), window, cx)
-                    });
-                }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("Remove from queue")
-                    .disabled(!upcoming)
-                    .on_click(move |_, _, cx| {
-                        let _ = remove.update(cx, |app, _| {
-                            app.queue_edit_at(revision, QueueEdit::Remove(vec![index]))
-                        });
-                    }),
-            )
+            let menu =
+                super::context_menu::track_rating(menu.min_w(px(220.)), &menu_state, &menu_track)
+                    .item(
+                        menu_row(Glyph::Play, "Play from Here").on_click(move |_, _, cx| {
+                            let _ = play.update(cx, |app, _| {
+                                app.service.player.send(PlayerCommand::JumpTo(index))
+                            });
+                        }),
+                    )
+                    .item(
+                        menu_row(Glyph::ListStart, "Move to Next")
+                            .disabled(!upcoming)
+                            .on_click(move |_, _, cx| {
+                                let _ = next.update(cx, |app, _| {
+                                    app.queue_edit_at(
+                                        revision,
+                                        QueueEdit::Move {
+                                            indices: next_indices.clone(),
+                                            before: next_index(&app.playback),
+                                        },
+                                    )
+                                });
+                            }),
+                    )
+                    .item(
+                        menu_row(Glyph::ArrowUp, "Move Earlier")
+                            .disabled(!upcoming)
+                            .on_click(move |_, _, cx| {
+                                let _ = earlier.update(cx, |app, _| {
+                                    app.queue_edit_at(
+                                        revision,
+                                        QueueEdit::Move {
+                                            indices: vec![index],
+                                            before: index
+                                                .saturating_sub(1)
+                                                .max(next_index(&app.playback)),
+                                        },
+                                    )
+                                });
+                            }),
+                    )
+                    .item(
+                        menu_row(Glyph::ArrowDown, "Move Later")
+                            .disabled(!upcoming)
+                            .on_click(move |_, _, cx| {
+                                let _ = later.update(cx, |app, _| {
+                                    app.queue_edit_at(
+                                        revision,
+                                        QueueEdit::Move {
+                                            indices: vec![index],
+                                            before: (index + 2).min(app.playback.queue.len()),
+                                        },
+                                    )
+                                });
+                            }),
+                    );
+            super::context_menu::track_extras(menu, &menu_state, &menu_track, window, cx)
+                .separator()
+                .item(
+                    menu_row(Glyph::ListX, "Remove from Queue")
+                        .disabled(!upcoming)
+                        .on_click(move |_, _, cx| {
+                            let _ = remove.update(cx, |app, _| {
+                                app.queue_edit_at(revision, QueueEdit::Remove(vec![index]))
+                            });
+                        }),
+                )
         };
         if upcoming {
             let revision = self.playback.queue_revision;

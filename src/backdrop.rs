@@ -5,12 +5,137 @@ use std::path::{Path, PathBuf};
 const SIDE: u32 = 192;
 const PALETTE_SIZE: usize = 3;
 
+/// The share of the backdrop's width behind Now Playing's details column;
+/// lyrics fill the rest.
+const DETAILS_WIDTH: f32 = 0.38;
+/// The middle band of the square backdrop that a wide window shows.
+const VISIBLE_BAND: f32 = 0.6;
+/// WCAG AA contrast for body text.
+pub const READABLE: f32 = 4.5;
+/// The most extra scrim a column may get to keep its text readable.
+const MAX_PLATE: f32 = 0.7;
+
 /// A pre-blurred copy of album art with its prominent colors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Backdrop {
     pub path: PathBuf,
     /// 0xRRGGBB colors, most prominent first.
     pub palette: [u32; PALETTE_SIZE],
+    /// Brightness behind the details column, then behind the lyrics.
+    pub tones: [Tone; 2],
+}
+
+/// The darkest and brightest tenth of a region, as sRGB luma (0–255).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tone {
+    pub low: f32,
+    pub high: f32,
+}
+
+/// A text color and the background it belongs with, as sRGB luma (0–255).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ink {
+    pub text: f32,
+    pub background: f32,
+}
+
+/// How Now Playing keeps its text readable over a backdrop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Legibility {
+    /// Light text (the dark palette) rather than dark text.
+    pub light_text: bool,
+    /// The background luma the chosen text must stand out from in the
+    /// worst spot of each column, after any plate.
+    pub worst: [f32; 2],
+    /// Extra opacity of the text palette's background laid behind each
+    /// column; zero unless the scrim alone leaves text unreadable.
+    pub plates: [f32; 2],
+}
+
+/// WCAG contrast ratio between two sRGB luma values (0–255).
+pub fn contrast(a: f32, b: f32) -> f32 {
+    let linear = |luma: f32| {
+        let c = (luma / 255.).clamp(0., 1.);
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (a, b) = (linear(a), linear(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// Chooses light or dark text for a backdrop seen through a scrim of luma
+/// `scrim` at opacity `alpha`, whichever reads better in each column's worst
+/// spot. Columns that still fall short of [`READABLE`] get a plate: just
+/// enough of that text's own background to reach it.
+pub fn legibility(tones: [Tone; 2], scrim: f32, alpha: f32, light: Ink, dark: Ink) -> Legibility {
+    let seen = |luma: f32| alpha * scrim + (1. - alpha) * luma;
+    let worst_for = |ink: &Ink, tone: &Tone| {
+        // Light text struggles on the brightest spot; dark text on the darkest.
+        let spot = if ink.text > ink.background {
+            seen(tone.high)
+        } else {
+            seen(tone.low)
+        };
+        (spot, contrast(ink.text, spot))
+    };
+    let score = |ink: &Ink| {
+        tones
+            .iter()
+            .map(|tone| worst_for(ink, tone).1)
+            .fold(f32::INFINITY, f32::min)
+    };
+    let light_text = score(&light) >= score(&dark);
+    let ink = if light_text { light } else { dark };
+    let mut worst = [0.; 2];
+    let mut plates = [0.; 2];
+    for (index, tone) in tones.iter().enumerate() {
+        let (spot, ratio) = worst_for(&ink, tone);
+        let mut plate = 0.;
+        let mut under = spot;
+        if ratio < READABLE {
+            while plate < MAX_PLATE {
+                plate = (plate + 0.05_f32).min(MAX_PLATE);
+                under = plate * ink.background + (1. - plate) * spot;
+                if contrast(ink.text, under) >= READABLE {
+                    break;
+                }
+            }
+        }
+        worst[index] = under;
+        plates[index] = plate;
+    }
+    Legibility {
+        light_text,
+        worst,
+        plates,
+    }
+}
+
+/// The brightness range behind the details column and behind the lyrics.
+pub fn tones(image: &RgbImage) -> [Tone; 2] {
+    let (width, height) = image.dimensions();
+    let split = (width as f32 * DETAILS_WIDTH).round() as u32;
+    let top = (height as f32 * (1. - VISIBLE_BAND) / 2.).round() as u32;
+    let bottom = height - top;
+    let tone = |columns: std::ops::Range<u32>| {
+        let mut lumas = columns
+            .flat_map(|x| (top..bottom).map(move |y| (x, y)))
+            .map(|(x, y)| luma(&image.get_pixel(x, y).0.map(f32::from)))
+            .collect::<Vec<_>>();
+        if lumas.is_empty() {
+            return Tone { low: 0., high: 0. };
+        }
+        lumas.sort_by(f32::total_cmp);
+        let at = |share: f32| lumas[((lumas.len() - 1) as f32 * share).round() as usize];
+        Tone {
+            low: at(0.1),
+            high: at(0.9),
+        }
+    };
+    [tone(0..split), tone(split..width)]
 }
 
 pub fn backdrop_path(art: &Path) -> PathBuf {
@@ -32,6 +157,7 @@ pub fn load_or_render(art: &Path) -> Result<Backdrop> {
     };
     Ok(Backdrop {
         palette: palette(&image),
+        tones: tones(&image),
         path,
     })
 }

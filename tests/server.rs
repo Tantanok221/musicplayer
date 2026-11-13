@@ -10,6 +10,7 @@ use std::collections::HashMap;
 async fn handler(
     Path(endpoint): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    uri: axum::http::Uri,
 ) -> Json<Value> {
     assert_eq!(query.get("u").unwrap(), "test");
     assert!(!query.contains_key("p"));
@@ -31,6 +32,13 @@ async fn handler(
         }
         "getScanStatus.view" => json!({"status":"ok","scanStatus":{"scanning":false}}),
         "star.view" => json!({"status":"ok"}),
+        "updatePlaylist.view" => {
+            assert_eq!(query["playlistId"], "p1");
+            // Every song is sent, in order, as its own parameter.
+            let raw = uri.query().unwrap();
+            assert!(raw.contains("songIdToAdd=1&songIdToAdd=2"), "{raw}");
+            json!({"status":"ok"})
+        }
         "getLyricsBySongId.view" => match query["id"].as_str() {
             "synced" => json!({"status":"ok","lyricsList":{"structuredLyrics":[
                 {"synced":false,"line":[{"value":"Plain version"}]},
@@ -78,6 +86,10 @@ async fn authentication_base_path_capabilities_and_pagination() {
     );
     assert!(!server.scan_status().await.unwrap());
     server.star("1", true).await.unwrap();
+    server
+        .add_to_playlist("p1", &["1".into(), "2".into()])
+        .await
+        .unwrap();
     assert_eq!(
         server
             .lyrics(&sonora::model::Track {

@@ -41,6 +41,8 @@ use std::{
 };
 mod album_feedback;
 mod artist_page;
+mod context_menu;
+use context_menu::{menu_row, menu_row_detail};
 mod downloads;
 mod queue_controls;
 mod tabs;
@@ -218,19 +220,20 @@ fn queue_options(
         .into_iter()
         .fold(menu, |menu, (placement, title, detail)| {
             let enqueue = enqueue.clone();
-            let detail = SharedString::from(detail);
+            let icon = match placement {
+                Placement::Next => Glyph::ListStart,
+                Placement::AfterAlbum => Glyph::CornerDownRight,
+                _ => Glyph::ListEnd,
+            };
             menu.item(
-                PopupMenuItem::element(move |_, cx| {
-                    div().flex().flex_col().child(title).child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(ink(cx).muted)
-                            .child(detail.clone()),
-                    )
-                })
-                .on_click(move |_, _, _| enqueue(placement)),
+                menu_row_detail(icon, title, detail).on_click(move |_, _, _| enqueue(placement)),
             )
         })
+}
+
+/// How much of the theme background covers the Now Playing backdrop.
+fn scrim_alpha(dark: bool) -> f32 {
+    if dark { 0.55 } else { 0.62 }
 }
 
 fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {
@@ -271,6 +274,43 @@ struct Ink {
     favorite: Hsla,
     flame: Hsla,
     selection: Hsla,
+    /// Light text on dark surfaces.
+    dark: bool,
+}
+
+thread_local! {
+    /// Colors that replace the theme's while a view renders over a backdrop.
+    static INK_OVERRIDE: std::cell::Cell<Option<Ink>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the theme's colors when the view that overrode them finishes.
+struct InkScope;
+impl InkScope {
+    fn new(ink: Ink) -> Self {
+        INK_OVERRIDE.set(Some(ink));
+        Self
+    }
+}
+impl Drop for InkScope {
+    fn drop(&mut self) {
+        INK_OVERRIDE.set(None);
+    }
+}
+
+/// sRGB luma (0–255) of a color, as `sonora::backdrop` measures images.
+fn luma_of(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) * 255.
+}
+
+/// Moves `color` toward `toward` until it reads at `READABLE` against a
+/// background of luma `under`; colors that already do are left alone.
+fn readable_on(color: Hsla, toward: Hsla, under: f32) -> Hsla {
+    use sonora::backdrop::{READABLE, contrast};
+    (0..=10)
+        .map(|step| mix(color, toward, step as f32 / 10.))
+        .find(|candidate| contrast(luma_of(*candidate), under) >= READABLE)
+        .unwrap_or(toward)
 }
 fn gain_index(mode: &GainMode) -> usize {
     match mode {
@@ -437,8 +477,14 @@ fn layout_choice<const N: usize>(
     .layout(Axis::Vertical)
 }
 fn ink(cx: &App) -> Ink {
-    if cx.theme().is_dark() {
+    INK_OVERRIDE
+        .get()
+        .unwrap_or_else(|| theme_ink(cx.theme().is_dark()))
+}
+fn theme_ink(dark: bool) -> Ink {
+    if dark {
         Ink {
+            dark: true,
             background: rgb(0x1b1c20).into(),
             panel: rgb(0x202125).into(),
             line: rgb(0x34353a).into(),
@@ -451,6 +497,7 @@ fn ink(cx: &App) -> Ink {
         }
     } else {
         Ink {
+            dark: false,
             background: rgb(0xfafafa).into(),
             panel: rgb(0xf0f0f2).into(),
             line: rgb(0xd8d9dc).into(),
@@ -603,6 +650,8 @@ pub struct MusicApp {
     queue_search: String,
     queue_ui: QueueViewState,
     titlebar_dragging: bool,
+    /// The seek slider value (0–1000) while the user drags it.
+    scrub: Option<f32>,
     workspace_scroll: ScrollHandle,
     server_url: Entity<InputState>,
     username: Entity<InputState>,
@@ -720,6 +769,8 @@ pub struct MusicApp {
     show_playlist_editor: bool,
     playlist_editor_rename: bool,
     playlist_editor_tracks: Option<Vec<String>>,
+    /// Album whose songs a new playlist from the editor will hold.
+    playlist_editor_album: Option<String>,
     pending_delete: Option<String>,
     status: String,
     connection: Connection,
@@ -827,11 +878,23 @@ impl MusicApp {
                     }
                 }
             }),
-            cx.subscribe_in(&seek, window, |app, _, event: &SliderEvent, _, _| {
-                if let SliderEvent::Release(SliderValue::Single(value)) = event {
-                    app.service.player.send(PlayerCommand::Seek(
-                        *value as f64 / 1000. * app.playback.duration,
-                    ));
+            cx.subscribe_in(&seek, window, |app, _, event: &SliderEvent, _, cx| {
+                match event {
+                    // While dragging, playback updates must not move the thumb
+                    // under the pointer; the elapsed time previews the target.
+                    SliderEvent::Change(SliderValue::Single(value)) => {
+                        app.scrub = Some(*value);
+                        cx.notify();
+                    }
+                    SliderEvent::Release(SliderValue::Single(value)) => {
+                        app.scrub = None;
+                        let target = *value as f64 / 1000. * app.playback.duration;
+                        app.playback.position = target;
+                        app.playback_at = Instant::now();
+                        app.service.player.send(PlayerCommand::Seek(target));
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             }),
             cx.subscribe_in(&volume, window, |app, _, event: &SliderEvent, _, _| {
@@ -873,6 +936,7 @@ impl MusicApp {
             queue_search: String::new(),
             queue_ui: QueueViewState::new(cx),
             titlebar_dragging: false,
+            scrub: None,
             workspace_scroll: ScrollHandle::new(),
             server_url,
             username,
@@ -970,6 +1034,7 @@ impl MusicApp {
             show_playlist_editor: false,
             playlist_editor_rename: false,
             playlist_editor_tracks: None,
+            playlist_editor_album: None,
             pending_delete: None,
             status: "Opening library…".into(),
             connection: Connection::None,
@@ -1265,9 +1330,11 @@ impl MusicApp {
                 } else {
                     0.
                 };
-                self.seek.update(cx, |slider, cx| {
-                    slider.set_value(progress as f32, window, cx)
-                });
+                if self.scrub.is_none() {
+                    self.seek.update(cx, |slider, cx| {
+                        slider.set_value(progress as f32, window, cx)
+                    });
+                }
                 self.playback = snapshot;
                 self.playback_at = Instant::now();
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
@@ -1294,7 +1361,23 @@ impl MusicApp {
                 ) {
                     self.show_playlist_editor = false;
                 }
-                self.status = "Saved to Navidrome".into();
+                self.status = match &mutation {
+                    Mutation::AddToPlaylist(id, ids) => {
+                        let name = self
+                            .playlists
+                            .iter()
+                            .find(|playlist| &playlist.id == id)
+                            .map_or("the playlist", |playlist| playlist.name.as_str());
+                        match ids.len() {
+                            1 => format!("Added 1 song to “{name}”"),
+                            count => format!("Added {count} songs to “{name}”"),
+                        }
+                    }
+                    _ => "Saved to Navidrome".into(),
+                };
+                if matches!(mutation, Mutation::CreatePlaylist(..)) {
+                    self.playlist_editor_album = None;
+                }
             }
             Event::MutationFailed(mutation, error) => {
                 if let Some(id) = mutation.album_feedback_id() {
@@ -1333,6 +1416,8 @@ impl MusicApp {
             theme.colors.muted = colors.panel;
             theme.colors.muted_foreground = colors.muted;
             theme.colors.border = colors.line;
+            theme.colors.popover = colors.background;
+            theme.colors.popover_foreground = colors.text;
             theme.colors.sidebar = colors.panel;
             theme.colors.sidebar_foreground = colors.text;
             theme.colors.sidebar_border = colors.line;
@@ -2551,6 +2636,7 @@ impl MusicApp {
                         cx.stop_propagation();
                         app.show_playlist_editor = true;
                         app.playlist_editor_rename = false;
+                        app.playlist_editor_album = None;
                         app.playlist_editor_tracks = None;
                         cx.notify();
                     },
@@ -3380,26 +3466,6 @@ impl MusicApp {
         })
     }
     /// Right-click menu for an album: play it, or queue it in one of three places.
-    fn album_menu(
-        &self,
-        album_id: String,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-        let places = self.queue_places();
-        let service = self.service.clone();
-        move |menu, _, _| {
-            let (play, queue) = (service.clone(), service.clone());
-            let (play_id, queue_id) = (album_id.clone(), album_id.clone());
-            let menu = menu
-                .item(
-                    PopupMenuItem::new("Play Album")
-                        .on_click(move |_, _, _| play.send(Command::PlayAlbum(play_id.clone()))),
-                )
-                .separator();
-            queue_options(menu, &places, move |placement| {
-                queue.send(Command::EnqueueAlbum(queue_id.clone(), placement))
-            })
-        }
-    }
     fn track_row(
         &mut self,
         track: Arc<Track>,
@@ -3418,11 +3484,7 @@ impl MusicApp {
             .is_some_and(|t| t.id == track.id);
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
-        let play = track.clone();
-        let queued = track.id.clone();
-        let service = self.service.clone();
-        let places = self.queue_places();
-        let weak = cx.weak_entity();
+        let menu = self.track_menu(track.clone(), queue_index, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
             .role(Role::Group)
@@ -3503,40 +3565,7 @@ impl MusicApp {
                     }
                 }
             }))
-            .context_menu(move |menu, _, _| {
-                let weak = weak.clone();
-                let remove_weak = weak.clone();
-                let play = play.clone();
-                let service = service.clone();
-                let queued = queued.clone();
-                let menu = menu
-                    .item(PopupMenuItem::new("Play Now").on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |app, _| {
-                            if let Some(index) = queue_index {
-                                app.service.player.send(PlayerCommand::JumpTo(index));
-                            } else {
-                                app.play_track(&play);
-                            }
-                        });
-                    }))
-                    .separator();
-                let menu = queue_options(menu, &places, move |placement| {
-                    service.send(Command::Enqueue(vec![queued.clone()], placement))
-                });
-                if let Some(index) = queue_index {
-                    let weak = remove_weak.clone();
-                    menu.separator()
-                        .item(
-                            PopupMenuItem::new("Remove from Queue").on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |app, _| {
-                                    app.service.player.send(PlayerCommand::Remove(index))
-                                });
-                            }),
-                        )
-                } else {
-                    menu
-                }
-            });
+            .context_menu(menu);
         row.into_any_element()
     }
     fn album_group(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -3794,7 +3823,7 @@ impl MusicApp {
                                     .on_click(cx.listener(move |app, _, _, cx| {
                                         app.select_album(selection.clone(), cx)
                                     }))
-                                    .context_menu(self.album_menu(album.id.clone())),
+                                    .context_menu(self.album_menu(&album, cx)),
                             )
                             .child(self.album_rating(&album, cx))
                             .when(!selected_panel, |cover| {
@@ -4095,7 +4124,7 @@ impl MusicApp {
                                 app.service.send(Command::PlayAlbum(open.id.clone()));
                             }
                         }))
-                        .context_menu(self.album_menu(album.id.clone())),
+                        .context_menu(self.album_menu(&album, cx)),
                 );
             for (index, track) in hit.songs.iter().cloned().enumerate() {
                 let number = track.track.map_or(index + 1, |number| number as usize);
@@ -4989,7 +5018,6 @@ impl MusicApp {
                         .is_some_and(|a| a.id == album.id);
                     let art = app.art(&album.cover_art, side, cx);
                     let open = album.clone();
-                    let id = album.id.clone();
                     cards = cards.child(
                         div()
                             .id(("cover", index))
@@ -5031,7 +5059,7 @@ impl MusicApp {
                                     app.service.send(Command::PlayAlbum(open.id.clone()));
                                 }
                             }))
-                            .context_menu(app.album_menu(id.clone())),
+                            .context_menu(app.album_menu(&album, cx)),
                     );
                 }
                 let first = app.cover_rows().albums_in_row(row).start;
@@ -5182,6 +5210,7 @@ impl MusicApp {
                             .on_click(cx.listener(|app, _, _, cx| {
                                 app.show_playlist_editor = true;
                                 app.playlist_editor_rename = false;
+                                app.playlist_editor_album = None;
                                 app.playlist_editor_tracks =
                                     Some(app.playback.queue.iter().map(|t| t.id.clone()).collect());
                                 cx.notify();
@@ -5206,6 +5235,8 @@ impl MusicApp {
                                 let service = app.service.clone();
                                 let service2 = service.clone();
                                 let service3 = service.clone();
+                                let menu_state = app.menu_state(cx);
+                                let menu_track = track.clone();
                                 div()
                                     .id(("queued", index))
                                     .w_full()
@@ -5282,26 +5313,40 @@ impl MusicApp {
                                             app.service.player.send(PlayerCommand::JumpTo(index));
                                         }
                                     }))
-                                    .context_menu(move |menu, _, _| {
+                                    .context_menu(move |menu, window, cx| {
                                         let service = service.clone();
                                         let service2 = service2.clone();
                                         let service3 = service3.clone();
-                                        menu.item(PopupMenuItem::new("Play Now").on_click(
+                                        let menu = context_menu::track_rating(
+                                            menu.min_w(px(220.)),
+                                            &menu_state,
+                                            &menu_track,
+                                        )
+                                        .item(menu_row(Glyph::Play, "Play Now").on_click(
                                             move |_, _, _| {
                                                 service.player.send(PlayerCommand::JumpTo(index))
                                             },
                                         ))
-                                        .item(PopupMenuItem::new("Move earlier").on_click(
-                                            move |_, _, _| {
-                                                service2.player.send(PlayerCommand::Move(
-                                                    index,
-                                                    index.saturating_sub(1),
-                                                ))
-                                            },
-                                        ))
+                                        .item(
+                                            menu_row(Glyph::ArrowUp, "Move Earlier").on_click(
+                                                move |_, _, _| {
+                                                    service2.player.send(PlayerCommand::Move(
+                                                        index,
+                                                        index.saturating_sub(1),
+                                                    ))
+                                                },
+                                            ),
+                                        );
+                                        context_menu::track_extras(
+                                            menu,
+                                            &menu_state,
+                                            &menu_track,
+                                            window,
+                                            cx,
+                                        )
                                         .separator()
                                         .item(
-                                            PopupMenuItem::new("Remove").on_click(
+                                            menu_row(Glyph::ListX, "Remove from Queue").on_click(
                                                 move |_, _, _| {
                                                     service3
                                                         .player
@@ -5640,7 +5685,7 @@ impl MusicApp {
         if !self.lyrics.contains_key(&track.id) && self.lyrics_requested.insert(track.id.clone()) {
             self.service.send(Command::Lyrics(track.clone()));
         }
-        let dark = cx.theme().is_dark();
+        let dark = colors.dark;
         let reduce_motion = cx.reduce_motion();
         let scroll = self.lyrics_scroll.clone();
         let viewport = scroll.bounds();
@@ -5889,8 +5934,21 @@ impl MusicApp {
                 cx,
             );
         };
+        let theme_dark = cx.theme().is_dark();
+        let theme = theme_ink(theme_dark);
+        let legible = self.backdrop_ink(&track.cover_art, theme_dark);
+        // The backdrop keeps the theme's scrim; everything after it uses
+        // colors chosen to read on this album's art.
+        let backdrop = self.backdrop(
+            &track.cover_art,
+            legible.map_or(theme.background, |(ink, _)| ink.background),
+            window,
+            cx,
+        );
+        let _scope = legible.map(|(ink, _)| InkScope::new(ink));
+        let plates = legible.map_or([0.; 2], |(_, plates)| plates);
         let colors = ink(cx);
-        let dark = cx.theme().is_dark();
+        let dark = colors.dark;
         if !track.album_id.is_empty() && self.highlight_requested.as_ref() != Some(&track.album_id)
         {
             self.highlight_requested = Some(track.album_id.clone());
@@ -5922,7 +5980,6 @@ impl MusicApp {
             });
         let album_time = album_tracks.iter().map(|track| track.duration).sum::<f64>();
 
-        let backdrop = self.backdrop(&track.cover_art, window, cx);
         let palette = self
             .backdrops
             .get(&track.cover_art)
@@ -5967,6 +6024,7 @@ impl MusicApp {
                 Button::new("album-tracks-toggle")
                     .ghost()
                     .small()
+                    .text_color(colors.muted)
                     .label(if self.album_tracks_expanded {
                         "Show fewer".to_string()
                     } else {
@@ -5990,6 +6048,9 @@ impl MusicApp {
             .px_8()
             .pt_8()
             .pb_4()
+            .when(plates[0] > 0., |hero| {
+                hero.bg(colors.background.opacity(plates[0]))
+            })
             .child(
                 div()
                     .size(px(cover_side))
@@ -6091,6 +6152,9 @@ impl MusicApp {
             .pl_4()
             .pr_8()
             .pt_6()
+            .when(plates[1] > 0., |lyrics| {
+                lyrics.bg(colors.background.opacity(plates[1]))
+            })
             .child(lyrics);
 
         let spectrum = self
@@ -6103,7 +6167,7 @@ impl MusicApp {
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .bg(colors.background)
+            .bg(theme.background)
             .child(backdrop)
             .child(
                 div()
@@ -6166,6 +6230,7 @@ impl MusicApp {
                 Button::new("up-next-toggle")
                     .ghost()
                     .small()
+                    .text_color(colors.muted)
                     .label(if self.up_next_expanded {
                         "Show fewer".to_string()
                     } else {
@@ -6194,8 +6259,44 @@ impl MusicApp {
                 .into_any_element(),
         )
     }
-    /// Blurred cover layers under a theme-colored scrim, crossfading on change.
-    fn backdrop(&mut self, cover: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Text colors for Now Playing that read on this album's backdrop, and
+    /// the plate behind each column; `None` until the backdrop is ready.
+    fn backdrop_ink(&self, cover: &str, theme_dark: bool) -> Option<(Ink, [f32; 2])> {
+        use sonora::backdrop::{Ink as Tone, contrast, legibility};
+        let backdrop = self.backdrops.get(cover)?;
+        let (light, dark) = (theme_ink(true), theme_ink(false));
+        let tone = |ink: &Ink| Tone {
+            text: luma_of(ink.text),
+            background: luma_of(ink.background),
+        };
+        let choice = legibility(
+            backdrop.tones,
+            luma_of(theme_ink(theme_dark).background),
+            scrim_alpha(theme_dark),
+            tone(&light),
+            tone(&dark),
+        );
+        let mut ink = if choice.light_text { light } else { dark };
+        // Secondary colors must hold up where the text is hardest to read.
+        let text = luma_of(ink.text);
+        let under = if contrast(text, choice.worst[0]) <= contrast(text, choice.worst[1]) {
+            choice.worst[0]
+        } else {
+            choice.worst[1]
+        };
+        ink.muted = readable_on(ink.muted, ink.text, under);
+        ink.accent = readable_on(ink.accent, ink.text, under);
+        Some((ink, choice.plates))
+    }
+    /// Blurred cover layers under a theme-colored scrim, crossfading on
+    /// change, fading at the bottom toward `fade`.
+    fn backdrop(
+        &mut self,
+        cover: &str,
+        fade: Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = ink(cx);
         let dark = cx.theme().is_dark();
         if !self.backdrops.contains_key(cover)
@@ -6246,7 +6347,7 @@ impl MusicApp {
                 div()
                     .absolute()
                     .inset_0()
-                    .bg(colors.background.opacity(if dark { 0.55 } else { 0.62 })),
+                    .bg(colors.background.opacity(scrim_alpha(dark))),
             )
             .child(
                 div()
@@ -6257,8 +6358,8 @@ impl MusicApp {
                     .h(px(220.))
                     .bg(linear_gradient(
                         180.,
-                        linear_color_stop(colors.background.opacity(0.), 0.),
-                        linear_color_stop(colors.background.opacity(0.7), 1.),
+                        linear_color_stop(fade.opacity(0.), 0.),
+                        linear_color_stop(fade.opacity(0.7), 1.),
                     )),
             )
             .into_any_element()
@@ -7154,9 +7255,42 @@ impl MusicApp {
                                     .flex()
                                     .items_center()
                                     .min_w_0()
-                                    .child(
-                                        div().min_w_0().text_size(px(11.)).truncate().child(title),
-                                    )
+                                    .child(match track.clone() {
+                                        Some(track) if !track.album_id.is_empty() => div()
+                                            .id("footer-title")
+                                            .min_w_0()
+                                            .text_size(px(11.))
+                                            .truncate()
+                                            .cursor_pointer()
+                                            .role(Role::Link)
+                                            .aria_label(format!(
+                                                "Show {} in the library",
+                                                track.album
+                                            ))
+                                            .hover(|title| title.text_color(colors.accent))
+                                            .tooltip({
+                                                let tip = format!(
+                                                    "Show “{}” in the library",
+                                                    track.album
+                                                );
+                                                move |window, cx| {
+                                                    tooltip::Tooltip::new(tip.clone())
+                                                        .build(window, cx)
+                                                }
+                                            })
+                                            .child(title)
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.open_queue_album(&track, window, cx);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element(),
+                                        _ => div()
+                                            .min_w_0()
+                                            .text_size(px(11.))
+                                            .truncate()
+                                            .child(title)
+                                            .into_any_element(),
+                                    })
                                     .when_some(favorite, |row, favorite| {
                                         row.child(favorite.h(px(18.)))
                                     }),
@@ -7256,7 +7390,15 @@ impl MusicApp {
                                 )),
                             ),
                     )
-                    .child(time(self.playback.position).text_right())
+                    .child(
+                        time(self.scrub.map_or(self.playback.position, |value| {
+                            value as f64 / 1000. * self.playback.duration
+                        }))
+                        .text_right()
+                        .when(self.scrub.is_some(), |label| {
+                            label.text_color(colors.accent)
+                        }),
+                    )
                     .child(
                         Slider::new(&self.seek)
                             .flex_1()
@@ -7619,6 +7761,11 @@ impl MusicApp {
                                             cx,
                                         );
                                     }
+                                } else if let Some(album) = app.playlist_editor_album.clone() {
+                                    app.service.send(Command::AlbumToPlaylist(
+                                        album,
+                                        sonora::service::PlaylistTarget::New(name),
+                                    ));
                                 } else {
                                     let ids =
                                         app.playlist_editor_tracks.clone().unwrap_or_default();
@@ -7631,6 +7778,7 @@ impl MusicApp {
                             cx.listener(|app, _, _, cx| {
                                 app.show_playlist_editor = false;
                                 app.playlist_editor_tracks = None;
+                                app.playlist_editor_album = None;
                                 cx.notify();
                             }),
                         ),

@@ -40,6 +40,14 @@ pub enum Mutation {
     ReplacePlaylist(String, Vec<String>),
     RenamePlaylist(String, String),
     DeletePlaylist(String),
+    /// Playlist ID and the songs appended to it.
+    AddToPlaylist(String, Vec<String>),
+}
+/// Where an album's songs go: a new playlist by name, or an existing one by ID.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlaylistTarget {
+    New(String),
+    Existing(String),
 }
 impl Mutation {
     pub fn album_feedback_id(&self) -> Option<&str> {
@@ -94,6 +102,8 @@ pub enum Command {
     PlayAlbum(String),
     Enqueue(Vec<String>, Placement),
     EnqueueAlbum(String, Placement),
+    /// Album ID: save its songs, in disc/track order, to a playlist.
+    AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
     Preferences(Preferences),
     Player(PlayerCommand),
@@ -1470,6 +1480,24 @@ fn run(
                 Command::EnqueueAlbum(id, placement) => {
                     player.send(PlayerCommand::Insert(catalog.album_tracks(&id)?, placement));
                 }
+                Command::AlbumToPlaylist(id, target) => {
+                    let ids = catalog
+                        .album_tracks(&id)?
+                        .iter()
+                        .map(|track| track.id.clone())
+                        .collect::<Vec<_>>();
+                    if ids.is_empty() {
+                        events.send(Event::Error(
+                            "This album has no songs in the library yet. Refresh and try again."
+                                .into(),
+                        ))?;
+                    } else {
+                        tx.send(Command::Mutate(match target {
+                            PlaylistTarget::New(name) => Mutation::CreatePlaylist(name, ids),
+                            PlaylistTarget::Existing(id) => Mutation::AddToPlaylist(id, ids),
+                        }))?;
+                    }
+                }
                 Command::Player(command) => player.send(command),
                 Command::Preferences(prefs) => {
                     catalog.set_state("preferences", &prefs)?;
@@ -1547,6 +1575,9 @@ fn run(
                                 server.rename_playlist(id, name).await
                             }
                             Mutation::DeletePlaylist(id) => server.delete_playlist(id).await,
+                            Mutation::AddToPlaylist(id, ids) => {
+                                server.add_to_playlist(id, ids).await
+                            }
                         };
                         match result {
                             Ok(()) => {
@@ -1636,7 +1667,8 @@ fn run(
                                 let tx = tx.clone();
                                 let changed_id = match mutation {
                                     Mutation::ReplacePlaylist(id, _)
-                                    | Mutation::RenamePlaylist(id, _) => Some(id),
+                                    | Mutation::RenamePlaylist(id, _)
+                                    | Mutation::AddToPlaylist(id, _) => Some(id),
                                     _ => None,
                                 };
                                 runtime.spawn(async move {

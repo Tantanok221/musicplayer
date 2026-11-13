@@ -296,6 +296,12 @@ impl Server {
         self.request("createPlaylist", &params).await?;
         Ok(())
     }
+    pub async fn add_to_playlist(&self, id: &str, ids: &[String]) -> Result<()> {
+        let mut params = vec![("playlistId", id.into())];
+        params.extend(ids.iter().cloned().map(|id| ("songIdToAdd", id)));
+        self.request("updatePlaylist", &params).await?;
+        Ok(())
+    }
     pub async fn rename_playlist(&self, id: &str, name: &str) -> Result<()> {
         self.request(
             "updatePlaylist",

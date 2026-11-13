@@ -459,7 +459,7 @@ impl MusicApp {
                     app.service.send(Command::PlayAlbum(open.id.clone()));
                 }
             }))
-            .context_menu(self.album_menu(album.id.clone()))
+            .context_menu(self.album_menu(album, cx))
             .into_any_element()
     }
 }
