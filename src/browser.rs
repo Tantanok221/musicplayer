@@ -414,18 +414,14 @@ impl Tabs {
     fn next_id(&self) -> u64 {
         self.tabs.iter().map(|tab| tab.id).max().unwrap_or(0) + 1
     }
-    /// Adds an empty tab after the active one and makes it active.
+    /// Adds an empty tab at the end of the strip and makes it active.
     pub fn new_tab(&mut self) -> u64 {
         let id = self.next_id();
-        let at = (self.active + 1).min(self.tabs.len());
-        self.tabs.insert(
-            at,
-            Tab {
-                id,
-                ..Default::default()
-            },
-        );
-        self.active = at;
+        self.tabs.push(Tab {
+            id,
+            ..Default::default()
+        });
+        self.active = self.tabs.len() - 1;
         id
     }
     /// Closes an unlocked tab. Closing the active tab activates its right
@@ -534,13 +530,28 @@ mod tests {
         assert!(tabs.tabs[0].page.is_none(), "the last tab becomes empty");
     }
     #[test]
-    fn new_tabs_open_empty_after_the_active_one() {
-        let mut tabs = Tabs::default();
-        let id = tabs.new_tab();
-        assert_eq!(tabs.active, 1);
-        assert_eq!(tabs.active().id, id);
-        assert_eq!(tabs.active().title(), "New Tab");
-        assert_eq!(tabs.tabs.len(), 5);
+    fn new_tabs_open_at_the_end_and_stay_there_when_an_artist_is_selected() {
+        for active in 0..Tabs::default().tabs.len() {
+            let mut tabs = Tabs {
+                active,
+                ..Default::default()
+            };
+            let existing = tabs.tabs.clone();
+            let id = tabs.new_tab();
+            assert_eq!(tabs.active, existing.len());
+            assert_eq!(tabs.active().id, id);
+            assert_eq!(tabs.active().title(), "New Tab");
+            assert_eq!(tabs.tabs.len(), existing.len() + 1);
+
+            tabs.active_mut().page = Some(Page {
+                artist: Some(("ONE OK ROCK".into(), "artist-id".into())),
+                ..Page::of(Workspace::Explorer)
+            });
+            assert_eq!(tabs.active, existing.len());
+            assert_eq!(tabs.tabs.last().unwrap().id, id);
+            assert_eq!(tabs.active().title(), "ONE OK ROCK");
+            assert_eq!(tabs.tabs[..existing.len()], existing);
+        }
     }
     #[test]
     fn moving_keeps_the_active_tab_and_reset_restores_defaults() {
