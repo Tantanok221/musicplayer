@@ -1,8 +1,9 @@
 # Integration test expansion plan
 
 Prepared 2026-11-16 after the first production-view scenario passed locally.
-Batch 1 is implemented in the working tree; see the progress document for
-validation. Batches 2–5 below remain proposed work.
+Batch 1 is committed. The Explorer-only Batch 2 and real-worker Batch 3 are
+implemented in the working tree; see the progress document for validation.
+Batches 4–5 remain proposed work.
 
 Current coverage and commands: [TESTING.md](TESTING.md).
 Completed work and validation: [AGENT_TESTING_PROGRESS.md](AGENT_TESTING_PROGRESS.md).
@@ -52,7 +53,7 @@ no scenario starts HTTP/audio/OS services; responses use controlled scheduling.
 Optimistic-favorite and per-tab-history regressions were deliberately introduced,
 detected by the new tests, and restored. See the progress document for evidence.
 
-## Batch 2: Explorer and artist navigation
+## Batch 2: Music Explorer only
 
 Add these production-view scenarios using the same fixture:
 
@@ -62,11 +63,14 @@ Add these production-view scenarios using the same fixture:
    controls, and clear the filters without changing the playing queue.
 3. Select sort and direction through the menu, verify visible album ordering,
    then reload preferences and verify the selection/order survives.
-4. Open an album's artist/genre/year links and verify the resulting page/filter
-   plus Back behavior.
-5. Delay artist A's result, open artist B, deliver A's stale result, and verify
-   the active page still shows B. Add the equivalent stale-search case if its
-   event path differs.
+4. Open an album's genre/year/record-label links and verify the resulting
+   Explorer filter plus Back behavior.
+5. Hold two search responses, deliver the newer one first, then deliver the
+   older one and verify the newer visible results and input remain.
+
+Artist-page navigation and stale artist responses are deferred per the user's
+scope clarification. The artist filtering case uses Explorer's Album Artist
+column, which keeps the page in Explorer.
 
 Use real catalog queries for query/filter/sort responses. Add structured access
 to visible release IDs and register album rows; do not satisfy UI assertions by
@@ -75,8 +79,14 @@ virtualized scrolling, with explicit scroll actions to reach offscreen items.
 
 ## Batch 3: real service-worker integration
 
-Add this layer before treating controlled-backend scenarios as proof of complete
-feature wiring. The existing fixture emulates selected service responses.
+Implemented as six scenarios in `tests/service_worker.rs`, with an isolated
+loopback fixture in `tests/service_worker/fixture.rs`. The requirements below
+describe this layer; validation evidence is in the progress document. Run
+`scripts/test-service.sh`, or include this target and the UI target together
+with `cargo test --locked --features test-support`.
+
+This layer is separate from controlled-backend UI scenarios. The existing UI
+fixture emulates selected service responses and is not proof of worker wiring.
 
 Required infrastructure:
 
@@ -99,6 +109,12 @@ Initial scenarios:
 
 Reuse existing Axum and SQLite helpers where useful. Client tests and catalog
 tests remain valuable, but these new tests must actually start the worker.
+
+Additional infrastructure scenarios verify both injected metadata endpoints and
+shutdown with a metadata response still pending. Interrupted-sync coverage also
+checks the no-deletion rule during a server scan. The real worker is started in
+all six scenarios. The controlled player and per-worker runtime lifecycle are
+test-only; production playback startup is unchanged.
 
 ## Batch 4: queue and playback controls
 
@@ -140,6 +156,9 @@ Protect the workflow before broadening coverage of its cosmetic variants.
 
 Continue using `scripts/test-ui.sh` as the UI gate. Add focused feature filtering
 to the runner as the suite grows, while keeping an all-scenarios CI run.
+Batch 3 adds `scripts/test-service.sh` as a separate real-worker gate and
+artifact source. Default `cargo test` continues to run ordinary integration
+tests; `test-support` enables the two additional integration targets.
 
 For each batch:
 

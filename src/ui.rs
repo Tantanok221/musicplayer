@@ -2067,6 +2067,7 @@ impl MusicApp {
         };
         div()
             .id(SharedString::from(key))
+            .test_support()
             .role(Role::Button)
             .aria_label(format!("Explore {kind}: {label}"))
             .cursor_pointer()
@@ -2543,6 +2544,8 @@ impl MusicApp {
             .child(
                 div().w(px(search_width)).flex_shrink_0().px_2().child(
                     Input::new(&self.search)
+                        .id("music-search")
+                        .aria_label("Search music")
                         .small()
                         .prefix(Icon::new(Glyph::Search).size_3()),
                 ),
@@ -3263,8 +3266,10 @@ impl MusicApp {
             .child(
                 div()
                     .id(SharedString::from(format!("all-{label}")))
+                    .test_support()
                     .role(Role::Button)
                     .aria_label(format!("All {label}"))
+                    .aria_selected(empty)
                     .h(px(23.))
                     .px_2()
                     .flex_shrink_0()
@@ -3290,9 +3295,13 @@ impl MusicApp {
                                     let active = selected.contains(&item.id);
                                     let id = item.id;
                                     div()
-                                        .id(("browser-value", i))
+                                        .id(SharedString::from(format!(
+                                            "browser-value-{label}-{id}"
+                                        )))
+                                        .test_support()
                                         .role(Role::Button)
                                         .aria_label(format!("Filter {label}: {}", item.label))
+                                        .aria_selected(active)
                                         // List rows shrink to their text unless told to fill.
                                         .w_full()
                                         .h(px(22.))
@@ -5066,9 +5075,11 @@ impl MusicApp {
                     let open = album.clone();
                     cards = cards.child(
                         div()
-                            .id(("cover", index))
+                            .id(SharedString::from(format!("explorer-album-{}", album.id)))
+                            .test_support()
                             .role(Role::Button)
                             .aria_label(format!("Select album {} by {}", album.name, album.artist))
+                            .aria_selected(selected)
                             .w(px(side))
                             .flex_shrink_0()
                             .cursor_pointer()
@@ -5193,6 +5204,10 @@ impl MusicApp {
     }
     fn empty(&self, message: &str, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .id("library-empty")
+            .test_support()
+            .role(Role::Status)
+            .aria_label(message.to_string())
             .size_full()
             .flex()
             .flex_col()

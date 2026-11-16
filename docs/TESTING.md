@@ -7,9 +7,30 @@ Broader roadmap: [AGENT_TESTING_GAPS.md](AGENT_TESTING_GAPS.md).
 
 ```sh
 cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features test-support -- -D warnings
 cargo test --locked
+scripts/test-service.sh
 scripts/test-ui.sh
+```
+
+### Does `cargo test` include integration tests?
+
+Yes, but required features matter:
+
+| Command | Tests executed |
+| --- | --- |
+| `cargo test` or `cargo test --locked` | Ordinary unit and integration tests, including the existing HTTP/catalog/audio tests in `tests/`; skips the feature-gated UI and real-worker targets |
+| `cargo test --locked --features test-support` | All ordinary tests **plus** the UI and real-worker integration targets |
+| `scripts/test-service.sh` | Real-worker integration only, with saved diagnostics |
+| `scripts/test-ui.sh` | Production-view UI integration only, with saved diagnostics |
+
+`--locked` controls dependency resolution, not test selection. `--all-targets`
+does not enable missing features. Formatting and Clippy do not execute tests.
+For a single command that runs every current test, use:
+
+```sh
+cargo test --locked --features test-support
 ```
 
 The focused script runs the `tests/ui.rs` integration target with the
@@ -43,7 +64,7 @@ AX delivery, pixels, or physical playback. Those remain separate roadmap work.
 
 ## Navigation and album feedback coverage
 
-The UI target now contains six scenarios. The five additional scenarios are:
+Batch 1 comprises six scenarios. The five added after the original restart test are:
 
 | Test | Behavior checked |
 | --- | --- |
@@ -66,12 +87,92 @@ SQLite through the catalog feedback API, then emits `AlbumUpdated` and
 `MutationDone`; failure emits the original `AlbumUpdated` before
 `MutationFailed`, matching the service's response order. Tests do not call the
 view's mutation/event handlers directly. These are controlled-backend UI tests;
-the real HTTP/service-worker mutation path remains future integration work.
+the real HTTP/service-worker mutation path is covered separately below.
+
+## Music Explorer coverage
+
+Batch 2 adds five scenarios in `tests/ui/explorer.rs`, bringing the UI target to
+eleven. These remain in Music Explorer and do not open artist pages:
+
+| Test | Behavior checked |
+| --- | --- |
+| `explorer::unicode_search_empty_results_and_clear_recover_in_explorer` | Unicode input, visible matching albums, accessible empty state, and recovery through Clear search and filters |
+| `explorer::genre_year_artist_filters_clear_without_changing_the_queue` | Genre, year and album-artist filters; selected controls; intersection and clearing; rendered queue order and no playback commands |
+| `explorer::explorer_sort_and_direction_survive_catalog_reload` | Real preset/direction menu clicks, visible album geometry/order, persisted sorting and checked menu state after SQLite reload |
+| `explorer::explorer_metadata_filters_and_back_restore_prior_queries` | Genre/year/record-label links, fresh filters replacing prior filters, Back restoring previous Explorer queries |
+| `explorer::stale_search_results_cannot_replace_newer_explorer_results` | Deliver a newer catalog-backed result before an older result; visible albums, input value and active query retain the newer search |
+
+Run this batch with:
+
+```sh
+cargo test --locked --features test-support --test ui explorer:: -- --nocapture
+```
+
+`seed_explorer()` enriches the existing three albums with predictable genre,
+year and record-label metadata. Query responses still use real catalog queries.
+`hold_queries()` plus `deliver_query(text)` control result order through the
+normal UI event receiver. Tests assert observed album IDs, accessible names and
+layout order, not just SQL output. Playback state is a controlled paused queue.
+
+New targets: `music-search`, `explorer-album-{album_id}`,
+`browser-value-{column_label}-{facet_id}`, `all-{column_label}`, metadata link
+IDs, and `library-empty`. These scenarios cover the default Album Covers view
+with the small fixture. Alternate Explorer layouts, large virtualized scrolling,
+artist pages, native app processes and pixel checks remain separate work.
+
+## Real service-worker coverage
+
+Batch 3 adds six scenarios in `tests/service_worker.rs`, with strict HTTP and
+catalog helpers in `tests/service_worker/fixture.rs`:
+
+| Test | Behavior checked |
+| --- | --- |
+| `album_feedback_reaches_http_catalog_and_real_events_without_editing_tracks` | Album favorite/unfavorite, rating set/clear, exact `albumId` versus `id` HTTP parameters, SQLite/event agreement, unchanged songs and unrelated albums; separate song favorite/rating commands leave the album unchanged |
+| `failed_album_feedback_publishes_rollback_before_failure_and_retry_repeats_http_intent` | Favorite and rating failures publish the original catalog album before `MutationFailed`; SQLite remains unchanged; resending the Retry intent makes exactly one further identical HTTP request |
+| `interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles` | A real later-page failure after 500 imports preserves cached songs/albums/playlists; a successful pass during scanning also preserves them; a later complete non-scanning pass reconciles and persists the result |
+| `preferences_save_through_the_worker_and_restore_after_clean_restart` | The real Preferences handler writes SQLite and updates the player; a joined worker restarts on the same paths and restores preferences through Ready and the player endpoint |
+| `worker_metadata_uses_injected_musicbrainz_and_listenbrainz_endpoints` | A worker command traverses the loopback Navidrome artist-ID lookup and both injected metadata endpoints, publishing the resulting discography |
+| `shutdown_finishes_the_worker_and_runtime_with_metadata_still_pending` | Shutdown completes the queue-save handshake, joins the worker, and shuts down its private runtime even with an HTTP response held pending |
+
+```sh
+scripts/test-service.sh
+# One exact scenario, still saving diagnostics:
+scripts/test-service.sh interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles --exact
+# Equivalent Cargo target:
+cargo test --locked --features test-support --test service_worker -- --nocapture
+```
+
+`service::test_support::Worker` runs the production catalog command loop, not
+`ControlledService`. It accepts isolated paths and an injected `MusicBrainz`
+client, and creates a silent player endpoint without audio devices or OS media
+controls. Each worker owns a private Tokio runtime; its completion signal comes
+after runtime teardown. Readiness, events, requests, and shutdown use explicit
+signals with five-second test deadlines, not sleep-based waits. The controlled
+player answers shutdown with an empty saved queue; these are not queue/playback
+algorithm tests.
+
+The loopback server validates methods/endpoints/parameters, rejects unexpected
+requests, and checks every expected mutation was consumed. It records only
+allowlisted request summaries and scenario-tagged event names, never auth query
+parameters, credentials, arbitrary commands, or complete URLs. Every scenario
+uses temporary data/cache directories and synthetic saved credentials, and joins
+its HTTP server after the worker stops. A held metadata response also exercises
+cleanup of an in-flight request.
+
+The runner saves `target/service-test-artifacts/test.log` and `environment.txt`
+(override the directory with `SONORA_SERVICE_ARTIFACT_DIR`). Like the UI runner,
+it preserves failures and rejects zero-test runs. CI invokes it on macOS/Linux
+and uploads its artifacts separately from UI diagnostics.
+
+These tests verify the service/HTTP/database/event boundary. They do not drive
+pointer/key handlers, render the UI, launch a packaged process, inspect pixels,
+or play audio. Batch 1 separately covers the actual Retry button and optimistic
+visible state; the worker test resends that same mutation intent.
 
 ## Add another feature scenario
 
 - Put production-view integration scenarios in `tests/ui.rs` or child modules
-  under `tests/ui/`. Put reusable fixtures in `tests/common/ui.rs`.
+  under `tests/ui/` (the Explorer module is an example). Put reusable fixtures in `tests/common/ui.rs`.
   `sonora::ui::MusicApp` is the same library view used by the binary; import it
   normally rather than including production source files through `#[path]`.
   Its state stays private. The `test-support` feature enables a read-only

@@ -8,8 +8,8 @@ use gpui_kit::{
 use sonora::ui::MusicApp;
 use sonora::{
     catalog::Catalog,
-    model::{Album, Preferences, Track},
-    platform::Account,
+    model::{Album, LibraryQuery, NamedId, Preferences, Track},
+    platform::{Account, shortcut},
     service::{Command, Event, Mutation, test_support::ControlledService},
 };
 use std::{collections::VecDeque, path::Path};
@@ -49,6 +49,9 @@ pub(crate) struct Fixture {
     pub(crate) saves: usize,
     mutations: Vec<Mutation>,
     pending_mutations: VecDeque<Mutation>,
+    hold_queries: bool,
+    query_requests: Vec<LibraryQuery>,
+    held_views: VecDeque<(String, Event)>,
 }
 
 impl Fixture {
@@ -60,6 +63,9 @@ impl Fixture {
             saves: 0,
             mutations: vec![],
             pending_mutations: VecDeque::new(),
+            hold_queries: false,
+            query_requests: vec![],
+            held_views: VecDeque::new(),
         }
     }
 
@@ -152,6 +158,77 @@ impl Fixture {
         self.catalog.set_state("preferences", &prefs).unwrap();
     }
 
+    pub(crate) fn seed_explorer(&mut self) {
+        for (id, track_id, genre, year, label) in [
+            ("album-1", "track-1", "Rock", 2024, "Label A"),
+            ("album-2", "track-2", "Rock", 2023, "Label B"),
+            ("album-3", "track-3", "Pop", 2024, "Label A"),
+        ] {
+            let mut album = (*self.catalog.album(id).unwrap().unwrap()).clone();
+            album.genre = genre.into();
+            album.year = Some(year);
+            album.record_labels = vec![NamedId {
+                id: label.into(),
+                name: label.into(),
+            }];
+            self.catalog.put_albums(&[album], 1).unwrap();
+            let mut track = (*self.catalog.by_ids(&[track_id.into()]).unwrap()[0]).clone();
+            track.genre = genre.into();
+            track.year = Some(year);
+            self.catalog.put_tracks(&[track], 1).unwrap();
+        }
+    }
+
+    pub(crate) fn hold_queries(&mut self) {
+        self.hold_queries = true;
+    }
+
+    pub(crate) fn deliver_query(&mut self, text: &str) {
+        let at = self
+            .held_views
+            .iter()
+            .position(|(query, _)| query == text)
+            .expect("held search result");
+        let (_, event) = self.held_views.remove(at).unwrap();
+        let Event::View(request, _) = &event else {
+            unreachable!("held query view")
+        };
+        self.trace
+            .push(format!("delivered held View({request}) for {text:?}"));
+        self.backend.emit(event);
+    }
+
+    pub(crate) fn last_query(&self) -> &LibraryQuery {
+        self.query_requests.last().expect("query sent by UI")
+    }
+
+    pub(crate) fn search(&mut self, window: AnyWindowHandle, text: &str, cx: &mut TestAppContext) {
+        cx.update_window(window, |_, window, cx| {
+            window.click("music-search", cx);
+            window.press(shortcut("cmd-a", "ctrl-a"), cx);
+            window.press("backspace", cx);
+            window.input(text, cx);
+        })
+        .unwrap();
+        self.settle(window, cx);
+    }
+
+    pub(crate) fn menu_item(
+        &mut self,
+        window: AnyWindowHandle,
+        label: &str,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            let mut menu = window.within("popup-menu");
+            let target = menu.find_by_label(label);
+            let id = target.path().last().unwrap().clone();
+            menu.click(id, cx);
+        })
+        .unwrap();
+        self.settle(window, cx);
+    }
+
     pub(crate) fn mount(&self, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<MusicApp>) {
         cx.update(|cx| {
             let (window, app) = gpui_kit::open_window(
@@ -192,8 +269,13 @@ impl Fixture {
                 }
                 Command::Query(request, query) => {
                     self.trace.push(format!("Query({request}) -> View"));
-                    self.backend
-                        .emit(Event::View(request, self.catalog.view(&query).unwrap()));
+                    let event = Event::View(request, self.catalog.view(&query).unwrap());
+                    self.query_requests.push(query.clone());
+                    if self.hold_queries {
+                        self.held_views.push_back((query.text, event));
+                    } else {
+                        self.backend.emit(event);
+                    }
                 }
                 Command::Artist(request, name, id) => {
                     self.trace.push(format!("Artist({request}) -> Artist"));
@@ -361,6 +443,11 @@ impl Fixture {
             }
             eprintln!("scenario={scenario} commands={:?}", self.trace);
             eprintln!("scenario={scenario} held album mutations={}", self.pending_mutations.len());
+            if let Some(query) = self.query_requests.last() {
+                eprintln!("scenario={scenario} query text={:?} genres={:?} artists={:?} year={:?} record_label={:?} sort={:?} held_views={}",
+                    query.text, query.selection.genres, query.selection.artists, query.year,
+                    query.record_label, query.ordering.as_ref().map(|sort| sort.summary()), self.held_views.len());
+            }
         })
         .unwrap();
     }

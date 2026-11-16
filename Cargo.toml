@@ -61,3 +61,8 @@ path = "src/main.rs"
 name = "ui"
 path = "tests/ui.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "service_worker"
+path = "tests/service_worker.rs"
+required-features = ["test-support"]

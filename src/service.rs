@@ -263,7 +263,9 @@ impl Service {
         std::thread::Builder::new()
             .name("sonora-catalog".into())
             .spawn(move || {
-                if let Err(error) = run(paths, runtime, worker, rx, events.clone()) {
+                let result = MusicBrainz::new()
+                    .and_then(|metadata| run(paths, runtime, worker, rx, events.clone(), metadata));
+                if let Err(error) = result {
                     let _ = events.send(Event::Error(format!("{error:#}")));
                 }
             })
@@ -557,6 +559,7 @@ fn run(
     service: Service,
     rx: Receiver<Command>,
     events: Sender<Event>,
+    musicbrainz: MusicBrainz,
 ) -> Result<()> {
     let Service {
         player,
@@ -620,7 +623,6 @@ fn run(
     let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
     let mut top_song_requests = HashSet::new();
     let mut submission_requests = HashSet::new();
-    let musicbrainz = MusicBrainz::new()?;
     let mut discography_requests = HashSet::new();
     let mut release_requests: HashSet<String> = HashSet::new();
     let mut open_artist: Option<(u64, String, String)> = None;

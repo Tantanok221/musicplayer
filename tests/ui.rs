@@ -1,6 +1,8 @@
 //! UI integration scenarios using the production library view.
 //! Run with `scripts/test-ui.sh` or `cargo test --features test-support --test ui`.
 mod common;
+#[path = "ui/explorer.rs"]
+mod explorer;
 use common::ui::{
     ARTIST, ARTIST_TARGET, Fixture, MUTATION_ERROR, SECOND_ARTIST, SECOND_ARTIST_TARGET,
     assert_active_tab, assert_rightmost, start,

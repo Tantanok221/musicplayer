@@ -6,6 +6,9 @@ use crate::{catalog::Catalog, model::Preferences, playback::PlayerCommand};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, atomic::AtomicU64};
 
+mod worker;
+pub use worker::Worker;
+
 pub struct ControlledService {
     service: Service,
     commands: Receiver<Command>,
