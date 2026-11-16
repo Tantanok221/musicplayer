@@ -56,12 +56,20 @@ pub(crate) struct Fixture {
     query_requests: Vec<LibraryQuery>,
     held_views: VecDeque<(String, Event)>,
     playback_intents: Option<Vec<PlaybackIntent>>,
+    expected: VecDeque<ExpectedCommand>,
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum PlaybackIntent {
     PlayAlbum(String),
     EnqueueAlbum(String, Placement),
+}
+
+type Response = Box<dyn FnOnce(Command, &Catalog) -> Vec<Event>>;
+
+struct ExpectedCommand {
+    label: &'static str,
+    respond: Response,
 }
 
 impl Fixture {
@@ -77,7 +85,32 @@ impl Fixture {
             query_requests: vec![],
             held_views: VecDeque::new(),
             playback_intents: None,
+            expected: VecDeque::new(),
         }
+    }
+
+    /// Scenario-local commands run after the small shared catalog defaults.
+    /// Closures assert intent and choose replies; labels are safe diagnostics.
+    pub(crate) fn expect(
+        &mut self,
+        label: &'static str,
+        respond: impl FnOnce(Command, &Catalog) -> Vec<Event> + 'static,
+    ) {
+        self.expected.push_back(ExpectedCommand {
+            label,
+            respond: Box::new(respond),
+        });
+    }
+
+    pub(crate) fn assert_script_finished(&self) {
+        assert!(
+            self.expected.is_empty(),
+            "unconsumed scenario commands: {:?}",
+            self.expected
+                .iter()
+                .map(|expected| expected.label)
+                .collect::<Vec<_>>()
+        );
     }
 
     pub(crate) fn seed(&mut self) {
@@ -354,10 +387,19 @@ impl Fixture {
                         .unwrap()
                         .push(PlaybackIntent::EnqueueAlbum(id, placement));
                 }
-                _ => panic!(
-                    "unexpected service command in UI scenario; trace={:?}",
+                command => {
+                    let expected = self.expected.pop_front().unwrap_or_else(|| {
+                        panic!(
+                            "unexpected service command in UI scenario; trace={:?}",
+                            self.trace
+                        )
+                    });
                     self.trace
-                ),
+                        .push(format!("scenario response: {}", expected.label));
+                    for event in (expected.respond)(command, &self.catalog) {
+                        self.backend.emit(event);
+                    }
+                }
             }
         }
         count

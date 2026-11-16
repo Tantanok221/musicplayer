@@ -248,6 +248,48 @@ Existing decoder, PCM and consumed-audio tests remain separate evidence.
 CI's feature-enabled all-tests command includes the paused-player target, while
 the UI and worker scripts still retain their separate diagnostic artifacts.
 
+## Playlists, layout, downloads and lyrics
+
+Batch 5 adds nine scenarios, bringing the merged UI suite to 26. These are
+controlled-backend UI tests: actual production input handlers and visible state,
+with scenario-local service replies and real SQLite preference persistence.
+They do not exercise playlist HTTP, slskd transfers, audio consumption or a
+packaged app. The worker and paused-player targets remain separate checks.
+
+| Test | Behavior checked |
+| --- | --- |
+| `playlists::create_failure_keeps_the_name_and_retry_creates_one_playlist` | Empty submission emits nothing; rejected Unicode name remains in the editor; actual Retry repeats the intent, displays the created playlist and clears the error/editor |
+| `playlists::rename_and_add_an_album_use_the_selected_playlist` | Rename starts with the selected name, updates the visible sidebar, then a real nested album menu appends the intended album to that playlist and shows confirmation |
+| `playlists::cancel_playlist_deletion_keeps_the_playlist_without_a_mutation` | Actual Cancel retains the playlist and emits no deletion |
+| `playlists::confirmed_playlist_deletion_removes_the_sidebar_entry` | Confirm sends the exact playlist ID once and removes its visible sidebar entry after acknowledgement |
+| `layout::resized_navigator_and_information_visibility_survive_catalog_reload` | Actual divider drag and menu visibility toggle persist to SQLite; a fresh view restores the measured divider position and hidden panel; the menu can show it again |
+| `layout::narrow_window_tab_arrows_reach_both_ends_and_keep_new_tab_usable` | At 760px width, create many tabs, scroll to both ends, activate them and create another tab through a reachable New Tab control |
+| `downloads::search_and_folder_failures_recover_without_marking_partial_downloads_complete` | Select a missing release; search failure retains the query; Retry gets candidates; folder refusal preserves choices; an alternative folder shows partial progress then failure rather than completion; dismissal restores folder selection |
+| `downloads::completed_download_waits_for_library_scan_and_clear_sends_only_dismiss` | Completed transfer still says waiting for Navidrome; Refresh emits Refresh; Clear only dismisses that release |
+| `lyrics::timed_lyrics_seek_only_the_playing_track_and_keep_selected_source_distinct` | Playing lyrics emit exactly one offset-adjusted Seek; Selected lyrics show another track and emit no Seek; switching back preserves the two sources |
+
+Run a feature module independently, retaining diagnostics:
+
+```sh
+scripts/test-ui.sh playlists::
+scripts/test-ui.sh layout::
+scripts/test-ui.sh downloads::
+scripts/test-ui.sh lyrics::
+```
+
+`Fixture::expect(label, response)` queues a one-shot scenario-local command
+assertion and its replies. Unexpected commands still fail; the fixture never
+Debug-dumps a command. Call `assert_script_finished()` to reject missing intents.
+The shared pump retains only its existing catalog/preferences/navigation and
+Batch 1/4 defaults; no playlist, Soulseek or lyrics algorithm was added to it.
+Download scrolling uses actual wheel input in the library viewport. Observation
+IDs and accessibility labels derive from the same names/captions shown onscreen.
+
+The narrow-window scenario exposed a real bug: New Tab was inside the scrolling
+strip and could be unreachable. It now stays beside the strip while the tabs
+scroll. The failing pre-fix log and the playlist/lyrics negative checks are
+recorded in the progress document.
+
 ## Add another feature scenario
 
 - Put production-view integration scenarios in `tests/ui.rs` or child modules

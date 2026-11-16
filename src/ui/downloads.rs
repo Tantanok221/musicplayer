@@ -286,6 +286,13 @@ fn downloads_panel(
         }
         list = list.child(
             div()
+                .id(SharedString::from(format!(
+                    "download-release-{}",
+                    row.release
+                )))
+                .test_support()
+                .role(Role::Group)
+                .aria_label(format!("{}: {}", row.title, row.caption))
                 .px_1()
                 .py_1()
                 .flex()

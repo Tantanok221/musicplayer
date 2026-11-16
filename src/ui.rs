@@ -2371,8 +2371,8 @@ impl MusicApp {
         let width = f32::from(window.viewport_size().width);
         let search_width = (width * 0.22).clamp(120., 240.);
         let controls_inset = crate::platform::TITLEBAR_CONTROLS_INSET;
-        // Everything left after Back/Forward, the layout button, a drag area and search.
-        let tabs_width = (width - search_width - controls_inset - 64. - 36. - 24. - 16.).max(100.);
+        // Reserve room for Back/Forward, New Tab, layout controls, drag space and search.
+        let tabs_width = (width - search_width - controls_inset - 64. - 36. - 48. - 16.).max(100.);
         // Offer an arrow only toward tabs that are out of view, as of the last layout.
         let scrolled = -f32::from(self.workspace_scroll.offset().x);
         let max_scroll = f32::from(self.workspace_scroll.max_offset().x);
@@ -2482,6 +2482,11 @@ impl MusicApp {
                     .context_menu(self.bar_menu(cx)),
             )
             .child(tabs)
+            // Keep New Tab reachable while the tab strip scrolls.
+            .child(
+                short_button("new-tab", Glyph::Plus, "New tab (⌘T)")
+                    .on_click(cx.listener(|app, _, window, cx| app.new_tab(window, cx))),
+            )
             .child(
                 div()
                     .id("titlebar-drag")
@@ -2708,6 +2713,7 @@ impl MusicApp {
                             active,
                             cx,
                         )
+                        .test_support()
                         .on_click(cx.listener(
                             move |app, _, window, cx| {
                                 app.switch_workspace(Workspace::Playlists, window, cx);
@@ -4302,6 +4308,7 @@ impl MusicApp {
                         "missing-release-{}",
                         release.id
                     )))
+                    .test_support()
                     .role(Role::Button)
                     .aria_label(format!("Missing release {}", release.title))
                     .w(px(side))
@@ -4742,6 +4749,7 @@ impl MusicApp {
                 .into_any_element();
         }
         if let Some(job) = job {
+            let caption = format!("{} · from {}", download_caption(&job), job.username);
             let dismiss = job.release.clone();
             return block
                 .child(
@@ -4749,11 +4757,13 @@ impl MusicApp {
                         .flex()
                         .items_center()
                         .gap_3()
-                        .child(note(format!(
-                            "{} · from {}",
-                            download_caption(&job),
-                            job.username
-                        )))
+                        .child(
+                            note(caption.clone())
+                                .id("missing-download-status")
+                                .test_support()
+                                .role(Role::Status)
+                                .aria_label(caption),
+                        )
                         .when(job.state != JobState::Active, |row| {
                             row.child(
                                 Button::new("missing-download-dismiss")
@@ -4791,10 +4801,11 @@ impl MusicApp {
                 .items_center()
                 .gap_2()
                 .child(
-                    div()
-                        .flex_1()
-                        .max_w(px(420.))
-                        .child(Input::new(&self.soulseek_query).small()),
+                    div().flex_1().max_w(px(420.)).child(
+                        Input::new(&self.soulseek_query)
+                            .id("soulseek-query")
+                            .small(),
+                    ),
                 )
                 .child(
                     Button::new("missing-search")
@@ -4831,6 +4842,8 @@ impl MusicApp {
             block = block.child(
                 div()
                     .id("download-start")
+                    .test_support()
+                    .aria_label(message.clone())
                     .role(if failed { Role::Alert } else { Role::Status })
                     .flex()
                     .items_center()
@@ -4855,23 +4868,30 @@ impl MusicApp {
                     .child(div().flex_1().min_w_0().child(message)),
             );
         }
+        let search_note = |text: String| {
+            note(text.clone())
+                .id("soulseek-search-state")
+                .test_support()
+                .role(Role::Status)
+                .aria_label(text)
+        };
         match search {
             None => {}
             Some(SearchUpdate::Searching(count)) => {
-                block = block.child(note(format!(
+                block = block.child(search_note(format!(
                     "Searching Soulseek… {count} {} so far",
                     if count == 1 { "response" } else { "responses" }
                 )));
             }
-            Some(SearchUpdate::Failed(message)) => block = block.child(note(message)),
+            Some(SearchUpdate::Failed(message)) => block = block.child(search_note(message)),
             Some(SearchUpdate::Results(candidates, expected)) => {
                 if candidates.is_empty() {
-                    block = block.child(note(
+                    block = block.child(search_note(
                         "No folders found. The Soulseek server hides some names; try different search text."
                             .into(),
                     ));
                 } else {
-                    block = block.child(note(format!(
+                    block = block.child(search_note(format!(
                         "{} {} · best matches first{}",
                         candidates.len(),
                         if candidates.len() == 1 {
@@ -4957,6 +4977,7 @@ impl MusicApp {
                     .child(
                         div()
                             .id(("soulseek-candidate-files", index))
+                            .test_support()
                             .role(Role::Button)
                             .aria_label(format!("Show files in {}", candidate.folder()))
                             .flex_1()
@@ -5512,6 +5533,7 @@ impl MusicApp {
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("info-tab-{label}")))
+                    .test_support()
                     .role(Role::Tab)
                     .aria_label(label)
                     .aria_selected(value == tab)
@@ -5574,6 +5596,7 @@ impl MusicApp {
                     let art = self.art(&track.cover_art, 66., cx);
                     let summary = div()
                         .id("inspected-track")
+                        .test_support()
                         .role(Role::Group)
                         .aria_label(format!(
                             "{} track: {}",
@@ -5819,6 +5842,9 @@ impl MusicApp {
         };
         let mut content = div()
             .id("lyrics-scroll")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(format!("Lyrics for {}", track.title))
             .size_full()
             .min_h_0()
             .overflow_y_scroll()
@@ -5928,6 +5954,7 @@ impl MusicApp {
                     let player = self.service.player.clone();
                     let mut row = div()
                         .id(SharedString::from(format!("lyric-{index}")))
+                        .test_support()
                         .role(Role::Group)
                         .aria_label(format!(
                             "{}{}",
@@ -7750,6 +7777,7 @@ impl MusicApp {
         };
         div()
             .id("library-status")
+            .test_support()
             .w_full()
             .min_w_0()
             .overflow_hidden()
@@ -7929,7 +7957,7 @@ impl MusicApp {
                     .child(
                         div()
                             .flex_1()
-                            .child(Input::new(&self.playlist_name).small()),
+                            .child(Input::new(&self.playlist_name).id("playlist-name").small()),
                     )
                     .child(
                         Button::new("save-playlist-editor")
@@ -7980,6 +8008,8 @@ impl MusicApp {
         let previous_height = self.library_height;
         let weak = cx.weak_entity();
         let content = div()
+            .id("library-content")
+            .test_support()
             .relative()
             .size_full()
             .min_w_0()

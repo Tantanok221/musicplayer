@@ -6,8 +6,8 @@ restart persistence through an isolated catalog. No commit/push is implied.
 Batch 3 (real service-worker integration) was requested on the same date.
 Batches 2–3 are now committed in `8689e80`; `b0808a5` adds the full-test push
 requirement. Earlier checkpoints below describe their state at implementation
-time. Batch 4 was implemented in a separate worktree; the user subsequently
-authorized merging it into main and pushing it.
+time. Batch 4 was implemented in a separate worktree and merged/pushed at
+`f38c40f`. Batch 5 continues locally on that merged baseline.
 
 ## Status
 
@@ -20,6 +20,7 @@ authorized merging it into main and pushing it.
 - [x] Pass fmt, Clippy, full tests, and local bundle checks.
 - [x] Add real-worker/loopback-HTTP scenarios with isolated catalogs and bounded shutdown.
 - [x] Add queue/playback UI scenarios paired with the real paused player actor.
+- [x] Add playlist/layout/download/lyrics UI scenarios with local command scripts.
 
 ## Implementation decisions
 
@@ -36,6 +37,80 @@ authorized merging it into main and pushing it.
   commands containing credentials or authenticated URLs.
 
 ## Current checkpoint
+
+### Batch 5 checkpoint (2026-11-16)
+
+Before continuing, inspected the user's Batch 4 merge `f38c40f`, its real paused
+player adapter, shared bindings, queue revision guard and five UI/two actor
+scenarios. The merge preserved the three in-progress Batch 5 files cleanly.
+No Batch 4 behavior was replaced. Verified
+[merged CI run 43854401169](https://github.com/Tantanok221/musicplayer/actions/runs/43854401169):
+macOS-15, Ubuntu-24.04 and formatting passed. The audit fix `bd6a07c` was also
+committed/pushed as requested and its
+[CI run 43853394810](https://github.com/Tantanok221/musicplayer/actions/runs/43853394810)
+passed. Those remote runs cover committed work, not this local Batch 5 diff.
+
+Implemented nine scenarios in `tests/ui/playlists.rs`, `layout.rs`,
+`downloads.rs` and `lyrics.rs`:
+
+- Four playlist scenarios cover create/empty submission, retained Unicode input
+  after failure and actual Retry, rename plus album-to-playlist submenu intent
+  and visible confirmation, cancellation without a delete command, and separate
+  confirmed deletion after acknowledgement.
+- Two layout scenarios cover a real divider drag and information-panel toggle
+  saved to temporary SQLite and restored in a fresh view, plus 760px tab-strip
+  navigation to both ends while New Tab remains usable.
+- Two download scenarios select a missing release and exercise real wheel input,
+  search failure/retry, partial-folder refusal and alternative folder choice,
+  duplicate Start suppression, partial transfer/failure captions, dismissal,
+  completed-but-waiting-for-library state, Refresh and Clear intents.
+- One lyrics scenario keeps Selected and Playing tracks distinct, checks an
+  offset-adjusted Seek through a timed playing line, rejects Seek from another
+  selected track, and switches back to the playing track's details.
+
+`Fixture::expect()` queues one-shot assertions/replies declared by each scenario;
+`assert_script_finished()` rejects missing commands. No new playlist, download
+or lyrics service algorithm was added to the shared pump. Diagnostics use safe
+expectation labels and existing synthetic data; all persistence uses isolated
+SQLite and no network/audio/OS services start in these nine scenarios.
+
+The narrow-window test found a production bug: New Tab was clipped inside the
+scroll strip. Moved the existing button beside the strip and reserved its width,
+leaving the scrollable tab indices/identity intact. Evidence:
+`target/batch5-layout-before-fix.log`; the corrected layout scenario passes.
+Added observation/accessibility to existing playlist controls, info/lyric rows,
+missing-release/download captions and the content viewport. Captions and labels
+come from displayed values; observation is a no-op in normal builds.
+
+Intentional negative checks also failed as expected when hiding the playlist
+editor on rejection (`target/batch5-playlist-editor-regression.log`) and when
+allowing Selected lyrics to seek another playing track
+(`target/batch5-lyrics-source-regression.log`). Source was restored in `finally`
+after each check.
+
+Final positive validation on local macOS after restoring both mutations:
+
+- `cargo fmt --check`: PASS (`target/batch5-fmt.log`).
+- Locked/all-targets Clippy with `-D warnings`, default and `test-support`: PASS
+  (`target/batch5-clippy-{default,feature}.log`).
+- `cargo test --locked`: PASS, 152 ordinary tests
+  (`target/batch5-default-tests.log`).
+- `cargo test --locked --features test-support`: PASS, 186 tests
+  (152 ordinary + 2 paused-player + 6 worker + 26 UI;
+  `target/batch5-all-tests.log`).
+- `scripts/test-ui.sh`: PASS, all 26 scenarios, 3.53s
+  (`target/batch5-ui-tests.log`, `target/ui-test-artifacts/`).
+- The four Batch 5 feature modules also passed independently:
+  `target/batch5-{playlists,layout,downloads,lyrics}.log`.
+- `git diff --check`: PASS. Intentional failure logs remain separate from
+  positive runner diagnostics.
+
+The user subsequently authorized committing/pushing Batch 5 and explicitly
+requested no repeat of suites already run. The final feature-enabled and UI
+gates above passed against these source changes; only documentation changed
+after those checks. These are in-process controlled UI tests, not playlist
+HTTP/slskd transfer/audio or packaged-app tests. Batch 5 remote validation is
+pending publication; the earlier linked runs cover the committed baseline.
 
 ### Audit follow-up (2026-11-16)
 
@@ -81,9 +156,9 @@ Local follow-up validation on macOS:
   Source restored in `finally`; subsequent positive suites passed. Evidence:
   `target/worker-ui-rollback-regression.log`.
 
-No Batch 4/player implementation was changed here, and no commit or push is
-implied. New follow-up changes have local macOS evidence only; the linked remote
-run above covers the previously committed Batches 2–3.
+No Batch 4/player implementation was changed in this checkpoint. The follow-up
+was subsequently committed/pushed as `bd6a07c` and passed macOS/Linux CI in run
+43853394810, linked above.
 
 ### Batch 4 publication authorization (2026-11-16)
 
@@ -422,12 +497,10 @@ for the next agent's entry point.
 
 ## Next work
 
-Batch 4 and the audit follow-up are combined locally. The merged suite contains
-seventeen UI scenarios (sixteen controlled plus one real worker/HTTP), six
-worker-only scenarios and two real paused-player scenarios. The separate
-implementation checkpoints above retain their original validation counts.
-Batches 1–3 have macOS/Linux CI evidence; Batch 4 and the audit follow-up have
-local macOS evidence, with merged-result checks required before publication.
+Batch 4 and the audit follow-up are committed on main and passed macOS/Linux CI
+at `f38c40f`. Batch 5 adds nine local scenarios, bringing the UI suite to 26;
+the six worker-only and two real paused-player scenarios remain. Historical
+implementation checkpoints retain their original validation counts.
 
 1. For CI failures, run the exact command in `docs/TESTING.md` and inspect the
    corresponding uploaded `environment.txt` and `test.log`.
@@ -435,5 +508,5 @@ local macOS evidence, with merged-result checks required before publication.
 3. Take the next requested deferred slice from
    [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md). Native process/AX,
    pixels, large catalogs/other layouts and artist pages remain unimplemented.
-4. Publication is authorized. Preserve unrelated main work and follow the
-   mandatory full-feature/UI pre-push gates in `AGENTS.md`.
+4. Batch 5 publication is authorized. Its final full-feature/UI gates passed;
+   honor the user's instruction not to repeat already-completed suites.

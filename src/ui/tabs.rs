@@ -436,11 +436,6 @@ impl MusicApp {
             );
         }
         items.push(
-            short_button("new-tab", Glyph::Plus, "New tab (⌘T)")
-                .on_click(cx.listener(|app, _, window, cx| app.new_tab(window, cx)))
-                .into_any_element(),
-        );
-        items.push(
             div()
                 .id("tab-strip-space")
                 .flex_1()

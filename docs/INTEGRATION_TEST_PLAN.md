@@ -4,8 +4,9 @@ Prepared 2026-11-16 after the first production-view scenario passed locally.
 Batches 1–3 are committed; Batches 2–3 landed in `8689e80`. Their macOS/Linux CI
 run [43850271484](https://github.com/Tantanok221/musicplayer/actions/runs/43850271484)
 passed at `b0808a5`. See the progress document for validation.
-Batch 4 is being implemented in a separate worktree and is outside this update;
-Batch 5 remains proposed work.
+Batch 4 was merged and pushed at `f38c40f`, with successful macOS/Linux CI.
+Batch 5 is implemented locally on that merged baseline; its validation is
+recorded in the progress document.
 
 Current coverage and commands: [TESTING.md](TESTING.md).
 Completed work and validation: [AGENT_TESTING_PROGRESS.md](AGENT_TESTING_PROGRESS.md).
@@ -174,6 +175,13 @@ Add focused scenarios for:
 Prioritize within this batch according to the feature currently being changed.
 Protect the workflow before broadening coverage of its cosmetic variants.
 
+Implemented as nine scenarios in `tests/ui/{playlists,layout,downloads,lyrics}.rs`.
+They use one-shot scenario-local command expectations rather than extending
+the fixture's shared command match with feature algorithms. Layout reload uses
+temporary SQLite; service responses remain controlled. The tab-overflow test
+found and fixed an unreachable New Tab control. See [TESTING.md](TESTING.md)
+for exact scenario names and the boundaries each layer checks.
+
 ## CI and completion criteria
 
 Continue using `scripts/test-ui.sh` as the UI gate. Add focused feature filtering
@@ -205,7 +213,7 @@ and physical audio-device changes remain separate checks.
 
 ## Explicit deferred work
 
-These are planned gaps, not coverage supplied by Batches 1–3:
+These remain gaps beyond the current suites:
 
 - **Executable data isolation:** add a supported launch option for temporary
   data/cache paths before native tests. The executable currently uses
@@ -223,5 +231,7 @@ These are planned gaps, not coverage supplied by Batches 1–3:
   artist response before an older one and assert that the newer page remains.
   This is a separate scenario from the existing stale Explorer search test.
 
-Playback-layer and queue persistence gaps belong to the separate Batch 4
-worktree. Do not mark them complete based on controlled UI snapshots.
+Paused queue edits are covered by the merged Batch 4 actor tests. Deterministic
+audio consumption, media-control stand-ins and real-worker queue persistence
+across restart remain separate owning-layer work; controlled UI snapshots do
+not complete those gaps.
