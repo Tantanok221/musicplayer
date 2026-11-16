@@ -3,6 +3,8 @@
 mod common;
 #[path = "ui/explorer.rs"]
 mod explorer;
+#[path = "ui/playback.rs"]
+mod playback;
 #[path = "ui/worker.rs"]
 mod worker;
 // This target shares the strict HTTP fixture, not its worker-only scenarios.

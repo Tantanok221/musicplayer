@@ -149,6 +149,14 @@ Controlled snapshots verify rendering and emitted intent. Actual queue edits,
 decoder timing, and consumed-audio behavior must also be checked by the player
 integration layer; the UI fixture must not invent a second player algorithm.
 
+Implemented in `tests/ui/playback.rs` and `tests/player_queue.rs`. The UI tests
+drive actual context menus, row selection, keyboard edits, Remove/Undo, pointer
+drag, seek transitions and input focus. The paused-player harness runs the real
+actor with native device/media adapters disabled; it does not model decoding or
+physical audio. The new stale-snapshot reproduction required a UI revision
+guard. See [TESTING.md](TESTING.md) for exact scenarios and boundary details,
+and the progress log for validation evidence.
+
 ## Batch 5: playlists, layout, and downloads
 
 Add focused scenarios for:
@@ -172,7 +180,8 @@ Continue using `scripts/test-ui.sh` as the UI gate. Add focused feature filterin
 to the runner as the suite grows, while keeping an all-scenarios CI run.
 Batch 3 adds `scripts/test-service.sh` as a separate real-worker gate and
 artifact source. Default `cargo test` continues to run ordinary integration
-tests; `test-support` enables the two additional integration targets.
+tests; `test-support` enables the UI, real-worker and paused-player targets.
+CI runs the feature-enabled full suite as well as the diagnostic runners.
 CI checks Clippy both with default features and with `test-support`.
 For an occasional thread/runtime stability check, run
 `scripts/test-service-repeat.sh` (20 repetitions, separate diagnostics per run).

@@ -66,3 +66,8 @@ required-features = ["test-support"]
 name = "service_worker"
 path = "tests/service_worker.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "player_queue"
+path = "tests/player_queue.rs"
+required-features = ["test-support"]

@@ -10,6 +10,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features test-support -- -D warnings
 cargo test --locked
+cargo test --locked --features test-support
 scripts/test-service.sh
 scripts/test-ui.sh
 # Occasional real-thread/runtime stability check (20 runs):
@@ -22,8 +23,9 @@ Yes, but required features matter:
 
 | Command | Tests executed |
 | --- | --- |
-| `cargo test` or `cargo test --locked` | Ordinary unit and integration tests, including the existing HTTP/catalog/audio tests in `tests/`; skips the feature-gated UI and real-worker targets |
-| `cargo test --locked --features test-support` | All ordinary tests **plus** the UI and real-worker integration targets |
+| `cargo test` or `cargo test --locked` | Ordinary unit and integration tests, including the existing HTTP/catalog/audio tests in `tests/`; skips the feature-gated UI, real-worker and paused-player targets |
+| `cargo test --locked --features test-support` | All ordinary tests **plus** the UI, real-worker and paused-player integration targets |
+| `cargo test --locked --features test-support --test player_queue` | Real paused-player queue integration only |
 | `scripts/test-service.sh` | Real-worker integration only, with saved diagnostics |
 | `scripts/test-ui.sh` | Production-view UI integration only, with saved diagnostics |
 
@@ -199,6 +201,52 @@ pointer/key handlers, render the UI, launch a packaged process, inspect pixels,
 or play audio. The cross-layer UI scenario above covers the actual Retry button
 and optimistic/rollback state against this worker; these worker-only scenarios
 resend mutation intents directly.
+
+## Queue and playback controls
+
+Batch 4 adds five scenarios in `tests/ui/playback.rs`. Together with the
+cross-layer worker scenario, the merged UI target contains seventeen scenarios:
+
+| Test | Behavior checked |
+| --- | --- |
+| `playback::album_play_next_and_queue_last_send_one_intended_command_each` | Actual album context-menu commands emit the intended album ID, Next/Last placement, and exactly one service intent per click; the unacknowledged queue remains unchanged |
+| `playback::duplicate_queue_occurrences_select_move_remove_and_undo_through_real_player` | Duplicate occurrence selection, keyboard move, nested Remove, one-level Undo and pointer drag; real player snapshots determine visible order and retained selection |
+| `playback::obsolete_queue_menu_edits_and_snapshots_cannot_claim_success` | An old rendered menu emits its captured revision while the actor has advanced; the real actor rejects the edit, and an older delayed snapshot cannot replace the current UI queue or Undo state |
+| `playback::seek_drag_previews_survives_position_updates_and_sends_once_on_release` | Pointer-down/move preview, no held-drag Seek, elapsed-time preview and unchanged thumb through a position event, one release Seek, then normal position updates resume |
+| `playback::space_types_in_search_but_toggles_once_with_queue_focus` | Space types into the focused Search input without a player command; with queue focus it emits exactly one Toggle and a delivered playing snapshot changes Play to Pause |
+
+```sh
+cargo test --locked --features test-support --test ui playback:: -- --nocapture
+cargo test --locked --features test-support --test player_queue -- --nocapture
+```
+
+For one exact UI case, use its full `playback::...` name before `--exact`:
+
+```sh
+cargo test --locked --features test-support --test ui playback::obsolete_queue_menu_edits_and_snapshots_cannot_claim_success -- --exact --nocapture
+```
+
+`playback::test_support::PausedPlayer` runs the production player command loop
+on a joined thread with a private runtime. Its platform adapter disables device
+discovery and OS media controls. The endpoint accepts only paused queue commands,
+rejecting transport/server commands, so it cannot start a decoder or audio
+device. Readiness, snapshots and shutdown have bounded waits. Tests send
+commands sequentially and consume real snapshots; the UI fixture contains no
+second queue algorithm.
+
+Two scenarios in `tests/player_queue.rs` cover duplicate occurrence IDs,
+stale/current/past edit rejection, Undo, repeated Undo, Next/Last insertion,
+clear-upcoming, position retention and metadata updates while Undo is pending.
+The UI and binary now share playback and queue keyboard bindings. The original
+keymap unit test remains. The stale-snapshot scenario exposed a real UI bug;
+`Event::Playback` now rejects lower queue revisions.
+
+Seek assertions use the existing slider's scoped track/thumb geometry and the
+elapsed label derived from the same duration text that is rendered. These are
+in-process observations, not numeric AX delivery, pixels or physical playback.
+Existing decoder, PCM and consumed-audio tests remain separate evidence.
+CI's feature-enabled all-tests command includes the paused-player target, while
+the UI and worker scripts still retain their separate diagnostic artifacts.
 
 ## Add another feature scenario
 
