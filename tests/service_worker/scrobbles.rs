@@ -91,6 +91,7 @@ fn offline_listen(initially_connected: bool) {
         offline: !initially_connected,
         ..Default::default()
     });
+    f.seed();
     let mut w = f.start();
     if initially_connected {
         synced(&w);
