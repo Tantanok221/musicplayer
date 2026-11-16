@@ -12,6 +12,8 @@ cargo clippy --locked --all-targets --features test-support -- -D warnings
 cargo test --locked
 scripts/test-service.sh
 scripts/test-ui.sh
+# Occasional real-thread/runtime stability check (20 runs):
+scripts/test-service-repeat.sh
 ```
 
 ### Does `cargo test` include integration tests?
@@ -40,6 +42,8 @@ It preserves Cargo's exit status while saving
 `target/ui-test-artifacts/test.log` and `environment.txt`. CI runs the same
 script on macOS and Linux and uploads these files. The progress document
 records which commands have actually been validated and on which platform.
+Both focused runners accept optional test filters after the script name.
+For example, `scripts/test-ui.sh worker::` runs only the cross-layer UI scenario.
 
 ## First protected workflow
 
@@ -87,7 +91,26 @@ SQLite through the catalog feedback API, then emits `AlbumUpdated` and
 `MutationDone`; failure emits the original `AlbumUpdated` before
 `MutationFailed`, matching the service's response order. Tests do not call the
 view's mutation/event handlers directly. These are controlled-backend UI tests;
-the real HTTP/service-worker mutation path is covered separately below.
+the real HTTP/service-worker mutation path is also exercised with the UI below.
+
+## UI with a real service worker
+
+`worker::favorite_http_failure_rolls_back_in_the_real_view_and_retry_recovers`
+in `tests/ui/worker.rs` mounts the production view with a real
+`service::test_support::Worker`, temporary SQLite paths and the strict loopback
+HTTP fixture shared with `tests/service_worker.rs`. Actual pointer clicks select
+an Explorer album, favorite it, attempt a duplicate while pending, and Retry
+after HTTP rejection. Assertions cover the optimistic/disabled control, visible
+rollback/error, one identical HTTP request on Retry, persisted success and
+error dismissal. The HTTP fixture also answers the selection's real artist and
+top-song requests with synthetic data.
+
+The harness stages the worker's actual events in FIFO order and forwards each
+through the view's normal receiver. It supplies no synthetic mutation responses
+and does not call view handlers. Five-second event deadlines bound waits. This
+connects the previously separate UI and worker layers: dropping the worker's
+rollback event must fail the visible heart assertion. The worker/player endpoint
+is silent; this is not packaged-process, OS input or audio-consumption coverage.
 
 ## Music Explorer coverage
 
@@ -164,10 +187,18 @@ The runner saves `target/service-test-artifacts/test.log` and `environment.txt`
 it preserves failures and rejects zero-test runs. CI invokes it on macOS/Linux
 and uploads its artifacts separately from UI diagnostics.
 
+For occasional repeated runs of all six real-worker scenarios, use
+`scripts/test-service-repeat.sh` (20 by default) or pass a positive run count.
+Each repetition retains its own `test.log` and `environment.txt` under
+`target/service-repeat-artifacts/run-N/`; override the root with
+`SONORA_SERVICE_REPEAT_ARTIFACT_DIR`. The runner stops on the first failure and
+keeps that run's diagnostics. CI checks both default and feature-enabled Clippy.
+
 These tests verify the service/HTTP/database/event boundary. They do not drive
 pointer/key handlers, render the UI, launch a packaged process, inspect pixels,
-or play audio. Batch 1 separately covers the actual Retry button and optimistic
-visible state; the worker test resends that same mutation intent.
+or play audio. The cross-layer UI scenario above covers the actual Retry button
+and optimistic/rollback state against this worker; these worker-only scenarios
+resend mutation intents directly.
 
 ## Add another feature scenario
 

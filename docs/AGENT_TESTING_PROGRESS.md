@@ -3,8 +3,10 @@
 Scope approved 2026-11-16: enable GPUI testing, controlled service/player
 handles, queryable tabs/navigator, real input regression, CI diagnostics, and
 restart persistence through an isolated catalog. No commit/push is implied.
-Batch 3 (real service-worker integration) was requested on the same date;
-the completed, uncommitted Batch 2 changes were preserved.
+Batch 3 (real service-worker integration) was requested on the same date.
+Batches 2–3 are now committed in `8689e80`; `b0808a5` adds the full-test push
+requirement. Earlier checkpoints below describe their state at implementation
+time. Batch 4 is being implemented in another worktree and is outside this update.
 
 ## Status
 
@@ -12,7 +14,7 @@ the completed, uncommitted Batch 2 changes were preserved.
 - [x] Add controlled service/player handles without starting network/audio/OS services.
 - [x] Register stable tab and navigator test targets.
 - [x] Exercise new tab → artist through actual input handlers; assert identity/order/layout.
-- [x] Configure the CI scenario and diagnostic artifacts (remote run pending).
+- [x] Configure CI scenarios/artifacts and verify Batches 1–3 on macOS/Linux.
 - [x] Close/recreate the view with preferences read from an isolated SQLite catalog.
 - [x] Pass fmt, Clippy, full tests, and local bundle checks.
 - [x] Add real-worker/loopback-HTTP scenarios with isolated catalogs and bounded shutdown.
@@ -32,6 +34,56 @@ the completed, uncommitted Batch 2 changes were preserved.
   commands containing credentials or authenticated URLs.
 
 ## Current checkpoint
+
+### Audit follow-up (2026-11-16)
+
+Added one cross-layer scenario in `tests/ui/worker.rs`: actual Explorer album
+selection and Favorite/Retry clicks run against `test_support::Worker`, strict
+loopback HTTP and temporary SQLite. The harness forwards real events in FIFO
+order through MusicApp's receiver without using the controlled UI fixture's
+`pump()`. It checks optimistic/disabled feedback, duplicate suppression, visible
+rollback/error, identical Retry HTTP intent, persisted success and error removal.
+The shared HTTP fixture now also answers strictly validated artist/top-song
+requests made when selecting the album.
+
+Added default-feature Clippy alongside feature-enabled Clippy in CI, optional
+filtering to the UI runner, and `scripts/test-service-repeat.sh` for 20 occasional
+real-worker repetitions with separate retained diagnostics. The expansion plan
+now explicitly tracks executable data isolation, packaged smoke, screenshots,
+large-catalog scrolling/other layouts and stale artist-page responses. Future
+controlled scenarios should declare expected commands/replies locally instead
+of growing a second service in `pump()`.
+
+Verified existing [CI run 43850271484](https://github.com/Tantanok221/musicplayer/actions/runs/43850271484)
+at `b0808a5`: formatting plus both macOS-15 and Ubuntu-24.04 jobs passed,
+including ordinary tests, all six real-worker scenarios and eleven UI scenarios.
+This resolves the previously pending Linux evidence for Batches 2–3; it does
+not validate the new follow-up changes, which have not been pushed.
+
+Local follow-up validation on macOS:
+
+- `cargo fmt --check`: PASS (`target/audit-followup-fmt.log`).
+- Locked/all-targets Clippy with `-D warnings`, default and `test-support`: PASS
+  (`target/audit-followup-clippy-{default,feature}.log`).
+- `cargo test --locked`: PASS, 152 ordinary tests
+  (`target/audit-followup-default-tests.log`).
+- `cargo test --locked --features test-support`: PASS, 170 tests
+  (152 ordinary + 6 worker + 12 UI; `target/audit-followup-all-tests.log`).
+- `scripts/test-ui.sh`: PASS, all 12 scenarios (`target/audit-followup-ui.log`;
+  standard diagnostics remain in `target/ui-test-artifacts/`).
+- `scripts/test-service-repeat.sh`: PASS, 20/20 repetitions, six worker
+  scenarios each (120 passes). Summary: `target/audit-followup-service-repeat.log`;
+  per-run diagnostics: `target/service-repeat-artifacts/run-{1..20}/`.
+- Removing the production worker's rollback event made the new scenario fail
+  on the visible heart label: actual Unfavorite versus expected Favorite.
+  Source restored in `finally`; subsequent positive suites passed. Evidence:
+  `target/worker-ui-rollback-regression.log`.
+
+No Batch 4/player implementation was changed here, and no commit or push is
+implied. New follow-up changes have local macOS evidence only; the linked remote
+run above covers the previously committed Batches 2–3.
+
+## Historical implementation checkpoints
 
 ### Batch 3 checkpoint (2026-11-16)
 
@@ -141,8 +193,8 @@ Batch 2 validation:
   `target/batch2-bundle.log`.
 - `git diff --check`: PASS.
 
-Batch 2 is complete locally. Changes are uncommitted and have not run in remote
-CI. No new commit/push is authorized by this request. The default Album Covers
+Batch 2 was complete locally at this checkpoint. It was subsequently committed
+with Batch 3 in `8689e80` and passed macOS/Linux CI at `b0808a5`. The default Album Covers
 view is covered with three fixture albums; alternate layouts, large-library
 scrolling, artist pages, real service workers and pixel/native checks remain
 separate work.
@@ -157,7 +209,8 @@ is `origin/main`; verify remote parity and the resulting CI run after pushing.
 The earlier references to uncommitted work/no push describe historical checkpoints.
 Publication completed at `be71419` on `origin/main`. The baseline CI run
 43826764407 completed successfully (macOS/Linux, verified during Batch 2).
-Batch 2 is now complete locally above; its changes are not part of that CI run.
+Batch 2 was not part of that baseline run; the later run at `b0808a5` passed
+both Batches 2–3 on macOS/Linux.
 
 ### Batch 1 checkpoint (2026-11-16)
 
@@ -223,7 +276,8 @@ guide and expansion plan use the new paths. Migration checks passed:
 
 Migration complete. All integration scenarios/fixtures live under `tests/`;
 unit tests of private helpers remain beside the implementation. No additional
-feature scenarios were added during this move. Changes remain uncommitted.
+feature scenarios were added during this move. This historical checkpoint was
+subsequently included in `9724a3d`.
 
 Earlier validation entries below refer to the previous binary-local layout.
 
@@ -288,20 +342,14 @@ for the next agent's entry point.
 
 ## Next work
 
-Batch 3 is complete locally. No required local implementation or validation remains.
+Batches 1–3 are committed and validated on macOS/Linux. Twelve UI scenarios
+(eleven controlled plus one real worker/HTTP) and six worker-only scenarios are
+implemented after this follow-up. Batch 4 belongs to the other worktree; do not
+duplicate its queue/player changes here or mark it complete from UI snapshots.
 
-The next planned expansion is Batch 4 (queue and playback controls) in
-[INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md). Eleven UI scenarios and six
-real-worker scenarios are implemented; later batches and deferred artist-page
-scenarios are not coverage.
-
-1. If the user requests publication, inspect both uncommitted batches and commit/
-   push using short conventional commits without coauthors. Earlier publication
-   authorization applied only to the foundation/Batch 1, which is already pushed.
-2. If CI fails, run the exact failing command from `docs/TESTING.md`; inspect
-   the uploaded service/UI `environment.txt` and `test.log`. Only the baseline
-   six-test UI suite is confirmed on Linux; Batches 2–3 have local macOS evidence.
-3. For the next requested slice, add Batch 4 queue/playback UI coverage, pairing
-   controlled snapshots with tests at the real queue/player owning layer.
-   Current scenarios do not start a packaged process, native AX, a pixel renderer,
-   or an audio device. Keep artist-page scenarios deferred unless scope expands.
+1. For CI failures, run the exact command in `docs/TESTING.md` and inspect the
+   corresponding uploaded `environment.txt` and `test.log`.
+2. Use `scripts/test-service-repeat.sh` for occasional thread/runtime checks.
+3. Take the next requested deferred slice from
+   [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md). Native process/AX,
+   pixels, large catalogs/other layouts and artist pages remain unimplemented.

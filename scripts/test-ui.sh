@@ -13,7 +13,7 @@ mkdir -p "$artifact_dir"
 
 # pipefail preserves the test failure when tee succeeds. Rust's panic output
 # plus the fixture's allowlisted state/geometry/command trace go into the log.
-cargo test --locked --features test-support --test ui -- --nocapture \
+cargo test --locked --features test-support --test ui -- --nocapture "$@" \
   2>&1 | tee "$artifact_dir/test.log"
 
 # A renamed/missing test module must not silently turn this gate green.

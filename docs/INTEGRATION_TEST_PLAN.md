@@ -1,9 +1,11 @@
 # Integration test expansion plan
 
 Prepared 2026-11-16 after the first production-view scenario passed locally.
-Batch 1 is committed. The Explorer-only Batch 2 and real-worker Batch 3 are
-implemented in the working tree; see the progress document for validation.
-Batches 4–5 remain proposed work.
+Batches 1–3 are committed; Batches 2–3 landed in `8689e80`. Their macOS/Linux CI
+run [43850271484](https://github.com/Tantanok221/musicplayer/actions/runs/43850271484)
+passed at `b0808a5`. See the progress document for validation.
+Batch 4 is being implemented in a separate worktree and is outside this update;
+Batch 5 remains proposed work.
 
 Current coverage and commands: [TESTING.md](TESTING.md).
 Completed work and validation: [AGENT_TESTING_PROGRESS.md](AGENT_TESTING_PROGRESS.md).
@@ -88,6 +90,18 @@ with `cargo test --locked --features test-support`.
 This layer is separate from controlled-backend UI scenarios. The existing UI
 fixture emulates selected service responses and is not proof of worker wiring.
 
+The cross-layer scenario in `tests/ui/worker.rs` mounts `MusicApp` with a real
+`test_support::Worker` and the same strict loopback HTTP fixture. It clicks
+Favorite, checks optimistic/pending state and duplicate-click suppression,
+delivers the worker's real events in FIFO order, and checks visible rollback and
+error after HTTP rejection. Clicking the actual Retry button must make exactly
+one identical HTTP request, persist success and clear the error. This scenario
+does not use the controlled UI fixture's hand-written mutation responses.
+
+Keep shared controlled-backend defaults limited to startup/catalog queries.
+New playlist/download/lyrics scenarios should declare their expected commands
+and replies locally; do not expand `pump()` into another service implementation.
+
 Required infrastructure:
 
 - Start the real service worker with temporary paths and a controlled player.
@@ -159,6 +173,9 @@ to the runner as the suite grows, while keeping an all-scenarios CI run.
 Batch 3 adds `scripts/test-service.sh` as a separate real-worker gate and
 artifact source. Default `cargo test` continues to run ordinary integration
 tests; `test-support` enables the two additional integration targets.
+CI checks Clippy both with default features and with `test-support`.
+For an occasional thread/runtime stability check, run
+`scripts/test-service-repeat.sh` (20 repetitions, separate diagnostics per run).
 
 For each batch:
 
@@ -176,3 +193,26 @@ Track runtime and flaky failures before adding strict time budgets. After the
 fast suites are reliable, add a small native packaged-app smoke suite for
 launch/reopen, focus, title-bar controls and accessibility. Pixel comparisons
 and physical audio-device changes remain separate checks.
+
+## Explicit deferred work
+
+These are planned gaps, not coverage supplied by Batches 1–3:
+
+- **Executable data isolation:** add a supported launch option for temporary
+  data/cache paths before native tests. The executable currently uses
+  `Paths::new()`; temporary paths in in-process fixtures do not isolate a real
+  app launch. Assert that the personal catalog and credentials are untouched.
+- **Packaged app smoke:** launch the locally bundled `.app` with isolated paths;
+  check launch/reopen, focus, menus and title-bar controls through native input.
+- **Pixels/screenshots:** add renderer-backed checks and retained images for a
+  few stable screens, including error/selected states. Accessibility properties
+  and layout bounds do not establish pixel correctness.
+- **Catalog scale and layouts:** generate a large isolated catalog, scroll to
+  offscreen items, and assert identity/selection through virtualization; cover
+  Album and Tracks and Tracks layouts as well as Album Covers.
+- **Artist pages:** cover navigation and back/forward, then deliver a newer
+  artist response before an older one and assert that the newer page remains.
+  This is a separate scenario from the existing stale Explorer search test.
+
+Playback-layer and queue persistence gaps belong to the separate Batch 4
+worktree. Do not mark them complete based on controlled UI snapshots.

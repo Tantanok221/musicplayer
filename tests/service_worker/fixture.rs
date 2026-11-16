@@ -147,6 +147,7 @@ async fn navidrome(
             | "unstar.view"
             | "setRating.view"
             | "getArtist.view"
+            | "getTopSongs.view"
     ) || query.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -159,6 +160,8 @@ async fn navidrome(
                 | "id"
                 | "albumId"
                 | "rating"
+                | "artist"
+                | "count"
         )
     }) {
         return state.unexpected("unknown endpoint or parameter");
@@ -183,7 +186,13 @@ async fn navidrome(
             json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
         }
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
-            json!({"status":"ok","artist":{"musicBrainzId":"mb-artist"}})
+            json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":"mb-artist"}})
+        }
+        "getTopSongs.view"
+            if query
+                == Request::new("", &[("artist", "Fixture Artist"), ("count", "50")]).params =>
+        {
+            json!({"status":"ok","topSongs":{"song":[]}})
         }
         "search3.view" => {
             let (kind, offset_key) = if query.get("songCount").map(String::as_str) == Some("500") {

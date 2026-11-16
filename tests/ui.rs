@@ -3,6 +3,12 @@
 mod common;
 #[path = "ui/explorer.rs"]
 mod explorer;
+#[path = "ui/worker.rs"]
+mod worker;
+// This target shares the strict HTTP fixture, not its worker-only scenarios.
+#[allow(dead_code)]
+#[path = "service_worker/fixture.rs"]
+mod worker_fixture;
 use common::ui::{
     ARTIST, ARTIST_TARGET, Fixture, MUTATION_ERROR, SECOND_ARTIST, SECOND_ARTIST_TARGET,
     assert_active_tab, assert_rightmost, start,
