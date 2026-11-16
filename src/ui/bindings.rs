@@ -24,3 +24,12 @@ pub fn queue_bindings() -> [KeyBinding; 11] {
         KeyBinding::new("enter", PlayQueueSelection, Some("Queue")),
     ]
 }
+
+/// Shared settings shortcut used by the application and integration inputs.
+pub fn settings_bindings() -> [KeyBinding; 1] {
+    [KeyBinding::new(
+        shortcut("cmd-,", "ctrl-,"),
+        OpenSettings,
+        Some("Sonora"),
+    )]
+}

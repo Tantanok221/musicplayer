@@ -132,3 +132,114 @@ fn narrow_window_tab_arrows_reach_both_ends_and_keep_new_tab_usable(cx: &mut Tes
     .unwrap();
     fixture.diagnose("narrow tab strip navigated", window, &app, cx);
 }
+
+#[gpui_kit::test]
+fn window_frame_debounces_resize_and_restores_size_and_position(cx: &mut TestAppContext) {
+    use gpui_kit::WindowBounds;
+    use std::time::Duration;
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = Fixture::open(&dir.path().join("catalog.sqlite"));
+    f.seed();
+    let (window, app) = f.mount_at(
+        Bounds::new(point(px(90.), px(70.)), size(px(1440.), px(900.))),
+        cx,
+    );
+    f.settle(window, cx);
+    cx.simulate_window_resize(window, size(px(1000.), px(700.)));
+    f.settle(window, cx);
+    cx.executor().advance_clock(Duration::from_millis(499));
+    f.settle(window, cx);
+    assert!(f.paths.window_frame().is_none());
+    cx.simulate_window_resize(window, size(px(1100.), px(720.)));
+    f.settle(window, cx);
+    cx.executor().advance_clock(Duration::from_millis(499));
+    f.settle(window, cx);
+    assert!(
+        f.paths.window_frame().is_none(),
+        "the previous save must be cancelled by a newer resize"
+    );
+    cx.executor().advance_clock(Duration::from_millis(1));
+    f.settle(window, cx);
+    let saved = f
+        .paths
+        .window_frame()
+        .expect("SaveWindow must persist the final debounced frame");
+    assert_eq!(
+        (saved.x, saved.y, saved.width, saved.height),
+        (90., 70., 1100., 720.)
+    );
+    assert_eq!(f.window_saves, 1);
+    assert!(!saved.fullscreen && !saved.maximized);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    drop(f);
+    cx.run_until_parked();
+    let mut restarted = Fixture::open(&dir.path().join("catalog.sqlite"));
+    let (window, _) = restarted.mount(cx);
+    restarted.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.window_bounds(),
+            WindowBounds::Windowed(Bounds::new(
+                point(px(90.), px(70.)),
+                size(px(1100.), px(720.))
+            ))
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn unreachable_saved_window_falls_back_and_small_window_is_clamped(cx: &mut TestAppContext) {
+    use gpui_kit::WindowBounds;
+    use sonora::platform::WindowFrame;
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = Fixture::open(&dir.path().join("catalog.sqlite"));
+    f.seed();
+    f.paths
+        .save_window_frame(&WindowFrame {
+            x: 100000.,
+            y: 100000.,
+            width: 900.,
+            height: 700.,
+            ..Default::default()
+        })
+        .unwrap();
+    let (window, app) = f.mount(cx);
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        let WindowBounds::Windowed(bounds) = window.window_bounds() else {
+            panic!("normal window")
+        };
+        assert!(bounds.origin.x < px(1920.) && bounds.origin.y < px(1080.));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    cx.run_until_parked();
+    f.paths
+        .save_window_frame(&WindowFrame {
+            x: 80.,
+            y: 60.,
+            width: 200.,
+            height: 100.,
+            ..Default::default()
+        })
+        .unwrap();
+    let (window, _) = f.mount(cx);
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.window_bounds(),
+            WindowBounds::Windowed(Bounds::new(
+                point(px(80.), px(60.)),
+                size(px(680.), px(540.))
+            ))
+        );
+    })
+    .unwrap();
+}

@@ -354,7 +354,7 @@ impl MusicApp {
             .group(
                 SettingGroup::new()
                     .title("slskd")
-                    .description(status)
+                    .description(status.clone())
                     .item(
                         SettingItem::new(
                             "Offer missing releases for download",
@@ -410,7 +410,9 @@ impl MusicApp {
                     .item(
                         SettingItem::render(move |_, _, _| {
                             let app = app.clone();
-                            Button::new("link-slskd")
+                            div().id("slskd-status").test_support().role(Role::Group)
+                                .aria_label(status.clone())
+                                .child(Button::new("link-slskd")
                                 .primary()
                                 .label("Save and test")
                                 .on_click(move |_, window, cx| {
@@ -438,7 +440,7 @@ impl MusicApp {
                                         app.service.send(Command::SlskdTest);
                                         cx.notify();
                                     });
-                                })
+                                }))
                         })
                         .keywords(["soulseek", "slskd", "download", "test"]),
                     ),

@@ -32,9 +32,12 @@ worker suite to expose flaky timing.
 | Artist pages, albums | `artist_page.rs`, `albums.rs` | `artists`, `discography` | `tests/ui/artists.rs`, `tests/service_worker/{artists,metadata}.rs` |
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
-| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/lyrics.rs`, `tests/service_worker/artwork.rs` |
+| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |
 | Playlists | `playlists.rs` | | `tests/ui/playlists.rs` |
-| Settings, layout, accounts, connection | `settings.rs`, `chrome.rs` | `platform` | `tests/ui/{layout,worker}.rs`, `tests/service_worker/{accounts,connection,preferences}.rs` |
+| Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs` |
+| Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
+| Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
+| Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
 | Sync, scrobbles, shutdown | | `service`, `catalog`, `listening` | `tests/service_worker/{sync,scrobbles,lifecycle}.rs` |
 
@@ -96,5 +99,8 @@ Never Debug-dump `Command` values or authenticated URLs; some carry credentials.
 Fixture strings stay synthetic and logged fields stay allowlisted.
 
 These suites run in process. They do not cover the packaged app, native
-accessibility, pixels or physical audio. Say so in review evidence when a change
+accessibility, pixels or physical audio. Backdrop scenarios check image-layer
+identity, geometry and fallback, not blur or animation. The GPUI test platform
+cannot inject native window moves, so window-position coverage starts from a
+nonzero origin instead of dragging. Say so in review evidence when a change
 depends on those.

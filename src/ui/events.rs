@@ -4,8 +4,8 @@ impl MusicApp {
     pub(super) fn event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Ready(account, prefs) => {
+                let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
-                self.settings = account.is_none();
                 // The first frame drew panels at default sizes before these arrived.
                 if self.preferences.layout != prefs.layout {
                     self.layout_generation += 1;
@@ -36,6 +36,8 @@ impl MusicApp {
                 }
                 // Reopen the saved tabs on the page the active one was showing.
                 self.show_active_tab(window, cx);
+                // Restoring tab content must not dismiss sign-in or an open form.
+                self.settings = show_settings;
             }
             Event::SignInRequired(message) => {
                 self.settings = true;
@@ -60,6 +62,9 @@ impl MusicApp {
                     self.artist_albums = None;
                 }
                 self.account = Some(account);
+                if self.settings {
+                    self.focus.focus(window, cx);
+                }
                 self.settings = false;
                 self.status = label;
                 self.error = None;
@@ -307,6 +312,9 @@ impl MusicApp {
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {
+                if self.status == "Connecting…" {
+                    self.status = "Could not connect".into();
+                }
                 self.error = Some(error);
                 self.loading_more = false;
             }

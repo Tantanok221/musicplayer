@@ -874,19 +874,34 @@ impl MusicApp {
         }
         let layer = |id: &Option<String>, opacity: f32| {
             id.as_ref()
-                .and_then(|id| self.backdrops.get(id))
-                .map(|backdrop| {
-                    img(backdrop.path.clone())
-                        .image_cache(&self.image_cache)
+                .and_then(|id| self.backdrops.get(id).map(|backdrop| (id, backdrop)))
+                .map(|(id, backdrop)| {
+                    div()
+                        .id(SharedString::from(format!("backdrop-layer-{}", id)))
+                        .test_support()
+                        .role(Role::Image)
+                        .aria_label(format!("Backdrop for {}", id))
                         .absolute()
                         .inset_0()
                         .size_full()
-                        .object_fit(ObjectFit::Cover)
                         .opacity(opacity)
+                        .child(
+                            img(backdrop.path.clone())
+                                .image_cache(&self.image_cache)
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        )
                 })
         };
         let eased = 1. - (1. - progress).powi(3);
         div()
+            .id("now-playing-backdrop")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(self.backdrop_shown.as_ref().map_or_else(
+                || "Backdrop unavailable".to_string(),
+                |id| format!("Backdrop for {id}"),
+            ))
             .absolute()
             .inset_0()
             .children(layer(&self.backdrop_previous, 1.))

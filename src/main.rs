@@ -32,7 +32,6 @@ fn main() -> Result<()> {
         Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
         cx.bind_keys([
             KeyBinding::new(shortcut("cmd-q", "ctrl-q"), Quit, None),
-            KeyBinding::new(shortcut("cmd-,", "ctrl-,"), OpenSettings, Some("Sonora")),
             KeyBinding::new(shortcut("cmd-f", "ctrl-f"), FocusSearch, Some("Sonora")),
             KeyBinding::new(shortcut("cmd-r", "ctrl-r"), Refresh, Some("Sonora")),
             KeyBinding::new(
@@ -48,6 +47,7 @@ fn main() -> Result<()> {
             KeyBinding::new(shortcut("cmd-[", "ctrl-["), GoBack, Some("Sonora")),
             KeyBinding::new(shortcut("cmd-]", "ctrl-]"), GoForward, Some("Sonora")),
         ]);
+        cx.bind_keys(settings_bindings());
         cx.bind_keys(tab_bindings());
         cx.bind_keys(playback_bindings());
         cx.bind_keys(queue_bindings());
@@ -123,27 +123,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The saved window frame, if it still lands on a connected display.
-fn restored_bounds(frame: Option<WindowFrame>, cx: &App) -> Option<WindowBounds> {
-    let frame = frame?;
-    let bounds = Bounds::new(
-        point(px(frame.x), px(frame.y)),
-        size(px(frame.width.max(680.)), px(frame.height.max(540.))),
-    );
-    // A display that was unplugged would leave the window out of reach.
-    let visible = cx.displays().iter().any(|display| {
-        let area = display.bounds().intersect(&bounds);
-        f32::from(area.size.width) >= 100. && f32::from(area.size.height) >= 100.
-    });
-    visible.then_some(if frame.fullscreen {
-        WindowBounds::Fullscreen(bounds)
-    } else if frame.maximized {
-        WindowBounds::Maximized(bounds)
-    } else {
-        WindowBounds::Windowed(bounds)
-    })
-}
-
 fn open(
     service: Service,
     events: flume::Receiver<sonora::service::Event>,
@@ -153,7 +132,7 @@ fn open(
     let options = WindowOptions {
         app_id: Some("app.sonora.player".into()),
         window_bounds: Some(
-            restored_bounds(frame, cx)
+            restored_window_bounds(frame, cx)
                 .unwrap_or_else(|| WindowBounds::centered(size(px(1440.), px(900.)), cx)),
         ),
         window_min_size: Some(size(px(680.), px(540.))),
