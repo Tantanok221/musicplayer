@@ -67,6 +67,7 @@ pub enum Command {
     Album(String),
     Artist(u64, String, String),
     Discover(u64),
+    HideDiscover(String, crate::discover::Dismissal),
     ArtistProfile(String, String, bool),
     ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
     TopSongs(String, String),
@@ -985,11 +986,21 @@ fn run(
                     }
                 }
                 Command::Discover(request) => {
+                    let hidden: Option<crate::discover::Hidden> =
+                        catalog.state("discover-hidden")?;
                     let shelves = crate::discover::rediscover(
                         &catalog.rediscover_candidates()?,
+                        &hidden.unwrap_or_default(),
                         chrono::Utc::now(),
                     );
                     events.send(Event::Discover(request, Arc::new(shelves)))?;
+                }
+                Command::HideDiscover(id, dismissal) => {
+                    let mut hidden: crate::discover::Hidden = catalog
+                        .state::<Option<_>>("discover-hidden")?
+                        .unwrap_or_default();
+                    hidden.hide(&id, dismissal, chrono::Utc::now());
+                    catalog.set_state("discover-hidden", &hidden)?;
                 }
                 Command::Artist(request, name, id) => {
                     events.send(Event::Artist(request, catalog.artist_page(&name, &id)?))?;

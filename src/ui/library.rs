@@ -125,7 +125,7 @@ impl MusicApp {
         if !self.group_tracks.contains_key(id) && self.group_requested.insert(id.into()) {
             self.service.send(Command::GroupTracks(
                 self.request,
-                if self.artist_name.is_some() {
+                if self.artist_name.is_some() || self.workspace == Workspace::Discover {
                     LibraryQuery::default()
                 } else {
                     self.query.clone()
