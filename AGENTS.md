@@ -4,4 +4,6 @@ This is a Rust macOS desktop app. Keep the UI, catalog, server, playback, and pl
 
 Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test for substantive changes. Use scripts/bundle.sh to create a local .app; no public distribution or remote Git changes are implied.
 
+Before every push, run cargo test --locked --features test-support and scripts/test-ui.sh against the final changes, and do not push unless both pass. The feature-enabled command runs the full suite, including ordinary tests, real service-worker integration tests, and UI integration tests. Plain cargo test skips the feature-gated integration targets and is not a substitute. Keep the UI runner's diagnostic artifacts.
+
 For UI changes, read docs/TESTING.md and docs/AGENT_TESTING_PROGRESS.md. Run scripts/test-ui.sh and cargo clippy --locked --all-targets --features test-support -- -D warnings when changing UI scenarios or controlled handles. Exercise actual input handlers and assert the resulting visible state; keep test catalogs isolated and diagnostics free of credentials.
