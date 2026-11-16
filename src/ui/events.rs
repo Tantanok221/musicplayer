@@ -14,8 +14,7 @@ impl MusicApp {
                 self.preferences.tabs = std::mem::take(&mut self.preferences.tabs).normalized();
                 self.prefs_loaded = true;
                 self.histories.clear();
-                self.history_back.clear();
-                self.history_forward.clear();
+                self.history = History::default();
                 self.album_pending.clear();
                 self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
                 self.explorer_query.ordering = self.query.ordering.clone();

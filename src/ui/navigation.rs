@@ -1,7 +1,5 @@
 use super::*;
 
-const HISTORY_LIMIT: usize = 50;
-
 impl MusicApp {
     pub(super) fn location(&self) -> Page {
         Page {
@@ -37,27 +35,19 @@ impl MusicApp {
         }
         // An empty tab is remembered too, so Back can return to it.
         let location = (!self.blank).then(|| self.location());
-        if self.history_back.last() != Some(&location) {
-            self.history_back.push(location);
-            if self.history_back.len() > HISTORY_LIMIT {
-                self.history_back.remove(0);
-            }
-        }
-        self.history_forward.clear();
+        self.history.remember(location);
     }
 
     pub(super) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(location) = self.history_back.pop() {
-            let current = (!self.blank).then(|| self.location());
-            self.history_forward.push(current);
+        let current = (!self.blank).then(|| self.location());
+        if let Some(location) = self.history.back(current) {
             self.open_history_page(location, window, cx);
         }
     }
 
     pub(super) fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(location) = self.history_forward.pop() {
-            let current = (!self.blank).then(|| self.location());
-            self.history_back.push(current);
+        let current = (!self.blank).then(|| self.location());
+        if let Some(location) = self.history.forward(current) {
             self.open_history_page(location, window, cx);
         }
     }

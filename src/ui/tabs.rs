@@ -78,8 +78,7 @@ impl MusicApp {
     /// Shows the active tab's page and history.
     pub(super) fn show_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.preferences.tabs.active().clone();
-        (self.history_back, self.history_forward) =
-            self.histories.remove(&tab.id).unwrap_or_default();
+        self.history = self.histories.remove(&tab.id).unwrap_or_default();
         self.settings = false;
         match tab.page {
             Some(page) => {
@@ -118,10 +117,7 @@ impl MusicApp {
     fn park_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_active_tab(window, cx);
         let id = self.preferences.tabs.active().id;
-        let history = (
-            std::mem::take(&mut self.history_back),
-            std::mem::take(&mut self.history_forward),
-        );
+        let history = std::mem::take(&mut self.history);
         self.histories.insert(id, history);
     }
 
@@ -215,8 +211,7 @@ impl MusicApp {
     pub(super) fn reset_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.tabs.reset();
         self.histories.clear();
-        self.history_back.clear();
-        self.history_forward.clear();
+        self.history = History::default();
         self.show_active_tab(window, cx);
         self.schedule_tab_save(window, cx);
     }
@@ -554,12 +549,12 @@ impl MusicApp {
                     .pr_2()
                     .child(
                         short_button("history-back", Glyph::ChevronLeft, "Back")
-                            .disabled(self.history_back.is_empty())
+                            .disabled(!self.history.can_go_back())
                             .on_click(cx.listener(|app, _, window, cx| app.go_back(window, cx))),
                     )
                     .child(
                         short_button("history-forward", Glyph::ChevronRight, "Forward")
-                            .disabled(self.history_forward.is_empty())
+                            .disabled(!self.history.can_go_forward())
                             .on_click(cx.listener(|app, _, window, cx| app.go_forward(window, cx))),
                     )
                     .context_menu(self.bar_menu(cx)),

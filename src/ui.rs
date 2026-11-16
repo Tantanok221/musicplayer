@@ -279,8 +279,6 @@ fn download_caption(job: &DownloadJob) -> String {
         JobState::Active => format!("Downloading {}/{}", progress.done, progress.total),
     }
 }
-/// A tab's Back and Forward pages.
-type TabHistory = (Vec<Option<Page>>, Vec<Option<Page>>);
 
 /// A spot at one end of the tab strip for a scroll arrow, covering the tabs beneath.
 /// A short fade on its inner side lets the covered tab slip out of view.
@@ -510,16 +508,15 @@ pub struct MusicApp {
     navigator_peek: Option<Task<()>>,
     /// The active tab's history; other tabs keep theirs in `histories`.
     /// `None` stands for the empty page a new tab starts on.
-    history_back: Vec<Option<Page>>,
-    history_forward: Vec<Option<Page>>,
-    histories: HashMap<u64, TabHistory>,
+    history: History,
+    histories: HashMap<u64, History>,
     /// The active tab is a new, empty tab waiting for a page from the navigator.
     blank: bool,
     /// Tabs are only saved once the stored preferences have been loaded.
     prefs_loaded: bool,
     tab_save: Option<Task<()>>,
     /// Closed tabs for Cmd-Shift-T, newest last: position, tab and history.
-    closed_tabs: Vec<(usize, crate::browser::Tab, TabHistory)>,
+    closed_tabs: Vec<(usize, crate::browser::Tab, History)>,
     restoring_location: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -781,8 +778,7 @@ impl MusicApp {
             rating_hover: None,
             information_width: 300.,
             navigator_peek: None,
-            history_back: vec![],
-            history_forward: vec![],
+            history: History::default(),
             histories: HashMap::new(),
             blank: false,
             prefs_loaded: false,
@@ -1037,7 +1033,7 @@ impl Render for MusicApp {
             .on_action(cx.listener(|app, _: &GoBack, window, cx| {
                 if app.settings {
                     app.settings = false;
-                } else if !app.history_back.is_empty() {
+                } else if app.history.can_go_back() {
                     app.go_back(window, cx);
                 } else if app.blank {
                     // An empty tab has nowhere to go back to.

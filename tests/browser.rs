@@ -272,3 +272,54 @@ fn compact_windows_budget_space_for_both_side_panels_and_library() {
     }
     assert_eq!(panel_widths(1440., Some(216.), Some(300.)), (216., 300.));
 }
+
+fn artist_page(name: &str) -> Option<Page> {
+    Some(Page {
+        workspace: Workspace::Explorer,
+        artist: Some((name.into(), format!("{name}-id"))),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn history_back_and_forward_walk_remembered_pages_and_new_navigation_drops_forward() {
+    let mut history = History::default();
+    assert!(!history.can_go_back());
+    assert_eq!(history.back(artist_page("A")), None);
+    assert!(!history.can_go_forward());
+
+    history.remember(None);
+    history.remember(artist_page("A"));
+    assert_eq!(history.back(artist_page("B")), Some(artist_page("A")));
+    assert!(history.can_go_forward());
+    assert_eq!(history.back(artist_page("A")), Some(None));
+    assert!(!history.can_go_back());
+    assert_eq!(history.forward(None), Some(artist_page("A")));
+    assert_eq!(history.forward(artist_page("A")), Some(artist_page("B")));
+    assert_eq!(history.forward(artist_page("B")), None);
+
+    assert_eq!(history.back(artist_page("B")), Some(artist_page("A")));
+    history.remember(artist_page("A"));
+    assert!(!history.can_go_forward());
+}
+
+#[test]
+fn history_skips_repeated_pages_and_keeps_only_the_newest_fifty() {
+    let mut history = History::default();
+    history.remember(artist_page("A"));
+    history.remember(artist_page("A"));
+    assert_eq!(history.back(artist_page("B")), Some(artist_page("A")));
+    assert!(!history.can_go_back());
+
+    let mut history = History::default();
+    for index in 0..60 {
+        history.remember(artist_page(&index.to_string()));
+    }
+    let mut seen = vec![];
+    while let Some(page) = history.back(None) {
+        seen.push(page.unwrap().artist.unwrap().0);
+    }
+    assert_eq!(seen.len(), HISTORY_LIMIT);
+    assert_eq!(seen.first().map(String::as_str), Some("59"));
+    assert_eq!(seen.last().map(String::as_str), Some("10"));
+}

@@ -308,6 +308,47 @@ pub struct Page {
     /// Search text of the queue or playlists page.
     pub search: String,
 }
+
+pub const HISTORY_LIMIT: usize = 50;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct History {
+    back: Vec<Option<Page>>,
+    forward: Vec<Option<Page>>,
+}
+
+impl History {
+    pub fn remember(&mut self, current: Option<Page>) {
+        if self.back.last() != Some(&current) {
+            self.back.push(current);
+            if self.back.len() > HISTORY_LIMIT {
+                self.back.remove(0);
+            }
+        }
+        self.forward.clear();
+    }
+
+    pub fn back(&mut self, current: Option<Page>) -> Option<Option<Page>> {
+        let target = self.back.pop()?;
+        self.forward.push(current);
+        Some(target)
+    }
+
+    pub fn forward(&mut self, current: Option<Page>) -> Option<Option<Page>> {
+        let target = self.forward.pop()?;
+        self.back.push(current);
+        Some(target)
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+}
+
 impl Page {
     pub fn of(workspace: Workspace) -> Self {
         Self {
