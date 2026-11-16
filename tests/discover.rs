@@ -1,6 +1,8 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use sonora::{
-    discover::{Candidate, Dismissal, Hidden, Pick, SHELF_LIMIT, rediscover, todays_order},
+    discover::{
+        Candidate, Dismissal, Hidden, Pick, SHELF_LIMIT, Song, Visit, rediscover, todays_order,
+    },
     model::Album,
 };
 use std::sync::Arc;
@@ -24,9 +26,17 @@ fn album(id: &str, plays: u64, played: Option<&str>) -> Album {
 }
 
 fn candidate(album: Album, loved_songs: usize) -> Candidate {
+    let loved = (0..loved_songs)
+        .map(|ix| Song {
+            id: format!("{}-loved-{ix}", album.id),
+            title: format!("Loved {ix}"),
+            plays: 0,
+        })
+        .collect();
     Candidate {
         album: Arc::new(album),
-        loved_songs,
+        loved,
+        top_song: None,
     }
 }
 
@@ -217,4 +227,164 @@ fn not_now_hides_for_thirty_days_and_never_hides_for_good() {
     let shelves = rediscover(&candidates, &hidden, later);
     assert_eq!(ids(&shelves.old_rotation.ranked), ["snoozed"]);
     assert_eq!(ids(&shelves.forgotten_favorites.ranked), ["kept"]);
+}
+
+#[test]
+fn memory_lane_groups_old_rotation_by_the_season_it_was_last_played() {
+    let mut candidates = filler(50);
+    for (id, plays, played) in [
+        ("spring-big", 50, "2026-04-10T00:00:00Z"),
+        ("spring-small", 46, "2026-05-01T00:00:00Z"),
+        ("winter-jan", 49, "2026-01-15T00:00:00Z"),
+        ("winter-dec", 48, "2025-12-20T00:00:00Z"),
+        ("long-ago", 47, "2025-08-01T00:00:00Z"),
+    ] {
+        candidates.push(candidate(album(id, plays, Some(played)), 0));
+    }
+    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let lane = shelves
+        .lane
+        .iter()
+        .map(|season| {
+            (
+                season.key.as_str(),
+                season.label.as_str(),
+                ids(&season.shelf.ranked),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lane,
+        [
+            (
+                "2026-spring",
+                "Spring 2026",
+                vec!["spring-big", "spring-small"]
+            ),
+            (
+                "2025-winter",
+                "Winter 2025–26",
+                vec!["winter-jan", "winter-dec"]
+            ),
+            ("older", "A year ago and longer", vec!["long-ago"]),
+        ]
+    );
+    let mut today = ids(&shelves.lane[1].shelf.today);
+    today.sort();
+    assert_eq!(today, ["winter-dec", "winter-jan"]);
+}
+
+#[test]
+fn each_pick_reads_like_a_memory() {
+    let mut candidates = filler(9);
+    let mut rotation = candidate(album("rotation", 44, Some("2026-03-10T00:00:00Z")), 0);
+    rotation.top_song = Some(Song {
+        id: "low-tide".into(),
+        title: "Low Tide".into(),
+        plays: 19,
+    });
+    candidates.push(rotation);
+    let mut saved = album("saved", 0, None);
+    saved.starred = Some("2023-06-01T00:00:00Z".into());
+    saved.created = Some("2023-06-01T00:00:00Z".into());
+    candidates.push(candidate(saved, 0));
+    candidates.push(candidate(album("loved", 1, Some(OLD)), 3));
+    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let find = |id: &str| {
+        shelves
+            .old_rotation
+            .ranked
+            .iter()
+            .chain(&shelves.forgotten_favorites.ranked)
+            .find(|pick| pick.album.id == id)
+            .unwrap()
+            .clone()
+    };
+    let rotation = find("rotation");
+    assert_eq!(
+        rotation.memory(),
+        "You played this 44 times. The last time was in March 2026."
+    );
+    assert_eq!(
+        rotation.detail(),
+        "The song you came back to most was \u{201c}Low Tide\u{201d}, 19 times."
+    );
+    let saved = find("saved");
+    assert_eq!(
+        saved.memory(),
+        "You saved this as a favorite but never pressed play."
+    );
+    assert_eq!(saved.detail(), "In your library since June 2023.");
+    let loved = find("loved");
+    assert_eq!(
+        loved.memory(),
+        "You loved 3 songs on this album, then let it rest."
+    );
+    assert_eq!(
+        loved.detail(),
+        "Songs you loved: Loved 0 · Loved 1 · Loved 2"
+    );
+    assert_eq!(
+        loved
+            .loved
+            .iter()
+            .map(|song| song.id.as_str())
+            .collect::<Vec<_>>(),
+        ["loved-loved-0", "loved-loved-1", "loved-loved-2"]
+    );
+}
+
+#[test]
+fn todays_spotlight_draws_from_both_shelves_and_holds_for_the_day() {
+    let mut candidates = filler(9);
+    candidates.push(candidate(album("rotation", 44, Some(OLD)), 0));
+    for ix in 0..6 {
+        candidates.push(candidate(album(&format!("loved-{ix}"), 1, Some(OLD)), 2));
+    }
+    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let mut all = ids(&shelves.spotlight);
+    all.sort();
+    let mut expected = ids(&shelves.old_rotation.ranked);
+    expected.extend(ids(&shelves.forgotten_favorites.ranked));
+    expected.sort();
+    assert_eq!(all, expected);
+    let again = rediscover(&candidates, &Hidden::default(), now());
+    assert_eq!(ids(&again.spotlight), ids(&shelves.spotlight));
+}
+
+#[test]
+fn a_visit_cycles_the_spotlight_and_remembers_expanded_shelves() {
+    let mut candidates = filler(9);
+    candidates.push(candidate(album("one", 44, Some(OLD)), 0));
+    candidates.push(candidate(album("two", 1, Some(OLD)), 3));
+    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let mut visit = Visit::default();
+    assert!(visit.spotlight(&[]).is_none());
+    let first = visit
+        .spotlight(&shelves.spotlight)
+        .unwrap()
+        .album
+        .id
+        .clone();
+    visit.another();
+    let second = visit
+        .spotlight(&shelves.spotlight)
+        .unwrap()
+        .album
+        .id
+        .clone();
+    assert_ne!(first, second);
+    visit.another();
+    assert_eq!(visit.spotlight(&shelves.spotlight).unwrap().album.id, first);
+    let fewer = &shelves.spotlight[..1];
+    assert!(
+        visit.spotlight(fewer).is_some(),
+        "a shorter spotlight still has a pick"
+    );
+
+    assert!(!visit.expanded("loved"));
+    visit.toggle("loved");
+    assert!(visit.expanded("loved") && !visit.expanded("older"));
+    visit.toggle("loved");
+    assert!(!visit.expanded("loved"));
 }

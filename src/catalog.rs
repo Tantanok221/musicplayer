@@ -902,27 +902,57 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
-    /// Albums that could sit on a Rediscover shelf, with their loved-song counts.
+    /// Albums that could sit on a Rediscover shelf, with their loved songs and
+    /// most played song.
     pub fn rediscover_candidates(&self) -> Result<Vec<crate::discover::Candidate>> {
+        let mut songs = self.conn.prepare(
+            "SELECT album_id, id, title, plays, starred=1 OR coalesce(rating,0)>=4 FROM tracks
+             WHERE starred=1 OR coalesce(rating,0)>=4 OR plays>0
+             ORDER BY album_id, disc, track, title, id",
+        )?;
+        let mut by_album: std::collections::HashMap<
+            String,
+            (Vec<crate::discover::Song>, Option<crate::discover::Song>),
+        > = std::collections::HashMap::new();
+        for row in songs.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::discover::Song {
+                    id: row.get(1)?,
+                    title: row.get(2)?,
+                    plays: row.get::<_, i64>(3)?.max(0) as u64,
+                },
+                row.get::<_, bool>(4)?,
+            ))
+        })? {
+            let (album, song, loved) = row?;
+            let (loved_songs, top) = by_album.entry(album).or_default();
+            if song.plays > top.as_ref().map_or(0, |top| top.plays) {
+                *top = Some(song.clone());
+            }
+            if loved {
+                loved_songs.push(song);
+            }
+        }
         let mut statement = self.conn.prepare(
-            "SELECT a.data, coalesce(l.loved,0) FROM albums a
-             LEFT JOIN (SELECT album_id, count(*) AS loved FROM tracks
-                        WHERE starred=1 OR coalesce(rating,0)>=4 GROUP BY album_id) l
-               ON l.album_id=a.id
+            "SELECT a.id, a.data FROM albums a
              WHERE coalesce(json_extract(a.data,'$.playCount'),0)>0
                 OR json_extract(a.data,'$.starred') IS NOT NULL
                 OR coalesce(json_extract(a.data,'$.userRating'),0)>=4
-                OR coalesce(l.loved,0)>0",
+                OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id=a.id
+                           AND (t.starred=1 OR coalesce(t.rating,0)>=4))",
         )?;
         statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .map(|row| {
-                let (data, loved) = row?;
+                let (id, data) = row?;
+                let (loved, top_song) = by_album.remove(&id).unwrap_or_default();
                 Ok(crate::discover::Candidate {
                     album: Arc::new(serde_json::from_str(&data)?),
-                    loved_songs: loved.max(0) as usize,
+                    loved,
+                    top_song,
                 })
             })
             .collect()

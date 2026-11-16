@@ -43,6 +43,11 @@ fn library() -> Library {
     albums.push(played("loved", 1, 300));
     albums.push(played("also-loved", 1, 310));
     let mut tracks = vec![song("song", "album"), song("other-song", "other-album")];
+    for (id, plays) in [("heavy-1", 12), ("heavy-2", 30), ("heavy-3", 8)] {
+        let mut track = song(id, "heavy");
+        track.play_count = Some(plays);
+        tracks.push(track);
+    }
     for (id, album) in [
         ("loved-1", "loved"),
         ("loved-2", "loved"),
@@ -73,6 +78,39 @@ fn rediscover_shelves_follow_synced_plays_and_favorites() {
         found.old_rotation.ranked[0].reason_text(Utc::now()),
         "50 plays · last played 6 months ago"
     );
+    let heavy = &found.old_rotation.ranked[0];
+    assert_eq!(
+        heavy.detail(),
+        "The song you came back to most was \u{201c}Song heavy-2\u{201d}, 30 times."
+    );
+    assert_eq!(
+        found
+            .lane
+            .iter()
+            .map(|season| ids(&season.shelf))
+            .collect::<Vec<_>>(),
+        [["heavy"]]
+    );
+    let loved = &found.forgotten_favorites.ranked[1];
+    assert_eq!(
+        loved
+            .loved
+            .iter()
+            .map(|song| song.id.as_str())
+            .collect::<Vec<_>>(),
+        ["loved-1", "loved-2"]
+    );
+    assert_eq!(
+        loved.detail(),
+        "Songs you loved: Song loved-1 · Song loved-2"
+    );
+    let mut spotlight = found
+        .spotlight
+        .iter()
+        .map(|pick| pick.album.id.as_str())
+        .collect::<Vec<_>>();
+    spotlight.sort();
+    assert_eq!(spotlight, ["also-loved", "heavy", "loved"]);
 
     fixture.edit_library(|library| {
         for album in &mut library.albums {
@@ -87,6 +125,7 @@ fn rediscover_shelves_follow_synced_plays_and_favorites() {
     assert!(refreshed.old_rotation.is_empty());
     assert!(refreshed.forgotten_favorites.is_empty());
     assert!(refreshed.forgotten_favorites.today.is_empty());
+    assert!(refreshed.lane.is_empty() && refreshed.spotlight.is_empty());
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

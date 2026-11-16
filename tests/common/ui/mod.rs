@@ -229,6 +229,9 @@ impl Fixture {
                 Command::EnqueueAlbum(id, placement) if self.capturing_playback() => {
                     self.record_playback(PlaybackIntent::EnqueueAlbum(id, placement))
                 }
+                Command::PlayIds(ids, at) if self.capturing_playback() => {
+                    self.record_playback(PlaybackIntent::PlayIds(ids, at))
+                }
                 command => {
                     let expected = self.expected.pop_front().unwrap_or_else(|| {
                         panic!(

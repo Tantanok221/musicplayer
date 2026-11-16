@@ -1,19 +1,32 @@
 //! Shelves of owned music that has fallen out of rotation.
 use crate::model::Album;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 pub const WINDOW_DAYS: i64 = 182;
 pub const SHELF_LIMIT: usize = 48;
 pub const MIN_ROTATION_PLAYS: u64 = 5;
 pub const NOT_NOW_DAYS: i64 = 30;
+pub const LOVED_SHOWN: usize = 5;
 
-/// An album with how many of its songs are favorited or rated four stars or more.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Song {
+    pub id: String,
+    pub title: String,
+    pub plays: u64,
+}
+
+/// An album with its loved songs (favorited or rated four stars or more) and
+/// its most played song.
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub album: Arc<Album>,
-    pub loved_songs: usize,
+    pub loved: Vec<Song>,
+    pub top_song: Option<Song>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +45,8 @@ pub enum Reason {
 pub struct Pick {
     pub album: Arc<Album>,
     pub reason: Reason,
+    pub loved: Vec<Song>,
+    pub top_song: Option<Song>,
 }
 
 /// One shelf: every pick by rank, and the same picks in today's rotation.
@@ -47,10 +62,48 @@ impl Shelf {
     }
 }
 
+/// Old rotation albums last played in the same season.
+#[derive(Clone, Debug, Default)]
+pub struct Season {
+    pub key: String,
+    pub label: String,
+    pub shelf: Shelf,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Rediscover {
     pub old_rotation: Shelf,
     pub forgotten_favorites: Shelf,
+    pub lane: Vec<Season>,
+    pub spotlight: Vec<Pick>,
+}
+
+/// What the listener has opened on the page: expanded shelves and which of
+/// today's spotlight picks is showing.
+#[derive(Clone, Debug, Default)]
+pub struct Visit {
+    expanded: HashSet<String>,
+    spotlight: usize,
+}
+
+impl Visit {
+    pub fn toggle(&mut self, key: &str) {
+        if !self.expanded.remove(key) {
+            self.expanded.insert(key.into());
+        }
+    }
+
+    pub fn expanded(&self, key: &str) -> bool {
+        self.expanded.contains(key)
+    }
+
+    pub fn another(&mut self) {
+        self.spotlight = self.spotlight.wrapping_add(1);
+    }
+
+    pub fn spotlight<'a>(&self, picks: &'a [Pick]) -> Option<&'a Pick> {
+        (!picks.is_empty()).then(|| &picks[self.spotlight % picks.len()])
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +154,76 @@ fn last_played(played: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
 }
 
 impl Pick {
+    /// The album's story in one sentence.
+    pub fn memory(&self) -> String {
+        match &self.reason {
+            Reason::Rotation { plays, played } => format!(
+                "You played this {plays} times. The last time was in {}.",
+                month(*played)
+            ),
+            Reason::Favorite { played, .. } => {
+                let rating = self.album.user_rating.filter(|rating| *rating >= 4);
+                match (self.album.starred.is_some(), rating, played) {
+                    (true, _, None) => {
+                        "You saved this as a favorite but never pressed play.".into()
+                    }
+                    (false, Some(rating), None) => {
+                        format!("You rated this {rating} stars but never pressed play.")
+                    }
+                    (true, _, Some(at)) => format!(
+                        "One of your favorite albums. You last played it in {}.",
+                        month(*at)
+                    ),
+                    (false, Some(rating), Some(at)) => format!(
+                        "You rated this {rating} stars. You last played it in {}.",
+                        month(*at)
+                    ),
+                    (false, None, _) if self.loved.len() == 1 => {
+                        "You loved a song on this album, then let it rest.".into()
+                    }
+                    (false, None, _) => format!(
+                        "You loved {} songs on this album, then let it rest.",
+                        self.loved.len()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A second line: the song that kept you coming back, or the ones you loved.
+    pub fn detail(&self) -> String {
+        if let (Reason::Rotation { .. }, Some(song)) = (&self.reason, &self.top_song)
+            && song.plays >= 2
+        {
+            return format!(
+                "The song you came back to most was \u{201c}{}\u{201d}, {} times.",
+                song.title, song.plays
+            );
+        }
+        if !self.loved.is_empty() {
+            let mut titles = self
+                .loved
+                .iter()
+                .take(LOVED_SHOWN)
+                .map(|song| song.title.as_str())
+                .collect::<Vec<_>>()
+                .join(" \u{b7} ");
+            if self.loved.len() > LOVED_SHOWN {
+                titles.push_str(&format!(" and {} more", self.loved.len() - LOVED_SHOWN));
+            }
+            return format!("Songs you loved: {titles}");
+        }
+        let added = self
+            .album
+            .created
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok());
+        match added {
+            Some(at) => format!("In your library since {}.", month(at.with_timezone(&Utc))),
+            None => "Still in your library, right where you left it.".into(),
+        }
+    }
+
     /// Why the album is on its shelf, in a few words.
     pub fn reason_text(&self, now: DateTime<Utc>) -> String {
         match &self.reason {
@@ -128,6 +251,67 @@ impl Pick {
             }
         }
     }
+}
+
+fn month(at: DateTime<Utc>) -> String {
+    at.format("%B %Y").to_string()
+}
+
+/// Groups old rotation by the season each album was last played, newest first;
+/// anything from a year ago or more shares one season.
+fn lane(ranked: &[Pick], now: DateTime<Utc>) -> Vec<Season> {
+    let mut seasons: Vec<(i64, Season)> = Vec::new();
+    for pick in ranked {
+        let Reason::Rotation { played, .. } = pick.reason else {
+            continue;
+        };
+        let (order, key, label) = if (now - played).num_days() >= 365 {
+            (
+                i64::MIN,
+                "older".to_string(),
+                "A year ago and longer".to_string(),
+            )
+        } else {
+            let (month, year) = (played.month() as i64, i64::from(played.year()));
+            let year = if month <= 2 { year - 1 } else { year };
+            let (index, name) = match month {
+                3..=5 => (1, "spring"),
+                6..=8 => (2, "summer"),
+                9..=11 => (3, "autumn"),
+                _ => (0, "winter"),
+            };
+            let label = if index == 0 {
+                format!("Winter {year}\u{2013}{:02}", (year + 1) % 100)
+            } else {
+                let mut title = name.to_string();
+                title[..1].make_ascii_uppercase();
+                format!("{title} {year}")
+            };
+            (year * 4 + index, format!("{year}-{name}"), label)
+        };
+        match seasons.iter_mut().find(|(_, season)| season.key == key) {
+            Some((_, season)) => season.shelf.ranked.push(pick.clone()),
+            None => seasons.push((
+                order,
+                Season {
+                    key,
+                    label,
+                    shelf: Shelf {
+                        ranked: vec![pick.clone()],
+                        today: Vec::new(),
+                    },
+                },
+            )),
+        }
+    }
+    seasons.sort_by_key(|(order, _)| std::cmp::Reverse(*order));
+    seasons
+        .into_iter()
+        .map(|(_, mut season)| {
+            season.shelf.today = todays_order(&season.shelf.ranked, now.date_naive(), &season.key);
+            season
+        })
+        .collect()
 }
 
 fn fnv(text: &str) -> u64 {
@@ -195,6 +379,8 @@ pub fn rediscover(candidates: &[Candidate], hidden: &Hidden, now: DateTime<Utc>)
                     plays: plays(album),
                     played: at,
                 },
+                loved: candidate.loved.clone(),
+                top_song: candidate.top_song.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -207,7 +393,7 @@ pub fn rediscover(candidates: &[Candidate], hidden: &Hidden, now: DateTime<Utc>)
     let mut forgotten = candidates
         .iter()
         .filter(|candidate| {
-            (favorite(&candidate.album) || candidate.loved_songs >= 2)
+            (favorite(&candidate.album) || candidate.loved.len() >= 2)
                 && resting(&candidate.album)
                 && !old_rotation
                     .iter()
@@ -217,23 +403,33 @@ pub fn rediscover(candidates: &[Candidate], hidden: &Hidden, now: DateTime<Utc>)
     forgotten.sort_by(|a, b| {
         favorite(&b.album)
             .cmp(&favorite(&a.album))
-            .then_with(|| b.loved_songs.cmp(&a.loved_songs))
+            .then_with(|| b.loved.len().cmp(&a.loved.len()))
             .then_with(|| played(&a.album).cmp(&played(&b.album)))
             .then_with(|| a.album.id.cmp(&b.album.id))
     });
-    let forgotten = forgotten
+    let forgotten: Vec<Pick> = forgotten
         .into_iter()
         .take(SHELF_LIMIT)
         .map(|candidate| Pick {
             album: candidate.album.clone(),
             reason: Reason::Favorite {
-                loved_songs: candidate.loved_songs,
+                loved_songs: candidate.loved.len(),
                 played: played(&candidate.album),
             },
+            loved: candidate.loved.clone(),
+            top_song: candidate.top_song.clone(),
         })
         .collect();
+    let lane = lane(&old_rotation, now);
+    let everything = old_rotation
+        .iter()
+        .chain(&forgotten)
+        .cloned()
+        .collect::<Vec<_>>();
     Rediscover {
+        spotlight: todays_order(&everything, now.date_naive(), "spotlight"),
         old_rotation: shelf(old_rotation, now, "old-rotation"),
         forgotten_favorites: shelf(forgotten, now, "forgotten-favorites"),
+        lane,
     }
 }

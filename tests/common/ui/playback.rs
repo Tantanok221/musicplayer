@@ -5,6 +5,7 @@ use sonora::playback::Placement;
 pub(crate) enum PlaybackIntent {
     PlayAlbum(String),
     EnqueueAlbum(String, Placement),
+    PlayIds(Vec<String>, usize),
 }
 
 impl Fixture {
@@ -26,6 +27,7 @@ impl Fixture {
             PlaybackIntent::EnqueueAlbum(id, placement) => {
                 format!("EnqueueAlbum({id}, {placement:?})")
             }
+            PlaybackIntent::PlayIds(ids, at) => format!("PlayIds({ids:?}, {at})"),
         });
         self.playback_intents.as_mut().unwrap().push(intent);
     }
