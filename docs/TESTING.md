@@ -61,7 +61,7 @@ cargo test --locked --features test-support --test ui album_feedback:: -- --noca
 
 | Layer | Target and root | Feature modules | Shared fixture |
 | --- | --- | --- | --- |
-| Production view, controlled service | `ui`: `tests/ui.rs` | `tests/ui/{tabs,album_feedback,song_feedback,explorer,large_library,artists,playback,playlists,layout,downloads,lyrics}.rs` | `tests/common/ui/` |
+| Production view, controlled service | `ui`: `tests/ui.rs` | `tests/ui/{tabs,album_feedback,song_feedback,explorer,large_library,artists,playback,playlists,layout,downloads,lyrics,settings,appearance,backdrop}.rs` | `tests/common/ui/` |
 | Production view, real worker + loopback HTTP | `ui`: `tests/ui.rs` | `tests/ui/worker.rs` | `tests/service_worker/fixture.rs` |
 | Real service worker + loopback HTTP + SQLite | `service_worker`: `tests/service_worker.rs` | `tests/service_worker/{feedback,sync,preferences,metadata,lifecycle,queue,scrobbles,accounts,connection,artists,artwork}.rs` | `tests/service_worker/fixture.rs` |
 | Real paused player actor | `player_queue`: `tests/player_queue.rs` | single file | `playback::test_support` |
@@ -81,6 +81,47 @@ Rules:
   Prefer scenario-local `Fixture::expect` replies over new shared defaults.
 - Scenario names describe the behavior and outcome. Refer to a scenario by its
   full `module::name` in docs and review evidence.
+
+## Settings, playback preferences, appearance and window coverage
+
+The settings-first follow-up adds 8 UI and 1 worker scenario, bringing the
+suite to 41 UI, 19 worker and 2 paused-player scenarios:
+
+| Scenario | Assertions |
+| --- | --- |
+| `settings::first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds` | First sign-in screen, Unicode username and masked password, exact Connect intent, disabled duplicate-click rejection, error/input retention, re-enabled retry, secret clearing on success and settings shortcut focus |
+| `settings::soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retry` | Actual Downloads navigation, API-key and username/password command routing, trimmed address/enabled preference, cleared credential fields, failure and success status, blank-auth retry preserving saved-login intent |
+| `worker::invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects` | A real worker rejects empty account input without HTTP; the form remains visible/enabled through late Ready events; entering valid fixture credentials connects through loopback HTTP |
+| `playback::volume_mute_shuffle_and_repeat_update_player_and_survive_restart` | Real volume thumb drags, mute/unmute remembered level and zero-volume fallback, shuffle, all three repeat modes, Preferences delivered to the player and controls restored from SQLite |
+| `appearance::light_dark_and_system_theme_apply_immediately_and_survive_restart` | Actual radio inputs change both persisted preference and active GPUI theme; System clears the override; Dark restores in a fresh view |
+| `backdrop::backdrop_waits_for_current_cover_ignores_late_previous_cover_and_handles_missing_art` | Now Playing input, delayed backdrop requests, old-cover completion cannot paint over a newer track, full-size current image layer, reduced-motion replacement, cache reuse without another request and missing-art fallback |
+| `layout::window_frame_debounces_resize_and_restores_size_and_position` | Real test-platform resize notifications, 499/500 ms debounce and cancellation, exactly one SaveWindow write, actual nonzero window origin and resized dimensions restored after reopening |
+| `layout::unreachable_saved_window_falls_back_and_small_window_is_clamped` | Unreachable saved coordinates fall back to a visible window; restored size obeys the application's minimum |
+| `preferences::window_frame_saves_outside_the_catalog_and_survives_worker_restart` | Production SaveWindow handler writes the isolated Paths file, retained across joined worker restart |
+
+```sh
+scripts/test-ui.sh settings::
+scripts/test-ui.sh appearance::
+scripts/test-ui.sh backdrop::
+scripts/test-ui.sh playback::volume
+scripts/test-ui.sh layout::
+scripts/test-ui.sh worker::invalid_sign_in
+scripts/test-service.sh preferences::window_frame
+```
+
+The fixture now handles SaveWindow through the same Paths persistence method
+as the worker instead of ignoring it. Startup frame validation and the settings
+shortcut are shared with the executable, so tests do not copy either algorithm.
+Settings replies remain scenario-local; no personal account, slskd service,
+credentials or catalog is used. Secret assertions use boolean checks/masked
+values and commands are never Debug-printed.
+
+Backdrop observation proves image-layer identity, geometry and fallback, not
+pixel decoding, blur quality or animation timing. The test uses reduced motion
+and real generated image files. Window-position coverage starts at a nonzero
+origin and observes a real resize; this GPUI test platform cannot inject native
+window moves. Physical title-bar dragging, monitor changes, native AX, pixels
+and packaged-process relaunch remain outside these scenarios.
 
 ## Queue, accounts, reconnect and deferred coverage
 

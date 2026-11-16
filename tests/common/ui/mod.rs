@@ -19,7 +19,7 @@ use sonora::ui::MusicApp;
 use sonora::{
     catalog::Catalog,
     model::LibraryQuery,
-    platform::Account,
+    platform::{Account, Paths},
     service::{Command, Event, Mutation, test_support::ControlledService},
 };
 use std::{collections::VecDeque, path::Path};
@@ -41,6 +41,7 @@ pub(crate) fn start(
 ) {
     cx.update(|cx| {
         gpui_kit::init(cx);
+        cx.bind_keys(sonora::ui::settings_bindings());
         cx.bind_keys(sonora::ui::tab_bindings());
         cx.bind_keys(sonora::ui::playback_bindings());
         cx.bind_keys(sonora::ui::queue_bindings());
@@ -59,6 +60,8 @@ pub(crate) struct Fixture {
     pub(crate) catalog: Catalog,
     trace: Vec<String>,
     pub(crate) saves: usize,
+    pub(crate) window_saves: usize,
+    pub(crate) paths: Paths,
     mutations: Vec<Mutation>,
     pending_mutations: VecDeque<Mutation>,
     hold_queries: bool,
@@ -67,6 +70,7 @@ pub(crate) struct Fixture {
     held_views: VecDeque<(String, Event)>,
     playback_intents: Option<Vec<PlaybackIntent>>,
     expected: VecDeque<ExpectedCommand>,
+    initial_account: Option<Account>,
 }
 
 type Response = Box<dyn FnOnce(Command, &Catalog) -> Vec<Event>>;
@@ -83,6 +87,11 @@ impl Fixture {
             catalog: Catalog::open(path).expect("isolated catalog"),
             trace: vec![],
             saves: 0,
+            window_saves: 0,
+            paths: Paths {
+                data: path.parent().unwrap().into(),
+                cache: path.parent().unwrap().join("cache"),
+            },
             mutations: vec![],
             pending_mutations: VecDeque::new(),
             hold_queries: false,
@@ -91,7 +100,15 @@ impl Fixture {
             held_views: VecDeque::new(),
             playback_intents: None,
             expected: VecDeque::new(),
+            initial_account: Some(Account {
+                url: "https://fixture.invalid".into(),
+                username: "fixture".into(),
+            }),
         }
+    }
+
+    pub(crate) fn signed_out(&mut self) {
+        self.initial_account = None;
     }
 
     /// Scenario-local commands run after the small shared catalog defaults.
@@ -119,13 +136,36 @@ impl Fixture {
     }
 
     pub(crate) fn mount(&self, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<MusicApp>) {
+        let frame = self.paths.window_frame();
+        let restored = cx.update(|cx| sonora::ui::restored_window_bounds(frame, cx));
+        self.mount_bounds(
+            restored.unwrap_or_else(|| {
+                WindowBounds::Windowed(Bounds {
+                    origin: Default::default(),
+                    size: size(px(1440.), px(900.)),
+                })
+            }),
+            cx,
+        )
+    }
+
+    pub(crate) fn mount_at(
+        &self,
+        bounds: Bounds<gpui_kit::Pixels>,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<MusicApp>) {
+        self.mount_bounds(WindowBounds::Windowed(bounds), cx)
+    }
+
+    fn mount_bounds(
+        &self,
+        bounds: WindowBounds,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<MusicApp>) {
         cx.update(|cx| {
             let (window, app) = gpui_kit::open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Default::default(),
-                        size: size(px(1440.), px(900.)),
-                    })),
+                    window_bounds: Some(bounds),
                     ..Default::default()
                 },
                 cx,
@@ -149,10 +189,7 @@ impl Fixture {
                 Command::Initialize => {
                     self.trace.push("Initialize -> Ready".into());
                     self.backend.emit(Event::Ready(
-                        Some(Account {
-                            url: "https://fixture.invalid".into(),
-                            username: "fixture".into(),
-                        }),
+                        self.initial_account.clone(),
                         self.catalog.state("preferences").unwrap(),
                     ));
                 }
@@ -179,7 +216,11 @@ impl Fixture {
                     self.trace
                         .push("optional artist enrichment deferred".into());
                 }
-                Command::SaveWindow(_) => self.trace.push("SaveWindow".into()),
+                Command::SaveWindow(frame) => {
+                    self.trace.push("SaveWindow".into());
+                    self.paths.save_window_frame(&frame).unwrap();
+                    self.window_saves += 1;
+                }
                 Command::PlayAlbum(id) if self.capturing_playback() => {
                     self.record_playback(PlaybackIntent::PlayAlbum(id))
                 }

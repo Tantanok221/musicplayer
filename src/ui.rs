@@ -41,8 +41,10 @@ use std::{
 };
 mod album_feedback;
 mod artist_page;
+mod window;
+pub use window::restored_window_bounds;
 mod bindings;
-pub use bindings::{playback_bindings, queue_bindings};
+pub use bindings::{playback_bindings, queue_bindings, settings_bindings};
 mod context_menu;
 use context_menu::{menu_row, menu_row_detail};
 mod downloads;
@@ -1083,8 +1085,8 @@ impl MusicApp {
     fn event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Ready(account, prefs) => {
+                let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
-                self.settings = account.is_none();
                 // The first frame drew panels at default sizes before these arrived.
                 if self.preferences.layout != prefs.layout {
                     self.layout_generation += 1;
@@ -1116,6 +1118,8 @@ impl MusicApp {
                 }
                 // Reopen the saved tabs on the page the active one was showing.
                 self.show_active_tab(window, cx);
+                // Restoring tab content must not dismiss sign-in or an open form.
+                self.settings = show_settings;
             }
             Event::SignInRequired(message) => {
                 self.settings = true;
@@ -1140,6 +1144,9 @@ impl MusicApp {
                     self.artist_albums = None;
                 }
                 self.account = Some(account);
+                if self.settings {
+                    self.focus.focus(window, cx);
+                }
                 self.settings = false;
                 self.status = label;
                 self.error = None;
@@ -1387,6 +1394,9 @@ impl MusicApp {
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {
+                if self.status == "Connecting…" {
+                    self.status = "Could not connect".into();
+                }
                 self.error = Some(error);
                 self.loading_more = false;
             }
@@ -6570,19 +6580,34 @@ impl MusicApp {
         }
         let layer = |id: &Option<String>, opacity: f32| {
             id.as_ref()
-                .and_then(|id| self.backdrops.get(id))
-                .map(|backdrop| {
-                    img(backdrop.path.clone())
-                        .image_cache(&self.image_cache)
+                .and_then(|id| self.backdrops.get(id).map(|backdrop| (id, backdrop)))
+                .map(|(id, backdrop)| {
+                    div()
+                        .id(SharedString::from(format!("backdrop-layer-{}", id)))
+                        .test_support()
+                        .role(Role::Image)
+                        .aria_label(format!("Backdrop for {}", id))
                         .absolute()
                         .inset_0()
                         .size_full()
-                        .object_fit(ObjectFit::Cover)
                         .opacity(opacity)
+                        .child(
+                            img(backdrop.path.clone())
+                                .image_cache(&self.image_cache)
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        )
                 })
         };
         let eased = 1. - (1. - progress).powi(3);
         div()
+            .id("now-playing-backdrop")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(self.backdrop_shown.as_ref().map_or_else(
+                || "Backdrop unavailable".to_string(),
+                |id| format!("Backdrop for {id}"),
+            ))
             .absolute()
             .inset_0()
             .children(layer(&self.backdrop_previous, 1.))
@@ -7038,7 +7063,7 @@ impl MusicApp {
             .group(
                 SettingGroup::new()
                     .title("slskd")
-                    .description(status)
+                    .description(status.clone())
                     .item(
                         SettingItem::new(
                             "Offer missing releases for download",
@@ -7094,7 +7119,9 @@ impl MusicApp {
                     .item(
                         SettingItem::render(move |_, _, _| {
                             let app = app.clone();
-                            Button::new("link-slskd")
+                            div().id("slskd-status").test_support().role(Role::Group)
+                                .aria_label(status.clone())
+                                .child(Button::new("link-slskd")
                                 .primary()
                                 .label("Save and test")
                                 .on_click(move |_, window, cx| {
@@ -7122,7 +7149,7 @@ impl MusicApp {
                                         app.service.send(Command::SlskdTest);
                                         cx.notify();
                                     });
-                                })
+                                }))
                         })
                         .keywords(["soulseek", "slskd", "download", "test"]),
                     ),

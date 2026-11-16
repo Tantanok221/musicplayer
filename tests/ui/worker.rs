@@ -408,3 +408,40 @@ fn sign_in_fields_and_connect_reach_the_real_worker(cx: &mut TestAppContext) {
     close_worker(worker, window, app, cx);
     fixture.finish();
 }
+
+#[gpui_kit::test]
+fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        matches!(e, Event::SignInRequired(_))
+    });
+    cx.update_window(window, |_, window, cx| window.click("connect-library", cx))
+        .unwrap();
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        matches!(e, Event::Error(_))
+    });
+    cx.update_window(window, |_, window, cx| {
+        assert_ne!(window.find("connect-library").disabled(), Some(true));
+        assert!(window.find("error-banner").visible());
+        assert!(
+            fixture.requests().is_empty(),
+            "invalid credentials must fail before HTTP"
+        );
+        for (field, value) in [
+            ("Server address", fixture.account.url.as_str()),
+            ("Username", "fixture"),
+            ("Password", "synthetic-password"),
+        ] {
+            window.click(field, cx);
+            window.input(value, cx);
+        }
+        window.click("connect-library", cx);
+    })
+    .unwrap();
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    assert!(fixture.paths.account().unwrap().is_some());
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}

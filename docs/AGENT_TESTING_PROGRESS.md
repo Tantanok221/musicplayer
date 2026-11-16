@@ -1,5 +1,41 @@
 # Agent integration testing: implementation progress
 
+## Settings-first follow-up (2026-11-16)
+
+Added 8 production-view scenarios and 1 worker scenario for settings/sign-in,
+Soulseek credentials, volume/mute/shuffle/repeat, theme switching, backdrop
+responses and window frame persistence. Current totals: 41 UI, 19 worker and
+2 paused-player scenarios. See [coverage, filters and limits](TESTING.md#settings-playback-preferences-appearance-and-window-coverage).
+
+The sign-in scenarios exposed three behavior bugs, fixed after reproduction:
+
+- A failed Connect left status at Connecting and the button disabled.
+- A successful Connect left focus on a removed credential input, preventing
+  the settings shortcut from reopening the form.
+- A late Ready restored tab content and dismissed the first-run sign-in form.
+
+The fixes reset connection status on failure, restore app focus on successful
+form submission and retain the settings surface across Ready tab restoration.
+Saved frame validation and the settings key binding moved into shared library
+functions used by the executable and tests. The fixture now persists SaveWindow
+through Paths; no catalog/server/player boundaries changed.
+
+Failure evidence: `target/settings-first-red.log`,
+`target/settings-worker-red.log`, `target/settings-slskd-red.log`,
+`target/window-frame-red.log` and `target/backdrop-red.log`. The control/theme
+scenarios cover existing behavior; fixture/API setup errors were corrected
+before recording meaningful assertion evidence. Six intentional regressions
+(removing focus restoration, dismissing the form on Ready, disabling shuffle,
+omitting theme application, choosing a stale backdrop and dropping the worker's
+window save) each fail their owning scenario. Source was restored in `finally`
+blocks. Evidence is retained in `target/settings-*-regression.log`.
+Final validation follows below.
+
+Only isolated fixtures and synthetic credentials are used. Native window moves,
+pixels, crossfade timing and physical audio are not covered. An unrelated
+`.claude/` directory appeared during this work and is left untouched. No commit
+or push is included in this follow-up.
+
 ## Nine-gap follow-up (2026-11-16)
 
 Implemented the nine requested gaps across existing integration targets: 12 new
@@ -566,8 +602,8 @@ for the next agent's entry point.
 
 ## Next work
 
-The nine-gap follow-up adds 12 worker and 7 UI scenarios; current totals are
-18 worker, 33 UI and 2 paused-player scenarios. Historical checkpoints retain
+The settings-first follow-up brings current totals to 19 worker, 41 UI and
+2 paused-player scenarios. Historical checkpoints retain
 their original counts and publication status.
 
 1. For CI failures, use the commands in `docs/TESTING.md` and retain the
@@ -575,4 +611,4 @@ their original counts and publication status.
 2. Use `scripts/test-service-repeat.sh` for occasional thread/runtime checks.
 3. Native packaged-process isolation, AX input, pixels, media controls and
    physical audio remain separate work in [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md).
-4. The user authorized committing and pushing this follow-up after local validation.
+4. The settings-first follow-up remains uncommitted; the earlier nine-gap follow-up was already published.

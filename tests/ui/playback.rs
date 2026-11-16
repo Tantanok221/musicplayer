@@ -415,3 +415,139 @@ fn space_types_in_search_but_toggles_once_with_queue_focus(cx: &mut TestAppConte
     .unwrap();
     player.shutdown(WAIT).unwrap();
 }
+
+fn drag_volume(
+    fixture: &mut Fixture,
+    window: AnyWindowHandle,
+    fraction: f32,
+    cx: &mut TestAppContext,
+) {
+    cx.update_window(window, |_, window, cx| {
+        let id = window
+            .find_by_label("Volume")
+            .path()
+            .last()
+            .unwrap()
+            .clone();
+        let scope = window.within(id);
+        let bar = scope.find("slider-bar-container").bounds();
+        let thumb = scope.find(("slider-thumb", 0_u32)).bounds();
+        window.drag(
+            thumb.center(),
+            point(bar.left() + bar.size.width * fraction, bar.center().y),
+            cx,
+        );
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+}
+
+#[gpui_kit::test]
+fn volume_mute_shuffle_and_repeat_update_player_and_survive_restart(cx: &mut TestAppContext) {
+    use sonora::model::{Preferences, RepeatMode};
+    let (dir, mut fixture, window, app) = start(cx);
+    drag_volume(&mut fixture, window, 0.25, cx);
+    let volume = fixture
+        .catalog
+        .state::<Preferences>("preferences")
+        .unwrap()
+        .volume;
+    assert!((volume - 0.25).abs() < 0.04);
+    fixture.click(window, "mute", cx);
+    assert_eq!(
+        fixture
+            .catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .volume,
+        0.
+    );
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("mute").label(), Some("Unmute"))
+    })
+    .unwrap();
+    fixture.click(window, "mute", cx);
+    assert_eq!(
+        fixture
+            .catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .volume,
+        volume
+    );
+    // Moving the slider to zero must update the mute control too, and moving it
+    // after a mute must discard the old remembered level.
+    drag_volume(&mut fixture, window, 0., cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("mute").label(), Some("Unmute"))
+    })
+    .unwrap();
+    fixture.click(window, "mute", cx);
+    assert!(
+        fixture
+            .catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .volume
+            > 0.
+    );
+    drag_volume(&mut fixture, window, 0.25, cx);
+    fixture.click(window, "shuffle", cx);
+    for (mode, label) in [
+        (RepeatMode::All, "Repeat: all"),
+        (RepeatMode::One, "Repeat: one"),
+        (RepeatMode::Off, "Repeat: off"),
+        (RepeatMode::All, "Repeat: all"),
+    ] {
+        fixture.click(window, "repeat", cx);
+        assert_eq!(
+            fixture
+                .catalog
+                .state::<Preferences>("preferences")
+                .unwrap()
+                .repeat,
+            mode
+        );
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(window.find("repeat").label(), Some(label))
+        })
+        .unwrap();
+    }
+    let saved: Preferences = fixture.catalog.state("preferences").unwrap();
+    assert!(saved.shuffle);
+    let mut last = None;
+    for command in fixture.backend.player_commands().try_iter() {
+        let PlayerCommand::Preferences(preferences) = command else {
+            panic!("preference controls must not send transport commands")
+        };
+        last = Some(preferences);
+    }
+    let player = last.unwrap();
+    assert_eq!(player.volume, saved.volume);
+    assert_eq!(player.shuffle, saved.shuffle);
+    assert_eq!(player.repeat, saved.repeat);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    drop(fixture);
+    cx.run_until_parked();
+    let mut restarted = Fixture::open(&dir.path().join("catalog.sqlite"));
+    let (window, _) = restarted.mount(cx);
+    restarted.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("shuffle").label(), Some("Shuffle: on"));
+        assert_eq!(window.find("repeat").label(), Some("Repeat: all"));
+        let id = window
+            .find_by_label("Volume")
+            .path()
+            .last()
+            .unwrap()
+            .clone();
+        let scope = window.within(id);
+        let bar = scope.find("slider-bar-container").bounds();
+        let thumb = scope.find(("slider-thumb", 0_u32)).bounds();
+        let ratio = f32::from(thumb.center().x - bar.left()) / f32::from(bar.size.width);
+        assert!((ratio - saved.volume).abs() < 0.04);
+    })
+    .unwrap();
+}

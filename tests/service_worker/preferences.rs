@@ -58,3 +58,32 @@ fn preferences_save_through_the_worker_and_restore_after_clean_restart() {
     restarted.shutdown(WAIT).unwrap();
     fixture.finish();
 }
+
+#[test]
+fn window_frame_saves_outside_the_catalog_and_survives_worker_restart() {
+    let fixture = Fixture::new(Library::default());
+    let frame = sonora::platform::WindowFrame {
+        x: 90.,
+        y: 70.,
+        width: 1100.,
+        height: 720.,
+        maximized: false,
+        fullscreen: false,
+    };
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::SaveWindow(frame));
+    worker.service().send(Command::Initialize);
+    crate::fixture::event(&worker, |event| {
+        matches!(event, sonora::service::Event::Ready(..))
+    });
+    assert_eq!(fixture.paths.window_frame(), Some(frame));
+    worker.shutdown(WAIT).unwrap();
+    let mut restarted = fixture.start();
+    restarted.wait_ready(WAIT).unwrap();
+    synced(&restarted);
+    assert_eq!(fixture.paths.window_frame(), Some(frame));
+    restarted.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
