@@ -5,6 +5,7 @@ pub mod backdrop;
 pub mod browser;
 pub mod catalog;
 pub mod discography;
+pub mod feedback;
 pub mod listening;
 pub mod lyrics;
 pub mod model;

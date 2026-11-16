@@ -3,7 +3,7 @@ use super::*;
 impl MusicApp {
     pub(super) fn album_favorite(&self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let busy = self.album_pending.contains(&album.id);
+        let busy = self.feedback.album_busy(&album.id);
         let favorite = album.starred.is_some();
         let id = album.id.clone();
         div()
@@ -41,7 +41,7 @@ impl MusicApp {
 
     pub(super) fn album_rating(&self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
-        let busy = self.album_pending.contains(&album.id);
+        let busy = self.feedback.album_busy(&album.id);
         let rating = album.user_rating.unwrap_or(0);
         let key = format!("album-feedback-{}", album.id);
         let preview = self

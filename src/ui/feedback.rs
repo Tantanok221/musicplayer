@@ -1,4 +1,5 @@
 use super::*;
+use crate::feedback::{optimistic_album, optimistic_track};
 
 impl MusicApp {
     /// Replaces a track everywhere it is shown, without reloading any list.
@@ -118,35 +119,23 @@ impl MusicApp {
     }
 
     pub(super) fn mutate(&mut self, mutation: Mutation, cx: &mut Context<Self>) {
-        if let Some(id) = mutation.album_feedback_id() {
-            if !self.album_pending.insert(id.into()) {
-                return;
-            }
-            if let Some(album) = self.find_album(id) {
-                let mut edited = (*album).clone();
-                match &mutation {
-                    Mutation::AlbumFavorite(_, favorite) => {
-                        edited.starred = favorite.then(|| chrono::Utc::now().to_rfc3339())
-                    }
-                    Mutation::AlbumRating(_, rating) => edited.user_rating = Some(*rating),
-                    _ => (),
-                }
-                self.apply_album_update(Arc::new(edited));
-            }
+        if !self.feedback.begin(&mutation) {
+            return;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(album) = mutation
+            .album_feedback_id()
+            .and_then(|id| self.find_album(id))
+            && let Some(edited) = optimistic_album(&album, &mutation, &now)
+        {
+            self.apply_album_update(Arc::new(edited));
         }
         // Show ratings and favorites at once; a failed save restores the
         // catalog value through the corresponding track/album update event.
         let edited = match &mutation {
-            Mutation::Favorite(id, value) => self.find_track(id).map(|track| {
-                let mut track = (*track).clone();
-                track.starred = value.then(|| chrono::Utc::now().to_rfc3339());
-                track
-            }),
-            Mutation::Rating(id, rating) => self.find_track(id).map(|track| {
-                let mut track = (*track).clone();
-                track.user_rating = Some(*rating);
-                track
-            }),
+            Mutation::Favorite(id, _) | Mutation::Rating(id, _) => self
+                .find_track(id)
+                .and_then(|track| optimistic_track(&track, &mutation, &now)),
             _ => None,
         };
         if let Some(track) = edited.map(Arc::new) {
@@ -155,7 +144,6 @@ impl MusicApp {
                 .send(PlayerCommand::UpdateTrack(track.clone()));
             self.apply_track_update(track);
         }
-        self.pending_mutation = Some(mutation.clone());
         self.service.send(Command::Mutate(mutation));
         cx.notify();
     }

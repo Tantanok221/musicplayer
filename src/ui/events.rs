@@ -15,7 +15,7 @@ impl MusicApp {
                 self.prefs_loaded = true;
                 self.histories.clear();
                 self.history = History::default();
-                self.album_pending.clear();
+                self.feedback.release_albums();
                 self.query.ordering = Some(self.preferences.sorting.get(self.sort_scope()));
                 self.explorer_query.ordering = self.query.ordering.clone();
                 self.request_query(cx);
@@ -311,11 +311,7 @@ impl MusicApp {
                 self.loading_more = false;
             }
             Event::MutationDone(mutation) => {
-                if let Some(id) = mutation.album_feedback_id() {
-                    self.album_pending.remove(id);
-                }
-                if self.pending_mutation.as_ref() == Some(&mutation) {
-                    self.pending_mutation = None;
+                if self.feedback.finished(&mutation) {
                     self.error = None;
                 }
                 if matches!(
@@ -345,10 +341,7 @@ impl MusicApp {
                 }
             }
             Event::MutationFailed(mutation, error) => {
-                if let Some(id) = mutation.album_feedback_id() {
-                    self.album_pending.remove(id);
-                }
-                self.pending_mutation = Some(mutation);
+                self.feedback.failed(mutation);
                 self.error = Some(error);
             }
         }

@@ -829,7 +829,7 @@ impl MusicApp {
                         .child(div().flex_1().min_w_0().child(error))
                         .child(Button::new("retry-error").small().label("Retry").on_click(
                             cx.listener(|app, _, _, cx| {
-                                if let Some(mutation) = app.pending_mutation.clone() {
+                                if let Some(mutation) = app.feedback.retryable().cloned() {
                                     app.mutate(mutation, cx);
                                 } else if app.playback.error.is_some() {
                                     app.service.player.send(PlayerCommand::Retry);
@@ -844,7 +844,7 @@ impl MusicApp {
                             cx.listener(|app, _, _, cx| {
                                 app.error = None;
                                 app.playback.error = None;
-                                app.pending_mutation = None;
+                                app.feedback.dismiss();
                                 app.service.player.send(PlayerCommand::ClearError);
                                 cx.notify();
                             }),
