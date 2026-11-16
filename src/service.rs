@@ -901,7 +901,11 @@ fn run(
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                         events.send(Event::Status(if can_delete {
-                            format!("Up to date · {} tracks", catalog.count()?)
+                            format!(
+                                "Up to date · {} tracks · {} albums",
+                                catalog.count()?,
+                                catalog.album_count()?
+                            )
                         } else {
                             "Server scan in progress · refresh again when complete".into()
                         }))?;

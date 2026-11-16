@@ -443,6 +443,11 @@ impl Catalog {
             .conn
             .query_row("SELECT count(*) FROM tracks", [], |r| r.get(0))?)
     }
+    pub fn album_count(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM albums", [], |r| r.get(0))?)
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -814,9 +819,7 @@ impl Catalog {
         let years = years_stmt
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let album_count = self
-            .conn
-            .query_row("SELECT count(*) FROM albums", [], |r| r.get(0))?;
+        let album_count = self.album_count()?;
         let facets = Facets {
             navigator: self.navigator_view()?,
             artists,

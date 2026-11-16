@@ -1,4 +1,4 @@
-use crate::fixture::{Fixture, Library, WAIT, album, event, song, synced, view};
+use crate::fixture::{Fixture, Library, WAIT, album, event, song, view};
 use sonora::{
     model::Playlist,
     service::{Command, Event},
@@ -70,7 +70,10 @@ fn interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles() {
 
     fixture.edit_library(|library| library.scanning = false);
     worker.service().send(Command::Refresh);
-    synced(&worker);
+    event(
+        &worker,
+        |event| matches!(event, Event::Status(message) if message == "Up to date · 501 tracks · 1 albums"),
+    );
     let complete = view(&worker);
     assert_eq!(complete.track_count, 501);
     assert_eq!(complete.album_count, 1);

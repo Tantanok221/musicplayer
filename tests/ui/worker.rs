@@ -287,6 +287,46 @@ fn close_worker(
 }
 
 #[gpui_kit::test]
+fn status_bar_shows_library_totals_while_search_narrows_the_explorer(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    let totals = "Up to date · 2 tracks · 2 albums";
+    cx.update_window(window, |_, window, _| {
+        let label = window.find("library-status").label().unwrap().to_string();
+        assert!(label.starts_with(totals), "{label}");
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("music-search", cx);
+        window.input("other", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, cx| {
+        matches!(event, Event::View(..))
+            && cx
+                .update_window(window, |_, window, _| {
+                    window
+                        .try_find("explorer-album-album")
+                        .is_none_or(|card| !card.visible())
+                })
+                .unwrap()
+    });
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("explorer-album-other-album").visible());
+        let label = window.find("library-status").label().unwrap().to_string();
+        // The filtered page has 1 track and 1 album; the bar keeps the totals.
+        assert!(label.starts_with(totals), "{label}");
+        assert!(!label.contains("1 tracks"), "{label}");
+        assert!(!label.contains('|'), "{label}");
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn refresh_click_updates_status_and_explorer_without_restart(cx: &mut TestAppContext) {
     let fixture = Fixture::new(Library::default());
     let (worker, tx, window, app) = mount_worker(&fixture, cx);
