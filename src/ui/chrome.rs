@@ -232,11 +232,6 @@ impl MusicApp {
     pub(super) fn status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let queue_time = self.playback.queue.iter().map(|t| t.duration).sum::<f64>();
-        let library = format!(
-            "{} tracks · {} albums",
-            self.view.track_count,
-            self.view.albums.len()
-        );
         // Many releases simply have no cover on the Cover Art Archive; that is not a failure.
         let failed_covers = self
             .art_failures
@@ -257,7 +252,7 @@ impl MusicApp {
             .bg(colors.panel)
             .role(Role::Status)
             .aria_label(format!(
-                "{library}; {}{artwork_status}. Queue: {}",
+                "{}{artwork_status}. Queue: {}",
                 self.status,
                 self.playback.queue.len()
             ))
@@ -277,7 +272,7 @@ impl MusicApp {
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .child(format!("{library}   |   {}{artwork_status}", self.status)),
+                    .child(format!("{}{artwork_status}", self.status)),
             )
             .child(div().ml_3().flex_shrink_0().child(format!(
                 "Queued: {} · {}",
