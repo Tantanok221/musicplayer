@@ -26,12 +26,18 @@ Include the important failure, stale, or cancel case, not only the success path.
 
 ## Integration test layout
 
-Integration tests are split by layer (Cargo target) and then by feature (module). The full table is in docs/TESTING.md under "Test layout".
+Integration tests are split by layer (Cargo target) and then by feature (module). docs/TESTING.md has the feature map and layer table.
 
 - Target roots (tests/ui.rs, tests/service_worker.rs) only declare modules. Never put scenarios in them.
 - Put a feature's scenarios in its existing module. For a new feature, add a new module file and declare it in the root with #[path = "<target>/<feature>.rs"]. Do not add a new [[test]] target per feature; each target is a separate binary linking the whole app.
 - The module name is the test filter. Run only your feature while iterating, e.g. scripts/test-ui.sh playlists:: or scripts/test-service.sh sync::, then the full suite before finishing.
 - The UI fixture lives in tests/common/ui/ and is split by domain (seed, input, library, feedback, playback, tabs). pump() arms only delegate to domain methods. Prefer scenario-local Fixture::expect replies over new shared defaults so the fixture does not become a second service implementation.
-- When you add or move a module, update the layout table and the feature's section in docs/TESTING.md.
+- When you add or move a module, update the feature map in docs/TESTING.md.
 
-For UI changes, read docs/TESTING.md and docs/AGENT_TESTING_PROGRESS.md. Run scripts/test-ui.sh and cargo clippy --locked --all-targets --features test-support -- -D warnings when changing UI scenarios or controlled handles. Exercise actual input handlers and assert the resulting visible state; keep test catalogs isolated and diagnostics free of credentials.
+## UI code layout
+
+- src/ui.rs holds only the MusicApp struct, new(), actions and Render. Put a feature's handlers and rendering in src/ui/<feature>.rs as an impl MusicApp block; use the feature map in docs/TESTING.md to find the right file, and add a module and map row for a new feature.
+- When you touch a feature, move its state and transition logic (what changes on an input or event, independent of GPUI) into a plain type outside the view, such as browser::History or feedback::Feedback, and cover it with unit tests. The view keeps rendering, input wiring and calls into that type.
+- Keep helpers used by one feature in that feature's module. Only shared helpers stay in src/ui.rs.
+
+For UI changes, read docs/TESTING.md. Run scripts/test-ui.sh and cargo clippy --locked --all-targets --features test-support -- -D warnings when changing UI scenarios or controlled handles. Exercise actual input handlers and assert the resulting visible state; keep test catalogs isolated and diagnostics free of credentials.
