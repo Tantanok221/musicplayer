@@ -66,6 +66,7 @@ pub enum Command {
     Page(u64, u64, LibraryQuery, usize),
     Album(String),
     Artist(u64, String, String),
+    Discover(u64),
     ArtistProfile(String, String, bool),
     ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
     TopSongs(String, String),
@@ -178,6 +179,7 @@ pub enum Event {
     Page(u64, u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
     Artist(u64, ArtistPageData),
+    Discover(u64, Arc<crate::discover::Rediscover>),
     ArtistProfile(String, Arc<ArtistProfile>),
     TopSongs(String, Arc<TopSongs>),
     Discography(String, Arc<DiscographyView>),
@@ -979,6 +981,13 @@ fn run(
                             }
                         });
                     }
+                }
+                Command::Discover(request) => {
+                    let shelves = crate::discover::rediscover(
+                        &catalog.rediscover_candidates()?,
+                        chrono::Utc::now(),
+                    );
+                    events.send(Event::Discover(request, Arc::new(shelves)))?;
                 }
                 Command::Artist(request, name, id) => {
                     events.send(Event::Artist(request, catalog.artist_page(&name, &id)?))?;

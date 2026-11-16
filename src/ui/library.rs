@@ -771,6 +771,9 @@ impl MusicApp {
         if self.workspace == Workspace::Playlists {
             return self.playlists_view(cx);
         }
+        if self.workspace == Workspace::Discover {
+            return self.discover_view(cx);
+        }
         if self.view.track_count == 0 {
             return self.empty(
                 if self.account.is_none() {

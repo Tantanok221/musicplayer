@@ -44,6 +44,7 @@ mod albums;
 mod artist_page;
 mod bindings;
 mod chrome;
+mod discover;
 mod events;
 mod feedback;
 mod information;
@@ -462,6 +463,8 @@ pub struct MusicApp {
     artist_name: Option<String>,
     artist_id: String,
     artist_request: u64,
+    discover_request: u64,
+    discover: Option<Arc<crate::discover::Rediscover>>,
     artist_data: Option<ArtistPageData>,
     artist_profiles: HashMap<String, Arc<ArtistProfile>>,
     profile_requested: HashSet<String>,
@@ -596,7 +599,7 @@ impl MusicApp {
                             }
                             Workspace::Playlists => app.playlist_search = value,
                             Workspace::Queue => app.queue_search = value,
-                            Workspace::NowPlaying => {
+                            Workspace::NowPlaying | Workspace::Discover => {
                                 app.workspace = Workspace::Explorer;
                                 app.query = app.explorer_query.clone();
                                 app.query.text = value;
@@ -736,6 +739,8 @@ impl MusicApp {
             artist_name: None,
             artist_id: String::new(),
             artist_request: 0,
+            discover_request: 0,
+            discover: None,
             artist_data: None,
             artist_profiles: HashMap::new(),
             profile_requested: HashSet::new(),

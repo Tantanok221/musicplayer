@@ -778,6 +778,7 @@ pub fn event(worker: &Worker, wanted: impl Fn(&Event) -> bool) -> Event {
             Event::Status(..) => "Status",
             Event::Connection(..) => "Connection",
             Event::Discography(..) => "Discography",
+            Event::Discover(..) => "Discover",
             _ => "other event",
         };
         eprintln!("scenario={} worker event={name}", scenario());

@@ -141,7 +141,7 @@ impl MusicApp {
             }
             Workspace::Playlists => self.playlist_search.clone(),
             Workspace::Queue => self.queue_search.clone(),
-            Workspace::NowPlaying => String::new(),
+            Workspace::NowPlaying | Workspace::Discover => String::new(),
         };
         self.search.update(cx, |input, cx| {
             input.set_value(self.search_text.clone(), window, cx)
@@ -151,6 +151,9 @@ impl MusicApp {
         }
         if workspace == Workspace::Queue {
             self.queue_ui.focus.focus(window, cx);
+        }
+        if workspace == Workspace::Discover {
+            self.request_discover();
         }
         cx.notify();
     }

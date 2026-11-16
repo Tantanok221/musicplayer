@@ -130,6 +130,7 @@ pub enum Workspace {
     Queue,
     Playlists,
     NowPlaying,
+    Discover,
 }
 impl Workspace {
     pub const ALL: [Self; 4] = [
@@ -144,6 +145,7 @@ impl Workspace {
             Self::Queue => "Queue",
             Self::Playlists => "Playlists",
             Self::NowPlaying => "Now Playing",
+            Self::Discover => "Discover",
         }
     }
 }

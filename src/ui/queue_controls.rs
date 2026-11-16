@@ -162,7 +162,15 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if track.album_id.is_empty() {
+        self.open_album_in_explorer(track.album_id.clone(), window, cx);
+    }
+    pub(super) fn open_album_in_explorer(
+        &mut self,
+        album_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if album_id.is_empty() {
             return;
         }
         // Switching workspaces records history itself, but not within Explorer.
@@ -172,7 +180,7 @@ impl MusicApp {
         self.switch_workspace(Workspace::Explorer, window, cx);
         self.query = LibraryQuery {
             selection: BrowserSelection {
-                albums: vec![track.album_id.clone()],
+                albums: vec![album_id.clone()],
                 ..Default::default()
             },
             ..Default::default()
@@ -181,7 +189,7 @@ impl MusicApp {
         self.search
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.request_query(cx);
-        self.pending_explorer_album = Some(track.album_id.clone());
+        self.pending_explorer_album = Some(album_id);
         self.focus.focus(window, cx);
     }
     fn queue_album_link(

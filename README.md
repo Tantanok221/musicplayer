@@ -33,6 +33,7 @@ Open **Settings**, enter your Navidrome address (including any subpath), usernam
 
 - **Music Explorer** is the main library page: search (including Japanese/CJK and full-width text), filter by genre, year, artist or record label, and sort by artist, album, release date, recently added, rating or play count. Your sort is remembered per account.
 - **Artist pages** show a portrait and biography, popular songs, your most played, similar artists, and a full discography split into albums, EPs and singles.
+- **Discover** brings back music you own but have stopped playing: *Old rotation* lists albums you played a lot but not in the last six months, and *Forgotten favorites* lists favorite albums and albums with loved songs you haven't played in six months. Click an album to open it, or shuffle a whole shelf.
 - **Queue** separates Now playing from Up next. Drag to reorder, select several entries to remove, and undo the last edit. Right-click any track or album for Play Next, Add to End of Queue, Add to Playlist, Go to Album and Go to Artist.
 - **Now Playing** shows the current track over its album art, with synchronized lyrics (click a line to seek) and a spectrum of the audio.
 - **Favorites and ratings** for songs and albums update immediately. If saving fails, the previous value comes back with a Retry button.

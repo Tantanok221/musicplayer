@@ -83,6 +83,9 @@ impl MusicApp {
             }
             Event::View(request, view) => {
                 if request == self.request {
+                    if self.workspace == Workspace::Discover && self.artist_name.is_none() {
+                        self.request_discover();
+                    }
                     if let Some(name) = &self.artist_name {
                         self.service.send(Command::Artist(
                             self.artist_request,
@@ -170,6 +173,11 @@ impl MusicApp {
                         let row = self.cover_rows().row_for_album(index);
                         self.cover_list.splice(row..row + 1, 1);
                     }
+                }
+            }
+            Event::Discover(request, shelves) => {
+                if request == self.discover_request {
+                    self.discover = Some(shelves);
                 }
             }
             Event::Artist(request, data) => {

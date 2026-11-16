@@ -902,6 +902,31 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
+    /// Albums that could sit on a Rediscover shelf, with their loved-song counts.
+    pub fn rediscover_candidates(&self) -> Result<Vec<crate::discover::Candidate>> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.data, coalesce(l.loved,0) FROM albums a
+             LEFT JOIN (SELECT album_id, count(*) AS loved FROM tracks
+                        WHERE starred=1 OR coalesce(rating,0)>=4 GROUP BY album_id) l
+               ON l.album_id=a.id
+             WHERE coalesce(json_extract(a.data,'$.playCount'),0)>0
+                OR json_extract(a.data,'$.starred') IS NOT NULL
+                OR coalesce(json_extract(a.data,'$.userRating'),0)>=4
+                OR coalesce(l.loved,0)>0",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (data, loved) = row?;
+                Ok(crate::discover::Candidate {
+                    album: Arc::new(serde_json::from_str(&data)?),
+                    loved_songs: loved.max(0) as usize,
+                })
+            })
+            .collect()
+    }
     /// MusicBrainz release IDs of every album in the library.
     pub fn release_ids(&self) -> Result<std::collections::HashSet<String>> {
         let mut statement = self.conn.prepare(

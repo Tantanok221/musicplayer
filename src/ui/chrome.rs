@@ -6,6 +6,7 @@ impl MusicApp {
         let label = self.artist_name.as_deref().unwrap_or(match self.workspace {
             Workspace::Queue => "Queue",
             Workspace::NowPlaying => "Now Playing",
+            Workspace::Discover => "Discover",
             Workspace::Playlists => self
                 .playlist
                 .as_ref()
