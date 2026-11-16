@@ -1,19 +1,5 @@
-use gpui_kit::assets::IconName as Glyph;
-use gpui_kit::base::{Transition, transition};
-use gpui_kit::component::{
-    button::*,
-    input::{Input, InputEvent, InputState},
-    link::Link,
-    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
-    radio::{Radio, RadioGroup},
-    resizable::{h_resizable, resizable_panel, v_resizable},
-    setting::{SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
-    slider::{Slider, SliderEvent, SliderState, SliderValue},
-    *,
-};
-use gpui_kit::{prelude::FluentBuilder, *};
-use sonora::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
-use sonora::{
+use crate::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
+use crate::{
     artists::{
         ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, lastfm_url, profile_url,
         search_releases,
@@ -32,6 +18,20 @@ use sonora::{
     thumbnail,
     visualizer::{FFT_SIZE, SPECTRUM_BANDS, Spectrum, frequency_position},
 };
+use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::{Transition, transition};
+use gpui_kit::component::{
+    button::*,
+    input::{Input, InputEvent, InputState},
+    link::Link,
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+    radio::{Radio, RadioGroup},
+    resizable::{h_resizable, resizable_panel, v_resizable},
+    setting::{SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    slider::{Slider, SliderEvent, SliderState, SliderValue},
+    *,
+};
+use gpui_kit::{prelude::FluentBuilder, *};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -49,6 +49,7 @@ mod sections;
 use sections::{Part, style};
 mod tabs;
 use queue_controls::QueueViewState;
+pub use tabs::tab_bindings;
 mod sorting_controls;
 
 actions!(
@@ -255,7 +256,7 @@ fn biography_lines(text: &str, width: f32, cx: &App) -> usize {
     }
     let mut wrapper = cx
         .text_system()
-        .line_wrapper(font(sonora::platform::UI_FONT), px(11.));
+        .line_wrapper(font(crate::platform::UI_FONT), px(11.));
     text.lines()
         .map(|line| {
             1 + wrapper
@@ -299,7 +300,7 @@ impl Drop for InkScope {
     }
 }
 
-/// sRGB luma (0–255) of a color, as `sonora::backdrop` measures images.
+/// sRGB luma (0–255) of a color, as `crate::backdrop` measures images.
 fn luma_of(color: Hsla) -> f32 {
     let rgb = color.to_rgb();
     (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) * 255.
@@ -308,7 +309,7 @@ fn luma_of(color: Hsla) -> f32 {
 /// Moves `color` toward `toward` until it reads at `READABLE` against a
 /// background of luma `under`; colors that already do are left alone.
 fn readable_on(color: Hsla, toward: Hsla, under: f32) -> Hsla {
-    use sonora::backdrop::{READABLE, contrast};
+    use crate::backdrop::{READABLE, contrast};
     (0..=10)
         .map(|step| mix(color, toward, step as f32 / 10.))
         .find(|candidate| contrast(luma_of(*candidate), under) >= READABLE)
@@ -801,11 +802,18 @@ pub struct MusicApp {
     prefs_loaded: bool,
     tab_save: Option<Task<()>>,
     /// Closed tabs for Cmd-Shift-T, newest last: position, tab and history.
-    closed_tabs: Vec<(usize, sonora::browser::Tab, TabHistory)>,
+    closed_tabs: Vec<(usize, crate::browser::Tab, TabHistory)>,
     restoring_location: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl MusicApp {
+    /// Read-only navigation state for integration assertions. Mutations still
+    /// go through the production input handlers and service events.
+    #[cfg(feature = "test-support")]
+    pub fn tab_state(&self) -> &crate::browser::Tabs {
+        &self.preferences.tabs
+    }
+
     pub fn new(
         service: Service,
         events: flume::Receiver<Event>,
@@ -1477,7 +1485,7 @@ impl MusicApp {
             WindowBounds::Maximized(bounds) => (bounds, true, false),
             WindowBounds::Fullscreen(bounds) => (bounds, false, true),
         };
-        let frame = sonora::platform::WindowFrame {
+        let frame = crate::platform::WindowFrame {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
             width: f32::from(bounds.size.width),
@@ -2356,7 +2364,7 @@ impl MusicApp {
         let colors = ink(cx);
         let width = f32::from(window.viewport_size().width);
         let search_width = (width * 0.22).clamp(120., 240.);
-        let controls_inset = sonora::platform::TITLEBAR_CONTROLS_INSET;
+        let controls_inset = crate::platform::TITLEBAR_CONTROLS_INSET;
         // Everything left after Back/Forward, the layout button, a drag area and search.
         let tabs_width = (width - search_width - controls_inset - 64. - 36. - 24. - 16.).max(100.);
         // Offer an arrow only toward tabs that are out of view, as of the last layout.
@@ -2754,9 +2762,15 @@ impl MusicApp {
                         let id = item.id.clone();
                         let artist_id = item.detail.clone();
                         div()
-                            .id(("navigator-facet", i))
+                            .id(SharedString::from(format!(
+                                "navigator-facet-{}-{}",
+                                mode.label(),
+                                item.id
+                            )))
+                            .test_support()
                             .role(Role::Button)
                             .aria_label(format!("Browse {}: {}", mode.label(), item.label))
+                            .aria_selected(active)
                             // List rows shrink to their text unless told to fill.
                             .w_full()
                             .h(px(45.))
@@ -6409,7 +6423,7 @@ impl MusicApp {
     /// Text colors for Now Playing that read on this album's backdrop, and
     /// the plate behind each column; `None` until the backdrop is ready.
     fn backdrop_ink(&self, cover: &str, theme_dark: bool) -> Option<(Ink, [f32; 2])> {
-        use sonora::backdrop::{Ink as Tone, contrast, legibility};
+        use crate::backdrop::{Ink as Tone, contrast, legibility};
         let backdrop = self.backdrops.get(cover)?;
         let (light, dark) = (theme_ink(true), theme_ink(false));
         let tone = |ink: &Ink| Tone {
@@ -7607,7 +7621,7 @@ impl MusicApp {
     }
     /// The unfinished Soulseek download that this library album is part of, if any.
     fn album_download(&self, album: &Album) -> Option<&DownloadJob> {
-        let title = sonora::discography::fold(&album.name);
+        let title = crate::discography::fold(&album.name);
         let artists = album
             .artist_credits()
             .iter()
@@ -7615,7 +7629,7 @@ impl MusicApp {
             .collect::<Vec<_>>();
         self.downloads.iter().find(|job| {
             job.state != JobState::Downloaded
-                && sonora::discography::fold(&job.title) == title
+                && crate::discography::fold(&job.title) == title
                 && artists.iter().any(|artist| job.artist.starts_with(artist))
         })
     }
@@ -7817,7 +7831,9 @@ impl MusicApp {
                             rgb(0xf8e9d7)
                         })
                         .id("error-banner")
+                        .test_support()
                         .role(Role::Alert)
+                        .aria_label(error.clone())
                         .flex()
                         .items_start()
                         .gap_2()
@@ -7911,7 +7927,7 @@ impl MusicApp {
                                 } else if let Some(album) = app.playlist_editor_album.clone() {
                                     app.service.send(Command::AlbumToPlaylist(
                                         album,
-                                        sonora::service::PlaylistTarget::New(name),
+                                        crate::service::PlaylistTarget::New(name),
                                     ));
                                 } else {
                                     let ids =
@@ -8191,7 +8207,7 @@ impl Render for MusicApp {
             .flex_col()
             .key_context("Sonora")
             .track_focus(&self.focus)
-            .font_family(sonora::platform::UI_FONT)
+            .font_family(crate::platform::UI_FONT)
             .text_size(px(12.))
             .text_color(colors.text)
             .bg(colors.background)
@@ -8307,7 +8323,7 @@ impl Render for MusicApp {
 #[cfg(test)]
 mod tests {
     use super::{gain_from_index, gain_index};
-    use sonora::model::GainMode;
+    use crate::model::GainMode;
 
     #[test]
     fn replaygain_choices_round_trip() {

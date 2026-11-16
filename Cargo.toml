@@ -5,6 +5,10 @@ edition = "2024"
 description = "An album-first Navidrome player for macOS and Linux"
 license = "MIT"
 
+[features]
+# Controlled handles for application tests; never enabled by the local bundler.
+test-support = []
+
 [lints.clippy]
 # Keep the default checks, and reject performance lint findings even without -D warnings.
 perf = { level = "deny", priority = -1 }
@@ -40,6 +44,7 @@ url = "2"
 
 [dev-dependencies]
 axum = "0.8"
+gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 hound = "3"
 
 [profile.release]
@@ -51,3 +56,8 @@ incremental = true
 [[bin]]
 name = "sonora"
 path = "src/main.rs"
+
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
+required-features = ["test-support"]

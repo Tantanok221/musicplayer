@@ -50,6 +50,15 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --features test-support --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked
+      - name: UI interaction and restart persistence
+        run: scripts/test-ui.sh
+      - name: Upload UI test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-diagnostics-${{ matrix.os }}
+          path: target/ui-test-artifacts/
+          if-no-files-found: ignore

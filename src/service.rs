@@ -209,6 +209,15 @@ pub struct Service {
     pub player: PlayerHandle,
     query_epoch: Arc<AtomicU64>,
 }
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
+fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
+    catalog.set_state("preferences", &prefs)?;
+    player.send(PlayerCommand::Preferences(prefs));
+    Ok(())
+}
 impl Service {
     pub fn start(paths: Paths, runtime: tokio::runtime::Handle) -> (Self, Receiver<Event>) {
         let (tx, rx) = flume::unbounded();
@@ -1500,8 +1509,7 @@ fn run(
                 }
                 Command::Player(command) => player.send(command),
                 Command::Preferences(prefs) => {
-                    catalog.set_state("preferences", &prefs)?;
-                    player.send(PlayerCommand::Preferences(prefs));
+                    persist_preferences(&catalog, &player, prefs)?;
                 }
                 Command::Persist(queue) => catalog.set_state("queue", &queue)?,
                 Command::Scrobble(report) => {

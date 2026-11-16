@@ -421,8 +421,10 @@ impl MusicApp {
             .is_some_and(|selected| selected.id == album.id);
         div()
             .id(SharedString::from(format!("artist-release-{}", album.id)))
+            .test_support()
             .role(Role::Button)
             .aria_label(format!("Select release {}", album.name))
+            .aria_selected(selected)
             .w(px(side))
             .min_w_0()
             .cursor_pointer()

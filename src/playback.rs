@@ -103,6 +103,20 @@ pub struct PlayerHandle {
     clock: Arc<Clock>,
 }
 impl PlayerHandle {
+    /// A silent command endpoint for controlled application tests. No actors,
+    /// devices, decoders, network requests or OS media controls are started.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn controlled() -> (Self, Receiver<PlayerCommand>) {
+        let (tx, rx) = flume::unbounded();
+        (
+            Self {
+                tx,
+                clock: Arc::new(Clock::default()),
+            },
+            rx,
+        )
+    }
+
     pub fn send(&self, command: PlayerCommand) {
         let _ = self.tx.send(command);
     }

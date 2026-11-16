@@ -951,7 +951,7 @@ impl MusicApp {
 #[cfg(test)]
 mod tests {
     use super::{QueueRow, queue_rows};
-    use sonora::model::{PlaybackSnapshot, Track};
+    use crate::model::{PlaybackSnapshot, Track};
     use std::sync::Arc;
     fn playback() -> PlaybackSnapshot {
         PlaybackSnapshot {

@@ -1,5 +1,6 @@
 pub mod artists;
 pub mod artwork;
+mod artwork_cache;
 pub mod backdrop;
 pub mod browser;
 pub mod catalog;
@@ -15,4 +16,5 @@ pub mod service;
 pub mod slskd;
 pub mod sorting;
 pub mod thumbnail;
+pub mod ui;
 pub mod visualizer;

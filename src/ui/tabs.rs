@@ -2,6 +2,29 @@
 //! history. Tabs, their pages and locks are saved in preferences.
 use super::*;
 
+/// The tab shortcuts used by the desktop app and its integration tests.
+pub fn tab_bindings() -> [KeyBinding; 12] {
+    use crate::platform::shortcut;
+    [
+        KeyBinding::new(shortcut("cmd-t", "ctrl-t"), NewTab, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-w", "ctrl-w"), CloseTab, Some("Sonora")),
+        KeyBinding::new(
+            shortcut("cmd-shift-t", "ctrl-shift-t"),
+            ReopenClosedTab,
+            Some("Sonora"),
+        ),
+        KeyBinding::new(shortcut("cmd-1", "ctrl-1"), SelectTab1, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-2", "ctrl-2"), SelectTab2, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-3", "ctrl-3"), SelectTab3, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-4", "ctrl-4"), SelectTab4, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-5", "ctrl-5"), SelectTab5, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-6", "ctrl-6"), SelectTab6, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-7", "ctrl-7"), SelectTab7, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-8", "ctrl-8"), SelectTab8, Some("Sonora")),
+        KeyBinding::new(shortcut("cmd-9", "ctrl-9"), SelectTab9, Some("Sonora")),
+    ]
+}
+
 /// A tab being dragged to a new position.
 #[derive(Clone)]
 struct TabDrag {
@@ -338,6 +361,7 @@ impl MusicApp {
                     .child(
                         div()
                             .id(("tab-close", tab.id))
+                            .test_support()
                             .role(Role::Button)
                             .aria_label(format!("Close {title}"))
                             .size(px(16.))
@@ -357,6 +381,7 @@ impl MusicApp {
             items.push(
                 div()
                     .id(("workspace-tab", tab.id))
+                    .test_support()
                     .group(group)
                     .role(Role::Tab)
                     .aria_label(title.clone())

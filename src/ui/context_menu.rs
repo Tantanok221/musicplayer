@@ -2,7 +2,7 @@
 //! row, a muted second line where it helps, and actions grouped as play →
 //! queue → playlists → navigation → feedback → copy.
 use super::*;
-use sonora::service::PlaylistTarget;
+use crate::service::PlaylistTarget;
 
 /// A plain menu row with a leading icon.
 pub(super) fn menu_row(icon: Glyph, title: impl Into<SharedString>) -> PopupMenuItem {
