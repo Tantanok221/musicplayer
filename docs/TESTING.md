@@ -37,7 +37,7 @@ For a single command that runs every current test, use:
 cargo test --locked --features test-support
 ```
 
-The focused script runs the `tests/ui.rs` integration target with the
+The focused script runs the `ui` integration target (`tests/ui.rs` and its modules) with the
 `test-support` feature. The equivalent Cargo command is
 `cargo test --locked --features test-support --test ui -- --nocapture`.
 It preserves Cargo's exit status while saving
@@ -47,9 +47,44 @@ records which commands have actually been validated and on which platform.
 Both focused runners accept optional test filters after the script name.
 For example, `scripts/test-ui.sh worker::` runs only the cross-layer UI scenario.
 
+## Test layout
+
+Integration tests are split by **layer** (Cargo target) and then by **feature**
+(module). Each module name is also its filter prefix, so an agent working on a
+feature runs only that feature's scenarios:
+
+```sh
+scripts/test-ui.sh tabs::
+scripts/test-service.sh sync::
+cargo test --locked --features test-support --test ui album_feedback:: -- --nocapture
+```
+
+| Layer | Target and root | Feature modules | Shared fixture |
+| --- | --- | --- | --- |
+| Production view, controlled service | `ui`: `tests/ui.rs` | `tests/ui/{tabs,album_feedback,explorer,playback,playlists,layout,downloads,lyrics}.rs` | `tests/common/ui/` |
+| Production view, real worker + loopback HTTP | `ui`: `tests/ui.rs` | `tests/ui/worker.rs` | `tests/service_worker/fixture.rs` |
+| Real service worker + loopback HTTP + SQLite | `service_worker`: `tests/service_worker.rs` | `tests/service_worker/{feedback,sync,preferences,metadata,lifecycle}.rs` | `tests/service_worker/fixture.rs` |
+| Real paused player actor | `player_queue`: `tests/player_queue.rs` | single file | `playback::test_support` |
+| Ordinary domain/HTTP/catalog tests | one target per `tests/*.rs` | n/a | per file |
+
+Rules:
+
+- Target roots (`tests/ui.rs`, `tests/service_worker.rs`) only declare modules.
+  Never put scenarios in them.
+- Add a feature's scenarios to its existing module. A new feature gets a new
+  module, declared in the root with `#[path = "<target>/<feature>.rs"]`, and a
+  row in this table. Do not add new `[[test]]` targets for a feature: each target
+  is a separate binary that links the whole app and GPUI.
+- The UI fixture is split by domain: `mod.rs` (setup, `pump()` dispatch,
+  `settle`, diagnostics), `seed.rs`, `input.rs`, `library.rs`, `feedback.rs`,
+  `playback.rs` and `tabs.rs`. `pump()` arms only delegate to domain methods.
+  Prefer scenario-local `Fixture::expect` replies over new shared defaults.
+- Scenario names describe the behavior and outcome. Refer to a scenario by its
+  full `module::name` in docs and review evidence.
+
 ## First protected workflow
 
-`new_tab_artist_stays_rightmost_and_survives_restart` mounts the production
+`tabs::new_tab_artist_stays_rightmost_and_survives_restart` mounts the production
 `MusicApp`, using its normal event receiver and actual pointer/key handlers:
 
 1. Start from the middle of four default tabs.
@@ -74,16 +109,16 @@ Batch 1 comprises six scenarios. The five added after the original restart test 
 
 | Test | Behavior checked |
 | --- | --- |
-| `closing_and_reopening_restores_the_artist_tab_in_place` | Close an artist tab with a right neighbor; correct neighbor activates; keyboard reopen restores the complete tab state and position |
-| `back_and_forward_histories_stay_with_each_tab` | Navigate between two artists, Back/Forward, switch tabs, and independently resume both histories |
-| `album_favorite_is_optimistic_blocks_duplicates_and_confirms` | Optimistic favorite state, disabled pending controls, duplicate-click suppression, confirmation, and a subsequent unfavorite |
-| `failed_album_favorite_rolls_back_and_retry_sends_the_same_intent` | Rollback to the catalog album, visible accessible error/Retry, exact retry intent, successful recovery |
-| `album_rating_sets_and_clears_without_changing_song_rating` | Initial album/song rating distinction, optimistic rating, confirmed update, selected-star clearing to zero, unrelated data preserved |
+| `tabs::closing_and_reopening_restores_the_artist_tab_in_place` | Close an artist tab with a right neighbor; correct neighbor activates; keyboard reopen restores the complete tab state and position |
+| `tabs::back_and_forward_histories_stay_with_each_tab` | Navigate between two artists, Back/Forward, switch tabs, and independently resume both histories |
+| `album_feedback::album_favorite_is_optimistic_blocks_duplicates_and_confirms` | Optimistic favorite state, disabled pending controls, duplicate-click suppression, confirmation, and a subsequent unfavorite |
+| `album_feedback::failed_album_favorite_rolls_back_and_retry_sends_the_same_intent` | Rollback to the catalog album, visible accessible error/Retry, exact retry intent, successful recovery |
+| `album_feedback::album_rating_sets_and_clears_without_changing_song_rating` | Initial album/song rating distinction, optimistic rating, confirmed update, selected-star clearing to zero, unrelated data preserved |
 
 Run one scenario independently by adding its name before `--`:
 
 ```sh
-cargo test --locked --features test-support --test ui album_rating_sets_and_clears_without_changing_song_rating -- --exact --nocapture
+cargo test --locked --features test-support --test ui album_feedback::album_rating_sets_and_clears_without_changing_song_rating -- --exact --nocapture
 ```
 
 The shared catalog contains two artists and three albums. Album and song
@@ -100,7 +135,7 @@ the real HTTP/service-worker mutation path is also exercised with the UI below.
 `worker::favorite_http_failure_rolls_back_in_the_real_view_and_retry_recovers`
 in `tests/ui/worker.rs` mounts the production view with a real
 `service::test_support::Worker`, temporary SQLite paths and the strict loopback
-HTTP fixture shared with `tests/service_worker.rs`. Actual pointer clicks select
+HTTP fixture shared with the `service_worker` target. Actual pointer clicks select
 an Explorer album, favorite it, attempt a duplicate while pending, and Retry
 after HTTP rejection. Assertions cover the optimistic/disabled control, visible
 rollback/error, one identical HTTP request on Retry, persisted success and
@@ -147,22 +182,23 @@ artist pages, native app processes and pixel checks remain separate work.
 
 ## Real service-worker coverage
 
-Batch 3 adds six scenarios in `tests/service_worker.rs`, with strict HTTP and
-catalog helpers in `tests/service_worker/fixture.rs`:
+Batch 3 adds six scenarios in the `service_worker` target, one module per
+feature under `tests/service_worker/`, with strict HTTP and catalog helpers in
+`tests/service_worker/fixture.rs`:
 
 | Test | Behavior checked |
 | --- | --- |
-| `album_feedback_reaches_http_catalog_and_real_events_without_editing_tracks` | Album favorite/unfavorite, rating set/clear, exact `albumId` versus `id` HTTP parameters, SQLite/event agreement, unchanged songs and unrelated albums; separate song favorite/rating commands leave the album unchanged |
-| `failed_album_feedback_publishes_rollback_before_failure_and_retry_repeats_http_intent` | Favorite and rating failures publish the original catalog album before `MutationFailed`; SQLite remains unchanged; resending the Retry intent makes exactly one further identical HTTP request |
-| `interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles` | A real later-page failure after 500 imports preserves cached songs/albums/playlists; a successful pass during scanning also preserves them; a later complete non-scanning pass reconciles and persists the result |
-| `preferences_save_through_the_worker_and_restore_after_clean_restart` | The real Preferences handler writes SQLite and updates the player; a joined worker restarts on the same paths and restores preferences through Ready and the player endpoint |
-| `worker_metadata_uses_injected_musicbrainz_and_listenbrainz_endpoints` | A worker command traverses the loopback Navidrome artist-ID lookup and both injected metadata endpoints, publishing the resulting discography |
-| `shutdown_finishes_the_worker_and_runtime_with_metadata_still_pending` | Shutdown completes the queue-save handshake, joins the worker, and shuts down its private runtime even with an HTTP response held pending |
+| `feedback::album_feedback_reaches_http_catalog_and_real_events_without_editing_tracks` | Album favorite/unfavorite, rating set/clear, exact `albumId` versus `id` HTTP parameters, SQLite/event agreement, unchanged songs and unrelated albums; separate song favorite/rating commands leave the album unchanged |
+| `feedback::failed_album_feedback_publishes_rollback_before_failure_and_retry_repeats_http_intent` | Favorite and rating failures publish the original catalog album before `MutationFailed`; SQLite remains unchanged; resending the Retry intent makes exactly one further identical HTTP request |
+| `sync::interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles` | A real later-page failure after 500 imports preserves cached songs/albums/playlists; a successful pass during scanning also preserves them; a later complete non-scanning pass reconciles and persists the result |
+| `preferences::preferences_save_through_the_worker_and_restore_after_clean_restart` | The real Preferences handler writes SQLite and updates the player; a joined worker restarts on the same paths and restores preferences through Ready and the player endpoint |
+| `metadata::worker_metadata_uses_injected_musicbrainz_and_listenbrainz_endpoints` | A worker command traverses the loopback Navidrome artist-ID lookup and both injected metadata endpoints, publishing the resulting discography |
+| `lifecycle::shutdown_finishes_the_worker_and_runtime_with_metadata_still_pending` | Shutdown completes the queue-save handshake, joins the worker, and shuts down its private runtime even with an HTTP response held pending |
 
 ```sh
 scripts/test-service.sh
 # One exact scenario, still saving diagnostics:
-scripts/test-service.sh interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles --exact
+scripts/test-service.sh sync::interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles --exact
 # Equivalent Cargo target:
 cargo test --locked --features test-support --test service_worker -- --nocapture
 ```
@@ -292,8 +328,9 @@ recorded in the progress document.
 
 ## Add another feature scenario
 
-- Put production-view integration scenarios in `tests/ui.rs` or child modules
-  under `tests/ui/` (the Explorer module is an example). Put reusable fixtures in `tests/common/ui.rs`.
+- Follow the layout rules in "Test layout" above: one feature module per
+  target, its name used as the filter, and fixture helpers in the matching
+  `tests/common/ui/` domain file.
   `sonora::ui::MusicApp` is the same library view used by the binary; import it
   normally rather than including production source files through `#[path]`.
   Its state stays private. The `test-support` feature enables a read-only

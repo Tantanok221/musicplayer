@@ -5,8 +5,8 @@ Batches 1–3 are committed; Batches 2–3 landed in `8689e80`. Their macOS/Linu
 run [43850271484](https://github.com/Tantanok221/musicplayer/actions/runs/43850271484)
 passed at `b0808a5`. See the progress document for validation.
 Batch 4 was merged and pushed at `f38c40f`, with successful macOS/Linux CI.
-Batch 5 is implemented locally on that merged baseline; its validation is
-recorded in the progress document.
+Batch 5 is committed at `6205f37`. Integration tests were then split into one
+module per feature; see "Test layout" in TESTING.md.
 
 Current coverage and commands: [TESTING.md](TESTING.md).
 Completed work and validation: [AGENT_TESTING_PROGRESS.md](AGENT_TESTING_PROGRESS.md).

@@ -38,6 +38,18 @@ time. Batch 4 was implemented in a separate worktree and merged/pushed at
 
 ## Current checkpoint
 
+### Feature-module split (2026-11-16)
+
+Split integration scenarios into one module per feature, with no behavior change.
+`tests/ui.rs` and `tests/service_worker.rs` now only declare modules. Batch 1
+moved to `tests/ui/tabs.rs` and `tests/ui/album_feedback.rs`. Worker scenarios
+moved to `tests/service_worker/{feedback,sync,preferences,metadata,lifecycle}.rs`.
+The UI fixture moved to `tests/common/ui/`, split by domain, with `pump()`
+delegating to per-domain responders. Test names now carry their module prefix.
+The before/after `--list` output has the same 26 UI and 6 worker scenario names.
+AGENTS.md now requires test-first work, an integration test for every feature
+change, and the layout rules. TESTING.md has the layer/feature table.
+
 ### Batch 5 checkpoint (2026-11-16)
 
 Before continuing, inspected the user's Batch 4 merge `f38c40f`, its real paused
