@@ -3,6 +3,8 @@
 mod common;
 #[path = "ui/explorer.rs"]
 mod explorer;
+#[path = "ui/playback.rs"]
+mod playback;
 use common::ui::{
     ARTIST, ARTIST_TARGET, Fixture, MUTATION_ERROR, SECOND_ARTIST, SECOND_ARTIST_TARGET,
     assert_active_tab, assert_rightmost, start,

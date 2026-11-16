@@ -31,6 +31,9 @@ mod queue;
 pub use queue::QueueEdit;
 use queue::QueueEdits;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioFormat {
     rate: rodio::SampleRate,
@@ -139,7 +142,13 @@ impl PlayerHandle {
         std::thread::Builder::new()
             .name("sonora-player".into())
             .spawn(move || {
-                if let Err(error) = run(rx, events.clone(), runtime, playback_clock) {
+                if let Err(error) = run(
+                    rx,
+                    events.clone(),
+                    runtime,
+                    playback_clock,
+                    PlaybackPlatform::Native,
+                ) {
                     let _ =
                         events.send(PlayerEvent::Error(format!("Audio unavailable: {error:#}")));
                 }
@@ -866,11 +875,41 @@ fn media_command(event: souvlaki::MediaControlEvent) -> Option<PlayerCommand> {
     })
 }
 
+enum PlaybackPlatform {
+    Native,
+    #[cfg(feature = "test-support")]
+    Headless,
+}
+
+impl PlaybackPlatform {
+    fn output_id(&self) -> Option<String> {
+        match self {
+            Self::Native => default_output_id(),
+            #[cfg(feature = "test-support")]
+            Self::Headless => None,
+        }
+    }
+
+    fn media_controls(&self) -> Option<souvlaki::MediaControls> {
+        match self {
+            Self::Native => souvlaki::MediaControls::new(souvlaki::PlatformConfig {
+                dbus_name: "sonora",
+                display_name: "Sonora",
+                hwnd: None,
+            })
+            .ok(),
+            #[cfg(feature = "test-support")]
+            Self::Headless => None,
+        }
+    }
+}
+
 fn run(
     commands: Receiver<PlayerCommand>,
     events: Sender<PlayerEvent>,
     runtime: tokio::runtime::Handle,
     clock: Arc<Clock>,
+    platform: PlaybackPlatform,
 ) -> Result<()> {
     let (pcm_tx, pcm_rx) = flume::bounded(96);
     let (error_tx, error_rx) = flume::unbounded();
@@ -878,7 +917,7 @@ fn run(
     let (format_changes, format_rx) = flume::unbounded::<Packet>();
     // Wait for decoded audio before opening a device: metadata can be incomplete.
     let mut output: Option<rodio::MixerDeviceSink> = None;
-    let mut output_id = default_output_id();
+    let mut output_id = platform.output_id();
     let mut last_device_check = Instant::now();
     let mut queue: Vec<Arc<Track>> = Vec::new();
     let mut queue_edits = QueueEdits::default();
@@ -911,12 +950,7 @@ fn run(
     let mut pending_output: Option<(Packet, Instant)> = None;
     // When the current stream started waiting for audio; cleared once samples flow.
     let mut stalled_since: Option<Instant> = None;
-    let mut media = souvlaki::MediaControls::new(souvlaki::PlatformConfig {
-        dbus_name: "sonora",
-        display_name: "Sonora",
-        hwnd: None,
-    })
-    .ok();
+    let mut media = platform.media_controls();
     // OS callbacks enter the same command queue as UI actions.
     let (media_tx, media_rx) = flume::unbounded();
     if let Some(controls) = media.as_mut() {
@@ -960,7 +994,7 @@ fn run(
         let elapsed = last_tick.elapsed().as_secs_f64();
         last_tick = Instant::now();
         if last_device_check.elapsed() >= Duration::from_secs(1) {
-            let device = default_output_id();
+            let device = platform.output_id();
             let failed = device_error_rx.try_iter().next().is_some();
             if device != output_id || failed || elapsed > 3. {
                 base_position = if started {
@@ -1303,7 +1337,7 @@ fn run(
                 .store(base_position.to_bits(), Ordering::Relaxed);
             pending_output = None;
             drop(output.take());
-            output_id = default_output_id();
+            output_id = platform.output_id();
             if let (Some(at), Some(server), true) = (index, server.clone(), output_id.is_some()) {
                 plan = Plan::shared(queue.clone(), prefs.repeat);
                 plan_boundary = clock.boundary.load(Ordering::Acquire);

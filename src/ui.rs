@@ -41,6 +41,8 @@ use std::{
 };
 mod album_feedback;
 mod artist_page;
+mod bindings;
+pub use bindings::{playback_bindings, queue_bindings};
 mod context_menu;
 use context_menu::{menu_row, menu_row_detail};
 mod downloads;
@@ -1345,6 +1347,9 @@ impl MusicApp {
                 self.lyrics.insert(id, text);
             }
             Event::Playback(snapshot) => {
+                if snapshot.queue_revision < self.playback.queue_revision {
+                    return;
+                }
                 // Snapshots arrive about five times a second while playing; when
                 // only the position moved, redraw just what shows it.
                 let previous = &self.playback;
@@ -7391,8 +7396,12 @@ impl MusicApp {
                 self.rating_stars(track, "footer", cx).into_any_element()
             }
         });
-        let time = |seconds| {
+        let time = |id, seconds| {
             div()
+                .id(id)
+                .test_support()
+                .role(Role::Status)
+                .aria_label(duration_label(seconds))
                 .w(px(34.))
                 .flex_shrink_0()
                 .text_size(px(10.))
@@ -7567,9 +7576,12 @@ impl MusicApp {
                             ),
                     )
                     .child(
-                        time(self.scrub.map_or(self.playback.position, |value| {
-                            value as f64 / 1000. * self.playback.duration
-                        }))
+                        time(
+                            "playback-elapsed",
+                            self.scrub.map_or(self.playback.position, |value| {
+                                value as f64 / 1000. * self.playback.duration
+                            }),
+                        )
                         .text_right()
                         .when(self.scrub.is_some(), |label| {
                             label.text_color(colors.accent)
@@ -7581,7 +7593,7 @@ impl MusicApp {
                             .min_w(px(40.))
                             .accessibility_label("Playback position"),
                     )
-                    .child(time(self.playback.duration)),
+                    .child(time("playback-duration", self.playback.duration)),
             )
             .child(
                 div()

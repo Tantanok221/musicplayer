@@ -478,6 +478,8 @@ impl MusicApp {
         }
         let entity = cx.entity();
         div()
+            .id("queue-view")
+            .test_support()
             .size_full()
             .min_h_0()
             .key_context("Queue")
@@ -654,6 +656,7 @@ impl MusicApp {
             }
             Some(QueueRow::End) => div()
                 .id("queue-drop-end")
+                .test_support()
                 .w_full()
                 .px_3()
                 .h_3()
@@ -720,7 +723,9 @@ impl MusicApp {
         let menu_state = self.menu_state(cx);
         let mut row = div()
             .id(SharedString::from(format!("queue-entry-{id}")))
+            .test_support()
             .role(Role::Group)
+            .aria_selected(selected)
             .aria_label(format!(
                 "Queue {}: {} · {}",
                 index + 1,

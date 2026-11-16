@@ -3,8 +3,8 @@
 Scope approved 2026-11-16: enable GPUI testing, controlled service/player
 handles, queryable tabs/navigator, real input regression, CI diagnostics, and
 restart persistence through an isolated catalog. No commit/push is implied.
-Batch 3 (real service-worker integration) was requested on the same date;
-the completed, uncommitted Batch 2 changes were preserved.
+Batches 2 and 3 were subsequently committed and pushed at the user's request.
+Batch 4 was requested in a separate worktree; its changes remain unpublished.
 
 ## Status
 
@@ -16,6 +16,7 @@ the completed, uncommitted Batch 2 changes were preserved.
 - [x] Close/recreate the view with preferences read from an isolated SQLite catalog.
 - [x] Pass fmt, Clippy, full tests, and local bundle checks.
 - [x] Add real-worker/loopback-HTTP scenarios with isolated catalogs and bounded shutdown.
+- [x] Add queue/playback UI scenarios paired with the real paused player actor.
 
 ## Implementation decisions
 
@@ -32,6 +33,84 @@ the completed, uncommitted Batch 2 changes were preserved.
   commands containing credentials or authenticated URLs.
 
 ## Current checkpoint
+
+### Batch 4 publication authorization (2026-11-16)
+
+The user subsequently authorized merging Batch 4 into main and pushing it.
+Statements about no publication authorization below describe earlier checkpoints.
+The user also authorized temporarily stashing main's unrelated uncommitted work,
+then restoring it after the push. Publication must rerun the mandatory full-feature
+and UI pre-push gates against the final main commit and retain diagnostics.
+
+### Batch 4 checkpoint
+
+Worktree `/Users/tantanok/c/musicplayer-batch4`, branch
+`test/batch4-queue-playback`, starts at `b0808a5`. All source edits from this
+session stay in that worktree. Independent changes now exist in the original
+worktree and were left untouched. No Batch 4 commit/push is authorized.
+
+Implemented five scenarios in `tests/ui/playback.rs`: album command ID/placement/
+count, duplicate occurrence selection/move/remove/Undo/drag, stale queue menus
+and snapshots, seek preview/held-position/release, and Space with Search versus
+queue focus. They use the production view, real input handlers and shared
+production key bindings. Queue scenarios pass captured commands through the
+production paused actor and deliver its snapshots, rather than duplicating the
+queue algorithm in the UI fixture.
+
+Added feature-gated `playback::test_support::PausedPlayer` and two integration
+scenarios in `tests/player_queue.rs`. The actor owns the real queue revisions,
+occurrence IDs, edits and Undo. Its native output discovery and media-control
+adapters are disabled, and the test endpoint rejects transport/server commands.
+It owns a private runtime and joined thread, with readiness/snapshot/completion
+deadlines. Owning-layer cases cover stale/current/past edits, duplicate IDs,
+Undo/repeated Undo, insertion placement, clear-upcoming, paused position and
+metadata retained through Undo.
+
+The stale UI scenario first failed with old visible IDs `[1, 2, 3, 4]` replacing
+current `[1, 4, 2, 3]`. `Event::Playback` now rejects a lower queue revision.
+Evidence: `target/batch4-stale-before-fix.log`; the fixed scenario passes.
+Additional negative checks confirmed that sending Seek during Change fails
+the held-drag assertion (`target/batch4-seek-regression.log`), and removing the
+actor's revision check fails the duplicate occurrence assertion
+(`target/batch4-player-stale-regression.log`). Both intentional mutations were
+restored in `finally` blocks.
+
+A shared build cache produced a stale-library compile failure during development.
+Final validation uses the worktree's own `target/`; dependency caches were
+copy-on-write cloned, then this package's copied artifacts were cleaned and
+rebuilt. No original source or diagnostic artifacts were removed.
+
+CI now runs `cargo test --locked --features test-support`, so the new player
+target is not skipped. UI/service runners still retain their separate logs.
+
+Final validation on local macOS, after restoring both negative mutations:
+
+- `cargo fmt --check`: PASS (`target/batch4-fmt.log`).
+- Both locked/all-targets Clippy modes with `-D warnings`: PASS
+  (`target/batch4-clippy-default.log`, `target/batch4-clippy-feature.log`).
+- `cargo test --locked`: PASS, 152 ordinary tests
+  (`target/batch4-default-tests.log`).
+- `cargo test --locked --features test-support`: PASS, 176 tests
+  (152 ordinary + 2 paused-player + 6 real-worker + 16 UI);
+  `target/batch4-all-feature-tests.log`.
+- `scripts/test-ui.sh`: PASS, all 16 scenarios, 2.88s;
+  `target/batch4-ui-tests.log` and `target/ui-test-artifacts/`.
+- `scripts/test-service.sh`: PASS, all 6 scenarios, 0.90s;
+  `target/batch4-service-tests.log` and `target/service-test-artifacts/`.
+- Each of the five new UI scenarios independently with exact Cargo filters:
+  PASS; `target/batch4-isolated-*.log`.
+- `scripts/bundle.sh` and `codesign --verify --deep --strict dist/Sonora.app`:
+  PASS, release compilation 55.46s. Console transcript and signature result
+  retained in `target/batch4-bundle.log`.
+- Runner shell syntax and `git diff --check`: PASS.
+
+Batch 4 is complete locally. No current compile/lint/test failures remain.
+The existing upstream `block` future-incompatibility notice remains. No commit,
+push or remote CI validation was performed.
+
+These are in-process UI and paused-actor checks, not packaged-process relaunch,
+native AX, pixels, decoder timing or physical audio-device tests. Existing
+decoder/PCM/consumed-audio tests remain distinct evidence.
 
 ### Batch 3 checkpoint (2026-11-16)
 
@@ -288,20 +367,18 @@ for the next agent's entry point.
 
 ## Next work
 
-Batch 3 is complete locally. No required local implementation or validation remains.
+Batch 4 is complete locally, including final validation above.
+Sixteen UI scenarios, six real-worker scenarios and two real paused-player
+scenarios are implemented. Later batches and deferred artist-page scenarios
+are not coverage.
 
-The next planned expansion is Batch 4 (queue and playback controls) in
-[INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md). Eleven UI scenarios and six
-real-worker scenarios are implemented; later batches and deferred artist-page
-scenarios are not coverage.
-
-1. If the user requests publication, inspect both uncommitted batches and commit/
-   push using short conventional commits without coauthors. Earlier publication
-   authorization applied only to the foundation/Batch 1, which is already pushed.
+1. If the user requests publication, inspect the Batch 4 worktree and follow the
+   mandatory full-feature/UI pre-push gates in `AGENTS.md`. Batches 2–3 are
+   already on main; Batch 4 has no publication authorization.
 2. If CI fails, run the exact failing command from `docs/TESTING.md`; inspect
    the uploaded service/UI `environment.txt` and `test.log`. Only the baseline
-   six-test UI suite is confirmed on Linux; Batches 2–3 have local macOS evidence.
-3. For the next requested slice, add Batch 4 queue/playback UI coverage, pairing
-   controlled snapshots with tests at the real queue/player owning layer.
+   six-test UI suite is confirmed on Linux; Batches 2–4 have local macOS evidence.
+3. For the next requested slice, choose a focused Batch 5 workflow from
+   [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md).
    Current scenarios do not start a packaged process, native AX, a pixel renderer,
    or an audio device. Keep artist-page scenarios deferred unless scope expands.

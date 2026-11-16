@@ -18,6 +18,10 @@ pub(super) fn menu_row_detail(
     let (title, detail) = (title.into(), detail.into());
     PopupMenuItem::element(move |_, cx| {
         div()
+            .id(SharedString::from(format!("menu-action-{title}")))
+            .test_support()
+            .role(Role::Group)
+            .aria_label(title.clone())
             .flex()
             .flex_col()
             .min_w_0()

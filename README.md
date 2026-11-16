@@ -125,17 +125,19 @@ On macOS, closing the window keeps playback running; reopen from the Dock. On Li
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-# Include all UI and real service-worker integration scenarios:
+# Include UI, real service-worker and paused-player integration:
 cargo test --locked --features test-support
 ```
 
 GitHub Actions runs formatting checks, plus Clippy and tests on macOS and Linux,
 for pushes and pull requests using the pinned Rust toolchain and locked dependencies.
 `scripts/test-ui.sh` runs production-view navigation, album feedback, Music
-Explorer, and SQLite restart scenarios with controlled services.
+Explorer, queue/playback controls, and SQLite restart scenarios with controlled services.
 `scripts/test-service.sh` runs real-worker/loopback-HTTP integration for feedback,
 interrupted sync, preferences, metadata routing, and shutdown. Plain `cargo test`
-includes ordinary integration tests but skips these two feature-gated targets.
+includes ordinary integration tests but skips the feature-gated UI, real-worker,
+and paused-player targets. `tests/player_queue.rs` exercises the production
+paused actor without audio devices or OS media controls.
 CI runs both scripts and saves separate diagnostics. See [the agent verification guide](docs/TESTING.md) for the test
 boundaries, focused commands, and instructions for adding feature scenarios.
 `Cargo.toml` denies Clippy's `perf` group and selected checks for redundant clones,

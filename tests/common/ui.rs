@@ -10,6 +10,7 @@ use sonora::{
     catalog::Catalog,
     model::{Album, LibraryQuery, NamedId, Preferences, Track},
     platform::{Account, shortcut},
+    playback::Placement,
     service::{Command, Event, Mutation, test_support::ControlledService},
 };
 use std::{collections::VecDeque, path::Path};
@@ -32,6 +33,8 @@ pub(crate) fn start(
     cx.update(|cx| {
         gpui_kit::init(cx);
         cx.bind_keys(sonora::ui::tab_bindings());
+        cx.bind_keys(sonora::ui::playback_bindings());
+        cx.bind_keys(sonora::ui::queue_bindings());
     });
     let dir = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::open(&dir.path().join("catalog.sqlite"));
@@ -52,6 +55,13 @@ pub(crate) struct Fixture {
     hold_queries: bool,
     query_requests: Vec<LibraryQuery>,
     held_views: VecDeque<(String, Event)>,
+    playback_intents: Option<Vec<PlaybackIntent>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PlaybackIntent {
+    PlayAlbum(String),
+    EnqueueAlbum(String, Placement),
 }
 
 impl Fixture {
@@ -66,6 +76,7 @@ impl Fixture {
             hold_queries: false,
             query_requests: vec![],
             held_views: VecDeque::new(),
+            playback_intents: None,
         }
     }
 
@@ -202,6 +213,14 @@ impl Fixture {
         self.query_requests.last().expect("query sent by UI")
     }
 
+    pub(crate) fn capture_playback(&mut self) {
+        self.playback_intents = Some(vec![]);
+    }
+
+    pub(crate) fn playback_intents(&self) -> &[PlaybackIntent] {
+        self.playback_intents.as_deref().unwrap_or_default()
+    }
+
     pub(crate) fn search(&mut self, window: AnyWindowHandle, text: &str, cx: &mut TestAppContext) {
         cx.update_window(window, |_, window, cx| {
             window.click("music-search", cx);
@@ -320,6 +339,21 @@ impl Fixture {
                         .push("optional artist enrichment deferred".into());
                 }
                 Command::SaveWindow(_) => self.trace.push("SaveWindow".into()),
+                Command::PlayAlbum(id) if self.playback_intents.is_some() => {
+                    self.trace.push(format!("PlayAlbum({id})"));
+                    self.playback_intents
+                        .as_mut()
+                        .unwrap()
+                        .push(PlaybackIntent::PlayAlbum(id));
+                }
+                Command::EnqueueAlbum(id, placement) if self.playback_intents.is_some() => {
+                    self.trace
+                        .push(format!("EnqueueAlbum({id}, {placement:?})"));
+                    self.playback_intents
+                        .as_mut()
+                        .unwrap()
+                        .push(PlaybackIntent::EnqueueAlbum(id, placement));
+                }
                 _ => panic!(
                     "unexpected service command in UI scenario; trace={:?}",
                     self.trace
