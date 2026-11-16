@@ -1,4 +1,4 @@
-//! Read-only MusicBrainz and ListenBrainz lookups for artist discographies.
+//! Read-only MusicBrainz lookups for artist discographies.
 use crate::discography::{
     Discography, ListenLink, ReleaseDetails, ReleaseGroup, ReleaseTrack, fold, listen_service,
 };
@@ -21,7 +21,6 @@ const MAX_GROUP_PAGES: usize = 10;
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: Url,
-    listens: Url,
     /// MusicBrainz blocks clients that exceed one request per second.
     interval: Duration,
     last: Arc<Mutex<Option<Instant>>>,
@@ -29,13 +28,9 @@ pub struct MusicBrainz {
 
 impl MusicBrainz {
     pub fn new() -> Result<Self> {
-        Self::with_endpoints(
-            "https://musicbrainz.org/ws/2/",
-            "https://api.listenbrainz.org/1/",
-            Duration::from_millis(1100),
-        )
+        Self::with_endpoints("https://musicbrainz.org/ws/2/", Duration::from_millis(1100))
     }
-    pub fn with_endpoints(base: &str, listens: &str, interval: Duration) -> Result<Self> {
+    pub fn with_endpoints(base: &str, interval: Duration) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent(concat!(
@@ -48,7 +43,6 @@ impl MusicBrainz {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             base: Url::parse(base)?,
-            listens: Url::parse(listens)?,
             interval,
             last: Arc::default(),
         })
@@ -60,18 +54,16 @@ impl MusicBrainz {
             .extend_pairs(params)
             .append_pair("fmt", "json");
         for attempt in 0..2 {
-            let response = {
-                // Held across the request so calls are spaced, not merely started, a second apart.
+            {
                 let mut last = self.last.lock().await;
                 if let Some(at) = *last {
                     tokio::time::sleep_until(at + self.interval).await;
                 }
-                let response = self.http.get(url.clone()).send().await;
                 *last = Some(Instant::now());
-                response.map_err(|error| {
-                    anyhow::Error::new(error.without_url()).context("Cannot reach MusicBrainz")
-                })?
-            };
+            }
+            let response = self.http.get(url.clone()).send().await.map_err(|error| {
+                anyhow::Error::new(error.without_url()).context("Cannot reach MusicBrainz")
+            })?;
             let status = response.status();
             if status.as_u16() == 503 && attempt == 0 {
                 tokio::time::sleep(self.interval * 3).await;
@@ -90,11 +82,18 @@ impl MusicBrainz {
 
     /// Every release group credited to the artist. Fetching by release also
     /// yields edition titles and the release IDs Navidrome reports for albums.
-    pub async fn discography(&self, artist: &str) -> Result<Discography> {
+    /// `overview` skips straight to the release-group listing for an artist
+    /// already known to have too many releases.
+    pub async fn discography(&self, artist: &str, overview: bool) -> Result<Discography> {
         let mut groups: Vec<ReleaseGroup> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut offset = 0;
         let mut total = usize::MAX;
+        let mut overview = overview;
+        if overview {
+            groups = self.groups_only(artist).await?;
+            total = 0;
+        }
         while offset < total {
             let page = self
                 .get(
@@ -110,6 +109,7 @@ impl MusicBrainz {
             total = page["release-count"].as_u64().unwrap_or(0) as usize;
             if total > MAX_RELEASES {
                 groups = self.groups_only(artist).await?;
+                overview = true;
                 break;
             }
             let releases = page["releases"].as_array().cloned().unwrap_or_default();
@@ -139,16 +139,11 @@ impl MusicBrainz {
                 }
             }
         }
-        // Popularity only orders the list, so its absence is not an error.
-        if let Ok(listens) = self.listens(artist).await {
-            for group in &mut groups {
-                group.listens = listens.get(&group.id).copied().unwrap_or(0);
-            }
-        }
         Ok(Discography {
             artist: artist.into(),
             groups,
             fetched_ms: chrono::Utc::now().timestamp_millis(),
+            overview,
         })
     }
 
@@ -179,34 +174,6 @@ impl MusicBrainz {
             }
         }
         Ok(groups)
-    }
-
-    async fn listens(&self, artist: &str) -> Result<HashMap<String, u64>> {
-        let url = self.listens.join(&format!(
-            "popularity/top-release-groups-for-artist/{artist}"
-        ))?;
-        let value: Value = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| anyhow::Error::new(error.without_url()))?
-            .error_for_status()
-            .map_err(|error| anyhow::Error::new(error.without_url()))?
-            .json()
-            .await
-            .map_err(|_| anyhow::anyhow!("ListenBrainz returned an invalid response"))?;
-        Ok(value
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                Some((
-                    item["release_group_mbid"].as_str()?.to_string(),
-                    item["total_listen_count"].as_u64()?,
-                ))
-            })
-            .collect())
     }
 
     /// Finds an artist the server has no MusicBrainz ID for. Namesakes are

@@ -52,7 +52,9 @@ pub struct Library {
     pub hold_scrobble: bool,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
-    pub releases: Vec<(&'static str, &'static str, &'static str, u64)>,
+    pub releases: Vec<(&'static str, &'static str, &'static str)>,
+    pub artist_mbid: &'static str,
+    pub prolific: bool,
 }
 
 impl Default for Library {
@@ -69,7 +71,9 @@ impl Default for Library {
             hold_scrobble: false,
             fail_artwork: false,
             fail_enrichment: false,
-            releases: vec![("missing-release", "Missing Release", "2020-01-01", 42)],
+            releases: vec![("missing-release", "Missing Release", "2020-01-01")],
+            artist_mbid: "mb-artist",
+            prolific: false,
         }
     }
 }
@@ -257,7 +261,7 @@ async fn navidrome(
             json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
         }
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
-            json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":"mb-artist"}})
+            json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":data.library.artist_mbid}})
         }
         "getArtistInfo2.view"
             if query
@@ -411,6 +415,65 @@ async fn metadata(
         state.record(Request::new("metadata/details", &[]));
         return Json(json!({"id":"edition", "media":[{"position":1, "tracks":[{"number":"1", "title":"Missing song", "length":120000}]}]})).into_response();
     }
+    if method == Method::GET
+        && endpoint == "artist"
+        && query
+            == Request::new(
+                "",
+                &[
+                    (
+                        "query",
+                        "artist:\"Fixture Artist\" OR alias:\"Fixture Artist\"",
+                    ),
+                    ("limit", "5"),
+                    ("fmt", "json"),
+                ],
+            )
+            .params
+    {
+        state.record(Request::new("metadata/artist-search", &[]));
+        return Json(json!({"artists":[{"id":"mb-artist","name":"Fixture Artist"}]}))
+            .into_response();
+    }
+    if method == Method::GET
+        && endpoint == "release-group"
+        && query
+            == Request::new(
+                "",
+                &[("artist", "mb-artist"), ("limit", "100"), ("fmt", "json")],
+            )
+            .params
+    {
+        state.record(Request::new("metadata/artist-check", &[]));
+        return Json(json!({"release-groups":[{"id":"owned","title":"Release album"}]}))
+            .into_response();
+    }
+    if method == Method::GET
+        && endpoint == "release-group"
+        && query
+            == Request::new(
+                "",
+                &[
+                    ("artist", "mb-artist"),
+                    ("release-group-status", "website-default"),
+                    ("limit", "100"),
+                    ("offset", "0"),
+                    ("fmt", "json"),
+                ],
+            )
+            .params
+    {
+        state.record(Request::new("metadata/release-groups", &[]));
+        let releases = state.data.lock().unwrap().library.releases.clone();
+        let groups = releases
+            .iter()
+            .map(|(id, title, date)| {
+                json!({"id":id,"title":title,"primary-type":"Album","first-release-date":date})
+            })
+            .collect::<Vec<_>>();
+        return Json(json!({"release-group-count":groups.len(),"release-groups":groups}))
+            .into_response();
+    }
     if method != Method::GET
         || endpoint != "release"
         || query
@@ -429,39 +492,27 @@ async fn metadata(
         return state.unexpected("unexpected metadata request");
     }
     state.record(Request::new("metadata/release", &[]));
-    let (hold, releases) = {
+    let (hold, releases, prolific) = {
         let data = state.data.lock().unwrap();
-        (data.library.hold_metadata, data.library.releases.clone())
+        (
+            data.library.hold_metadata,
+            data.library.releases.clone(),
+            data.library.prolific,
+        )
     };
     if hold {
         let _ = state.metadata_gate.recv_async().await;
     }
     let releases = releases
         .iter()
-        .map(|(id, title, date, _)| {
+        .map(|(id, title, date)| {
             json!({"id":format!("edition-{id}"),"status":"Official",
                 "release-group":{"id":id,"title":title,
                     "primary-type":"Album","first-release-date":date}})
         })
         .collect::<Vec<_>>();
-    Json(json!({"release-count":releases.len(),"releases":releases})).into_response()
-}
-
-async fn listens(
-    State(state): State<ServerState>,
-    method: Method,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> Response {
-    if method != Method::GET || !query.is_empty() {
-        return state.unexpected("unexpected ListenBrainz request");
-    }
-    state.record(Request::new("listens/mb-artist", &[]));
-    let releases = state.data.lock().unwrap().library.releases.clone();
-    let counts = releases
-        .iter()
-        .map(|(id, _, _, listens)| json!({"release_group_mbid":id,"total_listen_count":listens}))
-        .collect::<Vec<_>>();
-    Json(json!(counts)).into_response()
+    let count = if prolific { 1001 } else { releases.len() };
+    Json(json!({"release-count":count,"releases":releases})).into_response()
 }
 
 async fn unexpected(State(state): State<ServerState>) -> Response {
@@ -523,10 +574,6 @@ impl Fixture {
         let app = Router::new()
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
-            .route(
-                "/listens/popularity/top-release-groups-for-artist/mb-artist",
-                any(listens),
-            )
             .fallback(unexpected)
             .with_state(state.clone());
         let (stop, stopped) = flume::bounded(1);
@@ -597,12 +644,9 @@ impl Fixture {
     }
 
     fn start_player(&self, paused: bool) -> Worker {
-        let metadata = MusicBrainz::with_endpoints(
-            &format!("{}metadata/", self.account.url),
-            &format!("{}listens/", self.account.url),
-            Duration::ZERO,
-        )
-        .unwrap();
+        let metadata =
+            MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
+                .unwrap();
         if paused {
             Worker::start_paused(self.paths.clone(), metadata).unwrap()
         } else {

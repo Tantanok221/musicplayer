@@ -69,6 +69,7 @@ fn owned_by_release_id_edition_title_or_regional_twin() {
             group("rg-missing", "Eye of the Storm", "Album"),
         ],
         fetched_ms: 1,
+        ..Default::default()
     };
     let albums = [
         album("Zankyo Reference", "release-2"),
@@ -91,6 +92,7 @@ fn release_ids_match_albums_filed_under_another_artist_row() {
         artist: "artist".into(),
         groups: vec![owned, group("rg-2", "BOOTLEG", "Album")],
         fetched_ms: 1,
+        ..Default::default()
     };
     // The page's own artist row has no albums; the other row's album is in the library.
     let library = Library {
@@ -121,6 +123,7 @@ fn filters_unofficial_hidden_duplicate_and_already_owned_singles() {
             group("rg-twin-2", "Twin", "EP"),
         ],
         fetched_ms: 1,
+        ..Default::default()
     };
     let library = Library {
         track_titles: [fold("Owned Song (Album Version)")].into(),
@@ -158,6 +161,7 @@ fn a_release_still_downloading_stays_listed_after_a_partial_scan() {
             group("rg-2", "All Here", "Album"),
         ],
         fetched_ms: 1,
+        ..Default::default()
     };
     let albums = [album("Half Here", ""), album("All Here", "")];
     let mut library = Library {
@@ -173,21 +177,20 @@ fn a_release_still_downloading_stays_listed_after_a_partial_scan() {
 }
 
 #[test]
-fn newest_come_first_and_undated_last_regardless_of_listens() {
+fn newest_come_first_and_undated_last() {
     let mut popular = group("a", "Popular", "Album");
-    popular.listens = 900;
     popular.date = "1999".into();
     let mut newer = group("b", "Newer", "Album");
     newer.date = "2020-05-01".into();
     let mut older = group("c", "Older", "Album");
     older.date = "2001".into();
     let mut undated = group("d", "Undated", "Album");
-    undated.listens = 50;
     undated.date.clear();
     let discography = Discography {
         artist: "artist".into(),
         groups: vec![older, undated, newer, popular],
         fetched_ms: 1,
+        ..Default::default()
     };
     assert_eq!(
         titles(&discography, &Library::default()),

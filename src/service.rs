@@ -990,6 +990,10 @@ fn run(
                     let fetch = !cached.as_ref().is_some_and(|known| known.fresh(now))
                         && !discography::is_various_artists(&name, "");
                     let server = server.clone().filter(|_| fetch);
+                    let (known_artist, overview) = cached
+                        .as_ref()
+                        .map(|known| (known.artist.clone(), known.overview))
+                        .unwrap_or_default();
                     publish_discography(
                         &catalog,
                         &events,
@@ -1018,6 +1022,9 @@ fn run(
                                         return Ok(unknown());
                                     }
                                     if artist.is_empty() {
+                                        artist = known_artist.clone();
+                                    }
+                                    if artist.is_empty() {
                                         artist = musicbrainz
                                             .resolve_artist(&name, &titles)
                                             .await?
@@ -1026,7 +1033,8 @@ fn run(
                                     if artist.is_empty() {
                                         return Ok(unknown());
                                     }
-                                    musicbrainz.discography(&artist).await
+                                    let overview = overview && artist == known_artist;
+                                    musicbrainz.discography(&artist, overview).await
                                 }
                                 .await
                                 .map_err(|error: anyhow::Error| format!("{error:#}"));
@@ -1909,6 +1917,7 @@ mod tests {
                         group("owned-active", "Eye of the Storm"),
                     ],
                     fetched_ms: 1,
+                    ..Default::default()
                 },
             )
             .unwrap();

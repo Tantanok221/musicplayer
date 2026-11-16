@@ -69,7 +69,7 @@ Artist pages end with **Missing from your library**: official releases from Musi
 
 To download, connect your own [slskd](https://github.com/slskd/slskd) in **Settings → Downloads** with its address and an API key (`readwrite` role) or its web login. Choose **Find on Soulseek**, pick a folder from the results, and Sonora follows the download, then asks Navidrome to scan (administrators only). Sonora never searches or downloads on its own. slskd must save into a folder Navidrome scans.
 
-These lookups send artist and release identifiers to MusicBrainz, ListenBrainz and the Cover Art Archive, never your server address or login.
+These lookups send artist and release identifiers to MusicBrainz and the Cover Art Archive, never your server address or login.
 
 ## Your data
 

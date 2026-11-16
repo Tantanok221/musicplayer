@@ -164,16 +164,6 @@ async fn artists(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
     })
 }
 
-async fn listens(Path(artist): Path<String>) -> Result<Json<Value>, StatusCode> {
-    if artist != "artist" {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    Ok(Json(json!([
-        {"release_group_mbid": "rg-ep", "total_listen_count": 42},
-        {"release_group_mbid": "elsewhere", "total_listen_count": 7}
-    ])))
-}
-
 async fn client() -> MusicBrainz {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -184,27 +174,19 @@ async fn client() -> MusicBrainz {
                 .route("/ws/2/release", get(releases))
                 .route("/ws/2/release/{id}", get(release_lookup))
                 .route("/ws/2/release-group", get(groups))
-                .route("/ws/2/artist", get(artists))
-                .route(
-                    "/1/popularity/top-release-groups-for-artist/{artist}",
-                    get(listens),
-                ),
+                .route("/ws/2/artist", get(artists)),
         )
         .await
         .unwrap();
     });
-    MusicBrainz::with_endpoints(
-        &format!("http://{address}/ws/2/"),
-        &format!("http://{address}/1/"),
-        Duration::from_millis(1),
-    )
-    .unwrap()
+    MusicBrainz::with_endpoints(&format!("http://{address}/ws/2/"), Duration::from_millis(1))
+        .unwrap()
 }
 
 #[tokio::test]
-async fn discography_pages_releases_into_groups_with_editions_and_listens() {
+async fn discography_pages_releases_into_groups_with_editions() {
     let client = client().await;
-    let found = client.discography("artist").await.unwrap();
+    let found = client.discography("artist", false).await.unwrap();
     assert_eq!(found.artist, "artist");
     assert!(found.fetched_ms > 0);
     let ids = found
@@ -220,31 +202,39 @@ async fn discography_pages_releases_into_groups_with_editions_and_listens() {
     assert_eq!(album.date, "2011-05-10");
     assert!(!found.groups[1].official);
     assert_eq!(found.groups[1].secondary, ["Live"]);
-    assert_eq!(found.groups[2].listens, 42);
     assert_eq!(found.groups[2].primary, "EP");
 }
 
 #[tokio::test]
 async fn prolific_artists_fall_back_to_the_default_overview() {
-    let found = client().await.discography("prolific").await.unwrap();
+    let found = client().await.discography("prolific", false).await.unwrap();
     assert_eq!(found.groups.len(), 1);
     assert_eq!(found.groups[0].id, "rg-big");
     assert!(found.groups[0].official && found.groups[0].releases.is_empty());
+    assert!(found.overview);
 }
 
 #[tokio::test]
 async fn rate_limit_is_retried_once_and_errors_hide_the_address() {
     let client = client().await;
-    assert!(client.discography("busy").await.unwrap().groups.is_empty());
-    let error = format!("{:#}", client.discography("unknown").await.unwrap_err());
+    assert!(
+        client
+            .discography("busy", false)
+            .await
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+    let error = format!(
+        "{:#}",
+        client.discography("unknown", false).await.unwrap_err()
+    );
     assert_eq!(error, "MusicBrainz returned HTTP 404");
-    let offline = MusicBrainz::with_endpoints(
-        "http://127.0.0.1:1/ws/2/",
-        "http://127.0.0.1:1/1/",
-        Duration::ZERO,
-    )
-    .unwrap();
-    let error = format!("{:#}", offline.discography("artist").await.unwrap_err());
+    let offline = MusicBrainz::with_endpoints("http://127.0.0.1:1/ws/2/", Duration::ZERO).unwrap();
+    let error = format!(
+        "{:#}",
+        offline.discography("artist", false).await.unwrap_err()
+    );
     assert!(error.starts_with("Cannot reach MusicBrainz"));
     assert!(!error.contains("127.0.0.1"), "{error}");
 }
@@ -337,4 +327,59 @@ async fn release_details_read_the_usual_edition() {
         ]
     );
     assert!(details.fetched_ms > 0);
+}
+
+#[tokio::test]
+async fn requests_are_spaced_from_their_start_not_their_end() {
+    let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let log = started.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/ws/2/release",
+                get(move |Query(query): Query<HashMap<String, String>>| {
+                    let log = log.clone();
+                    async move {
+                        log.lock().unwrap().push(tokio::time::Instant::now());
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let offset = &query["offset"];
+                        Json(json!({"release-count": 3, "releases": [release(
+                            &format!("r{offset}"),
+                            "Title",
+                            "Official",
+                            rg(&format!("rg{offset}"), "Title", "Album", &[]),
+                        )]}))
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let client = MusicBrainz::with_endpoints(
+        &format!("http://{address}/ws/2/"),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .discography("artist", false)
+            .await
+            .unwrap()
+            .groups
+            .len(),
+        3
+    );
+    let started = started.lock().unwrap();
+    assert_eq!(started.len(), 3);
+    for pair in started.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!(
+            gap >= Duration::from_millis(490) && gap < Duration::from_millis(750),
+            "requests started {gap:?} apart"
+        );
+    }
 }

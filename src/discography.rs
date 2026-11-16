@@ -25,7 +25,6 @@ pub struct ReleaseGroup {
     pub titles: Vec<String>,
     /// Release IDs, the kind Navidrome reports as an album's MusicBrainz ID.
     pub releases: Vec<String>,
-    pub listens: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -35,6 +34,7 @@ pub struct Discography {
     pub artist: String,
     pub groups: Vec<ReleaseGroup>,
     pub fetched_ms: i64,
+    pub overview: bool,
 }
 impl Discography {
     pub fn fresh(&self, now_ms: i64) -> bool {
