@@ -647,7 +647,7 @@ impl Catalog {
             .collect::<Result<Vec<_>>>()?;
         let facets = self.facets()?;
         let browser = self.browser_view_with(query, Some((&filter, &values)))?;
-        let tracks = self.tracks_where(query, &filter, values.clone(), 0, 500)?;
+        let tracks = self.tracks_where(query, &filter, values, 0, 500)?;
         Ok(LibraryView {
             revision: self.revision,
             sort_fields: sorting::available(

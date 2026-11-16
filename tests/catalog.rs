@@ -316,7 +316,7 @@ fn favorites_filter_combines_hearts_and_ratings() {
     assert_eq!(ids(rated.clone()), ["both", "rated-4"]);
     let either = FavoritesFilter {
         hearted: true,
-        ..rated.clone()
+        ..rated
     };
     assert_eq!(ids(either.clone()), ["both", "hearted", "rated-4"]);
     assert_eq!(either.summary(), "Hearted or 4+ stars");

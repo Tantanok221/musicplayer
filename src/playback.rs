@@ -1906,7 +1906,7 @@ mod tests {
         // Still decoding the audible track: any edit is picked up later.
         assert!(plan.retarget(&queue, RepeatMode::One, Some(1), 0));
         assert_eq!(plan.next(1).map(|(i, _)| i), Some(1));
-        let mut reordered = queue.clone();
+        let mut reordered = queue;
         reordered.swap(1, 2);
         assert!(plan.retarget(&reordered, RepeatMode::Off, Some(1), 1));
         assert_eq!(plan.next(1).map(|(_, t)| t.id.clone()), Some("1".into()));
@@ -1961,7 +1961,7 @@ mod tests {
         });
         shuffled[1] = updated.clone();
         // Track 1 was removed while shuffled; the added track was appended.
-        let mut order = original.clone();
+        let mut order = original;
         order.remove(1);
         order.push(added);
         let (queue, index) = unshuffle(shuffled, &order, Some(1));
@@ -2067,7 +2067,7 @@ mod tests {
         assert_eq!(replay_gain(Some(&gain), &GainMode::Off), 1.);
         let fallback = ReplayGain {
             album_gain: None,
-            ..gain.clone()
+            ..gain
         };
         assert_eq!(
             replay_gain(Some(&fallback), &GainMode::Album),

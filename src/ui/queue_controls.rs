@@ -616,11 +616,7 @@ impl MusicApp {
                             .child(Icon::new(Glyph::Disc3).size_3().text_color(colors.text)),
                     )
                     .child(div().flex_1().min_w_0().flex().items_center().child(
-                        self.queue_album_link(
-                            track.clone(),
-                            format!("queue-album-heading-{index}"),
-                            cx,
-                        ),
+                        self.queue_album_link(track, format!("queue-album-heading-{index}"), cx),
                     ))
                     .into_any_element()
             }
@@ -713,13 +709,13 @@ impl MusicApp {
             },
         };
         let remove = indices.clone();
-        let move_next = indices.clone();
+        let move_next = indices;
         let weak = cx.weak_entity();
         let play_weak = weak.clone();
         let next_weak = weak.clone();
         let remove_weak = weak.clone();
         let earlier_weak = weak.clone();
-        let later_weak = weak.clone();
+        let later_weak = weak;
         let menu_track = track.clone();
         let menu_state = self.menu_state(cx);
         let mut row = div()

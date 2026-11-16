@@ -217,11 +217,11 @@ impl Service {
         let query_epoch = Arc::new(AtomicU64::new(0));
         let service = Self {
             tx: tx.clone(),
-            player: player.clone(),
-            query_epoch: query_epoch.clone(),
+            player,
+            query_epoch,
         };
         let event_tx = events.clone();
-        let command_tx = tx.clone();
+        let command_tx = tx;
         std::thread::Builder::new()
             .name("sonora-player-events".into())
             .spawn(move || {

@@ -127,6 +127,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+GitHub Actions runs formatting checks, plus Clippy and tests on macOS and Linux,
+for pushes and pull requests using the pinned Rust toolchain and locked dependencies.
+`Cargo.toml` denies Clippy's `perf` group and selected checks for redundant clones,
+large futures, debug macros, TODO macros, and undocumented unsafe blocks. Clippy's
+default checks remain enabled; CI also treats every warning as an error.
+
 Tests cover listening-session thresholds and restoration, durable duplicate prevention, timestamped Navidrome submissions with HTTP retries disabled, verified artist identities, owned-only popularity, cached biographies, personal rankings, and native 44.1 kHz mono / 96 kHz stereo / 48 kHz stereo streaming, exact PCM preservation, format-change handoff and playback timing, cascading browser selection, upstream facet counts, multi-selection unions, filtered album groups, layout persistence/upgrades, reconciliation, Unicode search, pagination/state, authenticated API requests, decoded FLAC continuity, MP3 delay/padding removal, ReplayGain, PCM boundaries, and seeking. Audio fixtures are generated sine waves, not copyrighted recordings; see `tests/fixtures/README.md`.
 
 The interface has been exercised with a real Navidrome collection. Physical output-device transitions still need broader manual coverage. Rebuilding an ad hoc signed application may make macOS request Local Network approval again. Sonora no longer uses Keychain for login. Same-format FLAC/MP3 playback preserves gapless boundaries. Changing source sample rate or channel count reopens the output and may briefly pause playback. Files are requested in their original format. FLAC, MP3, AAC/M4A, ALAC, WAV, AIFF, and Ogg/Vorbis decoding are supported; unsupported codecs still show an error. Device compatibility conversion happens locally, so a 96 kHz track can play through a 44.1 kHz Bluetooth output. AAC gapless, bit-perfect/exclusive output, additional DSP, local file management, and offline audio downloads are outside this release.

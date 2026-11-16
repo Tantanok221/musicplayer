@@ -7390,7 +7390,7 @@ impl MusicApp {
                                     .flex()
                                     .items_center()
                                     .min_w_0()
-                                    .child(match track.clone() {
+                                    .child(match track {
                                         Some(track) if !track.album_id.is_empty() => div()
                                             .id("footer-title")
                                             .min_w_0()

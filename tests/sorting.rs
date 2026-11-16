@@ -472,9 +472,9 @@ fn random_sort_is_stable_per_seed_and_keeps_album_tracks_together() {
     assert_eq!(first, albums(&db, shuffle(1)));
     assert_ne!(first, albums(&db, shuffle(2)));
     assert_ne!(first, sorted);
-    let mut every = first.clone();
+    let mut every = first;
     every.sort();
-    let mut expected = sorted.clone();
+    let mut expected = sorted;
     expected.sort();
     assert_eq!(every, expected);
     // Tracks follow the shuffled albums and an album plays in its own order.
