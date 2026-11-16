@@ -430,15 +430,6 @@ impl MusicApp {
                     .into_any_element(),
             );
         }
-        items.push(
-            div()
-                .id("tab-strip-space")
-                .flex_1()
-                .min_w(px(24.))
-                .h_full()
-                .context_menu(self.bar_menu(cx))
-                .into_any_element(),
-        );
         items
     }
 }

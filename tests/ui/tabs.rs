@@ -170,3 +170,27 @@ fn back_and_forward_histories_stay_with_each_tab(cx: &mut TestAppContext) {
     fixture.diagnose("independent tab histories restored", window, &app, cx);
     assert_active_tab(window, &app, 5, &[1, 2, 3, 4, 5, 6], SECOND_ARTIST, cx);
 }
+
+#[gpui_kit::test]
+fn new_tab_button_follows_the_last_tab_without_extra_space(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    for expected_ids in [&[1_u64, 2, 3, 4][..], &[1, 2, 3, 4, 5][..]] {
+        fixture.diagnose("tab strip", window, &app, cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let last = expected_ids[expected_ids.len() - 1];
+            let last = window.find(("workspace-tab", last)).bounds();
+            let previous = expected_ids[expected_ids.len() - 2];
+            let previous = window.find(("workspace-tab", previous)).bounds();
+            let new_tab = window.find("new-tab").bounds();
+            let between_tabs = last.left() - previous.right();
+            let before_new_tab = new_tab.left() - last.right();
+            assert!(
+                before_new_tab >= gpui_kit::px(0.) && before_new_tab <= between_tabs,
+                "New Tab sits {before_new_tab:?} after the last tab; tabs are {between_tabs:?} apart"
+            );
+        })
+        .unwrap();
+        fixture.click(window, "new-tab", cx);
+    }
+}
