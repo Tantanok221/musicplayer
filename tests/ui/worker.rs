@@ -485,3 +485,54 @@ fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut 
     close_worker(worker, window, app, cx);
     fixture.finish();
 }
+
+/// The Favorites page lists an album for its hearted songs, so a double-click
+/// plays those songs rather than the whole album.
+#[gpui_kit::test]
+fn favorites_album_double_click_plays_only_the_favorite_songs(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    let mut hearted = crate::worker_fixture::song("hearted", "album");
+    hearted.starred = Some("2026-01-01T00:00:00Z".into());
+    library.tracks.push(hearted);
+    let fixture = Fixture::new(library);
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        if window.try_find("nav-favorites").is_none() {
+            window.click("library-disclosure", cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("nav-favorites", cx))
+        .unwrap();
+    deliver_until(&worker, &tx, window, cx, |_, cx| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find("explorer-album-other-album").is_none()
+                && window
+                    .try_find("explorer-album-album")
+                    .is_some_and(|card| card.visible())
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("explorer-album-album", cx)
+    })
+    .unwrap();
+    let deadline = Instant::now() + WAIT;
+    let played = loop {
+        cx.run_until_parked();
+        if let sonora::playback::PlayerCommand::Replace(tracks, at) =
+            worker.player_commands().recv_deadline(deadline).unwrap()
+        {
+            assert_eq!(at, 0);
+            break tracks
+                .iter()
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>();
+        }
+    };
+    assert_eq!(played, ["hearted"]);
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}

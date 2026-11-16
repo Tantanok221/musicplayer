@@ -160,3 +160,54 @@ fn missing_current_track_resets_position_and_listen_and_empty_queue_is_safe() {
         fixture.finish();
     }
 }
+
+#[test]
+fn play_album_matching_favorites_plays_hearted_songs_or_a_favorite_album_in_full() {
+    use sonora::{
+        model::{LibraryQuery, Sort},
+        sorting::{Scope, SortSpec},
+    };
+    let starred = Some("2026-01-01T00:00:00Z".to_string());
+    let mut library = Library::default();
+    let mut hearted = crate::fixture::song("hearted", "album");
+    hearted.starred = starred.clone();
+    library.tracks.push(hearted);
+    let mut whole = crate::fixture::album("whole");
+    whole.starred = starred;
+    library.albums.push(whole);
+    for id in ["whole-1", "whole-2"] {
+        library.tracks.push(crate::fixture::song(id, "whole"));
+    }
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut worker = fixture.start();
+    synced(&worker);
+    let query = LibraryQuery {
+        favorites: true,
+        ordering: Some(SortSpec::legacy(Sort::Album, false, Scope::Albums)),
+        ..Default::default()
+    };
+    let played = |worker: &Worker, id: &str| {
+        worker
+            .service()
+            .send(Command::PlayAlbumMatching(query.clone(), id.into()));
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let PlayerCommand::Replace(tracks, at) =
+                worker.player_commands().recv_deadline(deadline).unwrap()
+            {
+                assert_eq!(at, 0);
+                return tracks
+                    .iter()
+                    .map(|track| track.id.clone())
+                    .collect::<Vec<_>>();
+            }
+        }
+    };
+    // Listed for one hearted song: only that song plays.
+    assert_eq!(played(&worker, "album"), ["hearted"]);
+    // A favorite album is a favorite as a whole.
+    assert_eq!(played(&worker, "whole"), ["whole-1", "whole-2"]);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}

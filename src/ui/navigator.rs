@@ -50,13 +50,14 @@ impl MusicApp {
         icon: Glyph,
         active: bool,
         cx: &App,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         // An empty tab shows no page, so nothing in the navigator is current.
         let active = active && !self.blank;
         let colors = ink(cx);
         let label: SharedString = label.into();
         div()
             .id(id)
+            .test_support()
             .role(Role::Button)
             .aria_label(label.clone())
             .h(px(25.))

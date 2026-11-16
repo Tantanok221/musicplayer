@@ -626,7 +626,15 @@ impl MusicApp {
                             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                                 app.select_album(open.clone(), cx);
                                 if event.click_count() == 2 {
-                                    app.service.send(Command::PlayAlbum(open.id.clone()));
+                                    // Favorites lists an album for its favorite songs; play those.
+                                    app.service.send(if app.query.favorites {
+                                        Command::PlayAlbumMatching(
+                                            app.query.clone(),
+                                            open.id.clone(),
+                                        )
+                                    } else {
+                                        Command::PlayAlbum(open.id.clone())
+                                    });
                                 }
                             }))
                             .context_menu(app.album_menu(&album, cx)),
