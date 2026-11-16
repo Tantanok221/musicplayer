@@ -103,6 +103,8 @@ pub enum Command {
     LyricsLoaded(String, String, Result<Lyrics, String>),
     PlayIds(Vec<String>, usize),
     PlayAlbum(String),
+    /// Plays the album's songs that match the query, as its expanded card lists them.
+    PlayAlbumMatching(LibraryQuery, String),
     Enqueue(Vec<String>, Placement),
     EnqueueAlbum(String, Placement),
     /// Album ID: save its songs, in disc/track order, to a playlist.
@@ -1569,6 +1571,12 @@ fn run(
                 }
                 Command::PlayAlbum(id) => {
                     player.send(PlayerCommand::Replace(catalog.album_tracks(&id)?, 0));
+                }
+                Command::PlayAlbumMatching(query, id) => {
+                    player.send(PlayerCommand::Replace(
+                        catalog.album_tracks_matching(&query, &id)?,
+                        0,
+                    ));
                 }
                 Command::Enqueue(ids, placement) => {
                     player.send(PlayerCommand::Insert(catalog.by_ids(&ids)?, placement));
