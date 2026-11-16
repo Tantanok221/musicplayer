@@ -6329,17 +6329,29 @@ impl MusicApp {
             )
             .into_any_element()
     }
-    /// Queued tracks after the current one, unless the queue is just this album.
+    /// Queued tracks after the current one, unless everything left in the
+    /// queue is from the playing album, which the album tracks already show.
     fn up_next(
         &mut self,
         album_tracks: &[Arc<Track>],
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let queue = self.playback.queue.clone();
-        let same_as_album = queue.len() == album_tracks.len()
-            && queue.iter().zip(album_tracks).all(|(a, b)| a.id == b.id);
         let start = self.playback.index.map_or(0, |index| index + 1);
-        if same_as_album || start >= queue.len() {
+        if start >= queue.len() {
+            return None;
+        }
+        let album = self
+            .playback
+            .track
+            .as_ref()
+            .map(|track| track.album_id.as_str())
+            .filter(|id| !id.is_empty());
+        let from_album = |track: &Arc<Track>| {
+            album.is_some_and(|id| track.album_id == id)
+                || album_tracks.iter().any(|item| item.id == track.id)
+        };
+        if queue[start..].iter().all(from_album) {
             return None;
         }
         let colors = ink(cx);
