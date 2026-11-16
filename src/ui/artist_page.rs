@@ -2,6 +2,27 @@
 //! page is a list of rows and only the rows on screen are built each frame.
 use super::*;
 
+const POPULAR_PER_ALBUM: usize = 3;
+
+const ARTIST_SONG_COLUMN_MIN: f32 = 300.;
+
+/// Wrapped line count of the artist biography at its 11px system font size.
+fn biography_lines(text: &str, width: f32, cx: &App) -> usize {
+    if width <= 0. {
+        return 0;
+    }
+    let mut wrapper = cx
+        .text_system()
+        .line_wrapper(font(crate::platform::UI_FONT), px(11.));
+    text.lines()
+        .map(|line| {
+            1 + wrapper
+                .wrap_line(&[LineFragment::text(line)], px(width), Default::default())
+                .count()
+        })
+        .sum()
+}
+
 /// One row of the artist page.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
@@ -463,5 +484,348 @@ impl MusicApp {
             }))
             .context_menu(self.album_menu(album, cx))
             .into_any_element()
+    }
+}
+
+impl MusicApp {
+    /// Popularity arrives later through `Event::TopSongs`; selection never waits for it.
+    pub(super) fn request_popularity(&mut self, artists: &[NamedId]) {
+        for artist in artists {
+            if self
+                .popularity_requested
+                .insert(cache_key(&artist.name, &artist.id))
+            {
+                self.service
+                    .send(Command::TopSongs(artist.name.clone(), artist.id.clone()));
+            }
+        }
+    }
+
+    pub(super) fn popular_tracks(&self, album_id: &str, artists: &[NamedId]) -> HashSet<String> {
+        let mut popular = HashSet::new();
+        for top in artists
+            .iter()
+            .filter_map(|artist| self.top_songs.get(&cache_key(&artist.name, &artist.id)))
+        {
+            for id in top.for_album(album_id, POPULAR_PER_ALBUM) {
+                if popular.len() < POPULAR_PER_ALBUM {
+                    popular.insert(id);
+                }
+            }
+        }
+        popular
+    }
+
+    pub(super) fn artist_portrait(
+        &mut self,
+        name: &str,
+        id: &str,
+        fallback: &str,
+        side: f32,
+        cx: &App,
+    ) -> AnyElement {
+        let key = cache_key(name, id);
+        if self.profile_requested.insert(key.clone()) {
+            self.service
+                .send(Command::ArtistProfile(name.into(), id.into(), false));
+        }
+        let portrait = self
+            .artist_profiles
+            .get(&key)
+            .map(|profile| profile.portrait.clone())
+            .filter(|portrait| !portrait.is_empty() && !self.art_failures.contains(portrait))
+            .unwrap_or_else(|| fallback.into());
+        self.art(&portrait, side, cx)
+    }
+
+    pub(super) fn artist_song_section(
+        &mut self,
+        title: &'static str,
+        tracks: Vec<Arc<Track>>,
+        personal: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let expanded = if personal {
+            self.most_played_expanded
+        } else {
+            self.popular_expanded
+        };
+        let mut section = div().w_full().min_w_0().flex().flex_col().gap_1().child(
+            div()
+                .mb_2()
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        );
+        if tracks.is_empty() {
+            section = section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .child("No plays recorded yet."),
+            );
+        }
+        for (i, track) in tracks
+            .iter()
+            .take(if expanded { 10 } else { 5 })
+            .enumerate()
+        {
+            let row = self.track_row(
+                track.clone(),
+                i + 1,
+                format!("artist-{}-{}", personal, track.id),
+                None,
+                None,
+                cx,
+            );
+            let art = self.art(&track.cover_art, 36., cx);
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .size(px(36.))
+                            .flex_shrink_0()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(art),
+                    )
+                    .child(div().flex_1().min_w_0().child(row))
+                    .when(personal, |row| {
+                        row.child(
+                            div()
+                                .w(px(48.))
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(colors.muted)
+                                .child(format!("{} plays", track.play_count.unwrap_or(0))),
+                        )
+                    }),
+            );
+        }
+        if tracks.len() > 5 {
+            section = section.child(
+                Button::new(if personal {
+                    "more-personal"
+                } else {
+                    "more-popular"
+                })
+                .ghost()
+                .small()
+                .label(if expanded { "Show less" } else { "Show more" })
+                .on_click(cx.listener(move |app, _, _, cx| {
+                    if personal {
+                        app.most_played_expanded = !app.most_played_expanded;
+                    } else {
+                        app.popular_expanded = !app.popular_expanded;
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        section.into_any_element()
+    }
+
+    pub(super) fn similar_artists(
+        &mut self,
+        profile: Option<Arc<ArtistProfile>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(profile) = profile.filter(|profile| !profile.similar.is_empty()) else {
+            return div().into_any_element();
+        };
+        let colors = ink(cx);
+        let mut cards = div().flex().flex_wrap().gap_3();
+        for similar in profile.similar.iter().take(12) {
+            let item = similar.clone();
+            let fallback = self
+                .view
+                .navigator
+                .artists
+                .iter()
+                .chain(&self.view.navigator.album_artists)
+                .find(|artist| normalize(&artist.label) == normalize(&item.name))
+                .map(|artist| artist.artwork.clone())
+                .unwrap_or_default();
+            let art = if item.in_library {
+                self.artist_portrait(&item.name, &item.id, &fallback, 88., cx)
+            } else {
+                self.art(&item.portrait, 88., cx)
+            };
+            cards = cards.child(
+                div()
+                    .id(SharedString::from(format!("similar-{}", item.name)))
+                    .role(Role::Button)
+                    .aria_label(format!(
+                        "{} {}",
+                        if item.in_library {
+                            "Open artist"
+                        } else {
+                            "View on Last.fm:"
+                        },
+                        item.name
+                    ))
+                    .w(px(112.))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_color(if item.in_library {
+                        colors.text
+                    } else {
+                        colors.muted
+                    })
+                    .items_center()
+                    .text_center()
+                    .child(
+                        div()
+                            .size(px(88.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .overflow_hidden()
+                            .when(!item.in_library, |image| image.opacity(0.4))
+                            .child(art),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(11.))
+                            .truncate()
+                            .child(item.name.clone()),
+                    )
+                    .when(!item.in_library, |card| {
+                        card.child(div().text_size(px(9.)).child("Not in your library"))
+                    })
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        if item.in_library {
+                            app.open_artist(item.name.clone(), item.id.clone(), window, cx);
+                        } else {
+                            cx.open_url(&lastfm_url(&item.name));
+                        }
+                    })),
+            );
+        }
+        div()
+            .mt_5()
+            .child(
+                div()
+                    .mb_3()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Similar artists to {}", profile.name)),
+            )
+            .child(cards)
+            .into_any_element()
+    }
+
+    pub(super) fn artist_search_section(
+        &mut self,
+        category: ReleaseCategory,
+        hits: Vec<ReleaseHit>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = ink(cx);
+        let count = hits.len();
+        let mut section = div().mt_5().min_w_0().child(
+            div()
+                .mb_3()
+                .text_size(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("{} ({count})", category.label())),
+        );
+        for hit in hits {
+            let album = hit.album;
+            let selected = self
+                .selected_album
+                .as_ref()
+                .is_some_and(|selected| selected.id == album.id);
+            let open = album.clone();
+            let year = if let Some(year) = album.year {
+                self.metadata_link(
+                    ExplorerFilter::Year(year),
+                    format!("search-release-year-{}", album.id),
+                    cx,
+                )
+            } else {
+                div().child("Year unknown").into_any_element()
+            };
+            let mut block = div()
+                .id(SharedString::from(format!("artist-search-{}", album.id)))
+                .mb_4()
+                .min_w_0()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "artist-search-release-{}",
+                            album.id
+                        )))
+                        .role(Role::Button)
+                        .aria_label(format!("Select release {}", album.name))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .cursor_pointer()
+                        .pb_2()
+                        .border_b_2()
+                        .border_color(if selected {
+                            colors.accent
+                        } else {
+                            colors.background
+                        })
+                        .child(self.art(&album.cover_art, 56., cx))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(album.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(colors.muted)
+                                        .child(year),
+                                ),
+                        )
+                        .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
+                            app.select_album(open.clone(), cx);
+                            if event.click_count() == 2 {
+                                app.service.send(Command::PlayAlbum(open.id.clone()));
+                            }
+                        }))
+                        .context_menu(self.album_menu(&album, cx)),
+                );
+            for (index, track) in hit.songs.iter().cloned().enumerate() {
+                let number = track.track.map_or(index + 1, |number| number as usize);
+                block = block.child(self.track_row(
+                    track,
+                    number,
+                    format!("artist-search-{}-{index}", album.id),
+                    None,
+                    None,
+                    cx,
+                ));
+            }
+            if selected {
+                block = block.child(
+                    div()
+                        .mt_2()
+                        .border_y_1()
+                        .border_color(colors.line)
+                        .child(self.album_panel(album, false, true, cx)),
+                );
+            }
+            section = section.child(block);
+        }
+        section.into_any_element()
     }
 }

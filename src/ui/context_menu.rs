@@ -4,6 +4,52 @@
 use super::*;
 use crate::service::PlaylistTarget;
 
+/// Play Next, Play After This Album, and Add to End of Queue, each with a
+/// second line naming what the music will follow.
+fn queue_options(
+    menu: PopupMenu,
+    places: &QueuePlaces,
+    enqueue: impl Fn(Placement) + 'static,
+) -> PopupMenu {
+    let enqueue = Rc::new(enqueue);
+    let mut options = vec![(
+        Placement::Next,
+        "Play Next",
+        places
+            .current_track
+            .as_deref()
+            .map_or_else(|| "At the start of the queue".to_string(), quoted),
+    )];
+    if let Some(album) = &places.current_album {
+        options.push((
+            Placement::AfterAlbum,
+            "Play After This Album",
+            quoted(album),
+        ));
+    }
+    options.push((
+        Placement::Last,
+        "Add to End of Queue",
+        places
+            .last_album
+            .as_deref()
+            .map_or_else(|| "The queue is empty".to_string(), quoted),
+    ));
+    options
+        .into_iter()
+        .fold(menu, |menu, (placement, title, detail)| {
+            let enqueue = enqueue.clone();
+            let icon = match placement {
+                Placement::Next => Glyph::ListStart,
+                Placement::AfterAlbum => Glyph::CornerDownRight,
+                _ => Glyph::ListEnd,
+            };
+            menu.item(
+                menu_row_detail(icon, title, detail).on_click(move |_, _, _| enqueue(placement)),
+            )
+        })
+}
+
 /// A plain menu row with a leading icon.
 pub(super) fn menu_row(icon: Glyph, title: impl Into<SharedString>) -> PopupMenuItem {
     PopupMenuItem::new(title).icon(Icon::new(icon))

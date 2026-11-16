@@ -447,3 +447,202 @@ impl MusicApp {
         items
     }
 }
+
+impl MusicApp {
+    pub(super) fn tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = ink(cx);
+        let width = f32::from(window.viewport_size().width);
+        let search_width = (width * 0.22).clamp(120., 240.);
+        let controls_inset = crate::platform::TITLEBAR_CONTROLS_INSET;
+        // Reserve room for Back/Forward, New Tab, layout controls, drag space and search.
+        let tabs_width = (width - search_width - controls_inset - 64. - 36. - 48. - 16.).max(100.);
+        // Offer an arrow only toward tabs that are out of view, as of the last layout.
+        let scrolled = -f32::from(self.workspace_scroll.offset().x);
+        let max_scroll = f32::from(self.workspace_scroll.max_offset().x);
+        let scroll_left = scrolled > 1.;
+        let scroll_right = scrolled < max_scroll - 1.;
+        let mut tabs = div()
+            .id("workspace-tabs")
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .h_full()
+            .gap_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.workspace_scroll)
+            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()));
+        tabs = tabs.children(self.tab_items(cx));
+        let tabs = div()
+            .max_w(px(tabs_width))
+            .min_w_0()
+            .h_full()
+            .flex_shrink(1.)
+            .relative()
+            .flex()
+            .items_center()
+            .child(tabs)
+            // The arrows float over the strip's ends so the tabs never shift
+            // when one appears or disappears.
+            .when(scroll_left, |row| {
+                row.child(
+                    edge("tabs-left-edge", colors.background, true)
+                        .left_0()
+                        .pr_1()
+                        .child(
+                            short_button("tabs-left", Glyph::ChevronLeft, "Scroll tabs left")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    let offset = app.workspace_scroll.offset();
+                                    let x = (offset.x + px(140.)).min(px(0.));
+                                    app.workspace_scroll.set_offset(point(x, px(0.)));
+                                    cx.notify();
+                                })),
+                        )
+                        .context_menu(self.bar_menu(cx)),
+                )
+            })
+            .when(scroll_right, |row| {
+                row.child(
+                    edge("tabs-right-edge", colors.background, false)
+                        .right_0()
+                        .pl_1()
+                        .child(
+                            short_button("tabs-right", Glyph::ChevronRight, "Scroll tabs right")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    let offset = app.workspace_scroll.offset();
+                                    let max = app.workspace_scroll.max_offset().x;
+                                    let x = (offset.x - px(140.)).max(-max);
+                                    app.workspace_scroll.set_offset(point(x, px(0.)));
+                                    cx.notify();
+                                })),
+                        )
+                        .context_menu(self.bar_menu(cx)),
+                )
+            });
+        let navigator = navigator_key(&self.preferences.layout);
+        let weak = cx.weak_entity();
+        let info = self.preferences.layout.show_information;
+        let browser = self.browser_visible();
+        div()
+            .w_full()
+            .min_w_0()
+            .h(px(36.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.line)
+            .when(controls_inset > 0., |bar| {
+                bar.child(
+                    // The transparent macOS title bar places traffic lights in this area.
+                    div()
+                        .id("titlebar-controls")
+                        .w(px(controls_inset))
+                        .h_full()
+                        .flex_shrink_0()
+                        .context_menu(self.bar_menu(cx)),
+                )
+            })
+            .child(
+                div()
+                    .id("history-buttons")
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(2.))
+                    .pr_2()
+                    .child(
+                        short_button("history-back", Glyph::ChevronLeft, "Back")
+                            .disabled(self.history_back.is_empty())
+                            .on_click(cx.listener(|app, _, window, cx| app.go_back(window, cx))),
+                    )
+                    .child(
+                        short_button("history-forward", Glyph::ChevronRight, "Forward")
+                            .disabled(self.history_forward.is_empty())
+                            .on_click(cx.listener(|app, _, window, cx| app.go_forward(window, cx))),
+                    )
+                    .context_menu(self.bar_menu(cx)),
+            )
+            .child(tabs)
+            // Keep New Tab reachable while the tab strip scrolls.
+            .child(
+                short_button("new-tab", Glyph::Plus, "New tab (⌘T)")
+                    .on_click(cx.listener(|app, _, window, cx| app.new_tab(window, cx))),
+            )
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .flex_1()
+                    .min_w(px(24.))
+                    .h_full()
+                    .on_double_click(|_, window, _| window.titlebar_double_click())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, _| app.titlebar_dragging = true),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, _| app.titlebar_dragging = false),
+                    )
+                    .on_mouse_down_out(cx.listener(|app, _, _, _| app.titlebar_dragging = false))
+                    .on_mouse_move(cx.listener(|app, _, window, _| {
+                        if app.titlebar_dragging {
+                            app.titlebar_dragging = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .context_menu(self.bar_menu(cx)),
+            )
+            .child(
+                short_button("layout-menu", Glyph::PanelsTopLeft, "Configure layout")
+                    .dropdown_menu(move |mut menu, _, _| {
+                        menu = menu.label("Navigator and artist browser");
+                        for (key, label) in [
+                            ("show", "Show"),
+                            ("auto", "Auto-hide"),
+                            ("disabled", "Disabled"),
+                        ] {
+                            let weak = weak.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(label)
+                                    .checked(navigator == key)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |app, cx| {
+                                            set_navigator(&mut app.preferences.layout, key);
+                                            app.navigator_peek = None;
+                                            app.save_preferences();
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        menu.separator()
+                            .item(
+                                PopupMenuItem::new("Queue and information")
+                                    .checked(info)
+                                    .action(Box::new(ToggleInformation)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Column browser")
+                                    .checked(browser)
+                                    .action(Box::new(ToggleBrowser)),
+                            )
+                            .separator()
+                            .menu("Restore initial layout", Box::new(RestoreLayout))
+                            .separator()
+                            .menu("Settings…", Box::new(OpenSettings))
+                    }),
+            )
+            .child(
+                div().w(px(search_width)).flex_shrink_0().px_2().child(
+                    Input::new(&self.search)
+                        .id("music-search")
+                        .aria_label("Search music")
+                        .small()
+                        .prefix(Icon::new(Glyph::Search).size_3()),
+                ),
+            )
+            .into_any_element()
+    }
+}
