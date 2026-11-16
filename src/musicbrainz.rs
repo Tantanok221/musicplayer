@@ -178,15 +178,13 @@ impl MusicBrainz {
 
     /// Finds an artist the server has no MusicBrainz ID for. Namesakes are
     /// common, so a candidate counts only if it alone shares a release title
-    /// with the library. `titles` are folded library album titles.
+    /// with the library. `titles` are folded library album titles. With no
+    /// titles (an artist the library lacks), only a unique name match counts.
     pub async fn resolve_artist(
         &self,
         name: &str,
         titles: &HashSet<String>,
     ) -> Result<Option<String>> {
-        if titles.is_empty() {
-            return Ok(None);
-        }
         let phrase = name.replace(['"', '\\'], " ");
         let found = self
             .get(
@@ -216,6 +214,12 @@ impl MusicBrainz {
             .filter_map(|artist| artist["id"].as_str().map(str::to_string))
             .take(3)
             .collect::<Vec<_>>();
+        if titles.is_empty() {
+            return Ok(match candidates.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            });
+        }
         let mut best: Option<(usize, String)> = None;
         let mut tied = false;
         for id in candidates {

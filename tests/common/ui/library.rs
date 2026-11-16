@@ -1,4 +1,4 @@
-use super::{ARTIST, Fixture, SECOND_ARTIST};
+use super::{ARTIST, Fixture, SECOND_ARTIST, UNOWNED_ARTIST};
 use sonora::{model::LibraryQuery, service::Event};
 
 impl Fixture {
@@ -52,8 +52,12 @@ impl Fixture {
     pub(super) fn respond_artist(&mut self, request: u64, name: String, id: String) {
         self.trace.push(format!("Artist({request}) -> Artist"));
         assert!(
-            [(ARTIST, "artist-1"), (SECOND_ARTIST, "artist-2")]
-                .contains(&(name.as_str(), id.as_str()))
+            [
+                (ARTIST, "artist-1"),
+                (SECOND_ARTIST, "artist-2"),
+                (UNOWNED_ARTIST, ""),
+            ]
+            .contains(&(name.as_str(), id.as_str()))
         );
         let event = Event::Artist(request, self.catalog.artist_page(&name, &id).unwrap());
         if self.hold_artists {

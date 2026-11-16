@@ -28,6 +28,8 @@ pub(crate) const ARTIST: &str = "ONE OK ROCK";
 pub(crate) const ARTIST_TARGET: &str = "navigator-facet-Album Artist-ONE OK ROCK";
 pub(crate) const SECOND_ARTIST: &str = "宇多田ヒカル";
 pub(crate) const SECOND_ARTIST_TARGET: &str = "navigator-facet-Album Artist-宇多田ヒカル";
+/// A similar artist with no songs in the seeded catalog.
+pub(crate) const UNOWNED_ARTIST: &str = "Stranger Band";
 pub(crate) const MUTATION_ERROR: &str =
     "Fixture server rejected album update. Retry when connected.";
 

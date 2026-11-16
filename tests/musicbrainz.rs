@@ -156,6 +156,9 @@ async fn artists(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
             {"id": "right", "name": "C.H.S"},
             {"id": "other", "name": "Someone Else"}
         ]})
+    } else if query["query"].contains("Loner") {
+        json!({"artists": [{"id": "loner", "name": "Loner"},
+                           {"id": "other", "name": "Someone Else"}]})
     } else if query["query"].contains("Twins") {
         json!({"artists": [{"id": "twin-a", "name": "Twins"},
                            {"id": "twin-b", "name": "Other", "aliases": [{"name": "TWINS"}]}]})
@@ -271,6 +274,33 @@ async fn namesakes_resolve_only_through_a_shared_release() {
     // Two candidates that fit equally well are not guessed between.
     let shared = [fold("Shared Title")].into();
     assert_eq!(client.resolve_artist("Twins", &shared).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_artist_with_no_owned_releases_resolves_only_by_a_unique_name() {
+    let client = client().await;
+    let nothing = Default::default();
+    assert_eq!(
+        client
+            .resolve_artist("Loner", &nothing)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("loner")
+    );
+    // Namesakes and alias clashes still are not guessed between.
+    assert_eq!(
+        client.resolve_artist("C.H.S", &nothing).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        client.resolve_artist("Twins", &nothing).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        client.resolve_artist("Nobody", &nothing).await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

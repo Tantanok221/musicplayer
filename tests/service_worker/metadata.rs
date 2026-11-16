@@ -1,7 +1,8 @@
-use crate::fixture::{Fixture, Library, Request, WAIT, event, synced};
+use crate::fixture::{Fixture, Library, Request, WAIT, album, event, song, synced};
 use sonora::{
     artists::cache_key,
     discography::Discography,
+    model::{Album, Track},
     service::{Command, Event},
 };
 
@@ -60,6 +61,51 @@ fn missing_releases_are_listed_newest_first() {
             .collect::<Vec<_>>(),
         ["newest", "newer", "popular-old", "undated"]
     );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn artist_not_in_the_library_still_gets_a_page_and_its_discography() {
+    // The library holds only someone else's music.
+    let fixture = Fixture::new(Library {
+        tracks: vec![Track {
+            artist: "Someone Else".into(),
+            artist_id: "someone".into(),
+            album_artist: "Someone Else".into(),
+            ..song("their-song", "their-album")
+        }],
+        albums: vec![Album {
+            artist: "Someone Else".into(),
+            artist_id: "someone".into(),
+            ..album("their-album")
+        }],
+        artist_mbid: "",
+        ..Library::default()
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    // Similar artists outside the library have no server ID.
+    worker
+        .service()
+        .send(Command::Artist(7, "Fixture Artist".into(), String::new()));
+    let Event::Artist(_, page) = event(&worker, |event| matches!(event, Event::Artist(7, _)))
+    else {
+        unreachable!()
+    };
+    assert!(page.albums.is_empty() && page.tracks.is_empty());
+    let Event::Discography(_, result) = event(
+        &worker,
+        |event| matches!(event, Event::Discography(_, result) if !result.loading),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(result.missing.len(), 1);
+    assert_eq!(result.missing[0].id, "missing-release");
+    assert_eq!(count(&fixture, "metadata/artist-search"), 1);
+    // With nothing owned there is no release to cross-check against.
+    assert_eq!(count(&fixture, "metadata/artist-check"), 0);
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

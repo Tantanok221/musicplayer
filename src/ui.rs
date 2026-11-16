@@ -1,7 +1,7 @@
 use crate::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
 use crate::{
     artists::{
-        ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, lastfm_url, profile_url,
+        ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, profile_url,
         search_releases,
     },
     artwork::Priority,

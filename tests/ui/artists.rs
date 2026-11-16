@@ -1,7 +1,10 @@
-use crate::common::ui::{ARTIST, ARTIST_TARGET, SECOND_ARTIST, SECOND_ARTIST_TARGET, start};
+use crate::common::ui::{
+    ARTIST, ARTIST_TARGET, SECOND_ARTIST, SECOND_ARTIST_TARGET, UNOWNED_ARTIST, start,
+};
 use gpui_kit::{AppContext, TestAppContext, test::TestWindowExt};
 use sonora::{
-    artists::{ArtistProfile, TopSongs, cache_key},
+    artists::{ArtistProfile, SimilarArtist, TopSongs, cache_key},
+    discography::{DiscographyView, MissingRelease},
     service::Event,
 };
 use std::sync::Arc;
@@ -66,7 +69,7 @@ fn stale_artist_and_late_enrichment_do_not_replace_the_newer_page(cx: &mut TestA
 fn failed_release_details_can_be_reopened_and_hidden_through_the_ui(cx: &mut TestAppContext) {
     use crate::downloads::{reveal, start_missing_with_details};
     use sonora::{
-        discography::{DiscographyView, ReleaseDetails, ReleaseTrack},
+        discography::{ReleaseDetails, ReleaseTrack},
         service::Command,
     };
     let (_dir, mut f, window) =
@@ -121,4 +124,90 @@ fn failed_release_details_can_be_reopened_and_hidden_through_the_ui(cx: &mut Tes
     })
     .unwrap();
     f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn unowned_similar_artist_opens_its_artist_page_with_a_not_in_library_label(
+    cx: &mut TestAppContext,
+) {
+    use crate::downloads::reveal;
+    let (_dir, mut f, window, app) = start(cx);
+    f.click(window, "new-tab", cx);
+    f.click(window, ARTIST_TARGET, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("artist-release-album-1").visible());
+        assert!(window.try_find("artist-not-in-library").is_none());
+    })
+    .unwrap();
+    f.backend.emit(Event::ArtistProfile(
+        cache_key(ARTIST, "artist-1"),
+        Arc::new(ArtistProfile {
+            name: ARTIST.into(),
+            complete: true,
+            similar: vec![
+                SimilarArtist {
+                    name: SECOND_ARTIST.into(),
+                    id: "artist-2".into(),
+                    in_library: true,
+                    ..Default::default()
+                },
+                SimilarArtist {
+                    name: UNOWNED_ARTIST.into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }),
+    ));
+    f.settle(window, cx);
+    let card = format!("similar-{UNOWNED_ARTIST}");
+    let owned = format!("similar-{SECOND_ARTIST}");
+    reveal(&mut f, window, card.clone(), cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find(card.clone()).label(),
+            Some("Open artist Stranger Band, not in your library")
+        );
+        assert_eq!(
+            window.find(owned.clone()).label(),
+            Some(format!("Open artist {SECOND_ARTIST}").as_str())
+        );
+    })
+    .unwrap();
+
+    // The click stays in the app: the artist page opens instead of Last.fm.
+    f.click(window, card.clone(), cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("artist-release-album-1").is_none());
+        let label = window.find("artist-not-in-library");
+        assert!(label.visible());
+        assert_eq!(
+            label.label(),
+            Some("Not in your library: no songs from this artist")
+        );
+    })
+    .unwrap();
+
+    // Its discography still fills in as missing releases.
+    f.backend.emit(Event::Discography(
+        cache_key(UNOWNED_ARTIST, ""),
+        Arc::new(DiscographyView {
+            loading: false,
+            missing: vec![MissingRelease {
+                id: "stranger-debut".into(),
+                title: "Stranger Debut".into(),
+                kind: "Album".into(),
+                core: true,
+                ..Default::default()
+            }],
+        }),
+    ));
+    f.settle(window, cx);
+    reveal(&mut f, window, "missing-release-stranger-debut", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("missing-release-stranger-debut").visible());
+    })
+    .unwrap();
+    f.assert_script_finished();
+    f.diagnose("unowned similar artist page", window, &app, cx);
 }

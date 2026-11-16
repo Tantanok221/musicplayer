@@ -99,16 +99,23 @@ impl MusicApp {
             let songs = self.artist_songs(cx);
             let missing = self.missing_releases(&name, cx);
             let similar = self.similar_artists(profile, cx);
+            // An unowned artist already says so in the header.
+            let owned = self
+                .artist_data
+                .as_ref()
+                .is_none_or(|data| data.owned_tracks > 0);
             return page()
                 .child(header)
                 .child(songs)
                 .children(missing)
                 .child(similar)
-                .child(
-                    div()
-                        .text_color(colors.muted)
-                        .child("No releases for this artist in your library."),
-                )
+                .when(owned, |page| {
+                    page.child(
+                        div()
+                            .text_color(colors.muted)
+                            .child("No releases for this artist in your library."),
+                    )
+                })
                 .into_any_element();
         }
         self.sync_artist_rows(&albums);
@@ -261,6 +268,10 @@ impl MusicApp {
         let colors = ink(cx);
         let name = self.artist_name.clone().unwrap_or_default();
         let profile = self.current_profile();
+        let unowned = self
+            .artist_data
+            .as_ref()
+            .is_some_and(|data| data.albums.is_empty() && data.owned_tracks == 0);
         let data = self.artist_data.clone().unwrap_or_default();
         let fallback = albums
             .first()
@@ -291,7 +302,25 @@ impl MusicApp {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(name.clone()),
                         )
-                        .child(
+                        .child(if unowned {
+                            div()
+                                .id("artist-not-in-library")
+                                .test_support()
+                                .aria_label("Not in your library: no songs from this artist")
+                                .mt_1()
+                                .flex()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(colors.line)
+                                        .text_size(px(10.))
+                                        .text_color(colors.muted)
+                                        .child("Not in your library"),
+                                )
+                                .into_any_element()
+                        } else {
                             div()
                                 .mt_1()
                                 .text_size(px(11.))
@@ -300,8 +329,9 @@ impl MusicApp {
                                     "{} release{} in your library",
                                     albums.len(),
                                     if albums.len() == 1 { "" } else { "s" }
-                                )),
-                        ),
+                                ))
+                                .into_any_element()
+                        }),
                 ),
         );
         if let Some(profile) = &profile {
@@ -659,16 +689,13 @@ impl MusicApp {
             cards = cards.child(
                 div()
                     .id(SharedString::from(format!("similar-{}", item.name)))
+                    .test_support()
                     .role(Role::Button)
-                    .aria_label(format!(
-                        "{} {}",
-                        if item.in_library {
-                            "Open artist"
-                        } else {
-                            "View on Last.fm:"
-                        },
-                        item.name
-                    ))
+                    .aria_label(if item.in_library {
+                        format!("Open artist {}", item.name)
+                    } else {
+                        format!("Open artist {}, not in your library", item.name)
+                    })
                     .w(px(112.))
                     .min_w_0()
                     .flex()
@@ -701,12 +728,9 @@ impl MusicApp {
                     .when(!item.in_library, |card| {
                         card.child(div().text_size(px(9.)).child("Not in your library"))
                     })
+                    // Unowned artists still get a page: discography, profile and similar artists.
                     .on_click(cx.listener(move |app, _, window, cx| {
-                        if item.in_library {
-                            app.open_artist(item.name.clone(), item.id.clone(), window, cx);
-                        } else {
-                            cx.open_url(&lastfm_url(&item.name));
-                        }
+                        app.open_artist(item.name.clone(), item.id.clone(), window, cx);
                     })),
             );
         }

@@ -70,6 +70,8 @@ pub struct ArtistPageData {
     pub tracks: Vec<Arc<Track>>,
     pub most_played: Vec<Arc<Track>>,
     pub genres: Vec<String>,
+    /// Library songs credited to the artist, including guest spots on other releases.
+    pub owned_tracks: usize,
 }
 /// One release kept by an artist-page search, with the songs whose titles matched.
 pub struct ReleaseHit {

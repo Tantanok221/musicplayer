@@ -291,6 +291,22 @@ async fn navidrome(
                 json!({"status":"ok","topSongs":{"song":[]}})
             }
         }
+        // A profile lookup by name for an artist the server does not have.
+        "search3.view"
+            if query
+                == Request::new(
+                    "",
+                    &[
+                        ("query", "Fixture Artist"),
+                        ("artistCount", "500"),
+                        ("albumCount", "0"),
+                        ("songCount", "0"),
+                    ],
+                )
+                .params =>
+        {
+            json!({"status":"ok","searchResult3":{"artist":[]}})
+        }
         "search3.view" => {
             let (kind, offset_key) = if query.get("songCount").map(String::as_str) == Some("500") {
                 ("song", "songOffset")
