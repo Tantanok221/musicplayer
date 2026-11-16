@@ -129,6 +129,10 @@ cargo test
 
 GitHub Actions runs formatting checks, plus Clippy and tests on macOS and Linux,
 for pushes and pull requests using the pinned Rust toolchain and locked dependencies.
+`scripts/test-ui.sh` runs production-view navigation, album feedback, and SQLite
+restart scenarios with controlled services. CI saves state/layout diagnostics as
+artifacts. See [the agent verification guide](docs/TESTING.md) for the test
+boundaries, focused commands, and instructions for adding feature scenarios.
 `Cargo.toml` denies Clippy's `perf` group and selected checks for redundant clones,
 large futures, debug macros, TODO macros, and undocumented unsafe blocks. Clippy's
 default checks remain enabled; CI also treats every warning as an error.
