@@ -73,6 +73,8 @@ pub enum PlayerCommand {
     Server(Server),
     Replace(Vec<Arc<Track>>, usize),
     Restore(Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
+    /// Restore an account's queue and change its persistence owner atomically.
+    RestoreAccount(String, Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
     Insert(Vec<Arc<Track>>, Placement),
     Remove(usize),
     Move(usize, usize),
@@ -95,7 +97,7 @@ pub enum PlayerCommand {
 #[derive(Clone, Debug)]
 pub enum PlayerEvent {
     Snapshot(PlaybackSnapshot),
-    Persist(SavedQueue),
+    Persist(String, SavedQueue),
     Scrobble(ListenReport),
     Error(String),
 }
@@ -920,6 +922,7 @@ fn run(
     let mut output_id = platform.output_id();
     let mut last_device_check = Instant::now();
     let mut queue: Vec<Arc<Track>> = Vec::new();
+    let mut queue_account = String::new();
     let mut queue_edits = QueueEdits::default();
     let mut index = None;
     let mut base_position = 0.;
@@ -1046,6 +1049,7 @@ fn run(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
+                    | PlayerCommand::RestoreAccount(..)
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
@@ -1054,26 +1058,33 @@ fn run(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
+                    | PlayerCommand::RestoreAccount(..)
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::UpdateTrack(..)
             );
+            if let PlayerCommand::RestoreAccount(namespace, ..) = &command {
+                queue_account = namespace.clone();
+            }
             match command {
                 PlayerCommand::Shutdown => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
                     drop(output.take());
                     drain_listens(&clock, &mut tracker, &mut listen_seed, &events);
-                    let _ = events.send(PlayerEvent::Persist(SavedQueue {
-                        listen: tracker.session(listen_seed),
-                        ids: queue.iter().map(|t| t.id.clone()).collect(),
-                        index,
-                        position: if started {
-                            position(&clock)
-                        } else {
-                            base_position
+                    let _ = events.send(PlayerEvent::Persist(
+                        queue_account,
+                        SavedQueue {
+                            listen: tracker.session(listen_seed),
+                            ids: queue.iter().map(|t| t.id.clone()).collect(),
+                            index,
+                            position: if started {
+                                position(&clock)
+                            } else {
+                                base_position
+                            },
                         },
-                    }));
+                    ));
                     return Ok(());
                 }
                 PlayerCommand::Server(value) => server = Some(value),
@@ -1115,7 +1126,8 @@ fn run(
                     clock.playing.store(true, Ordering::Relaxed);
                     restart = true;
                 }
-                PlayerCommand::Restore(tracks, at, pos, listen) => {
+                PlayerCommand::Restore(tracks, at, pos, listen)
+                | PlayerCommand::RestoreAccount(_, tracks, at, pos, listen) => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
                     drop(output.take());
                     pending_output = None;
@@ -1547,16 +1559,19 @@ fn run(
             || (clock.playing.load(Ordering::Relaxed)
                 && last_persist.elapsed() >= Duration::from_secs(3))
         {
-            let _ = events.send(PlayerEvent::Persist(SavedQueue {
-                listen: tracker.session(listen_seed),
-                ids: queue.iter().map(|t| t.id.clone()).collect(),
-                index,
-                position: if started {
-                    position(&clock)
-                } else {
-                    base_position
+            let _ = events.send(PlayerEvent::Persist(
+                queue_account.clone(),
+                SavedQueue {
+                    listen: tracker.session(listen_seed),
+                    ids: queue.iter().map(|t| t.id.clone()).collect(),
+                    index,
+                    position: if started {
+                        position(&clock)
+                    } else {
+                        base_position
+                    },
                 },
-            }));
+            ));
             last_persist = Instant::now();
         }
         // Reopen the output after a device failure through Retry; source state stays in the actor.

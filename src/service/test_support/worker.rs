@@ -20,12 +20,21 @@ pub struct Worker {
     player_commands: Receiver<PlayerCommand>,
     finished: Receiver<Result<(), String>>,
     thread: Option<JoinHandle<()>>,
+    player_threads: Vec<JoinHandle<()>>,
 }
 
 impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
     /// The supplied metadata client must use fixture endpoints in isolated tests.
     pub fn start(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
+        Self::start_inner(paths, metadata, false)
+    }
+
+    pub fn start_paused(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
+        Self::start_inner(paths, metadata, true)
+    }
+
+    fn start_inner(paths: Paths, metadata: MusicBrainz, paused: bool) -> Result<Self> {
         let (tx, commands) = flume::unbounded();
         let (events, received_events) = flume::unbounded();
         let (player, player_commands) = crate::playback::PlayerHandle::controlled();
@@ -34,6 +43,19 @@ impl Worker {
             player,
             query_epoch: Arc::new(AtomicU64::new(0)),
         };
+        let mut service = service;
+        let mut player_threads = Vec::new();
+        if paused {
+            let (player, player_events, thread) =
+                crate::playback::test_support::start_worker_player()?;
+            service.player = player;
+            player_threads.push(thread);
+            let command_tx = service.tx.clone();
+            let event_tx = events.clone();
+            player_threads.push(thread::spawn(move || {
+                super::super::forward_player_events(player_events, command_tx, event_tx)
+            }));
+        }
         let worker = service.clone();
         let (finished, received_finish) = flume::bounded(1);
         let thread = thread::Builder::new()
@@ -65,6 +87,7 @@ impl Worker {
             player_commands,
             finished: received_finish,
             thread: Some(thread),
+            player_threads,
         })
     }
 
@@ -101,22 +124,24 @@ impl Worker {
         let remaining = || deadline.saturating_duration_since(Instant::now());
         let (ack, received_ack) = flume::bounded(1);
         self.service.tx.send(Command::Shutdown(ack))?;
-        let mut saved = false;
-        loop {
-            match self
-                .player_commands
-                .recv_timeout(remaining())
-                .context("controlled player shutdown")?
-            {
-                PlayerCommand::SaveQueue(reply) => {
-                    reply.send(SavedQueue::default())?;
-                    saved = true;
+        if self.player_threads.is_empty() {
+            let mut saved = false;
+            loop {
+                match self
+                    .player_commands
+                    .recv_timeout(remaining())
+                    .context("controlled player shutdown")?
+                {
+                    PlayerCommand::SaveQueue(reply) => {
+                        reply.send(SavedQueue::default())?;
+                        saved = true;
+                    }
+                    PlayerCommand::Shutdown => break,
+                    _ => {}
                 }
-                PlayerCommand::Shutdown => break,
-                _ => {}
             }
+            ensure!(saved, "worker skipped the queue-save handshake");
         }
-        ensure!(saved, "worker skipped the queue-save handshake");
         received_ack
             .recv_timeout(remaining())
             .context("worker shutdown acknowledgement")?;
@@ -129,6 +154,11 @@ impl Worker {
             .expect("worker thread")
             .join()
             .map_err(|_| anyhow::anyhow!("worker thread panicked"))?;
+        for thread in self.player_threads.drain(..) {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("player or event bridge panicked"))?;
+        }
         result.map_err(anyhow::Error::msg)
     }
 }

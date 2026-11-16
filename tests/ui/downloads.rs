@@ -74,7 +74,7 @@ fn job(state: JobState, done: u32) -> DownloadJob {
     }
 }
 
-fn reveal(
+pub(super) fn reveal(
     fixture: &mut Fixture,
     window: AnyWindowHandle,
     id: impl Into<ElementId>,
@@ -118,6 +118,13 @@ fn reveal(
 }
 
 fn start_missing(cx: &mut TestAppContext) -> (tempfile::TempDir, Fixture, AnyWindowHandle) {
+    start_missing_with_details(cx, Ok(ReleaseDetails::default()))
+}
+
+pub(super) fn start_missing_with_details(
+    cx: &mut TestAppContext,
+    details: Result<ReleaseDetails, String>,
+) -> (tempfile::TempDir, Fixture, AnyWindowHandle) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         cx.bind_keys(sonora::ui::tab_bindings());
@@ -148,11 +155,11 @@ fn start_missing(cx: &mut TestAppContext) -> (tempfile::TempDir, Fixture, AnyWin
     ));
     fixture.settle(window, cx);
     reveal(&mut fixture, window, "missing-release-missing", cx);
-    fixture.expect("missing release details", |command, _| {
+    fixture.expect("missing release details", move |command, _| {
         assert!(matches!(command, Command::ReleaseDetails(id) if id == "missing"));
         vec![Event::ReleaseDetails(
             "missing".into(),
-            Ok(Arc::new(ReleaseDetails::default())),
+            details.map(Arc::new),
         )]
     });
     fixture.click(window, "missing-release-missing", cx);

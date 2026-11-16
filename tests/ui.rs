@@ -20,6 +20,12 @@ mod tabs;
 #[path = "ui/worker.rs"]
 mod worker;
 // This target shares the strict HTTP fixture, not its worker-only scenarios.
+#[path = "ui/artists.rs"]
+mod artists;
+#[path = "ui/large_library.rs"]
+mod large_library;
+#[path = "ui/song_feedback.rs"]
+mod song_feedback;
 #[allow(dead_code)]
 #[path = "service_worker/fixture.rs"]
 mod worker_fixture;

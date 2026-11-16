@@ -76,7 +76,7 @@ impl PausedPlayer {
                 .context("paused player snapshot")?
             {
                 PlayerEvent::Snapshot(snapshot) => return Ok(snapshot),
-                PlayerEvent::Persist(_) => {}
+                PlayerEvent::Persist(..) => {}
                 _ => bail!("unexpected event from paused player"),
             }
         }
@@ -104,4 +104,28 @@ impl Drop for PausedPlayer {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::from_secs(5));
     }
+}
+
+/// Production actor with the headless platform, for worker persistence scenarios.
+/// The caller must keep playback paused and join after the shutdown handshake.
+pub(crate) fn start_worker_player()
+-> Result<(super::PlayerHandle, Receiver<PlayerEvent>, JoinHandle<()>)> {
+    let (handle, commands) = super::PlayerHandle::controlled();
+    let clock = handle.clock.clone();
+    let (events, received) = flume::unbounded();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        run(
+            commands,
+            events,
+            runtime.handle().clone(),
+            clock,
+            PlaybackPlatform::Headless,
+        )
+        .unwrap();
+    });
+    Ok((handle, received, thread))
 }

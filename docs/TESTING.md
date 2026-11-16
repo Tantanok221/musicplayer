@@ -61,9 +61,9 @@ cargo test --locked --features test-support --test ui album_feedback:: -- --noca
 
 | Layer | Target and root | Feature modules | Shared fixture |
 | --- | --- | --- | --- |
-| Production view, controlled service | `ui`: `tests/ui.rs` | `tests/ui/{tabs,album_feedback,explorer,playback,playlists,layout,downloads,lyrics}.rs` | `tests/common/ui/` |
+| Production view, controlled service | `ui`: `tests/ui.rs` | `tests/ui/{tabs,album_feedback,song_feedback,explorer,large_library,artists,playback,playlists,layout,downloads,lyrics}.rs` | `tests/common/ui/` |
 | Production view, real worker + loopback HTTP | `ui`: `tests/ui.rs` | `tests/ui/worker.rs` | `tests/service_worker/fixture.rs` |
-| Real service worker + loopback HTTP + SQLite | `service_worker`: `tests/service_worker.rs` | `tests/service_worker/{feedback,sync,preferences,metadata,lifecycle}.rs` | `tests/service_worker/fixture.rs` |
+| Real service worker + loopback HTTP + SQLite | `service_worker`: `tests/service_worker.rs` | `tests/service_worker/{feedback,sync,preferences,metadata,lifecycle,queue,scrobbles,accounts,connection,artists,artwork}.rs` | `tests/service_worker/fixture.rs` |
 | Real paused player actor | `player_queue`: `tests/player_queue.rs` | single file | `playback::test_support` |
 | Ordinary domain/HTTP/catalog tests | one target per `tests/*.rs` | n/a | per file |
 
@@ -81,6 +81,60 @@ Rules:
   Prefer scenario-local `Fixture::expect` replies over new shared defaults.
 - Scenario names describe the behavior and outcome. Refer to a scenario by its
   full `module::name` in docs and review evidence.
+
+## Queue, accounts, reconnect and deferred coverage
+
+The nine-gap follow-up adds 12 worker and 7 UI scenarios (18 worker, 33 UI,
+and 2 paused-player scenarios in total). Run each feature independently:
+
+```sh
+scripts/test-service.sh queue::
+scripts/test-service.sh scrobbles::
+scripts/test-service.sh accounts::
+scripts/test-service.sh connection::
+scripts/test-service.sh artists::
+scripts/test-service.sh artwork::
+scripts/test-ui.sh artists::
+scripts/test-ui.sh song_feedback::
+scripts/test-ui.sh large_library::
+scripts/test-ui.sh worker::
+```
+
+| Module | Added behavior |
+| --- | --- |
+| worker `queue` | Duplicate order/index/position/listen survive a joined worker and player restart; missing predecessors remap the current occurrence; a missing current song resets position/listen; fully missing queues restore safely |
+| worker `scrobbles` | One exact HTTP submission and confirmed SQLite state, terminal rejection, startup/established offline pending submission and one reconnect send, restart during a held response with no duplicate |
+| worker `accounts` | Missing account publishes SignInRequired; Connect opens its own SQLite file; distinct A/B catalogs, queues and preferences; switch refusal during held sync; delayed saves from the old account rejected |
+| worker `connection` | Explicit CheckConnection(true) forces the production check without a timer wait; cached library and PlayTrack command survive failure; reconnect sync imports new music |
+| worker `artists` | Catalog artist page is published before optional enrichment; failed profile/top-song HTTP remains usable and profile recovers; release details HTTP/cache/restart and persistent HideRelease |
+| worker `artwork` | Download, thumbnails, disk-cache reuse, backdrop disk artifact, account namespace rejection, bounded 2s/4s retry backoff, exhaustion and Refresh recovery |
+| UI `artists` | Older Artist(request_id) cannot replace the newer page; late/empty optional enrichment retains navigation; failed release details reopen successfully and Hide removes the selected release |
+| UI `song_feedback` | Actual favorite/rating clicks, immediate visible state, rollback, exact Retry intent and confirmation |
+| UI `large_library` | 5,000 tracks/1,000 albums in isolated SQLite; real wheel input triggers Page at offset 500; previously offscreen domain rows show the matching album; Album and Tracks and Album Covers also scroll with correct IDs |
+| real-worker UI `worker` | Sign-in fields/Connect reach HTTP/catalog; Refresh shows sync status and new Explorer albums; offline indicator, cached selection/PlayAlbum intent and Retry reconnect/re-sync |
+
+`Worker::start_paused` runs the production headless player actor and the same
+player-event bridge as the normal application. Queue-save acknowledgement,
+worker runtime teardown, player teardown and bridge teardown are joined.
+Account restoration changes the queue and its persistence namespace atomically;
+old-account saves cannot replace the newly active catalog state. Switching also
+saves the outgoing queue before replacing the catalog.
+
+Artwork's test-only `Command::ArtworkTime` advances a worker-owned backoff clock
+and reads its next retry deadline. Tests wait for real HTTP completions using
+bounded channel acknowledgements; they never sleep through backoff. The normal
+build uses the same queue/timer with zero clock offset. Connection tests use the
+existing explicit CheckConnection(true) command and the real ping path.
+
+The HTTP fixture can hold sync or scrobble replies and return server-unavailable
+responses on the same bound loopback address. Recorded requests strip auth
+parameters before storage/logging. Held scrobble requests are validated when
+accepted, even if the client shuts down before receiving the reply.
+
+These are in-process tests. Offline playback coverage proves cached selection
+and real worker-to-player play intent; it does not prove physical audio output
+or imply that uncached audio streams can play without a server. Native AX,
+pixel rendering, packaged-process relaunch and physical audio remain separate.
 
 ## First protected workflow
 

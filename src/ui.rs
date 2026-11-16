@@ -367,7 +367,7 @@ fn credential_field(
     let item = SettingItem::new(
         title,
         SettingField::render(move |options, _, _| {
-            let field = Input::new(&input).with_size(options.size());
+            let field = Input::new(&input).id(title).with_size(options.size());
             if options.layout() == Axis::Vertical {
                 field.w_full()
             } else {
@@ -3384,6 +3384,19 @@ impl MusicApp {
     }
     fn track_feedback(&self, track: Arc<Track>, key: String, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .id(SharedString::from(format!("song-feedback-{key}")))
+            .test_support()
+            .role(Role::Group)
+            .aria_label(format!(
+                "{}: {}, rating {} of 5",
+                track.title,
+                if track.starred.is_some() {
+                    "favorite"
+                } else {
+                    "not favorite"
+                },
+                track.user_rating.unwrap_or(0)
+            ))
             .flex()
             .items_center()
             .flex_shrink_0()
@@ -3553,8 +3566,14 @@ impl MusicApp {
         let menu = self.track_menu(track.clone(), queue_index, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
+            .test_support()
             .role(Role::Group)
-            .aria_label(format!("{} · {}", track.title, track.artist_label()))
+            .aria_label(format!(
+                "{} · {} · {}",
+                track.title,
+                track.artist_label(),
+                track.album
+            ))
             .w_full()
             .min_w_0()
             .h(px(27.))
@@ -3822,6 +3841,10 @@ impl MusicApp {
             );
         }
         div()
+            .id(SharedString::from(format!("album-panel-{}", album.id)))
+            .test_support()
+            .role(Role::Group)
+            .aria_label(format!("Album {} by {}", album.name, album.artist))
             .w_full()
             .min_w_0()
             .px_3()
@@ -4550,10 +4573,15 @@ impl MusicApp {
                 );
             }
             Some(Err(error)) => {
+                let message = format!("Could not load the track list: {error}");
                 right = right.child(
                     div()
+                        .id("release-details-error")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(message.clone())
                         .pt_2()
-                        .child(note(format!("Could not load the track list: {error}"))),
+                        .child(note(message)),
                 );
             }
             Some(Ok(details)) if details.tracks.is_empty() => {
@@ -4582,6 +4610,13 @@ impl MusicApp {
                     }
                     right = right.child(
                         div()
+                            .id(SharedString::from(format!(
+                                "release-detail-track-{}-{}-{}",
+                                release.id, track.disc, track.number
+                            )))
+                            .test_support()
+                            .role(Role::Group)
+                            .aria_label(track.title.clone())
                             .w_full()
                             .min_w_0()
                             .h(px(27.))
@@ -5210,7 +5245,8 @@ impl MusicApp {
                 range
                     .map(|index| {
                         if let Some(track) = app.tracks.get(index).cloned() {
-                            app.track_row(track, index + 1, format!("flat-{index}"), None, None, cx)
+                            let key = format!("flat-{}", track.id);
+                            app.track_row(track, index + 1, key, None, None, cx)
                         } else {
                             div()
                                 .h(px(27.))
@@ -7700,6 +7736,9 @@ impl MusicApp {
         let quiet = |id: &'static str, color: u32, label: &'static str, hint: &'static str| {
             div()
                 .id(id)
+                .test_support()
+                .role(Role::Status)
+                .aria_label(label)
                 .mr_2()
                 .flex()
                 .flex_shrink_0()
@@ -7730,6 +7769,7 @@ impl MusicApp {
                 Some(
                     div()
                         .id("server-offline")
+                        .test_support()
                         .mr_2()
                         .flex()
                         .flex_shrink_0()

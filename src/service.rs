@@ -94,6 +94,8 @@ pub enum Command {
     /// Finds a cover in the disk cache; with a priority, downloads it when missing.
     Artwork(String, Option<Priority>),
     ArtworkFinished(String, String, Result<PathBuf, String>),
+    #[cfg(feature = "test-support")]
+    ArtworkTime(Duration, Sender<Option<Duration>>),
     Backdrop(String),
     BackdropFinished(String, String, Result<Backdrop, String>),
     Lyrics(Arc<Track>),
@@ -107,7 +109,7 @@ pub enum Command {
     Mutate(Mutation),
     Preferences(Preferences),
     Player(PlayerCommand),
-    Persist(SavedQueue),
+    Persist(String, SavedQueue),
     Scrobble(ListenReport),
     Connected(Server, String),
     Tracks(i64, Vec<Track>),
@@ -230,34 +232,9 @@ impl Service {
             query_epoch,
         };
         let event_tx = events.clone();
-        let command_tx = tx;
         std::thread::Builder::new()
             .name("sonora-player-events".into())
-            .spawn(move || {
-                let mut playback_failed = false;
-                while let Ok(event) = player_events.recv() {
-                    match event {
-                        PlayerEvent::Snapshot(snapshot) => {
-                            // A new playback error is often the first sign the server went away.
-                            let failed = snapshot.error.is_some();
-                            if failed && !playback_failed {
-                                let _ = command_tx.send(Command::CheckConnection(true));
-                            }
-                            playback_failed = failed;
-                            let _ = event_tx.send(Event::Playback(snapshot));
-                        }
-                        PlayerEvent::Persist(queue) => {
-                            let _ = command_tx.send(Command::Persist(queue));
-                        }
-                        PlayerEvent::Scrobble(report) => {
-                            let _ = command_tx.send(Command::Scrobble(report));
-                        }
-                        PlayerEvent::Error(error) => {
-                            let _ = event_tx.send(Event::Error(error));
-                        }
-                    }
-                }
-            })
+            .spawn(move || forward_player_events(player_events, tx, event_tx))
             .expect("Could not start playback bridge");
         let worker = service.clone();
         std::thread::Builder::new()
@@ -281,6 +258,66 @@ impl Service {
         epoch
     }
 }
+fn forward_player_events(
+    player_events: Receiver<PlayerEvent>,
+    command_tx: Sender<Command>,
+    event_tx: Sender<Event>,
+) {
+    let mut playback_failed = false;
+    while let Ok(event) = player_events.recv() {
+        match event {
+            PlayerEvent::Snapshot(snapshot) => {
+                // A new playback error is often the first sign the server went away.
+                let failed = snapshot.error.is_some();
+                if failed && !playback_failed {
+                    let _ = command_tx.send(Command::CheckConnection(true));
+                }
+                playback_failed = failed;
+                let _ = event_tx.send(Event::Playback(snapshot));
+            }
+            PlayerEvent::Persist(namespace, queue) => {
+                let _ = command_tx.send(Command::Persist(namespace, queue));
+            }
+            PlayerEvent::Scrobble(report) => {
+                let _ = command_tx.send(Command::Scrobble(report));
+            }
+            PlayerEvent::Error(error) => {
+                let _ = event_tx.send(Event::Error(error));
+            }
+        }
+    }
+}
+
+/// Resolve saved occurrences individually so missing predecessors do not move
+/// the current entry. A missing current entry starts its replacement at zero.
+fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) -> Result<()> {
+    let queue: SavedQueue = catalog.state("queue")?;
+    let current = queue.index.unwrap_or(0);
+    let mut tracks = Vec::new();
+    let mut index = None;
+    let mut same = false;
+    for (at, id) in queue.ids.iter().enumerate() {
+        if let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.pop() {
+            if at == current {
+                same = true;
+            }
+            if at >= current && index.is_none() {
+                index = Some(tracks.len());
+            }
+            tracks.push(track);
+        }
+    }
+    let index = index.unwrap_or(tracks.len().saturating_sub(1));
+    player.send(PlayerCommand::RestoreAccount(
+        namespace,
+        tracks,
+        index,
+        if same { queue.position } else { 0. },
+        if same { queue.listen } else { None },
+    ));
+    Ok(())
+}
+
 fn catalog_path(paths: &Paths, account: Option<&Account>) -> PathBuf {
     paths.data.join(format!(
         "{}.sqlite",
@@ -553,6 +590,16 @@ fn reconnect(
     true
 }
 
+#[derive(Default)]
+struct ArtworkClock {
+    offset: Duration,
+}
+impl ArtworkClock {
+    fn now(&self) -> Instant {
+        Instant::now() + self.offset
+    }
+}
+
 fn run(
     paths: Paths,
     runtime: tokio::runtime::Handle,
@@ -571,13 +618,11 @@ fn run(
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
     player.send(PlayerCommand::Preferences(prefs.clone()));
-    let queue: SavedQueue = catalog.state("queue")?;
-    player.send(PlayerCommand::Restore(
-        catalog.by_ids(&queue.ids)?,
-        queue.index.unwrap_or(0),
-        queue.position,
-        queue.listen,
-    ));
+    restore_queue(
+        &catalog,
+        &player,
+        account.as_ref().map(Account::namespace).unwrap_or_default(),
+    )?;
     events.send(Event::Ready(account.clone(), prefs))?;
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     events.send(Event::Status(
@@ -596,6 +641,9 @@ fn run(
         if checking {
             set_connection(&mut connection, Connection::Connecting, &events);
         }
+    }
+    if account.is_none() {
+        events.send(Event::SignInRequired(SIGN_IN_NOTICE.into()))?;
     }
     {
         let ticker = tx.clone();
@@ -619,6 +667,10 @@ fn run(
     let mut current_request = 0;
     let mut failed_generations = HashSet::new();
     let mut artwork_queue = ArtworkQueue::default();
+    #[cfg(feature = "test-support")]
+    let mut artwork_clock = ArtworkClock::default();
+    #[cfg(not(feature = "test-support"))]
+    let artwork_clock = ArtworkClock::default();
     let mut profile_requests = HashSet::new();
     let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
     let mut top_song_requests = HashSet::new();
@@ -632,7 +684,7 @@ fn run(
     let mut published = 0;
     loop {
         if let Some(server) = server.clone() {
-            for id in artwork_queue.take_ready(Instant::now()) {
+            for id in artwork_queue.take_ready(artwork_clock.now()) {
                 let server = server.clone();
                 let cache = paths.cache.clone();
                 let tx = tx.clone();
@@ -666,7 +718,9 @@ fn run(
                 });
             }
         }
-        if let Some(server) = server.clone() {
+        if connection == Connection::Online
+            && let Some(server) = server.clone()
+        {
             for report in catalog
                 .pending_scrobbles(&server.account.namespace())?
                 .into_iter()
@@ -689,7 +743,7 @@ fn run(
         // Completed requests wake this actor; only artwork backoff needs a timer.
         let retry = server
             .as_ref()
-            .and_then(|_| artwork_queue.next_retry(Instant::now()));
+            .and_then(|_| artwork_queue.next_retry(artwork_clock.now()));
         let received = match retry {
             Some(wait) => rx.recv_timeout(wait),
             None => rx.recv().map_err(|_| flume::RecvTimeoutError::Disconnected),
@@ -757,18 +811,23 @@ fn run(
                                 "Wait for the current refresh to finish before changing accounts"
                             );
                         }
+                        if account.is_some() {
+                            let (reply, saved) = flume::bounded(1);
+                            player.send(PlayerCommand::SaveQueue(reply));
+                            let saved =
+                                saved.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "Could not save the current queue before changing accounts"
+                                    )
+                                })?;
+                            catalog.set_state("queue", &saved)?;
+                        }
                         artwork_queue = ArtworkQueue::default();
                         profile_pending.clear();
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
                         let prefs: Preferences = catalog.state("preferences")?;
                         player.send(PlayerCommand::Preferences(prefs.clone()));
-                        let queue: SavedQueue = catalog.state("queue")?;
-                        player.send(PlayerCommand::Restore(
-                            catalog.by_ids(&queue.ids)?,
-                            queue.index.unwrap_or(0),
-                            queue.position,
-                            queue.listen,
-                        ));
+                        restore_queue(&catalog, &player, value.account.namespace())?;
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
                         slskd = None;
                         watched.clear();
@@ -782,7 +841,7 @@ fn run(
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
                     server = Some(value.clone());
-                    artwork_queue.retry_failed(Instant::now());
+                    artwork_queue.retry_failed(artwork_clock.now());
                     events.send(Event::Connected(value.account.clone(), label))?;
                     events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                     if !syncing {
@@ -793,7 +852,7 @@ fn run(
                 }
                 Command::Refresh => {
                     catalog.invalidate_artist_profiles()?;
-                    artwork_queue.retry_failed(Instant::now());
+                    artwork_queue.retry_failed(artwork_clock.now());
                     events.send(Event::ArtworkRetrying)?;
                     if let Some(server) = server.clone() {
                         if !syncing {
@@ -1421,6 +1480,11 @@ fn run(
                         events.send(Event::Lyrics(id, result.map(Arc::new)))?;
                     }
                 }
+                #[cfg(feature = "test-support")]
+                Command::ArtworkTime(elapsed, reply) => {
+                    artwork_clock.offset += elapsed;
+                    let _ = reply.send(artwork_queue.next_retry(artwork_clock.now()));
+                }
                 Command::Artwork(id, fetch) => {
                     if let Some(account) = &account {
                         let path = paths
@@ -1433,7 +1497,7 @@ fn run(
                         }
                     }
                     if let Some(priority) = fetch {
-                        artwork_queue.request(id, Instant::now(), priority);
+                        artwork_queue.request(id, artwork_clock.now(), priority);
                     }
                 }
                 Command::Backdrop(id) => {
@@ -1467,11 +1531,11 @@ fn run(
                     {
                         match result {
                             Ok(path) => {
-                                artwork_queue.finished(&id, true, Instant::now());
+                                artwork_queue.finished(&id, true, artwork_clock.now());
                                 publish_artwork(&runtime, &events, id, path);
                             }
                             Err(_) => {
-                                if artwork_queue.finished(&id, false, Instant::now()) {
+                                if artwork_queue.finished(&id, false, artwork_clock.now()) {
                                     events.send(Event::ArtworkFailed(id))?;
                                 }
                             }
@@ -1513,7 +1577,11 @@ fn run(
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;
                 }
-                Command::Persist(queue) => catalog.set_state("queue", &queue)?,
+                Command::Persist(namespace, queue) => {
+                    if namespace == account.as_ref().map(Account::namespace).unwrap_or_default() {
+                        catalog.set_state("queue", &queue)?;
+                    }
+                }
                 Command::Scrobble(report) => {
                     if account.as_ref().map(Account::namespace) == Some(report.account.clone()) {
                         if report.submission {
@@ -1762,6 +1830,23 @@ fn run(
                     if account.as_ref().map(Account::namespace) == Some(namespace) {
                         checking = false;
                         last_check = Instant::now();
+                        let reconnected =
+                            matches!(connection, Connection::Offline(_)) && result.is_ok();
+                        if reconnected {
+                            artwork_queue.retry_failed(artwork_clock.now());
+                            events.send(Event::ArtworkRetrying)?;
+                            if !syncing && let Some(server) = server.clone() {
+                                syncing = true;
+                                generation = chrono::Utc::now().timestamp_micros();
+                                begin_sync(
+                                    server,
+                                    tx.clone(),
+                                    events.clone(),
+                                    &runtime,
+                                    generation,
+                                );
+                            }
+                        }
                         set_connection(
                             &mut connection,
                             match result {

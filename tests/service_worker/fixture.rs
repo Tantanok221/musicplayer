@@ -47,6 +47,11 @@ pub struct Library {
     pub fail_song_offset: Option<usize>,
     pub scanning: bool,
     pub hold_metadata: bool,
+    pub offline: bool,
+    pub hold_sync: bool,
+    pub hold_scrobble: bool,
+    pub fail_artwork: bool,
+    pub fail_enrichment: bool,
 }
 
 impl Default for Library {
@@ -58,6 +63,11 @@ impl Default for Library {
             fail_song_offset: None,
             scanning: false,
             hold_metadata: false,
+            offline: false,
+            hold_sync: false,
+            hold_scrobble: false,
+            fail_artwork: false,
+            fail_enrichment: false,
         }
     }
 }
@@ -99,6 +109,8 @@ struct ServerState {
     data: Arc<Mutex<StateData>>,
     received: flume::Sender<Request>,
     metadata_gate: flume::Receiver<()>,
+    sync_gate: flume::Receiver<()>,
+    scrobble_gate: flume::Receiver<()>,
 }
 
 impl ServerState {
@@ -148,6 +160,10 @@ async fn navidrome(
             | "setRating.view"
             | "getArtist.view"
             | "getTopSongs.view"
+            | "getArtistInfo2.view"
+            | "scrobble.view"
+            | "getSong.view"
+            | "getCoverArt.view"
     ) || query.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -162,6 +178,10 @@ async fn navidrome(
                 | "rating"
                 | "artist"
                 | "count"
+                | "submission"
+                | "time"
+                | "size"
+                | "includeNotPresent"
         )
     }) {
         return state.unexpected("unknown endpoint or parameter");
@@ -171,6 +191,55 @@ async fn navidrome(
         params: query.clone(),
     };
     state.record(request.clone());
+    let (offline, hold_sync, hold_scrobble, fail_artwork) = {
+        let data = state.data.lock().unwrap();
+        (
+            data.library.offline,
+            data.library.hold_sync,
+            data.library.hold_scrobble,
+            data.library.fail_artwork,
+        )
+    };
+    if offline {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if endpoint == "getScanStatus.view" && hold_sync {
+        let _ = state.sync_gate.recv_async().await;
+    }
+    if endpoint == "scrobble.view" {
+        let succeeds = {
+            let mut data = state.data.lock().unwrap();
+            match data.expected_mutations.pop_front() {
+                Some((expected, succeeds)) if expected == request => succeeds,
+                _ => {
+                    data.unexpected.push("unexpected scrobble");
+                    false
+                }
+            }
+        };
+        if hold_scrobble {
+            let _ = state.scrobble_gate.recv_async().await;
+        }
+        return envelope(if succeeds {
+            json!({"status":"ok"})
+        } else {
+            json!({"status":"failed","error":{"code":70,"message":"Fixture scrobble rejected"}})
+        });
+    }
+    if endpoint == "getCoverArt.view" {
+        if query != Request::new("", &[("id", "cover"), ("size", "512")]).params {
+            return state.unexpected("invalid cover request");
+        }
+        if fail_artwork {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let image = image::RgbaImage::from_pixel(32, 32, image::Rgba([120, 40, 80, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        return bytes.into_inner().into_response();
+    }
     let mut data = state.data.lock().unwrap();
     let body = match endpoint.as_str() {
         "ping.view" if query.is_empty() => {
@@ -188,11 +257,33 @@ async fn navidrome(
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
             json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":"mb-artist"}})
         }
+        "getArtistInfo2.view"
+            if query
+                == Request::new(
+                    "",
+                    &[
+                        ("id", "artist"),
+                        ("count", "12"),
+                        ("includeNotPresent", "true"),
+                    ],
+                )
+                .params =>
+        {
+            if data.library.fail_enrichment {
+                json!({"status":"failed", "error":{"code":70,"message":"Fixture enrichment failed"}})
+            } else {
+                json!({"status":"ok", "artistInfo2":{"biography":"Fixture biography"}})
+            }
+        }
         "getTopSongs.view"
             if query
                 == Request::new("", &[("artist", "Fixture Artist"), ("count", "50")]).params =>
         {
-            json!({"status":"ok","topSongs":{"song":[]}})
+            if data.library.fail_enrichment {
+                json!({"status":"failed", "error":{"code":70,"message":"Fixture enrichment failed"}})
+            } else {
+                json!({"status":"ok","topSongs":{"song":[]}})
+            }
         }
         "search3.view" => {
             let (kind, offset_key) = if query.get("songCount").map(String::as_str) == Some("500") {
@@ -250,6 +341,9 @@ async fn navidrome(
                 json!({"status":"ok","searchResult3":{kind:items}})
             }
         }
+        "getSong.view" if query == Request::new("", &[("id", "song")]).params => {
+            json!({"status":"ok", "song":data.library.tracks[0]})
+        }
         "star.view" | "unstar.view" | "setRating.view" => {
             match data.expected_mutations.pop_front() {
                 Some((expected, succeeds)) if request == expected => {
@@ -279,6 +373,42 @@ async fn metadata(
     method: Method,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    if method == Method::GET
+        && endpoint == "release"
+        && query
+            == Request::new(
+                "",
+                &[
+                    ("release-group", "missing-release"),
+                    ("inc", "media url-rels"),
+                    ("status", "official"),
+                    ("limit", "100"),
+                    ("fmt", "json"),
+                ],
+            )
+            .params
+    {
+        state.record(Request::new("metadata/editions", &[]));
+        return Json(json!({"releases":[{"id":"edition", "date":"2020-01-01", "media":[{"track-count":1}]}]})).into_response();
+    }
+    if method == Method::GET
+        && endpoint == "release/edition"
+        && query
+            == Request::new(
+                "",
+                &[
+                    (
+                        "inc",
+                        "recordings artist-credits labels url-rels release-group-level-rels genres",
+                    ),
+                    ("fmt", "json"),
+                ],
+            )
+            .params
+    {
+        state.record(Request::new("metadata/details", &[]));
+        return Json(json!({"id":"edition", "media":[{"position":1, "tracks":[{"number":"1", "title":"Missing song", "length":120000}]}]})).into_response();
+    }
     if method != Method::GET
         || endpoint != "release"
         || query
@@ -333,6 +463,8 @@ pub struct Fixture {
     requests: flume::Receiver<Request>,
     stop: flume::Sender<()>,
     release_metadata: flume::Sender<()>,
+    release_sync: flume::Sender<()>,
+    release_scrobble: flume::Sender<()>,
     finished: flume::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -361,6 +493,8 @@ impl Fixture {
             .unwrap();
         let (received, requests) = flume::unbounded();
         let (release_metadata, metadata_gate) = flume::bounded(1);
+        let (release_sync, sync_gate) = flume::unbounded();
+        let (release_scrobble, scrobble_gate) = flume::unbounded();
         let state = ServerState {
             data: Arc::new(Mutex::new(StateData {
                 library,
@@ -370,10 +504,12 @@ impl Fixture {
             })),
             received,
             metadata_gate,
+            sync_gate,
+            scrobble_gate,
         };
         let app = Router::new()
             .route("/rest/{endpoint}", any(navidrome))
-            .route("/metadata/{endpoint}", any(metadata))
+            .route("/metadata/{*endpoint}", any(metadata))
             .route(
                 "/listens/popularity/top-release-groups-for-artist/mb-artist",
                 any(listens),
@@ -408,6 +544,8 @@ impl Fixture {
             requests,
             stop,
             release_metadata,
+            release_sync,
+            release_scrobble,
             finished,
             thread: Some(thread),
         }
@@ -438,13 +576,25 @@ impl Fixture {
     }
 
     pub fn start(&self) -> Worker {
+        self.start_player(false)
+    }
+
+    pub fn start_paused(&self) -> Worker {
+        self.start_player(true)
+    }
+
+    fn start_player(&self, paused: bool) -> Worker {
         let metadata = MusicBrainz::with_endpoints(
             &format!("{}metadata/", self.account.url),
             &format!("{}listens/", self.account.url),
             Duration::ZERO,
         )
         .unwrap();
-        Worker::start(self.paths.clone(), metadata).unwrap()
+        if paused {
+            Worker::start_paused(self.paths.clone(), metadata).unwrap()
+        } else {
+            Worker::start(self.paths.clone(), metadata).unwrap()
+        }
     }
 
     pub fn expect_mutation(&self, request: Request, succeeds: bool) {
@@ -473,9 +623,21 @@ impl Fixture {
         self.state.data.lock().unwrap().requests.clone()
     }
 
+    pub fn resume_sync(&self) {
+        self.edit_library(|library| library.hold_sync = false);
+        let _ = self.release_sync.send(());
+    }
+
+    pub fn resume_scrobble(&self) {
+        self.edit_library(|library| library.hold_scrobble = false);
+        let _ = self.release_scrobble.send(());
+    }
+
     fn stop(&mut self) {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
+            self.resume_sync();
+            self.resume_scrobble();
             let _ = self.stop.try_send(());
             self.finished
                 .recv_timeout(WAIT)

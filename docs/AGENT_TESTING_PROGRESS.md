@@ -1,5 +1,62 @@
 # Agent integration testing: implementation progress
 
+## Nine-gap follow-up (2026-11-16)
+
+Implemented the nine requested gaps across existing integration targets: 12 new
+worker scenarios and 7 UI scenarios, bringing the totals to 18 worker, 33 UI and
+2 paused-player scenarios. Module layout, commands and scope are documented in
+[TESTING.md](TESTING.md#queue-accounts-reconnect-and-deferred-coverage).
+
+Production fixes found by the scenarios:
+
+- Remap a restored queue's index after missing catalog records, retaining the
+  exact duplicate occurrence; reset position/listen when the current song is gone.
+- Publish SignInRequired when starting without a saved account.
+- Re-sync and retry failed covers when an established offline connection recovers.
+- Keep scrobbles pending while the known connection is offline.
+- Scope player persistence messages to their account. Restore queue/namespace
+  atomically, reject delayed old-account saves, and save the outgoing queue
+  before switching catalogs.
+
+Added a real paused-player worker option using the shared production event
+bridge, a controllable artwork backoff clock, strict HTTP routes/gates and
+observation of song feedback, domain track rows, album panels, connection state,
+sign-in fields and release details. UI input still traverses production handlers.
+Flat track row keys now use song IDs instead of virtual row indices.
+
+Failing-before-fix evidence is retained in `target/gaps-queue-red.log`,
+`gaps-worker-red.log`, `gaps-scrobble-red.log`, `gaps-account-save-red.log`,
+`gaps-song-red.log` and `gaps-details-red.log`. Compilation/setup errors were
+corrected before recording the scenario failures used as regression evidence.
+Positive focused runs and intentional regression checks are retained alongside
+them under `target/gaps-*.log`. Four intentional regressions (stale artist,
+missing song optimism, disabled paging and removed artwork backoff) each failed
+the new scenario as intended; all temporary source changes were restored.
+
+Final local macOS validation:
+
+- `cargo fmt --check`: PASS.
+- `cargo clippy --locked --all-targets -- -D warnings`: PASS.
+- `cargo clippy --locked --all-targets --features test-support -- -D warnings`: PASS.
+- `cargo test --locked`: PASS, 152 ordinary tests.
+- `cargo test --locked --features test-support`: PASS, 205 tests total.
+- `scripts/test-service.sh`: PASS, all 18 scenarios.
+- `scripts/test-ui.sh`: PASS, all 33 scenarios.
+- `scripts/bundle.sh`: PASS; `dist/Sonora.app` built locally.
+- `codesign --verify --deep --strict dist/Sonora.app`: PASS.
+- `git diff --check`: PASS.
+
+Command logs are retained as `target/gaps-final-*.log`; both runners also retain
+their standard `target/{ui,service}-test-artifacts/` diagnostics. The pre-existing
+upstream `block` future-incompatibility notice remains. No new warnings remain.
+
+The user authorized committing and pushing this follow-up after local
+validation. Remote CI results are not included in the local validation above.
+All catalogs, credentials and HTTP replies are synthetic and isolated. Offline play is a real UI-to-worker
+command assertion, not physical audio or proof of an offline audio-file cache.
+
+## Earlier scope
+
 Scope approved 2026-11-16: enable GPUI testing, controlled service/player
 handles, queryable tabs/navigator, real input regression, CI diagnostics, and
 restart persistence through an isolated catalog. No commit/push is implied.
@@ -509,16 +566,13 @@ for the next agent's entry point.
 
 ## Next work
 
-Batch 4 and the audit follow-up are committed on main and passed macOS/Linux CI
-at `f38c40f`. Batch 5 adds nine local scenarios, bringing the UI suite to 26;
-the six worker-only and two real paused-player scenarios remain. Historical
-implementation checkpoints retain their original validation counts.
+The nine-gap follow-up adds 12 worker and 7 UI scenarios; current totals are
+18 worker, 33 UI and 2 paused-player scenarios. Historical checkpoints retain
+their original counts and publication status.
 
-1. For CI failures, run the exact command in `docs/TESTING.md` and inspect the
-   corresponding uploaded `environment.txt` and `test.log`.
+1. For CI failures, use the commands in `docs/TESTING.md` and retain the
+   corresponding runner `environment.txt` and `test.log`.
 2. Use `scripts/test-service-repeat.sh` for occasional thread/runtime checks.
-3. Take the next requested deferred slice from
-   [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md). Native process/AX,
-   pixels, large catalogs/other layouts and artist pages remain unimplemented.
-4. Batch 5 publication is authorized. Its final full-feature/UI gates passed;
-   honor the user's instruction not to repeat already-completed suites.
+3. Native packaged-process isolation, AX input, pixels, media controls and
+   physical audio remain separate work in [INTEGRATION_TEST_PLAN.md](INTEGRATION_TEST_PLAN.md).
+4. The user authorized committing and pushing this follow-up after local validation.

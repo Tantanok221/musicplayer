@@ -213,7 +213,14 @@ and physical audio-device changes remain separate checks.
 
 ## Explicit deferred work
 
-These remain gaps beyond the current suites:
+The nine-gap follow-up is implemented locally; see
+[coverage and commands](TESTING.md#queue-accounts-reconnect-and-deferred-coverage)
+and [current validation](AGENT_TESTING_PROGRESS.md#nine-gap-follow-up-2026-11-16).
+Queue restart, scrobble submissions, account switching, reconnect, artist races
+and enrichment, song feedback, large catalog paging/layouts, artwork and UI
+Refresh now have owning-layer integration scenarios.
+
+These remain beyond the in-process suites:
 
 - **Executable data isolation:** add a supported launch option for temporary
   data/cache paths before native tests. The executable currently uses
@@ -224,14 +231,7 @@ These remain gaps beyond the current suites:
 - **Pixels/screenshots:** add renderer-backed checks and retained images for a
   few stable screens, including error/selected states. Accessibility properties
   and layout bounds do not establish pixel correctness.
-- **Catalog scale and layouts:** generate a large isolated catalog, scroll to
-  offscreen items, and assert identity/selection through virtualization; cover
-  Album and Tracks and Tracks layouts as well as Album Covers.
-- **Artist pages:** cover navigation and back/forward, then deliver a newer
-  artist response before an older one and assert that the newer page remains.
-  This is a separate scenario from the existing stale Explorer search test.
 
-Paused queue edits are covered by the merged Batch 4 actor tests. Deterministic
-audio consumption, media-control stand-ins and real-worker queue persistence
-across restart remain separate owning-layer work; controlled UI snapshots do
-not complete those gaps.
+Paused queue edits and worker/player queue persistence are covered. Deterministic
+audio consumption and media-control stand-ins remain separate owning-layer work;
+controlled player endpoints do not prove physical playback.
