@@ -52,6 +52,7 @@ pub struct Library {
     pub hold_scrobble: bool,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
+    pub releases: Vec<(&'static str, &'static str, &'static str, u64)>,
 }
 
 impl Default for Library {
@@ -68,6 +69,7 @@ impl Default for Library {
             hold_scrobble: false,
             fail_artwork: false,
             fail_enrichment: false,
+            releases: vec![("missing-release", "Missing Release", "2020-01-01", 42)],
         }
     }
 }
@@ -427,16 +429,22 @@ async fn metadata(
         return state.unexpected("unexpected metadata request");
     }
     state.record(Request::new("metadata/release", &[]));
-    let hold = state.data.lock().unwrap().library.hold_metadata;
+    let (hold, releases) = {
+        let data = state.data.lock().unwrap();
+        (data.library.hold_metadata, data.library.releases.clone())
+    };
     if hold {
         let _ = state.metadata_gate.recv_async().await;
     }
-    Json(json!({"release-count":1,"releases":[{
-        "id":"edition","status":"Official",
-        "release-group":{"id":"missing-release","title":"Missing Release",
-            "primary-type":"Album","first-release-date":"2020-01-01"}
-    }]}))
-    .into_response()
+    let releases = releases
+        .iter()
+        .map(|(id, title, date, _)| {
+            json!({"id":format!("edition-{id}"),"status":"Official",
+                "release-group":{"id":id,"title":title,
+                    "primary-type":"Album","first-release-date":date}})
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"release-count":releases.len(),"releases":releases})).into_response()
 }
 
 async fn listens(
@@ -448,7 +456,12 @@ async fn listens(
         return state.unexpected("unexpected ListenBrainz request");
     }
     state.record(Request::new("listens/mb-artist", &[]));
-    Json(json!([{"release_group_mbid":"missing-release","total_listen_count":42}])).into_response()
+    let releases = state.data.lock().unwrap().library.releases.clone();
+    let counts = releases
+        .iter()
+        .map(|(id, _, _, listens)| json!({"release_group_mbid":id,"total_listen_count":listens}))
+        .collect::<Vec<_>>();
+    Json(json!(counts)).into_response()
 }
 
 async fn unexpected(State(state): State<ServerState>) -> Response {

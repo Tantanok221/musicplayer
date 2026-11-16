@@ -204,7 +204,7 @@ pub struct Library<'a> {
     pub downloading: HashSet<String>,
 }
 
-/// Official releases the library lacks, most listened first, then newest.
+/// Official releases the library lacks, newest first; undated releases last.
 /// `today` is `YYYY-MM-DD`.
 pub fn missing(discography: &Discography, library: &Library, today: &str) -> Vec<MissingRelease> {
     let album_titles: HashSet<String> = library
@@ -271,12 +271,7 @@ pub fn missing(discography: &Discography, library: &Library, today: &str) -> Vec
             },
         ));
     }
-    result.sort_by(|(a, _), (b, _)| {
-        b.listens
-            .cmp(&a.listens)
-            .then_with(|| b.date.cmp(&a.date))
-            .then_with(|| a.title.cmp(&b.title))
-    });
+    result.sort_by(|(a, _), (b, _)| b.date.cmp(&a.date).then_with(|| a.title.cmp(&b.title)));
     result.into_iter().map(|(_, release)| release).collect()
 }
 

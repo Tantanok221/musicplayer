@@ -173,7 +173,7 @@ fn a_release_still_downloading_stays_listed_after_a_partial_scan() {
 }
 
 #[test]
-fn most_listened_come_first_then_newest() {
+fn newest_come_first_and_undated_last_regardless_of_listens() {
     let mut popular = group("a", "Popular", "Album");
     popular.listens = 900;
     popular.date = "1999".into();
@@ -181,14 +181,17 @@ fn most_listened_come_first_then_newest() {
     newer.date = "2020-05-01".into();
     let mut older = group("c", "Older", "Album");
     older.date = "2001".into();
+    let mut undated = group("d", "Undated", "Album");
+    undated.listens = 50;
+    undated.date.clear();
     let discography = Discography {
         artist: "artist".into(),
-        groups: vec![older, newer, popular],
+        groups: vec![older, undated, newer, popular],
         fetched_ms: 1,
     };
     assert_eq!(
         titles(&discography, &Library::default()),
-        ["Popular", "Newer", "Older"]
+        ["Newer", "Older", "Popular", "Undated"]
     );
 }
 
