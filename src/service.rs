@@ -95,6 +95,8 @@ pub enum Command {
     HideRelease(String, String, String),
     /// API key, username, password as typed; all empty keeps what is saved.
     SlskdAuth(String, String, String),
+    /// A Last.fm API key as typed; empty keeps what is saved.
+    LastFmKey(String),
     SlskdTest,
     /// Release group and search text.
     SoulseekSearch(String, String),
@@ -805,6 +807,11 @@ fn run(
     let mut submission_requests = HashSet::new();
     let mut discography_requests = HashSet::new();
     let mut discover_request = 0;
+    let mut lastfm = lastfm;
+    // A key entered in Settings wins over one this build was made with.
+    if let Ok(Some(key)) = paths.lastfm_key() {
+        lastfm.set_key(key);
+    }
     let mut lastfm_fetch: Option<LastFmFetch> = None;
     let mut lastfm_failure: Option<(String, String)> = None;
     let mut release_requests: HashSet<String> = HashSet::new();
@@ -1336,6 +1343,25 @@ fn run(
                         .and_then(|auth| auth.map_or(Ok(()), |auth| paths.save_slskd_auth(&auth)));
                     if let Err(error) = saved {
                         events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
+                    }
+                }
+                Command::LastFmKey(key) => {
+                    let key = key.trim().to_string();
+                    if !key.is_empty() {
+                        match paths.save_lastfm_key(&key) {
+                            Ok(()) => {
+                                lastfm.set_key(key);
+                                lastfm_failure = None;
+                            }
+                            Err(error) => {
+                                let user = catalog
+                                    .state::<Preferences>("preferences")?
+                                    .lastfm_user
+                                    .trim()
+                                    .to_string();
+                                lastfm_failure = Some((user, format!("{error:#}")));
+                            }
+                        }
                     }
                 }
                 Command::SlskdTest => match slskd_client(&mut slskd, &catalog, &paths) {

@@ -365,7 +365,10 @@ fn memory_lane_tells_how_far_lastfm_history_has_come(cx: &mut TestAppContext) {
             HistoryStatus::Failed("listener's Last.fm listening history is private".into()),
             Some("Last.fm: listener's Last.fm listening history is private"),
         ),
-        (HistoryStatus::Unavailable, None),
+        (
+            HistoryStatus::Unavailable,
+            Some("Add a Last.fm API key in Settings to reach back through your history."),
+        ),
         (HistoryStatus::Ready, None),
     ] {
         fixture.backend.emit(Event::Discover(

@@ -157,6 +157,45 @@ impl Paths {
         .context("Could not save login locally")
     }
 
+    /// The Last.fm API key entered in Settings, if any.
+    pub fn lastfm_key(&self) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.data.join("credentials").join("lastfm.key")) {
+            Ok(text) => Ok(Some(text.trim().to_string()).filter(|key| !key.is_empty())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => anyhow::bail!("Could not read the saved Last.fm API key. Enter it again."),
+        }
+    }
+
+    /// Saves a Last.fm API key; an empty field keeps the saved one.
+    pub fn save_lastfm_key(&self, key: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(());
+        }
+        self.credentials_directory()?;
+        atomic_write(
+            &self.data.join("credentials").join("lastfm.key"),
+            key.as_bytes(),
+        )
+        .context("Could not save the Last.fm API key")
+    }
+
+    fn credentials_directory(&self) -> Result<()> {
+        let directory = self.data.join("credentials");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory)?;
+        Ok(())
+    }
+
     fn slskd_key_path(&self) -> PathBuf {
         self.data.join("credentials").join("slskd.key")
     }
@@ -177,18 +216,7 @@ impl Paths {
     }
 
     pub fn save_slskd_auth(&self, auth: &crate::slskd::SlskdAuth) -> Result<()> {
-        let directory = self.data.join("credentials");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&directory)?;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(&directory)?;
+        self.credentials_directory()?;
         atomic_write(&self.slskd_key_path(), auth.to_file().as_bytes())
             .context("Could not save the slskd login")
     }

@@ -1,4 +1,4 @@
-use crate::fixture::{Fixture, Library, WAIT, album, event, song, synced};
+use crate::fixture::{Fixture, LASTFM_KEY, Library, WAIT, album, event, song, synced};
 use chrono::{Duration, Utc};
 use sonora::{
     discover::{Dismissal, HistoryStatus, Rediscover, Shelf, seasons_between},
@@ -321,5 +321,55 @@ fn without_a_username_or_api_key_lastfm_is_never_asked() {
     assert_eq!(settled(&worker, 2).history, HistoryStatus::Unavailable);
     assert!(lastfm_requests(&fixture).is_empty());
     worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn a_lastfm_api_key_entered_in_settings_is_used_and_kept_privately() {
+    let (library, _) = history_library();
+    let fixture = Fixture::new(Library {
+        lastfm_key: false,
+        ..library
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    listen_as(&worker, "listener");
+    assert_eq!(settled(&worker, 1).history, HistoryStatus::Unavailable);
+
+    worker
+        .service()
+        .send(Command::LastFmKey(format!("  {LASTFM_KEY} \n")));
+    let found = settled(&worker, 2);
+    assert_eq!(found.history, HistoryStatus::Ready);
+    assert_eq!(found.lane.len(), 2);
+    assert_eq!(
+        fixture.paths.lastfm_key().unwrap().as_deref(),
+        Some(LASTFM_KEY)
+    );
+    let in_catalog = std::fs::read_dir(&fixture.paths.data)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .any(|entry| {
+            std::fs::read(entry.path())
+                .unwrap()
+                .windows(LASTFM_KEY.len())
+                .any(|bytes| bytes == LASTFM_KEY.as_bytes())
+        });
+    assert!(!in_catalog, "the key stays out of the catalog");
+
+    worker.service().send(Command::LastFmKey(" ".into()));
+    assert_eq!(
+        settled(&worker, 3).history,
+        HistoryStatus::Ready,
+        "an empty field keeps the saved key"
+    );
+    worker.shutdown(WAIT).unwrap();
+    let mut restarted = fixture.start();
+    restarted.wait_ready(WAIT).unwrap();
+    synced(&restarted);
+    assert_eq!(settled(&restarted, 4).history, HistoryStatus::Ready);
+    restarted.shutdown(WAIT).unwrap();
     fixture.finish();
 }

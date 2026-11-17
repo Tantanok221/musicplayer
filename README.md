@@ -15,7 +15,7 @@ open dist/Sonora.app
 
 This builds a locally signed `dist/Sonora.app`. To update, rebuild and replace your installed app while Sonora is closed. Rebuilding may make macOS ask for Local Network access again.
 
-To let Memory lane reach back through Last.fm history, [create a Last.fm API key](https://www.last.fm/api/account/create) and save it as `~/.config/sonora/lastfm-api-key` (or set `SONORA_LASTFM_API_KEY`) before building. Then add your Last.fm username in Settings → Library.
+To let Memory lane reach back through Last.fm history, [create a Last.fm API key](https://www.last.fm/api/account/create) and enter it with your Last.fm username in Settings → Library. The key is kept in a private file on this Mac.
 
 ### Linux
 
@@ -35,7 +35,7 @@ Open **Settings**, enter your Navidrome address (including any subpath), usernam
 
 - **Music Explorer** is the main library page: search (including Japanese/CJK and full-width text), filter by genre, year, artist or record label, and sort by artist, album, release date, recently added, rating or play count. Your sort is remembered per account.
 - **Artist pages** show a portrait and biography, popular songs, your most played, similar artists, and a full discography split into albums, EPs and singles.
-- **Discover** brings back albums you once had on repeat but haven't played in six months. *Memory lane* groups them by season, newest first, and each album says how often you played it. Without Last.fm, seasons come from Navidrome's play counts and last-played dates. Add your Last.fm username in Settings → Library and Memory lane reaches back through every season you've scrobbled: Sonora reads your public album charts once, one season at a time, keeps them on this Mac and puts each album in the season you played it most. Each season shows a fresh row every day with **See all** for the rest, **Shuffle** plays the whole lane, and albums select and play just like in Music Explorer. Right-click an album for **Not now** (hidden for 30 days) or **Never suggest**.
+- **Discover** brings back albums you once had on repeat but haven't played in six months. *Memory lane* groups them by season, newest first, and each album says how often you played it. Without Last.fm, seasons come from Navidrome's play counts and last-played dates. Add your Last.fm username and API key in Settings → Library and Memory lane reaches back through every season you've scrobbled: Sonora reads your public album charts once, one season at a time, keeps them on this Mac and puts each album in the season you played it most. Each season shows a fresh row every day with **See all** for the rest, **Shuffle** plays the whole lane, and albums select and play just like in Music Explorer. Right-click an album for **Not now** (hidden for 30 days) or **Never suggest**.
 - **Queue** separates Now playing from Up next. Drag to reorder, select several entries to remove, and undo the last edit. Right-click any track or album for Play Next, Add to End of Queue, Add to Playlist, Go to Album and Go to Artist.
 - **Now Playing** shows the current track over its album art, with synchronized lyrics (click a line to seek) and a spectrum of the audio.
 - **Favorites and ratings** for songs and albums update immediately. If saving fails, the previous value comes back with a Retry button.

@@ -201,3 +201,37 @@ fn slskd_key_is_saved_privately_and_rejected_when_damaged() {
     assert_eq!(error, "The saved slskd login is invalid. Enter it again.");
     assert!(!error.contains("short"));
 }
+
+#[test]
+fn lastfm_key_is_saved_privately() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data: directory.path().into(),
+        cache: directory.path().join("cache"),
+    };
+    assert_eq!(paths.lastfm_key().unwrap(), None);
+    paths.save_lastfm_key("  synthetic-lastfm-key\n").unwrap();
+    let path = directory.path().join("credentials").join("lastfm.key");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "synthetic-lastfm-key"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        paths.lastfm_key().unwrap().as_deref(),
+        Some("synthetic-lastfm-key")
+    );
+    paths.save_lastfm_key(" ").unwrap();
+    assert_eq!(
+        paths.lastfm_key().unwrap().as_deref(),
+        Some("synthetic-lastfm-key"),
+        "an empty field keeps the saved key"
+    );
+}

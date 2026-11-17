@@ -190,10 +190,13 @@ impl MusicApp {
             HistoryStatus::Loading { done, total } => {
                 format!("Reading your Last.fm history\u{2026} {done} of {total} seasons")
             }
+            HistoryStatus::Unavailable => {
+                "Add a Last.fm API key in Settings to reach back through your history.".to_string()
+            }
             HistoryStatus::Failed(message) => format!("Last.fm: {message}"),
-            HistoryStatus::Unavailable | HistoryStatus::Ready => return None,
+            HistoryStatus::Ready => return None,
         };
-        let off = matches!(status, HistoryStatus::Off);
+        let off = matches!(status, HistoryStatus::Off | HistoryStatus::Unavailable);
         Some(
             div()
                 .pt_1()

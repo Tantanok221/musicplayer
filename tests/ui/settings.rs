@@ -205,3 +205,32 @@ fn lastfm_username_is_saved_trimmed_for_memory_lane(cx: &mut TestAppContext) {
     );
     f.assert_script_finished();
 }
+
+#[gpui_kit::test]
+fn lastfm_api_key_is_sent_once_and_cleared_from_the_field(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    fill(window, "Last.fm username", "listener", cx);
+    fill(window, "Last.fm API key", " synthetic-lastfm-key ", cx);
+    f.expect("Last.fm key", |command, _| {
+        assert!(matches!(command, Command::LastFmKey(key) if key == "synthetic-lastfm-key"));
+        vec![]
+    });
+    f.click(window, "save-lastfm", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("Last.fm API key").value().unwrap_or_default(),
+            ""
+        );
+    })
+    .unwrap();
+    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
+    assert_eq!(prefs.lastfm_user, "listener");
+    let saved = serde_json::to_string(&prefs).unwrap();
+    assert!(!saved.contains("synthetic-lastfm-key"));
+
+    // An empty key field keeps the saved key and sends nothing.
+    f.click(window, "save-lastfm", cx);
+    f.assert_script_finished();
+}

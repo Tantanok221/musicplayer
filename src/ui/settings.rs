@@ -344,16 +344,18 @@ impl MusicApp {
             .group(
                 SettingGroup::new()
                     .title("Last.fm history")
-                    .description(if crate::lastfm::LastFm::built_with_key() {
-                        "Memory lane on Discover reaches back through your public Last.fm listening history. Sonora reads your album charts one season at a time and keeps them on this Mac."
-                    } else {
-                        "This build of Sonora has no Last.fm API key, so Memory lane uses Navidrome's play history only."
-                    })
+                    .description("Memory lane on Discover reaches back through your public Last.fm listening history. Sonora reads your album charts one season at a time and keeps them on this Mac.")
                     .item(credential_field(
                         "Last.fm username",
                         self.lastfm_user.clone(),
                         None,
                         &["last.fm", "lastfm", "history", "discover", "memory lane"],
+                    ))
+                    .item(credential_field(
+                        "Last.fm API key",
+                        self.lastfm_key.clone(),
+                        Some("Create one at last.fm/api/account/create. Leave empty to keep the saved key. Saved in a private file on this Mac."),
+                        &["last.fm", "lastfm", "api", "key", "token"],
                     ))
                     .item(SettingItem::render(move |_, _, _| {
                         let app = lastfm_app.clone();
@@ -367,6 +369,13 @@ impl MusicApp {
                                     });
                                     app.preferences.lastfm_user = user;
                                     app.save_preferences();
+                                    let key = app.lastfm_key.read(cx).value().trim().to_string();
+                                    if !key.is_empty() {
+                                        app.service.send(Command::LastFmKey(key));
+                                        app.lastfm_key.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                    }
                                     if app.discover.is_some() {
                                         app.request_discover();
                                     }

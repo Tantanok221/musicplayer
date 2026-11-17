@@ -17,14 +17,11 @@ pub struct LastFm {
 }
 
 impl LastFm {
-    /// Uses the API key this build was made with, if any.
+    /// Last.fm without a key until one is entered in Settings.
     pub fn new() -> Result<Self> {
         Self::with_endpoints(
             "https://ws.audioscrobbler.com/2.0/",
-            option_env!("SONORA_LASTFM_API_KEY")
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .map(Into::into),
+            None,
             Duration::from_millis(250),
         )
     }
@@ -44,9 +41,9 @@ impl LastFm {
         })
     }
 
-    /// Whether this build was made with a Last.fm API key.
-    pub fn built_with_key() -> bool {
-        option_env!("SONORA_LASTFM_API_KEY").is_some_and(|key| !key.trim().is_empty())
+    /// Uses an API key entered in Settings.
+    pub fn set_key(&mut self, key: String) {
+        self.key = Some(key);
     }
 
     pub fn has_key(&self) -> bool {
@@ -55,7 +52,7 @@ impl LastFm {
 
     async fn get(&self, user: &str, method: &str, params: &[(&str, &str)]) -> Result<Value> {
         let Some(key) = &self.key else {
-            bail!("This build of Sonora has no Last.fm API key");
+            bail!("Add a Last.fm API key in Settings");
         };
         let mut url = self.base.clone();
         url.query_pairs_mut()
