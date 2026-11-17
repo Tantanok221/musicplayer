@@ -902,11 +902,10 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
-    /// Albums that have been played, the pool for Rediscover.
+    /// Every album, the pool for Rediscover: Last.fm history reaches albums
+    /// Navidrome has never seen played.
     pub fn rediscover_candidates(&self) -> Result<Vec<Arc<Album>>> {
-        let mut statement = self.conn.prepare(
-            "SELECT data FROM albums WHERE coalesce(json_extract(data,'$.playCount'),0)>0",
-        )?;
+        let mut statement = self.conn.prepare("SELECT data FROM albums")?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))

@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod discography;
 pub mod discover;
 pub mod feedback;
+pub mod lastfm;
 pub mod listening;
 pub mod lyrics;
 pub mod model;

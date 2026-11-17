@@ -1,7 +1,7 @@
 use crate::common::ui::{Fixture, PlaybackIntent, start};
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, test::TestWindowExt};
 use sonora::{
-    discover::{Dismissal, Pick, Reason, Rediscover, Season, Shelf},
+    discover::{Dismissal, HistoryStatus, Pick, Reason, Rediscover, Season, Shelf},
     model::Album,
     playback::Placement,
     service::{Command, Event},
@@ -35,7 +35,8 @@ fn rotation(fixture: &Fixture, id: &str) -> Pick {
         album: album(fixture, id),
         reason: Reason {
             plays: 44,
-            played: "2026-03-10T00:00:00Z".parse().unwrap(),
+            played: Some("2026-03-10T00:00:00Z".parse().unwrap()),
+            in_season: false,
         },
     }
 }
@@ -140,6 +141,7 @@ fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestApp
             today: all,
         },
         lane: vec![spring, older],
+        ..Default::default()
     };
     open(&mut fixture, window, shelves, cx);
     fixture.diagnose("memory lane", window, &app, cx);
@@ -308,6 +310,7 @@ fn discover_is_only_memory_lane(cx: &mut TestAppContext) {
     let shelves = Rediscover {
         old_rotation: older.shelf.clone(),
         lane: vec![older],
+        ..Default::default()
     };
     open(&mut fixture, window, shelves, cx);
     fixture.diagnose("memory lane only", window, &app, cx);
@@ -319,5 +322,101 @@ fn discover_is_only_memory_lane(cx: &mut TestAppContext) {
         }
     })
     .unwrap();
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn memory_lane_tells_how_far_lastfm_history_has_come(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    let asked = Arc::new(std::sync::Mutex::new(0));
+    let seen = asked.clone();
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    fixture.expect("open Discover", move |command, _| {
+        let Command::Discover(request) = command else {
+            panic!("expected a Discover request")
+        };
+        *seen.lock().unwrap() = request;
+        vec![Event::Discover(request, Arc::new(Rediscover::default()))]
+    });
+    fixture.click(window, "nav-discover", cx);
+    fixture.diagnose("lastfm history status", window, &app, cx);
+    assert_eq!(
+        label(window, "discover-history", cx),
+        "Add your Last.fm username to reach back through every season you've scrobbled."
+    );
+    let request = *asked.lock().unwrap();
+    let older = season(
+        &fixture,
+        "2021-summer",
+        "Summer 2021",
+        &["album-2"],
+        &["album-2"],
+    );
+    for (status, expected) in [
+        (
+            HistoryStatus::Loading { done: 0, total: 0 },
+            Some("Reading your Last.fm history\u{2026}"),
+        ),
+        (
+            HistoryStatus::Loading { done: 3, total: 28 },
+            Some("Reading your Last.fm history\u{2026} 3 of 28 seasons"),
+        ),
+        (
+            HistoryStatus::Failed("listener's Last.fm listening history is private".into()),
+            Some("Last.fm: listener's Last.fm listening history is private"),
+        ),
+        (HistoryStatus::Unavailable, None),
+        (HistoryStatus::Ready, None),
+    ] {
+        fixture.backend.emit(Event::Discover(
+            request,
+            Arc::new(Rediscover {
+                old_rotation: older.shelf.clone(),
+                lane: vec![older.clone()],
+                history: status,
+            }),
+        ));
+        fixture.settle(window, cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("discover-season-2021-summer").visible());
+            let shown = window
+                .try_find("discover-history")
+                .and_then(|status| status.label().map(str::to_string));
+            assert_eq!(shown.as_deref(), expected);
+        })
+        .unwrap();
+    }
+
+    fixture
+        .backend
+        .emit(Event::Discover(request, Arc::new(Rediscover::default())));
+    fixture.settle(window, cx);
+    fixture.click(window, "discover-add-lastfm", cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("Last.fm username").visible());
+        window.click("Last.fm username", cx);
+        window.input("listener", cx);
+    })
+    .unwrap();
+    fixture.expect("Discover again with the new username", |command, _| {
+        let Command::Discover(request) = command else {
+            panic!("expected a Discover request")
+        };
+        vec![Event::Discover(
+            request,
+            Arc::new(Rediscover {
+                history: HistoryStatus::Loading { done: 0, total: 0 },
+                ..Default::default()
+            }),
+        )]
+    });
+    fixture.click(window, "save-lastfm", cx);
+    fixture.press(window, sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+    assert_eq!(
+        label(window, "discover-history", cx),
+        "Reading your Last.fm history\u{2026}"
+    );
     fixture.assert_script_finished();
 }

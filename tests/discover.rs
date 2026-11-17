@@ -1,6 +1,9 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use sonora::{
-    discover::{Dismissal, Hidden, Pick, SHELF_LIMIT, Visit, rediscover, todays_order},
+    discover::{
+        ChartAlbum, Dismissal, Hidden, History, Pick, SHELF_LIMIT, SeasonChart, Visit, rediscover,
+        seasons_between, stale_seasons, todays_order,
+    },
     model::Album,
 };
 use std::sync::Arc;
@@ -44,7 +47,7 @@ fn old_rotation_keeps_the_most_played_tenth_not_played_for_six_months() {
     candidates.push(candidate(album("heavier-old", 80, Some(OLD)), 0));
     candidates.push(candidate(album("heavy-recent", 90, Some(RECENT)), 0));
     candidates.push(candidate(album("light-old", 2, Some(OLD)), 0));
-    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     assert_eq!(
         ids(&shelves.old_rotation.ranked),
         ["heavier-old", "heavy-old"]
@@ -62,7 +65,7 @@ fn six_month_cutoff_is_inclusive_of_older_plays_only() {
         album("just-outside", 40, Some("2026-05-10T00:00:00Z")),
         0,
     ));
-    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     assert_eq!(ids(&shelves.old_rotation.ranked), ["just-outside"]);
 }
 
@@ -71,10 +74,10 @@ fn old_rotation_stops_at_the_limit_and_an_empty_library_has_none() {
     let candidates = (0..SHELF_LIMIT + 5)
         .map(|ix| candidate(album(&format!("heavy-{ix:02}"), 50, Some(OLD)), 0))
         .collect::<Vec<_>>();
-    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     assert_eq!(shelves.old_rotation.ranked.len(), SHELF_LIMIT);
     assert_eq!(shelves.old_rotation.today.len(), SHELF_LIMIT);
-    let empty = rediscover(&[], &Hidden::default(), now());
+    let empty = rediscover(&[], None, &Hidden::default(), now());
     assert!(empty.old_rotation.ranked.is_empty() && empty.lane.is_empty());
 }
 
@@ -93,7 +96,7 @@ fn each_pick_explains_why_it_is_on_the_shelf() {
         album("long-ago", 41, Some("2024-06-01T00:00:00Z")),
         0,
     ));
-    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     let reason = |id: &str| {
         shelves
             .old_rotation
@@ -116,7 +119,7 @@ fn todays_order_is_stable_within_a_day_and_changes_the_next() {
     let candidates = (0..20)
         .map(|ix| candidate(album(&format!("heavy-{ix:02}"), 50, Some(OLD)), 0))
         .collect::<Vec<_>>();
-    let ranked = rediscover(&candidates, &Hidden::default(), now())
+    let ranked = rediscover(&candidates, None, &Hidden::default(), now())
         .old_rotation
         .ranked;
     let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
@@ -147,10 +150,10 @@ fn not_now_hides_for_thirty_days_and_never_hides_for_good() {
     let mut hidden = Hidden::default();
     hidden.hide("snoozed", Dismissal::NotNow, now());
     hidden.hide("never", Dismissal::Never, now());
-    let shelves = rediscover(&candidates, &hidden, now());
+    let shelves = rediscover(&candidates, None, &hidden, now());
     assert_eq!(ids(&shelves.old_rotation.ranked), ["kept"]);
     let later = now() + chrono::Duration::days(31);
-    let shelves = rediscover(&candidates, &hidden, later);
+    let shelves = rediscover(&candidates, None, &hidden, later);
     assert_eq!(ids(&shelves.old_rotation.ranked), ["snoozed", "kept"]);
 }
 
@@ -166,7 +169,7 @@ fn memory_lane_groups_old_rotation_by_the_season_it_was_last_played() {
     ] {
         candidates.push(candidate(album(id, plays, Some(played)), 0));
     }
-    let shelves = rediscover(&candidates, &Hidden::default(), now());
+    let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     let lane = shelves
         .lane
         .iter()
@@ -207,4 +210,193 @@ fn a_visit_remembers_expanded_shelves() {
     assert!(visit.expanded("older") && !visit.expanded("2026-spring"));
     visit.toggle("older");
     assert!(!visit.expanded("older"));
+}
+
+fn at(text: &str) -> DateTime<Utc> {
+    text.parse().unwrap()
+}
+
+fn chart(albums: &[(&str, &str, u64)]) -> Vec<ChartAlbum> {
+    albums
+        .iter()
+        .map(|(artist, name, plays)| ChartAlbum {
+            artist: (*artist).into(),
+            name: (*name).into(),
+            plays: *plays,
+        })
+        .collect()
+}
+
+fn history(seasons: &[(&str, Vec<ChartAlbum>)]) -> History {
+    let mut history = History {
+        user: "listener".into(),
+        registered: Some(at("2020-07-15T00:00:00Z").timestamp()),
+        ..Default::default()
+    };
+    for (key, albums) in seasons {
+        let span = seasons_between(at("2020-01-01T00:00:00Z"), now())
+            .into_iter()
+            .find(|span| span.key == *key)
+            .unwrap();
+        history.seasons.insert(
+            span.key.clone(),
+            SeasonChart {
+                from: span.from,
+                to: span.to,
+                fetched_ms: now().timestamp_millis(),
+                albums: albums.clone(),
+            },
+        );
+    }
+    history
+}
+
+fn owned(id: &str, artist: &str, name: &str, played: Option<&str>) -> Arc<Album> {
+    Arc::new(Album {
+        id: id.into(),
+        name: name.into(),
+        artist: artist.into(),
+        play_count: Some(u64::from(played.is_some())),
+        played: played.map(Into::into),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn seasons_run_from_the_first_scrobble_to_now_with_their_bounds() {
+    let spans = seasons_between(at("2020-07-15T00:00:00Z"), at("2021-01-10T00:00:00Z"));
+    let keys = spans
+        .iter()
+        .map(|span| (span.key.as_str(), span.label.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            ("2020-summer", "Summer 2020"),
+            ("2020-autumn", "Autumn 2020"),
+            ("2020-winter", "Winter 2020–21"),
+        ]
+    );
+    assert_eq!(spans[0].from, at("2020-06-01T00:00:00Z").timestamp());
+    assert_eq!(spans[0].to, at("2020-09-01T00:00:00Z").timestamp());
+    assert_eq!(spans[2].from, at("2020-12-01T00:00:00Z").timestamp());
+    assert_eq!(spans[2].to, at("2021-03-01T00:00:00Z").timestamp());
+}
+
+#[test]
+fn only_missing_or_unfinished_seasons_are_fetched_again() {
+    let mut known = history(&[("2025-summer", vec![]), ("2026-autumn", vec![])]);
+    let stale = |history: &History, now: DateTime<Utc>| {
+        stale_seasons(history, now)
+            .into_iter()
+            .map(|span| span.key)
+            .collect::<Vec<_>>()
+    };
+    let missing = stale(&known, now());
+    assert!(missing.contains(&"2020-summer".to_string()));
+    assert!(
+        !missing.contains(&"2025-summer".to_string()),
+        "a finished season stays"
+    );
+    assert!(
+        !missing.contains(&"2026-autumn".to_string()),
+        "just fetched"
+    );
+    assert_eq!(missing.len(), 24);
+
+    let later = now() + chrono::Duration::hours(13);
+    assert!(stale(&known, later).contains(&"2026-autumn".to_string()));
+    let summer = known.seasons.get_mut("2025-summer").unwrap();
+    summer.fetched_ms = at("2025-08-20T00:00:00Z").timestamp_millis();
+    assert!(
+        stale(&known, now()).contains(&"2025-summer".to_string()),
+        "a season fetched before it ended is fetched again"
+    );
+    known.registered = None;
+    assert!(
+        stale(&known, now()).is_empty(),
+        "nothing to fetch before the profile is known"
+    );
+}
+
+#[test]
+fn memory_lane_reaches_back_through_lastfm_seasons() {
+    let library = vec![
+        owned("lanterns", "Mira Hollow", "Paper Lanterns", None),
+        owned(
+            "northbound",
+            "Oslo Static",
+            "Northbound (Deluxe Edition)",
+            Some("2024-02-01T00:00:00Z"),
+        ),
+        owned(
+            "recent-here",
+            "Wren Atlas",
+            "Small Rooms",
+            Some("2026-10-01T00:00:00Z"),
+        ),
+        owned("light", "Juniper", "Velvet Hours", None),
+        owned("recent-there", "Haru Kito", "Midnight Ferry", None),
+        owned("hidden", "Field Notes", "Common Ground", None),
+        owned("greatest", "Someone Else", "Greatest Hits", None),
+    ];
+    let known = history(&[
+        (
+            "2021-summer",
+            chart(&[
+                ("mira hollow", "Paper Lanterns", 40),
+                ("Oslo Static", "Northbound", 12),
+                ("Wren Atlas", "Small Rooms", 30),
+                ("Not Owned", "Elsewhere", 50),
+                ("Juniper", "Velvet Hours", 3),
+                ("Field Notes", "Common Ground", 25),
+                ("The Band", "Greatest Hits", 25),
+            ]),
+        ),
+        (
+            "2022-winter",
+            chart(&[("Mira Hollow", "Paper Lanterns", 10)]),
+        ),
+        ("2023-spring", chart(&[("Haru Kito", "Midnight Ferry", 20)])),
+        ("2026-autumn", chart(&[("Haru Kito", "Midnight Ferry", 5)])),
+    ]);
+    let mut hidden = Hidden::default();
+    hidden.hide("hidden", Dismissal::Never, now());
+    let shelves = rediscover(&library, Some(&known), &hidden, now());
+    let lane = shelves
+        .lane
+        .iter()
+        .map(|season| (season.label.as_str(), ids(&season.shelf.ranked)))
+        .collect::<Vec<_>>();
+    assert_eq!(lane, [("Summer 2021", vec!["lanterns", "northbound"])]);
+    let reason = |id: &str| {
+        shelves.lane[0]
+            .shelf
+            .ranked
+            .iter()
+            .find(|pick| pick.album.id == id)
+            .unwrap()
+            .reason_text(now())
+    };
+    assert_eq!(reason("lanterns"), "40 plays that season");
+    assert_eq!(
+        reason("northbound"),
+        "12 plays that season · last played over a year ago"
+    );
+    assert_eq!(
+        ids(&shelves.old_rotation.ranked),
+        ["lanterns", "northbound"]
+    );
+}
+
+#[test]
+fn seasons_without_charts_fall_back_to_navidrome_plays() {
+    let mut candidates = filler(20);
+    candidates.push(candidate(album("heavy", 50, Some(OLD)), 0));
+    let empty = History {
+        user: "listener".into(),
+        ..Default::default()
+    };
+    let shelves = rediscover(&candidates, Some(&empty), &Hidden::default(), now());
+    assert_eq!(ids(&shelves.lane[0].shelf.ranked), ["heavy"]);
 }

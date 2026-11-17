@@ -1,8 +1,8 @@
 use crate::fixture::{Fixture, Library, WAIT, album, event, song, synced};
 use chrono::{Duration, Utc};
 use sonora::{
-    discover::{Dismissal, Rediscover, Shelf},
-    model::Album,
+    discover::{Dismissal, HistoryStatus, Rediscover, Shelf, seasons_between},
+    model::{Album, Preferences},
     service::{Command, Event},
 };
 use std::sync::Arc;
@@ -140,5 +140,186 @@ fn dismissed_albums_leave_their_shelves_and_stay_hidden_after_restart() {
     let found = shelves(&restarted, 2);
     assert_eq!(ids(&found.old_rotation), ["kept"]);
     restarted.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+fn listen_as(worker: &sonora::service::test_support::Worker, user: &str) {
+    worker.service().send(Command::Preferences(Preferences {
+        lastfm_user: user.into(),
+        ..Default::default()
+    }));
+}
+
+/// Asks for Discover and waits until its Last.fm history has finished loading.
+fn settled(worker: &sonora::service::test_support::Worker, request: u64) -> Arc<Rediscover> {
+    worker.service().send(Command::Discover(request));
+    loop {
+        let Event::Discover(_, shelves) = event(
+            worker,
+            |event| matches!(event, Event::Discover(id, _) if *id == request),
+        ) else {
+            unreachable!()
+        };
+        if !matches!(shelves.history, HistoryStatus::Loading { .. }) {
+            return shelves;
+        }
+    }
+}
+
+fn lastfm_requests(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.endpoint.starts_with("lastfm/"))
+        .map(|request| request.endpoint)
+        .collect()
+}
+
+fn history_library() -> (Library, Vec<sonora::discover::SeasonSpan>) {
+    let registered = Utc::now() - Duration::days(500);
+    let spans = seasons_between(registered, Utc::now());
+    let mut albums = vec![
+        album("old-love"),
+        album("single"),
+        album("other"),
+        played("still-playing", 3, 5),
+    ];
+    albums[1].name = "Lone Album (Remastered)".into();
+    let library = Library {
+        albums,
+        tracks: vec![song("song", "old-love")],
+        lastfm_registered: registered.timestamp(),
+        lastfm_charts: vec![
+            (
+                spans[0].from,
+                vec![
+                    ("Fixture Artist", "Release old-love", 30),
+                    ("Fixture Artist", "Release still-playing", 40),
+                    ("Somebody Else", "Release other", 25),
+                ],
+            ),
+            (spans[1].from, vec![("Fixture Artist", "Lone Album", 12)]),
+        ],
+        ..Library::default()
+    };
+    (library, spans)
+}
+
+#[test]
+fn memory_lane_reaches_back_through_lastfm_history_and_keeps_it() {
+    let (library, spans) = history_library();
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    listen_as(&worker, "listener");
+    worker.service().send(Command::Discover(1));
+    let Event::Discover(_, first) = event(&worker, |event| matches!(event, Event::Discover(1, _)))
+    else {
+        unreachable!()
+    };
+    assert!(matches!(first.history, HistoryStatus::Loading { .. }));
+    let found = settled(&worker, 2);
+    assert_eq!(found.history, HistoryStatus::Ready);
+    let lane = found
+        .lane
+        .iter()
+        .map(|season| (season.label.as_str(), ids(&season.shelf)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lane,
+        [
+            (spans[1].label.as_str(), vec!["single"]),
+            (spans[0].label.as_str(), vec!["old-love"]),
+        ],
+        "still-playing was played this month, and the other artist's album is not ours"
+    );
+    assert_eq!(
+        found.lane[1].shelf.ranked[0].reason_text(Utc::now()),
+        "30 plays that season"
+    );
+    let mut expected = vec!["lastfm/getinfo".to_string()];
+    expected.extend(spans.iter().map(|_| "lastfm/chart".to_string()));
+    assert_eq!(lastfm_requests(&fixture), expected);
+    let charts = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.endpoint == "lastfm/chart")
+        .map(|request| request.params["from"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        charts,
+        spans
+            .iter()
+            .map(|span| span.from.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let again = settled(&worker, 3);
+    assert_eq!(again.lane.len(), 2);
+    worker.shutdown(WAIT).unwrap();
+    let mut restarted = fixture.start();
+    restarted.wait_ready(WAIT).unwrap();
+    synced(&restarted);
+    let cached = settled(&restarted, 4);
+    assert_eq!(cached.history, HistoryStatus::Ready);
+    assert_eq!(cached.lane.len(), 2);
+    assert_eq!(
+        lastfm_requests(&fixture).len(),
+        expected.len(),
+        "finished seasons are not fetched again"
+    );
+    restarted.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn a_private_or_missing_lastfm_profile_says_so_and_recovers() {
+    let (library, _) = history_library();
+    let fixture = Fixture::new(Library {
+        lastfm_error: Some(17),
+        ..library
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    listen_as(&worker, "listener");
+    let private = settled(&worker, 1);
+    assert_eq!(
+        private.history,
+        HistoryStatus::Failed("listener's Last.fm listening history is private".into())
+    );
+    assert!(private.lane.is_empty());
+
+    fixture.edit_library(|library| library.lastfm_error = Some(6));
+    let missing = settled(&worker, 2);
+    assert_eq!(
+        missing.history,
+        HistoryStatus::Failed("Last.fm has no user named listener".into())
+    );
+
+    fixture.edit_library(|library| library.lastfm_error = None);
+    let recovered = settled(&worker, 3);
+    assert_eq!(recovered.history, HistoryStatus::Ready);
+    assert_eq!(recovered.lane.len(), 2);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn without_a_username_or_api_key_lastfm_is_never_asked() {
+    let (library, _) = history_library();
+    let fixture = Fixture::new(Library {
+        lastfm_key: false,
+        ..library
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    assert_eq!(settled(&worker, 1).history, HistoryStatus::Off);
+    listen_as(&worker, "listener");
+    assert_eq!(settled(&worker, 2).history, HistoryStatus::Unavailable);
+    assert!(lastfm_requests(&fixture).is_empty());
+    worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

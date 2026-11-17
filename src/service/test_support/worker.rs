@@ -1,6 +1,7 @@
 //! Real catalog actor with a private network runtime and silent player endpoint.
 use super::{Command, Event, Service};
 use crate::{
+    lastfm::LastFm,
     model::{Preferences, SavedQueue},
     musicbrainz::MusicBrainz,
     platform::{Account, Paths},
@@ -25,16 +26,21 @@ pub struct Worker {
 
 impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
-    /// The supplied metadata client must use fixture endpoints in isolated tests.
-    pub fn start(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, false)
+    /// The supplied metadata and Last.fm clients must use fixture endpoints in isolated tests.
+    pub fn start(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
+        Self::start_inner(paths, metadata, lastfm, false)
     }
 
-    pub fn start_paused(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, true)
+    pub fn start_paused(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
+        Self::start_inner(paths, metadata, lastfm, true)
     }
 
-    fn start_inner(paths: Paths, metadata: MusicBrainz, paused: bool) -> Result<Self> {
+    fn start_inner(
+        paths: Paths,
+        metadata: MusicBrainz,
+        lastfm: LastFm,
+        paused: bool,
+    ) -> Result<Self> {
         let (tx, commands) = flume::unbounded();
         let (events, received_events) = flume::unbounded();
         let (player, player_commands) = crate::playback::PlayerHandle::controlled();
@@ -73,6 +79,7 @@ impl Worker {
                         commands,
                         events,
                         metadata,
+                        lastfm,
                     );
                     // Dropping this private runtime cancels async requests/timers
                     // and waits for blocking work before reporting completion.

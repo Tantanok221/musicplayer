@@ -178,3 +178,30 @@ fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retr
     .unwrap();
     f.assert_script_finished();
 }
+
+#[gpui_kit::test]
+fn lastfm_username_is_saved_trimmed_for_memory_lane(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    fill(window, "Last.fm username", "  listener ", cx);
+    f.click(window, "save-lastfm", cx);
+    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
+    assert_eq!(prefs.lastfm_user, "listener");
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("Last.fm username").value().unwrap_or_default(),
+            "listener"
+        );
+    })
+    .unwrap();
+
+    fill(window, "Last.fm username", " ", cx);
+    f.click(window, "save-lastfm", cx);
+    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
+    assert_eq!(
+        prefs.lastfm_user, "",
+        "clearing the name turns Last.fm history off"
+    );
+    f.assert_script_finished();
+}

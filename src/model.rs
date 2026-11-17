@@ -348,6 +348,8 @@ pub struct Preferences {
     pub favorites: FavoritesFilter,
     /// The top-bar tabs and the page each one shows.
     pub tabs: crate::browser::Tabs,
+    /// Whose Last.fm history Memory lane reaches back through; empty is off.
+    pub lastfm_user: String,
 }
 /// What counts as a favorite on the Favorites page.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -406,6 +408,7 @@ impl Default for Preferences {
             all_missing_releases: false,
             favorites: FavoritesFilter::default(),
             tabs: crate::browser::Tabs::default(),
+            lastfm_user: String::new(),
         }
     }
 }

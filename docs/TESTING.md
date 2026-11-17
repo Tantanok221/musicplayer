@@ -30,7 +30,7 @@ worker suite to expose flaky timing.
 | Music Explorer, navigator, sorting | `library.rs`, `navigator.rs`, `sorting_controls.rs` | `catalog`, `sorting`, `browser` | `tests/ui/{explorer,large_library}.rs`, `tests/{sorting,catalog,navigator}.rs` |
 | Album and song favorites/ratings | `feedback.rs`, `album_feedback.rs` | `feedback::{Feedback, optimistic_*}` | `tests/ui/{album_feedback,song_feedback,worker}.rs`, `tests/service_worker/feedback.rs`, `feedback` unit tests |
 | Artist pages, albums | `artist_page.rs`, `albums.rs` | `artists`, `discography` | `tests/ui/artists.rs`, `tests/service_worker/{artists,metadata}.rs` |
-| Discover (Memory lane) | `discover.rs` | `discover` (`rediscover`, `Visit`), `Catalog::rediscover_candidates` | `tests/ui/discover.rs`, `tests/service_worker/discover.rs`, `tests/discover.rs` |
+| Discover (Memory lane, Last.fm history) | `discover.rs`, `settings.rs` | `discover` (`rediscover`, `stale_seasons`, `Visit`), `lastfm`, `Catalog::rediscover_candidates` | `tests/ui/discover.rs`, `tests/ui/settings.rs`, `tests/service_worker/discover.rs`, `tests/discover.rs` |
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
 | Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |

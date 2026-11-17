@@ -2,6 +2,11 @@
 set -euo pipefail
 cd "${0:A:h:h}"
 profile="${1:-release}"
+# Memory lane's Last.fm history needs an API key; keep it outside the repository.
+lastfm_key_file="${XDG_CONFIG_HOME:-$HOME/.config}/sonora/lastfm-api-key"
+if [[ -z "${SONORA_LASTFM_API_KEY:-}" && -r "$lastfm_key_file" ]]; then
+  export SONORA_LASTFM_API_KEY="$(<"$lastfm_key_file")"
+fi
 case "$profile" in
   release) "${CARGO:-$HOME/.cargo/bin/cargo}" build --release ;;
   debug) "${CARGO:-$HOME/.cargo/bin/cargo}" build ;;

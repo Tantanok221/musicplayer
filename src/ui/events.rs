@@ -26,6 +26,9 @@ impl MusicApp {
                 let slskd = self.preferences.downloads.url.clone();
                 self.slskd_url
                     .update(cx, |input, cx| input.set_value(slskd, window, cx));
+                let lastfm = self.preferences.lastfm_user.clone();
+                self.lastfm_user
+                    .update(cx, |input, cx| input.set_value(lastfm, window, cx));
                 self.discographies.clear();
                 if let Some(account) = account {
                     self.server_url

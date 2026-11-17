@@ -152,7 +152,8 @@ impl MusicApp {
                     .child(div().text_size(px(12.)).text_color(colors.muted).child(
                         "Albums you once had on repeat, grouped by when you last played them. \
                          New picks every day.",
-                    )),
+                    ))
+                    .children(self.history_line(&shelves.history, cx)),
             )
             .child(if shelves.lane.is_empty() {
                 div()
@@ -169,6 +170,60 @@ impl MusicApp {
                 self.memory_lane(&shelves, cx)
             })
             .into_any_element()
+    }
+
+    fn history_line(
+        &self,
+        status: &crate::discover::HistoryStatus,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::discover::HistoryStatus;
+        let colors = ink(cx);
+        let text = match status {
+            HistoryStatus::Off => {
+                "Add your Last.fm username to reach back through every season you've scrobbled."
+                    .to_string()
+            }
+            HistoryStatus::Loading { done: 0, total: 0 } => {
+                "Reading your Last.fm history\u{2026}".to_string()
+            }
+            HistoryStatus::Loading { done, total } => {
+                format!("Reading your Last.fm history\u{2026} {done} of {total} seasons")
+            }
+            HistoryStatus::Failed(message) => format!("Last.fm: {message}"),
+            HistoryStatus::Unavailable | HistoryStatus::Ready => return None,
+        };
+        let off = matches!(status, HistoryStatus::Off);
+        Some(
+            div()
+                .pt_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("discover-history")
+                        .test_support()
+                        .aria_label(text.clone())
+                        .text_size(px(11.))
+                        .text_color(colors.muted)
+                        .child(text),
+                )
+                .when(off, |line| {
+                    line.child(
+                        Button::new("discover-add-lastfm")
+                            .ghost()
+                            .xsmall()
+                            .label("Add Last.fm")
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.settings = true;
+                                app.settings_page = 0;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn memory_lane(&mut self, shelves: &Rediscover, cx: &mut Context<Self>) -> AnyElement {

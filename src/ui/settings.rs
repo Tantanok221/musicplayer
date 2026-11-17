@@ -262,6 +262,7 @@ impl MusicApp {
     }
 
     pub(super) fn library_settings(&self, app: WeakEntity<Self>) -> SettingPage {
+        let lastfm_app = app.clone();
         let signed_in = self
             .account
             .as_ref()
@@ -339,6 +340,40 @@ impl MusicApp {
                             },
                         )
                     }).keywords(["last.fm", "scrobble", "navidrome"])),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("Last.fm history")
+                    .description(if crate::lastfm::LastFm::built_with_key() {
+                        "Memory lane on Discover reaches back through your public Last.fm listening history. Sonora reads your album charts one season at a time and keeps them on this Mac."
+                    } else {
+                        "This build of Sonora has no Last.fm API key, so Memory lane uses Navidrome's play history only."
+                    })
+                    .item(credential_field(
+                        "Last.fm username",
+                        self.lastfm_user.clone(),
+                        None,
+                        &["last.fm", "lastfm", "history", "discover", "memory lane"],
+                    ))
+                    .item(SettingItem::render(move |_, _, _| {
+                        let app = lastfm_app.clone();
+                        Button::new("save-lastfm")
+                            .label("Save")
+                            .on_click(move |_, window, cx| {
+                                let _ = app.update(cx, |app, cx| {
+                                    let user = app.lastfm_user.read(cx).value().trim().to_string();
+                                    app.lastfm_user.update(cx, |input, cx| {
+                                        input.set_value(user.clone(), window, cx)
+                                    });
+                                    app.preferences.lastfm_user = user;
+                                    app.save_preferences();
+                                    if app.discover.is_some() {
+                                        app.request_discover();
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                    })),
             )
     }
 

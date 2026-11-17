@@ -379,6 +379,7 @@ pub struct MusicApp {
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
     slskd_url: Entity<InputState>,
+    lastfm_user: Entity<InputState>,
     slskd_key: Entity<InputState>,
     slskd_username: Entity<InputState>,
     slskd_password: Entity<InputState>,
@@ -551,6 +552,7 @@ impl MusicApp {
         let playlist_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
         let slskd_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://your-slskd-host:5030"));
+        let lastfm_user = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
         let slskd_key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Optional")
@@ -677,6 +679,7 @@ impl MusicApp {
             password,
             playlist_name,
             slskd_url,
+            lastfm_user,
             slskd_key,
             slskd_username,
             slskd_password,

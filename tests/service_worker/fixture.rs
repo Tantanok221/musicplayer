@@ -8,6 +8,7 @@ use axum::{
 use serde_json::{Value, json};
 use sonora::{
     catalog::{Catalog, LibraryView},
+    lastfm::LastFm,
     model::{Album, LibraryQuery, Playlist, Track},
     musicbrainz::MusicBrainz,
     platform::{Account, Paths, ServerCredentials},
@@ -40,6 +41,9 @@ impl Request {
     }
 }
 
+/// A fixture Last.fm chart entry: artist, album and plays.
+pub type ChartEntry = (&'static str, &'static str, u64);
+
 pub struct Library {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
@@ -55,6 +59,14 @@ pub struct Library {
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
     pub artist_mbid: &'static str,
     pub prolific: bool,
+    /// Unix seconds the fixture Last.fm profile was created.
+    pub lastfm_registered: i64,
+    /// Album charts by season start: artist, album and plays.
+    pub lastfm_charts: Vec<(i64, Vec<ChartEntry>)>,
+    /// A Last.fm error code every Last.fm request answers with.
+    pub lastfm_error: Option<u32>,
+    /// Whether the worker is built with a Last.fm API key.
+    pub lastfm_key: bool,
 }
 
 impl Default for Library {
@@ -74,6 +86,10 @@ impl Default for Library {
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
             artist_mbid: "mb-artist",
             prolific: false,
+            lastfm_registered: 0,
+            lastfm_charts: vec![],
+            lastfm_error: None,
+            lastfm_key: true,
         }
     }
 }
@@ -389,6 +405,81 @@ async fn navidrome(
     envelope(body)
 }
 
+pub const LASTFM_KEY: &str = "fixture-lastfm-key";
+
+async fn lastfm(
+    State(state): State<ServerState>,
+    method: Method,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let param = |key: &str| query.get(key).cloned().unwrap_or_default();
+    if method != Method::GET
+        || param("api_key") != LASTFM_KEY
+        || param("format") != "json"
+        || param("user") != "listener"
+    {
+        return state.unexpected("invalid Last.fm request");
+    }
+    let (registered, charts, error) = {
+        let data = state.data.lock().unwrap();
+        (
+            data.library.lastfm_registered,
+            data.library.lastfm_charts.clone(),
+            data.library.lastfm_error,
+        )
+    };
+    let (endpoint, params) = match param("method").as_str() {
+        "user.getinfo" if query.len() == 4 => ("lastfm/getinfo", vec![]),
+        "user.getweeklyalbumchart" if query.len() == 6 => (
+            "lastfm/chart",
+            vec![("from", param("from")), ("to", param("to"))],
+        ),
+        _ => return state.unexpected("unknown Last.fm method"),
+    };
+    let params = params
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect::<Vec<_>>();
+    state.record(Request::new(endpoint, &params));
+    if let Some(code) = error {
+        let message = match code {
+            6 => "User not found",
+            17 => "Login: User required to be logged in",
+            _ => "Fixture error",
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "message": message})),
+        )
+            .into_response();
+    }
+    if endpoint == "lastfm/getinfo" {
+        return Json(json!({"user": {"name": "listener", "registered": {
+            "unixtime": registered.to_string(), "#text": registered
+        }}}))
+        .into_response();
+    }
+    let from: i64 = param("from").parse().unwrap_or_default();
+    let albums = charts
+        .iter()
+        .find(|(start, _)| *start == from)
+        .map(|(_, albums)| albums.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(artist, name, plays)| {
+            json!({"artist": {"mbid": "", "#text": artist}, "name": name, "mbid": "",
+                   "playcount": plays.to_string(), "@attr": {"rank": "1"}})
+        })
+        .collect::<Vec<_>>();
+    // Last.fm sends a lone chart entry as an object rather than a one-item list.
+    let album = match albums.as_slice() {
+        [one] => one.clone(),
+        _ => json!(albums),
+    };
+    Json(json!({"weeklyalbumchart": {"album": album, "@attr": {"user": "listener"}}}))
+        .into_response()
+}
+
 async fn metadata(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
@@ -590,6 +681,7 @@ impl Fixture {
         let app = Router::new()
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
+            .route("/lastfm/", any(lastfm))
             .fallback(unexpected)
             .with_state(state.clone());
         let (stop, stopped) = flume::bounded(1);
@@ -663,10 +755,17 @@ impl Fixture {
         let metadata =
             MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
                 .unwrap();
+        let key = self.state.data.lock().unwrap().library.lastfm_key;
+        let lastfm = LastFm::with_endpoints(
+            &format!("{}lastfm/", self.account.url),
+            key.then(|| LASTFM_KEY.to_string()),
+            Duration::ZERO,
+        )
+        .unwrap();
         if paused {
-            Worker::start_paused(self.paths.clone(), metadata).unwrap()
+            Worker::start_paused(self.paths.clone(), metadata, lastfm).unwrap()
         } else {
-            Worker::start(self.paths.clone(), metadata).unwrap()
+            Worker::start(self.paths.clone(), metadata, lastfm).unwrap()
         }
     }
 
