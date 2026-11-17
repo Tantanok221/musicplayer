@@ -2,10 +2,6 @@ use super::*;
 use crate::discover::{Dismissal, Pick, Rediscover, Season};
 use rand::seq::SliceRandom;
 
-const LOVED_ROWS: usize = 4;
-const SPOTLIGHT_SIDE: f32 = 200.;
-const LOVED_SIDE: f32 = 64.;
-
 impl MusicApp {
     pub(super) fn request_discover(&mut self) {
         self.discover_request += 1;
@@ -114,24 +110,11 @@ impl MusicApp {
         )
     }
 
-    fn play_pick(&self, pick: &Pick) {
-        if pick.loved.is_empty() || matches!(pick.reason, crate::discover::Reason::Rotation { .. })
-        {
-            self.service.send(Command::PlayAlbum(pick.album.id.clone()));
-        } else {
-            let ids = pick.loved.iter().map(|song| song.id.clone()).collect();
-            self.service.send(Command::PlayIds(ids, 0));
-        }
-    }
-
     pub(super) fn discover_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let Some(shelves) = self.discover.clone() else {
             return div().into_any_element();
         };
-        let empty = shelves.spotlight.is_empty()
-            && shelves.lane.is_empty()
-            && shelves.forgotten_favorites.is_empty();
         div()
             .id("discover-page")
             .size_full()
@@ -167,182 +150,25 @@ impl MusicApp {
                             .child("Rediscover"),
                     )
                     .child(div().text_size(px(12.)).text_color(colors.muted).child(
-                        "Music you already own and haven't heard in a while. \
-                         Different memories every day.",
+                        "Albums you once had on repeat, grouped by when you last played them. \
+                         New picks every day.",
                     )),
             )
-            .children(self.discover_spotlight(&shelves, cx))
-            .when(!shelves.lane.is_empty(), |page| {
-                page.child(self.memory_lane(&shelves, cx))
-            })
-            .when(!shelves.forgotten_favorites.is_empty(), |page| {
-                page.child(self.loved_letters(&shelves, cx))
-            })
-            .child(if empty {
+            .child(if shelves.lane.is_empty() {
                 div()
                     .id("discover-empty")
                     .test_support()
                     .px_1()
                     .text_color(colors.muted)
                     .child(
-                        "Nothing to rediscover yet. Albums you used to play a lot and \
-                         favorites you haven't played in six months will show up here.",
+                        "Nothing to rediscover yet. Albums you used to play a lot but \
+                         haven't played in six months will show up here.",
                     )
                     .into_any_element()
             } else {
-                div()
-                    .id("discover-closing")
-                    .test_support()
-                    .pt_4()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("That's all for today."),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(colors.muted)
-                            .child("Tomorrow brings different memories."),
-                    )
-                    .into_any_element()
+                self.memory_lane(&shelves, cx)
             })
             .into_any_element()
-    }
-
-    fn discover_spotlight(
-        &mut self,
-        shelves: &Rediscover,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let colors = ink(cx);
-        let pick = self.discover_visit.spotlight(&shelves.spotlight)?.clone();
-        let album = pick.album.clone();
-        let memory = pick.memory();
-        let detail = pick.detail();
-        let byline = match album.year {
-            Some(year) => format!("{} \u{b7} {year}", album.artist),
-            None => album.artist.clone(),
-        };
-        let play = pick.clone();
-        let dismiss = album.id.clone();
-        let loved = !pick.loved.is_empty()
-            && !matches!(pick.reason, crate::discover::Reason::Rotation { .. });
-        Some(
-            div()
-                .id("discover-spotlight")
-                .test_support()
-                .role(Role::Group)
-                .aria_label("Today's rediscovery")
-                .px_1()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_6()
-                .child(
-                    div()
-                        .id("discover-spotlight-album")
-                        .test_support()
-                        .aria_label(format!("{} by {}", album.name, album.artist))
-                        .flex_shrink_0()
-                        .child(self.art(&album.cover_art, SPOTLIGHT_SIDE, cx)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(260.))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors.muted)
-                                .child("TODAY'S REDISCOVERY"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(20.))
-                                .font_weight(FontWeight::BOLD)
-                                .child(album.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(colors.muted)
-                                .child(byline),
-                        )
-                        .child(
-                            div()
-                                .id("discover-spotlight-memory")
-                                .test_support()
-                                .aria_label(memory.clone())
-                                .pt_1()
-                                .text_size(px(14.))
-                                .child(memory),
-                        )
-                        .child(
-                            div()
-                                .id("discover-spotlight-detail")
-                                .test_support()
-                                .aria_label(detail.clone())
-                                .text_size(px(12.))
-                                .text_color(colors.muted)
-                                .child(detail),
-                        )
-                        .child(
-                            div()
-                                .pt_2()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("discover-spotlight-play")
-                                        .primary()
-                                        .icon(Glyph::Play)
-                                        .label(if loved {
-                                            "Play the songs you loved"
-                                        } else {
-                                            "Play it again"
-                                        })
-                                        .on_click(
-                                            cx.listener(move |app, _, _, _| app.play_pick(&play)),
-                                        ),
-                                )
-                                .when(shelves.spotlight.len() > 1, |row| {
-                                    row.child(
-                                        Button::new("discover-spotlight-next")
-                                            .ghost()
-                                            .label("Another memory")
-                                            .on_click(cx.listener(|app, _, _, cx| {
-                                                app.discover_visit.another();
-                                                cx.notify();
-                                            })),
-                                    )
-                                })
-                                .child(
-                                    Button::new("discover-spotlight-dismiss")
-                                        .ghost()
-                                        .label("Not today")
-                                        .tooltip("Hide this album from Discover for 30 days")
-                                        .on_click(cx.listener(move |app, _, _, cx| {
-                                            app.dismiss_discover(
-                                                dismiss.clone(),
-                                                Dismissal::NotNow,
-                                            );
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
     }
 
     fn memory_lane(&mut self, shelves: &Rediscover, cx: &mut Context<Self>) -> AnyElement {
@@ -432,157 +258,6 @@ impl MusicApp {
                     .children(see_all),
             )
             .child(rows)
-            .into_any_element()
-    }
-
-    fn loved_letters(&mut self, shelves: &Rediscover, cx: &mut Context<Self>) -> AnyElement {
-        let shelf = &shelves.forgotten_favorites;
-        let key = "loved".to_string();
-        let expanded = self.discover_visit.expanded(&key);
-        let picks = if expanded {
-            shelf.ranked.clone()
-        } else {
-            shelf.today.iter().take(LOVED_ROWS).cloned().collect()
-        };
-        let shuffle = shelf.ranked.clone();
-        let total = shuffle.len();
-        let mut actions = vec![
-            Button::new("discover-shuffle-loved")
-                .ghost()
-                .small()
-                .icon(Glyph::Shuffle)
-                .label("Shuffle")
-                .tooltip(format!(
-                    "Shuffle all {total} albums in Songs you once loved"
-                ))
-                .on_click(cx.listener(move |app, _, _, _| app.shuffle_shelf(&shuffle)))
-                .into_any_element(),
-        ];
-        if let Some(button) = self.see_all(key, total, LOVED_ROWS, cx) {
-            actions.push(button.into_any_element());
-        }
-        let header = self.section_header(
-            "Songs you once loved",
-            "Albums you favorited, or loved songs on, that have been resting.",
-            actions,
-            cx,
-        );
-        let mut list = div()
-            .id("discover-loved")
-            .test_support()
-            .role(Role::Group)
-            .aria_label("Songs you once loved")
-            .flex()
-            .flex_col()
-            .child(header);
-        for pick in &picks {
-            list = list.child(self.loved_letter(pick, cx));
-            list = list.children(self.selected_panel(&[pick.album.id.as_str()], cx));
-        }
-        list.into_any_element()
-    }
-
-    fn loved_letter(&mut self, pick: &Pick, cx: &mut Context<Self>) -> AnyElement {
-        let colors = ink(cx);
-        let album = pick.album.clone();
-        let id = album.id.clone();
-        let selected = self
-            .selected_album
-            .as_ref()
-            .is_some_and(|selected| selected.id == id);
-        let memory = pick.memory();
-        let detail = pick.detail();
-        let open = album.clone();
-        let play = pick.clone();
-        let loved = !pick.loved.is_empty();
-        div()
-            .id(SharedString::from(format!("discover-loved-{id}")))
-            .test_support()
-            .role(Role::Button)
-            .aria_label(format!("Select album {} by {}", album.name, album.artist))
-            .aria_selected(selected)
-            .px_1()
-            .py_3()
-            .flex()
-            .items_center()
-            .gap_4()
-            .cursor_pointer()
-            .border_b_1()
-            .border_color(if selected { colors.accent } else { colors.line })
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .child(self.art(&album.cover_art, LOVED_SIDE, cx)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .text_size(px(12.))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(album.name.clone()),
-                            )
-                            .child(div().text_color(colors.muted).child("\u{b7}"))
-                            .child(div().text_color(colors.muted).truncate().child(
-                                self.artist_links(
-                                    album.artist_credits(),
-                                    format!("discover-artist-loved-{id}"),
-                                    cx,
-                                ),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("discover-loved-memory-{id}")))
-                            .test_support()
-                            .aria_label(memory.clone())
-                            .text_size(px(12.))
-                            .child(memory),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("discover-loved-detail-{id}")))
-                            .test_support()
-                            .aria_label(detail.clone())
-                            .text_size(px(11.))
-                            .text_color(colors.accent)
-                            .truncate()
-                            .child(detail),
-                    ),
-            )
-            .child(
-                Button::new(SharedString::from(format!("discover-play-loved-{id}")))
-                    .ghost()
-                    .small()
-                    .icon(Glyph::Play)
-                    .label(if loved {
-                        "Play the songs you loved"
-                    } else {
-                        "Play album"
-                    })
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        cx.stop_propagation();
-                        app.play_pick(&play)
-                    })),
-            )
-            .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
-                app.select_album(open.clone(), cx);
-                if event.click_count() == 2 {
-                    app.service.send(Command::PlayAlbum(open.id.clone()));
-                }
-            }))
-            .context_menu(self.discover_menu(&album, cx))
             .into_any_element()
     }
 

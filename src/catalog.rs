@@ -902,59 +902,14 @@ impl Catalog {
             .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
-    /// Albums that could sit on a Rediscover shelf, with their loved songs and
-    /// most played song.
-    pub fn rediscover_candidates(&self) -> Result<Vec<crate::discover::Candidate>> {
-        let mut songs = self.conn.prepare(
-            "SELECT album_id, id, title, plays, starred=1 OR coalesce(rating,0)>=4 FROM tracks
-             WHERE starred=1 OR coalesce(rating,0)>=4 OR plays>0
-             ORDER BY album_id, disc, track, title, id",
-        )?;
-        let mut by_album: std::collections::HashMap<
-            String,
-            (Vec<crate::discover::Song>, Option<crate::discover::Song>),
-        > = std::collections::HashMap::new();
-        for row in songs.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                crate::discover::Song {
-                    id: row.get(1)?,
-                    title: row.get(2)?,
-                    plays: row.get::<_, i64>(3)?.max(0) as u64,
-                },
-                row.get::<_, bool>(4)?,
-            ))
-        })? {
-            let (album, song, loved) = row?;
-            let (loved_songs, top) = by_album.entry(album).or_default();
-            if song.plays > top.as_ref().map_or(0, |top| top.plays) {
-                *top = Some(song.clone());
-            }
-            if loved {
-                loved_songs.push(song);
-            }
-        }
+    /// Albums that have been played, the pool for Rediscover.
+    pub fn rediscover_candidates(&self) -> Result<Vec<Arc<Album>>> {
         let mut statement = self.conn.prepare(
-            "SELECT a.id, a.data FROM albums a
-             WHERE coalesce(json_extract(a.data,'$.playCount'),0)>0
-                OR json_extract(a.data,'$.starred') IS NOT NULL
-                OR coalesce(json_extract(a.data,'$.userRating'),0)>=4
-                OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id=a.id
-                           AND (t.starred=1 OR coalesce(t.rating,0)>=4))",
+            "SELECT data FROM albums WHERE coalesce(json_extract(data,'$.playCount'),0)>0",
         )?;
         statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .map(|row| {
-                let (id, data) = row?;
-                let (loved, top_song) = by_album.remove(&id).unwrap_or_default();
-                Ok(crate::discover::Candidate {
-                    album: Arc::new(serde_json::from_str(&data)?),
-                    loved,
-                    top_song,
-                })
-            })
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(Arc::new(serde_json::from_str(&row?)?)))
             .collect()
     }
     /// MusicBrainz release IDs of every album in the library.

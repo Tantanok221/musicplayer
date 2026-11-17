@@ -1,7 +1,7 @@
 use crate::common::ui::{Fixture, PlaybackIntent, start};
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, test::TestWindowExt};
 use sonora::{
-    discover::{Dismissal, Pick, Reason, Rediscover, Season, Shelf, Song},
+    discover::{Dismissal, Pick, Reason, Rediscover, Season, Shelf},
     model::Album,
     playback::Placement,
     service::{Command, Event},
@@ -30,50 +30,18 @@ fn album(fixture: &Fixture, id: &str) -> Arc<Album> {
         })
 }
 
-fn song(id: &str, title: &str, plays: u64) -> Song {
-    Song {
-        id: id.into(),
-        title: title.into(),
-        plays,
-    }
-}
-
-fn pick(fixture: &Fixture, id: &str) -> Pick {
-    Pick {
-        album: album(fixture, id),
-        reason: Reason::Favorite {
-            loved_songs: 2,
-            played: None,
-        },
-        loved: vec![
-            song(&format!("{id}-a"), "Moonwake", 0),
-            song(&format!("{id}-b"), "Paper Boats", 0),
-        ],
-        top_song: None,
-    }
-}
-
 fn rotation(fixture: &Fixture, id: &str) -> Pick {
     Pick {
         album: album(fixture, id),
-        reason: Reason::Rotation {
+        reason: Reason {
             plays: 44,
             played: "2026-03-10T00:00:00Z".parse().unwrap(),
         },
-        loved: vec![],
-        top_song: Some(song(&format!("{id}-top"), "Low Tide", 19)),
     }
 }
 
-fn picks(fixture: &Fixture, ids: &[&str], make: fn(&Fixture, &str) -> Pick) -> Vec<Pick> {
-    ids.iter().map(|id| make(fixture, id)).collect()
-}
-
-fn shelf(fixture: &Fixture, ranked: &[&str], today: &[&str]) -> Shelf {
-    Shelf {
-        ranked: picks(fixture, ranked, pick),
-        today: picks(fixture, today, pick),
-    }
+fn picks(fixture: &Fixture, ids: &[&str]) -> Vec<Pick> {
+    ids.iter().map(|id| rotation(fixture, id)).collect()
 }
 
 fn season(fixture: &Fixture, key: &str, label: &str, ranked: &[&str], today: &[&str]) -> Season {
@@ -81,8 +49,8 @@ fn season(fixture: &Fixture, key: &str, label: &str, ranked: &[&str], today: &[&
         key: key.into(),
         label: label.into(),
         shelf: Shelf {
-            ranked: picks(fixture, ranked, rotation),
-            today: picks(fixture, today, rotation),
+            ranked: picks(fixture, ranked),
+            today: picks(fixture, today),
         },
     }
 }
@@ -145,85 +113,6 @@ fn open(
 }
 
 #[gpui_kit::test]
-fn todays_rediscovery_tells_the_albums_story_and_moves_on(cx: &mut TestAppContext) {
-    let (_dir, mut fixture, window, app) = start(cx);
-    fixture.capture_playback();
-    let first = rotation(&fixture, "album-2");
-    let second = pick(&fixture, "album-3");
-    let shelves = Rediscover {
-        spotlight: vec![first.clone(), second.clone()],
-        ..Default::default()
-    };
-    open(&mut fixture, window, shelves, cx);
-    fixture.diagnose("todays rediscovery", window, &app, cx);
-    assert_eq!(active_title(window, &app, cx), "Discover");
-    assert_eq!(
-        label(window, "discover-spotlight-memory", cx),
-        first.memory()
-    );
-    assert_eq!(
-        label(window, "discover-spotlight-memory", cx),
-        "You played this 44 times. The last time was in March 2026."
-    );
-    assert_eq!(
-        label(window, "discover-spotlight-detail", cx),
-        first.detail()
-    );
-    assert_eq!(
-        label(window, "discover-spotlight-album", cx),
-        format!("{} by {}", first.album.name, first.album.artist)
-    );
-
-    fixture.click(window, "discover-spotlight-play", cx);
-    assert_eq!(
-        fixture.playback_intents(),
-        [PlaybackIntent::PlayAlbum("album-2".into())]
-    );
-
-    fixture.click(window, "discover-spotlight-next", cx);
-    assert_eq!(
-        label(window, "discover-spotlight-memory", cx),
-        second.memory()
-    );
-    fixture.click(window, "discover-spotlight-play", cx);
-    assert_eq!(
-        fixture.playback_intents()[1],
-        PlaybackIntent::PlayIds(vec!["album-3-a".into(), "album-3-b".into()], 0),
-        "a favorite's spotlight plays the songs you loved"
-    );
-    fixture.click(window, "discover-spotlight-next", cx);
-    assert_eq!(
-        label(window, "discover-spotlight-memory", cx),
-        first.memory()
-    );
-
-    fixture.click(window, "discover-spotlight-next", cx);
-    fixture.expect("not today", |command, _| {
-        assert!(matches!(
-            command,
-            Command::HideDiscover(id, Dismissal::NotNow) if id == "album-3"
-        ));
-        vec![]
-    });
-    let after = Rediscover {
-        spotlight: vec![first.clone()],
-        ..Default::default()
-    };
-    reply(&mut fixture, "spotlight without album-3", after);
-    fixture.click(window, "discover-spotlight-dismiss", cx);
-    assert_eq!(
-        label(window, "discover-spotlight-memory", cx),
-        first.memory()
-    );
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.find("discover-closing").visible());
-    })
-    .unwrap();
-    fixture.assert_script_finished();
-}
-
-#[gpui_kit::test]
 fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app) = start(cx);
     fixture.capture_playback();
@@ -251,7 +140,6 @@ fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestApp
             today: all,
         },
         lane: vec![spring, older],
-        ..Default::default()
     };
     open(&mut fixture, window, shelves, cx);
     fixture.diagnose("memory lane", window, &app, cx);
@@ -334,81 +222,16 @@ fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
-fn songs_you_once_loved_play_only_the_loved_songs(cx: &mut TestAppContext) {
-    let (_dir, mut fixture, window, app) = start(cx);
-    fixture.capture_playback();
-    let extras = (0..EXTRA)
-        .map(|ix| format!("extra-{ix}"))
-        .collect::<Vec<_>>();
-    let mut ranked = vec!["album-3"];
-    ranked.extend(extras.iter().map(String::as_str));
-    let shelves = Rediscover {
-        forgotten_favorites: shelf(&fixture, &ranked, &ranked),
-        ..Default::default()
-    };
-    let loved = pick(&fixture, "album-3");
-    open(&mut fixture, window, shelves, cx);
-    fixture.diagnose("songs you once loved", window, &app, cx);
-    assert_eq!(
-        label(window, "discover-loved-memory-album-3", cx),
-        loved.memory()
-    );
-    assert_eq!(
-        label(window, "discover-loved-detail-album-3", cx),
-        "Songs you loved: Moonwake · Paper Boats"
-    );
-    let collapsed = shown(window, "discover-loved-", cx);
-    assert!(collapsed < EXTRA, "only a few letters show at first");
-
-    fixture.click(window, "discover-play-loved-album-3", cx);
-    assert_eq!(
-        fixture.playback_intents(),
-        [PlaybackIntent::PlayIds(
-            vec!["album-3-a".into(), "album-3-b".into()],
-            0
-        )]
-    );
-    fixture.click(window, "discover-loved-album-3", cx);
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(window.find("discover-loved-album-3").selected(), Some(true));
-        assert!(window.find("album-panel-album-3").visible());
-    })
-    .unwrap();
-    assert_eq!(
-        fixture.playback_intents().len(),
-        1,
-        "one click only selects"
-    );
-
-    fixture.click(window, "discover-see-all-loved", cx);
-    assert_eq!(shown(window, "discover-loved-", cx), EXTRA);
-    fixture.click(window, "discover-see-all-loved", cx);
-    assert_eq!(shown(window, "discover-loved-", cx), collapsed);
-    fixture.assert_script_finished();
-}
-
-#[gpui_kit::test]
 fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app) = start(cx);
     fixture.click(window, ("workspace-tab", 1_u64), cx);
     fixture.hold_queries();
     fixture.search(window, "Fixture", cx);
-    let both = &["album-3", "album-1"];
-    let lane = |fixture: &Fixture| {
-        vec![season(
-            fixture,
-            "older",
-            "A year ago and longer",
-            &["album-2"],
-            &["album-2"],
-        )]
-    };
-    let first = Rediscover {
-        forgotten_favorites: shelf(&fixture, both, both),
-        lane: lane(&fixture),
+    let lane = |fixture: &Fixture, ids: &[&str]| Rediscover {
+        lane: vec![season(fixture, "older", "Spring 2024", ids, ids)],
         ..Default::default()
     };
+    let first = lane(&fixture, &["album-3", "album-1", "album-2"]);
     reply(&mut fixture, "open Discover", first);
     fixture.click(window, "nav-discover", cx);
 
@@ -419,22 +242,18 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
         ));
         vec![]
     });
-    let after_hide = Rediscover {
-        forgotten_favorites: shelf(&fixture, &["album-1"], &["album-1"]),
-        lane: lane(&fixture),
-        ..Default::default()
-    };
-    reply(&mut fixture, "shelves without album-3", after_hide);
+    let after_hide = lane(&fixture, &["album-1", "album-2"]);
+    reply(&mut fixture, "lane without album-3", after_hide);
     cx.update_window(window, |_, window, cx| {
-        window.right_click("discover-loved-album-3", cx)
+        window.right_click("discover-album-older-album-3", cx)
     })
     .unwrap();
     fixture.settle(window, cx);
     fixture.menu_item(window, "Not now", cx);
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("discover-loved-album-3").is_none());
-        assert!(window.find("discover-loved-album-1").visible());
+        assert!(window.try_find("discover-album-older-album-3").is_none());
+        assert!(window.find("discover-album-older-album-1").visible());
     })
     .unwrap();
 
@@ -445,11 +264,8 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
         ));
         vec![]
     });
-    let without_lane = Rediscover {
-        forgotten_favorites: shelf(&fixture, &["album-1"], &["album-1"]),
-        ..Default::default()
-    };
-    reply(&mut fixture, "lane without album-2", without_lane);
+    let after_never = lane(&fixture, &["album-1"]);
+    reply(&mut fixture, "lane without album-2", after_never);
     cx.update_window(window, |_, window, cx| {
         window.right_click("discover-album-older-album-2", cx)
     })
@@ -458,8 +274,8 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
     fixture.menu_item(window, "Never suggest", cx);
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("discover-lane").is_none());
-        assert!(window.find("discover-loved").visible());
+        assert!(window.try_find("discover-album-older-album-2").is_none());
+        assert!(window.find("discover-album-older-album-1").visible());
     })
     .unwrap();
 
@@ -472,7 +288,7 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
     fixture.settle(window, cx);
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("discover-loved").is_none());
+        assert!(window.try_find("discover-lane").is_none());
         assert!(window.find("discover-empty").visible());
     })
     .unwrap();
@@ -482,5 +298,26 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
     reply(&mut fixture, "forward to Discover", Rediscover::default());
     fixture.click(window, "history-forward", cx);
     assert_eq!(active_title(window, &app, cx), "Discover");
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn discover_is_only_memory_lane(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    let older = season(&fixture, "older", "Spring 2024", &["album-2"], &["album-2"]);
+    let shelves = Rediscover {
+        old_rotation: older.shelf.clone(),
+        lane: vec![older],
+    };
+    open(&mut fixture, window, shelves, cx);
+    fixture.diagnose("memory lane only", window, &app, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("discover-lane").visible());
+        for gone in ["discover-spotlight", "discover-loved", "discover-closing"] {
+            assert!(window.try_find(gone).is_none(), "{gone} should be gone");
+        }
+    })
+    .unwrap();
     fixture.assert_script_finished();
 }
