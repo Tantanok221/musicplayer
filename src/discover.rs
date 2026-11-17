@@ -9,6 +9,8 @@ use std::{
 
 pub const WINDOW_DAYS: i64 = 182;
 pub const SHELF_LIMIT: usize = 48;
+/// Albums a season shows before See all, however wide the window is.
+pub const SEASON_ROW: usize = 8;
 pub const MIN_ROTATION_PLAYS: u64 = 5;
 pub const NOT_NOW_DAYS: i64 = 30;
 
@@ -225,10 +227,7 @@ fn history_lane(albums: &[&Arc<Album>], history: &History, now: DateTime<Utc>) -
                 Season {
                     key: span.key,
                     label: span.label,
-                    shelf: Shelf {
-                        ranked: vec![pick],
-                        today: Vec::new(),
-                    },
+                    shelf: Shelf { ranked: vec![pick] },
                 },
             )),
         }
@@ -239,7 +238,6 @@ fn history_lane(albums: &[&Arc<Album>], history: &History, now: DateTime<Utc>) -
         .map(|(_, mut season)| {
             season.shelf.ranked.sort_by(by_plays);
             season.shelf.ranked.truncate(SHELF_LIMIT);
-            season.shelf.today = todays_order(&season.shelf.ranked, now.date_naive(), &season.key);
             season
         })
         .collect()
@@ -258,11 +256,10 @@ pub struct Pick {
     pub reason: Reason,
 }
 
-/// One shelf: every pick by rank, and the same picks in today's rotation.
+/// One shelf: every pick, most played first.
 #[derive(Clone, Debug, Default)]
 pub struct Shelf {
     pub ranked: Vec<Pick>,
-    pub today: Vec<Pick>,
 }
 
 impl Shelf {
@@ -392,7 +389,6 @@ fn lane(ranked: &[Pick], now: DateTime<Utc>) -> Vec<Season> {
                     label,
                     shelf: Shelf {
                         ranked: vec![pick.clone()],
-                        today: Vec::new(),
                     },
                 },
             )),
@@ -402,23 +398,10 @@ fn lane(ranked: &[Pick], now: DateTime<Utc>) -> Vec<Season> {
     seasons
         .into_iter()
         .map(|(_, mut season)| {
-            season.shelf.today = todays_order(&season.shelf.ranked, now.date_naive(), &season.key);
+            season.shelf.ranked.sort_by(by_plays);
             season
         })
         .collect()
-}
-
-fn fnv(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-/// The shelf in the day's order: the same all day, different the next.
-pub fn todays_order(picks: &[Pick], day: NaiveDate, shelf: &str) -> Vec<Pick> {
-    let mut order = picks.to_vec();
-    order.sort_by_cached_key(|pick| fnv(&format!("{day}/{shelf}/{}", pick.album.id)));
-    order
 }
 
 fn played(album: &Album) -> Option<DateTime<Utc>> {
@@ -430,11 +413,6 @@ fn played(album: &Album) -> Option<DateTime<Utc>> {
 
 fn plays(album: &Album) -> u64 {
     album.play_count.unwrap_or(0)
-}
-
-fn shelf(ranked: Vec<Pick>, now: DateTime<Utc>, key: &str) -> Shelf {
-    let today = todays_order(&ranked, now.date_naive(), key);
-    Shelf { ranked, today }
 }
 
 /// Old rotation: the most played tenth of the library, not played in the
@@ -490,13 +468,15 @@ pub fn rediscover(
         all.sort_by(by_plays);
         return Rediscover {
             lane,
-            old_rotation: shelf(all, now, "old-rotation"),
+            old_rotation: Shelf { ranked: all },
             history: HistoryStatus::Ready,
         };
     }
     Rediscover {
         lane: lane(&old_rotation, now),
-        old_rotation: shelf(old_rotation, now, "old-rotation"),
+        old_rotation: Shelf {
+            ranked: old_rotation,
+        },
         history: HistoryStatus::Off,
     }
 }

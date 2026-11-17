@@ -1,8 +1,8 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use sonora::{
     discover::{
         ChartAlbum, Dismissal, Hidden, History, Pick, SHELF_LIMIT, SeasonChart, Visit, rediscover,
-        seasons_between, stale_seasons, todays_order,
+        seasons_between, stale_seasons,
     },
     model::Album,
 };
@@ -76,7 +76,6 @@ fn old_rotation_stops_at_the_limit_and_an_empty_library_has_none() {
         .collect::<Vec<_>>();
     let shelves = rediscover(&candidates, None, &Hidden::default(), now());
     assert_eq!(shelves.old_rotation.ranked.len(), SHELF_LIMIT);
-    assert_eq!(shelves.old_rotation.today.len(), SHELF_LIMIT);
     let empty = rediscover(&[], None, &Hidden::default(), now());
     assert!(empty.old_rotation.ranked.is_empty() && empty.lane.is_empty());
 }
@@ -112,33 +111,6 @@ fn each_pick_explains_why_it_is_on_the_shelf() {
         "40 plays · last played 11 months ago"
     );
     assert_eq!(reason("long-ago"), "41 plays · last played over a year ago");
-}
-
-#[test]
-fn todays_order_is_stable_within_a_day_and_changes_the_next() {
-    let candidates = (0..20)
-        .map(|ix| candidate(album(&format!("heavy-{ix:02}"), 50, Some(OLD)), 0))
-        .collect::<Vec<_>>();
-    let ranked = rediscover(&candidates, None, &Hidden::default(), now())
-        .old_rotation
-        .ranked;
-    let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
-    let tuesday = monday.succ_opt().unwrap();
-    let first = todays_order(&ranked, monday, "old-rotation");
-    assert_eq!(
-        ids(&first),
-        ids(&todays_order(&ranked, monday, "old-rotation"))
-    );
-    let next = todays_order(&ranked, tuesday, "old-rotation");
-    assert_ne!(ids(&first)[..6], ids(&next)[..6]);
-    let mut all = ids(&next);
-    all.sort();
-    assert_eq!(all, ids(&ranked));
-    assert_ne!(
-        ids(&first),
-        ids(&ranked),
-        "today's row is not just the ranking"
-    );
 }
 
 #[test]
@@ -197,9 +169,6 @@ fn memory_lane_groups_old_rotation_by_the_season_it_was_last_played() {
             ("older", "A year ago and longer", vec!["long-ago"]),
         ]
     );
-    let mut today = ids(&shelves.lane[1].shelf.today);
-    today.sort();
-    assert_eq!(today, ["winter-dec", "winter-jan"]);
 }
 
 #[test]

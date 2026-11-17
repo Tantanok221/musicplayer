@@ -1,5 +1,7 @@
 use crate::common::ui::{Fixture, PlaybackIntent, start};
-use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, test::TestWindowExt};
+use gpui_kit::{
+    AnyWindowHandle, AppContext, Entity, TestAppContext, px, size, test::TestWindowExt,
+};
 use sonora::{
     discover::{Dismissal, HistoryStatus, Pick, Reason, Rediscover, Season, Shelf},
     model::Album,
@@ -10,6 +12,8 @@ use sonora::{
 use std::sync::Arc;
 
 const EXTRA: usize = 10;
+/// Albums a season shows before See all.
+const ROW: usize = 8;
 
 fn album(fixture: &Fixture, id: &str) -> Arc<Album> {
     fixture
@@ -45,13 +49,12 @@ fn picks(fixture: &Fixture, ids: &[&str]) -> Vec<Pick> {
     ids.iter().map(|id| rotation(fixture, id)).collect()
 }
 
-fn season(fixture: &Fixture, key: &str, label: &str, ranked: &[&str], today: &[&str]) -> Season {
+fn season(fixture: &Fixture, key: &str, label: &str, ranked: &[&str]) -> Season {
     Season {
         key: key.into(),
         label: label.into(),
         shelf: Shelf {
             ranked: picks(fixture, ranked),
-            today: picks(fixture, today),
         },
     }
 }
@@ -122,24 +125,13 @@ fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestApp
         .collect::<Vec<_>>();
     let mut ranked = vec!["album-3", "album-1"];
     ranked.extend(extras.iter().map(String::as_str));
-    let mut today = ranked.clone();
-    today.reverse();
-    let spring = season(&fixture, "2026-spring", "Spring 2026", &ranked, &today);
-    let older = season(
-        &fixture,
-        "older",
-        "A year ago and longer",
-        &["album-2"],
-        &["album-2"],
-    );
+    let spring = season(&fixture, "2026-spring", "Spring 2026", &ranked);
+    let older = season(&fixture, "older", "A year ago and longer", &["album-2"]);
     let mut all = spring.shelf.ranked.clone();
     all.extend(older.shelf.ranked.clone());
     let reason = older.shelf.ranked[0].reason_text(chrono::Utc::now());
     let shelves = Rediscover {
-        old_rotation: Shelf {
-            ranked: all.clone(),
-            today: all,
-        },
+        old_rotation: Shelf { ranked: all },
         lane: vec![spring, older],
         ..Default::default()
     };
@@ -154,21 +146,34 @@ fn memory_lane_groups_seasons_selects_like_explorer_and_expands(cx: &mut TestApp
         let spring = window.find("discover-season-2026-spring").bounds();
         let older = window.find("discover-season-older").bounds();
         assert!(spring.top() < older.top(), "seasons run newest first");
-        let first = window
-            .find(format!("discover-album-2026-spring-extra-{}", EXTRA - 1))
-            .bounds();
-        let second = window
-            .find(format!("discover-album-2026-spring-extra-{}", EXTRA - 2))
-            .bounds();
+        let first = window.find("discover-album-2026-spring-album-3").bounds();
+        let second = window.find("discover-album-2026-spring-album-1").bounds();
         assert!(
             first.left() < second.left(),
-            "the row follows today's order"
+            "the most played album comes first"
         );
         assert!(window.try_find("album-panel-album-2").is_none());
     })
     .unwrap();
+    // The eight most played albums, however wide the window is.
     let collapsed = shown(window, "discover-album-2026-spring-", cx);
-    assert!(collapsed < EXTRA, "one row shows only part of the season");
+    assert_eq!(collapsed, ROW - 2);
+    for width in [760., 1600.] {
+        cx.simulate_window_resize(window, size(px(width), px(1800.)));
+        fixture.settle(window, cx);
+        assert_eq!(shown(window, "discover-album-2026-spring-", cx), ROW - 2);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            for ix in 0..ROW - 2 {
+                assert!(
+                    window
+                        .try_find(format!("discover-album-2026-spring-extra-{ix}"))
+                        .is_some()
+                );
+            }
+        })
+        .unwrap();
+    }
 
     fixture.click(window, "discover-album-older-album-2", cx);
     cx.update_window(window, |_, window, cx| {
@@ -230,7 +235,7 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
     fixture.hold_queries();
     fixture.search(window, "Fixture", cx);
     let lane = |fixture: &Fixture, ids: &[&str]| Rediscover {
-        lane: vec![season(fixture, "older", "Spring 2024", ids, ids)],
+        lane: vec![season(fixture, "older", "Spring 2024", ids)],
         ..Default::default()
     };
     let first = lane(&fixture, &["album-3", "album-1", "album-2"]);
@@ -306,7 +311,7 @@ fn discover_dismissals_refresh_and_history_keep_the_page_current(cx: &mut TestAp
 #[gpui_kit::test]
 fn discover_is_only_memory_lane(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app) = start(cx);
-    let older = season(&fixture, "older", "Spring 2024", &["album-2"], &["album-2"]);
+    let older = season(&fixture, "older", "Spring 2024", &["album-2"]);
     let shelves = Rediscover {
         old_rotation: older.shelf.clone(),
         lane: vec![older],
@@ -345,13 +350,7 @@ fn memory_lane_tells_how_far_lastfm_history_has_come(cx: &mut TestAppContext) {
         "Add your Last.fm username to reach back through every season you've scrobbled."
     );
     let request = *asked.lock().unwrap();
-    let older = season(
-        &fixture,
-        "2021-summer",
-        "Summer 2021",
-        &["album-2"],
-        &["album-2"],
-    );
+    let older = season(&fixture, "2021-summer", "Summer 2021", &["album-2"]);
     for (status, expected) in [
         (
             HistoryStatus::Loading { done: 0, total: 0 },

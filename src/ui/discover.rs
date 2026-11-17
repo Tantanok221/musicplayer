@@ -150,8 +150,7 @@ impl MusicApp {
                             .child("Rediscover"),
                     )
                     .child(div().text_size(px(12.)).text_color(colors.muted).child(
-                        "Albums you once had on repeat, grouped by when you last played them. \
-                         New picks every day.",
+                        "Albums you once had on repeat, grouped by when you played them most.",
                     ))
                     .children(self.history_line(&shelves.history, cx)),
             )
@@ -273,11 +272,18 @@ impl MusicApp {
         let columns = columns.max(1);
         let key = season.key.clone();
         let expanded = self.discover_visit.expanded(&key);
-        let picks = if expanded {
-            season.shelf.ranked.clone()
+        let shown = if expanded {
+            season.shelf.ranked.len()
         } else {
-            season.shelf.today.iter().take(columns).cloned().collect()
+            crate::discover::SEASON_ROW
         };
+        let picks = season
+            .shelf
+            .ranked
+            .iter()
+            .take(shown)
+            .cloned()
+            .collect::<Vec<_>>();
         let now = chrono::Utc::now();
         let mut rows = div().flex().flex_col();
         for chunk in picks.chunks(columns) {
@@ -292,7 +298,12 @@ impl MusicApp {
                 .collect::<Vec<_>>();
             rows = rows.children(self.selected_panel(&ids, cx));
         }
-        let see_all = self.see_all(key.clone(), season.shelf.ranked.len(), columns, cx);
+        let see_all = self.see_all(
+            key.clone(),
+            season.shelf.ranked.len(),
+            crate::discover::SEASON_ROW,
+            cx,
+        );
         div()
             .flex()
             .flex_col()
