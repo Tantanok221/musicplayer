@@ -47,11 +47,16 @@ axum = "0.8"
 gpui-kit = { version = "=0.9.0", features = ["test-support"] }
 hound = "3"
 
+[profile.dev]
+# Keep file/line backtraces without storing full variable and type debug data.
+# The test profile inherits this setting.
+debug = "line-tables-only"
+
 [profile.release]
-# Favor fast local rebuilds: compile in parallel and reuse unchanged work.
+# Keep parallel compilation, but avoid a separate incremental release cache.
 lto = "thin"
 codegen-units = 16
-incremental = true
+incremental = false
 
 [[bin]]
 name = "sonora"
