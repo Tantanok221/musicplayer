@@ -139,20 +139,6 @@ struct QueueDrag {
     first_index: usize,
     title: String,
 }
-struct QueueDragPreview(String);
-impl Render for QueueDragPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .border_1()
-            .border_color(cx.theme().border)
-            .child(self.0.clone())
-    }
-}
 
 impl MusicApp {
     /// Shows the track's album, selected and expanded, in Music Explorer.
@@ -931,7 +917,7 @@ impl MusicApp {
                         app.queue_ui.focus.focus(window, cx);
                         cx.notify();
                     });
-                    cx.new(|_| QueueDragPreview(drag.title.clone()))
+                    cx.new(|_| tracks::TrackDragPreview(drag.title.clone()))
                 })
                 .child(
                     short_button(

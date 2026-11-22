@@ -335,13 +335,12 @@ impl MusicApp {
                 }
                 if matches!(
                     mutation,
-                    Mutation::CreatePlaylist(..)
-                        | Mutation::RenamePlaylist(..)
-                        | Mutation::ReplacePlaylist(..)
+                    Mutation::CreatePlaylist(..) | Mutation::RenamePlaylist(..)
                 ) {
                     self.show_playlist_editor = false;
                 }
                 self.status = match &mutation {
+                    Mutation::ReorderPlaylist { .. } => "Playlist order saved".into(),
                     Mutation::AddToPlaylist(id, ids) => {
                         let name = self
                             .playlists

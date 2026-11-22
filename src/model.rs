@@ -267,10 +267,21 @@ pub struct Playlist {
     pub name: String,
     pub comment: String,
     pub owner: String,
+    pub readonly: bool,
     pub song_count: u32,
     pub duration: f64,
     pub cover_art: String,
     pub entry: Arc<Vec<Arc<Track>>>,
+}
+
+impl Playlist {
+    pub(crate) fn can_reorder(&self) -> bool {
+        !self.readonly && self.entry.len() > 1 && self.entry.len() == self.song_count as usize
+    }
+
+    pub(crate) fn track_ids(&self) -> impl Iterator<Item = &str> {
+        self.entry.iter().map(|track| track.id.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

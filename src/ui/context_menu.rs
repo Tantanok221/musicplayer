@@ -272,7 +272,7 @@ impl MusicApp {
             _ => None,
         };
         let removal = match position {
-            Some(tracks::TrackPosition::Playlist { removal, .. }) => removal,
+            Some(tracks::TrackPosition::Playlist { editable_entry, .. }) => editable_entry,
             _ => None,
         };
         move |menu, window, cx| {
