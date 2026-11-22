@@ -151,6 +151,10 @@ pub enum Command {
     /// Album ID: save its songs, in disc/track order, to a playlist.
     AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
+    /// Writes the edit into the files under the mapped music folder.
+    WriteTags(crate::tags::TagEdit),
+    /// Puts back the tags the last edit changed.
+    UndoTags,
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
@@ -253,6 +257,7 @@ pub enum Event {
     MutationFailed(Mutation, String),
     AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
+    TagsWritten(crate::tags::TagReport),
 }
 #[derive(Clone)]
 pub struct Service {
@@ -263,6 +268,214 @@ pub struct Service {
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+/// Writes an edit into every selected file it can find, journaling each
+/// file before it is touched.
+fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::tags::TagReport> {
+    use crate::tags::{self, EditState};
+    let prefs: Preferences = catalog.state("preferences")?;
+    let mut report = tags::TagReport {
+        job: chrono::Utc::now().timestamp_micros(),
+        ..Default::default()
+    };
+    let tracks = catalog.by_ids(&edit.tracks)?;
+    if !prefs.metadata.write_tags {
+        report.failures = tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.title.clone(),
+                    "Turn on Write tags to files in Settings → Metadata first.".into(),
+                )
+            })
+            .collect();
+        return Ok(report);
+    }
+    let root = std::path::PathBuf::from(&prefs.metadata.library_folder);
+    // A file written since the last rescan no longer matches the size Navidrome has.
+    let unconfirmed = catalog.unconfirmed_tag_edits()?;
+    for track in tracks {
+        let file = match unconfirmed
+            .iter()
+            .rev()
+            .find(|entry| entry.track_id == track.id)
+        {
+            Some(entry) => Ok(std::path::PathBuf::from(&entry.file)),
+            None => tags::resolve(&root, &track),
+        };
+        let file = match file {
+            Ok(file) => file,
+            Err(reason) => {
+                report.failures.push((track.title.clone(), reason));
+                continue;
+            }
+        };
+        let before = match tags::read(&file) {
+            Ok(before) => before,
+            Err(error) => {
+                report
+                    .failures
+                    .push((track.title.clone(), format!("{error:#}")));
+                continue;
+            }
+        };
+        let id = catalog.journal_tag_edit(report.job, &track, &file, &before)?;
+        match tags::write(&file, &edit.fields) {
+            Ok((_, after)) => {
+                catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
+                report.written += 1;
+            }
+            Err(error) => {
+                catalog.finish_tag_edit(id, None, EditState::Failed)?;
+                report
+                    .failures
+                    .push((track.title.clone(), format!("{error:#}")));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Puts back what the newest job changed, as a new job so it can be undone too.
+fn undo_tags(catalog: &Catalog) -> Result<crate::tags::TagReport> {
+    use crate::tags::{self, EditState};
+    let mut report = tags::TagReport {
+        job: chrono::Utc::now().timestamp_micros(),
+        undo: true,
+        ..Default::default()
+    };
+    let Some(job) = catalog.last_tag_job()? else {
+        report
+            .failures
+            .push((String::new(), "There is no tag edit to undo.".into()));
+        return Ok(report);
+    };
+    for entry in catalog.tag_job(job)? {
+        if !matches!(entry.state, EditState::Written | EditState::Confirmed) {
+            continue;
+        }
+        let changed: tags::TagValues = entry
+            .after
+            .iter()
+            .filter(|(field, values)| entry.before.get(field) != Some(values))
+            .map(|(field, values)| (*field, values.clone()))
+            .collect();
+        let track = catalog
+            .track_by_path(&entry.path)?
+            .map(|track| (*track).clone())
+            .unwrap_or_else(|| Track {
+                id: entry.track_id.clone(),
+                path: entry.path.clone(),
+                title: entry.title.clone(),
+                starred: entry.starred.then(String::new),
+                user_rating: entry.rating,
+                ..Default::default()
+            });
+        let file = std::path::PathBuf::from(&entry.file);
+        let current = match tags::read(&file) {
+            Ok(current) => current,
+            Err(error) => {
+                report
+                    .failures
+                    .push((entry.title.clone(), format!("{error:#}")));
+                continue;
+            }
+        };
+        let id = catalog.journal_tag_edit(report.job, &track, &file, &current)?;
+        match tags::write(&file, &tags::restore(&entry.before, &changed)) {
+            Ok((_, after)) => {
+                catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
+                catalog.finish_tag_edit(entry.id, None, EditState::Undone)?;
+                report.written += 1;
+            }
+            Err(error) => {
+                catalog.finish_tag_edit(id, None, EditState::Failed)?;
+                report
+                    .failures
+                    .push((entry.title.clone(), format!("{error:#}")));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Reports a tag job and asks Navidrome to rescan. Only administrators can
+/// start a scan; for others Navidrome's file watcher picks the change up.
+fn finish_tag_job(
+    report: &crate::tags::TagReport,
+    server: Option<Server>,
+    runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
+    events: &Sender<Event>,
+) -> Result<()> {
+    events.send(Event::TagsWritten(report.clone()))?;
+    if report.written == 0 {
+        return Ok(());
+    }
+    let Some(server) = server else {
+        events.send(Event::Status(
+            "Tags saved · connect to Navidrome to rescan".into(),
+        ))?;
+        return Ok(());
+    };
+    let (tx, events) = (tx.clone(), events.clone());
+    runtime.spawn(async move {
+        if server.start_scan().await.is_err() {
+            let _ = events.send(Event::Status(
+                "Tags saved · Navidrome shows them after its next scan".into(),
+            ));
+            return;
+        }
+        let _ = events.send(Event::Status("Tags saved · Navidrome is rescanning".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..600 {
+            if matches!(server.scan_status().await, Ok(false)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let _ = tx.send(Command::Refresh);
+    });
+    Ok(())
+}
+
+/// After a complete sync, finds each written file by path and, when the
+/// rescan gave it a new ID, carries its favorite and rating over.
+/// Confirms written edits Navidrome has rescanned. Returns annotations to
+/// carry over to new IDs, and each rescanned song with the ID it had before.
+type Reconciled = (Vec<Mutation>, Vec<(String, Arc<Track>)>);
+
+fn reconcile_tags(catalog: &Catalog) -> Result<Reconciled> {
+    use crate::tags::EditState;
+    let mut mutations = Vec::new();
+    let mut rescanned_tracks = Vec::new();
+    for entry in catalog.unconfirmed_tag_edits()? {
+        let Some(track) = catalog.track_by_path(&entry.path)? else {
+            continue;
+        };
+        let rescanned = entry
+            .after
+            .iter()
+            .filter(|(field, values)| entry.before.get(field) != Some(values))
+            .all(|(field, values)| field.shown(&track) == values.join("; "));
+        if !rescanned {
+            continue;
+        }
+        if track.id != entry.track_id {
+            if entry.starred && track.starred.is_none() {
+                mutations.push(Mutation::Favorite(track.id.clone(), true));
+            }
+            if let Some(rating) = entry.rating.filter(|rating| *rating > 0)
+                && track.user_rating != Some(rating)
+            {
+                mutations.push(Mutation::Rating(track.id.clone(), rating));
+            }
+        }
+        catalog.finish_tag_edit(entry.id, None, EditState::Confirmed)?;
+        rescanned_tracks.push((entry.track_id, track));
+    }
+    Ok((mutations, rescanned_tracks))
+}
 
 fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
     catalog.set_state("preferences", &prefs)?;
@@ -798,6 +1011,17 @@ fn run(
     )?;
     events.send(Event::Ready(account.clone(), prefs))?;
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+    let interrupted = catalog.interrupted_tag_edits()?;
+    if !interrupted.is_empty() {
+        for entry in &interrupted {
+            catalog.finish_tag_edit(entry.id, None, crate::tags::EditState::Failed)?;
+        }
+        events.send(Event::Error(format!(
+            "Sonora stopped while writing tags to {} file(s), starting with {}. Check them before editing again.",
+            interrupted.len(),
+            interrupted[0].file
+        )))?;
+    }
     events.send(Event::Status(
         if account.is_some() {
             "Cached library · connecting…"
@@ -1175,6 +1399,20 @@ fn run(
                             catalog.finish_sync(generation)?;
                         }
                         catalog.save_playlist_summaries(&playlists, can_delete)?;
+                        if can_delete {
+                            let (mutations, rescanned) = reconcile_tags(&catalog)?;
+                            for mutation in mutations {
+                                tx.send(Command::Mutate(mutation))?;
+                            }
+                            for (old, track) in rescanned {
+                                player.send(if old == track.id {
+                                    PlayerCommand::UpdateTrack(track.clone())
+                                } else {
+                                    PlayerCommand::RetagTrack(old, track.clone())
+                                });
+                                events.send(Event::TrackUpdated(track))?;
+                            }
+                        }
                         syncing = false;
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         for id in refresh {
@@ -1997,6 +2235,14 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
+                Command::WriteTags(edit) => {
+                    let report = write_tags(&catalog, &edit)?;
+                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
+                Command::UndoTags => {
+                    let report = undo_tags(&catalog)?;
+                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;
                 }

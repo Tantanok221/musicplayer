@@ -22,6 +22,7 @@ pub mod slskd;
 pub mod smart_editor;
 pub mod smart_rules;
 pub mod sorting;
+pub mod tags;
 pub mod thumbnail;
 pub mod ui;
 pub mod visualizer;

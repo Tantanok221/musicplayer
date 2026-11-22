@@ -225,6 +225,8 @@ pub struct Library {
     pub lastfm_error: Option<u32>,
     /// Whether the worker is built with a Last.fm API key.
     pub lastfm_key: bool,
+    /// Whether the account may start a scan, as Navidrome administrators can.
+    pub scan_admin: bool,
 }
 
 impl Default for Library {
@@ -257,6 +259,7 @@ impl Default for Library {
             lastfm_charts: vec![],
             lastfm_error: None,
             lastfm_key: true,
+            scan_admin: false,
         }
     }
 }
@@ -353,6 +356,7 @@ async fn navidrome(
         "ping.view"
             | "getOpenSubsonicExtensions.view"
             | "getScanStatus.view"
+            | "startScan.view"
             | "getPlaylists.view"
             | "getPlaylist.view"
             | "createPlaylist.view"
@@ -465,6 +469,12 @@ async fn navidrome(
             .unwrap_or_else(
                 || json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}}),
             ),
+        "startScan.view" if query.is_empty() && data.library.scan_admin => {
+            json!({"status":"ok","scanStatus":{"scanning":false}})
+        }
+        "startScan.view" if query.is_empty() => {
+            json!({"status":"failed","error":{"code":50,"message":"Not an administrator"}})
+        }
         "getPlaylists.view" if query.is_empty() => {
             data.library.playlists_response.clone().unwrap_or_else(
                 || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),

@@ -358,6 +358,7 @@ pub struct Preferences {
     pub layout: crate::browser::LayoutPreferences,
     pub sorting: crate::sorting::SortingPreferences,
     pub downloads: DownloadPreferences,
+    pub metadata: MetadataPreferences,
     /// Show missing singles, live albums, compilations and the like on artist pages.
     pub all_missing_releases: bool,
     pub favorites: FavoritesFilter,
@@ -402,6 +403,16 @@ impl FavoritesFilter {
         rules.join(if self.match_all { " and " } else { " or " })
     }
 }
+/// Opt-in tag writing through a folder mapped to the Navidrome library.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct MetadataPreferences {
+    /// Off until the user turns it on; Sonora never touches files otherwise.
+    pub write_tags: bool,
+    /// The local or network folder that holds Navidrome's music library.
+    pub library_folder: String,
+}
+
 /// Where the user's slskd lives. Its API key is kept in a private file instead.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -412,6 +423,7 @@ pub struct DownloadPreferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            metadata: MetadataPreferences::default(),
             volume: 0.7,
             gain: GainMode::Smart,
             shuffle: false,

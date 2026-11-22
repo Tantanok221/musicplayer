@@ -31,3 +31,5 @@ mod scrobbles;
 mod smart_playlists;
 #[path = "service_worker/sync.rs"]
 mod sync;
+#[path = "service_worker/tag_writes.rs"]
+mod tag_writes;

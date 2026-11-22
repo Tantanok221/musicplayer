@@ -79,7 +79,13 @@ These lookups send artist and release identifiers to MusicBrainz and the Cover A
 - macOS: `~/Library/Application Support/app.Sonora.Sonora/`, with artwork in the matching Caches folder.
 - Linux: `~/.local/share/sonora/library/`, with cache in `~/.cache/sonora/library/`.
 
-Each account has its own library. Sonora never modifies your music files.
+Each account has its own library. Sonora doesn't modify your music files unless you turn on tag editing.
+
+### Tag editing (opt-in)
+
+Navidrome can't save tags, so Sonora can write them into your files itself. This is off by default. To use it, open Settings → Metadata, set Music folder to a folder that holds the same files as Navidrome's library (a mounted SMB/NFS share, or the folder itself when Navidrome runs on this computer), and turn on Write tags to files. In Navidrome, turn on Report Real Path for the Sonora player so Sonora can find each file.
+
+Then choose Edit Tags… on a song, or Edit Album Tags… on an album. Fields you don't change keep their values in every file, and fields that differ across the selection show `<multiple values>`. Sonora checks that each file's size matches what Navidrome reports, writes to a copy and renames it over the original, records the change so you can undo it, and asks Navidrome to rescan when your account is an administrator. Otherwise Navidrome's file watcher picks the change up. Favorites, ratings and play counts stay in Navidrome. When a rescan gives a song a new ID (Navidrome bases IDs on tags for files without MusicBrainz IDs), Sonora carries its favorite and rating over.
 
 ## License
 

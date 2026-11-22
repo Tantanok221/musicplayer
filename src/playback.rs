@@ -101,6 +101,8 @@ pub enum PlayerCommand {
     Seek(f64),
     Preferences(Preferences),
     UpdateTrack(Arc<Track>),
+    /// A rescan gave a queued song a new ID: replace the old ID's entries.
+    RetagTrack(String, Arc<Track>),
     SaveQueue(Sender<SavedQueue>),
     Retry,
     ClearError,
@@ -1060,6 +1062,7 @@ fn run(
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::UpdateTrack(..)
+                    | PlayerCommand::RetagTrack(..)
             );
             let restored_positions = match &mut command {
                 PlayerCommand::RestoreAccount {
@@ -1095,12 +1098,11 @@ fn run(
                 }
                 PlayerCommand::Server(value) => server = Some(value),
                 PlayerCommand::UpdateTrack(track) => {
-                    queue_edits.update_track(&track);
-                    for queued in &mut queue {
-                        if queued.id == track.id {
-                            *queued = track.clone();
-                        }
-                    }
+                    let id = track.id.clone();
+                    retag(&mut queue, &mut queue_edits, &id, &track);
+                }
+                PlayerCommand::RetagTrack(old, track) => {
+                    retag(&mut queue, &mut queue_edits, &old, &track);
                 }
                 PlayerCommand::SaveQueue(reply) => {
                     let _ = reply.send(SavedQueue {
@@ -1618,6 +1620,15 @@ fn run(
     }
     clock.epoch.fetch_add(1, Ordering::AcqRel);
     Ok(())
+}
+
+fn retag(queue: &mut [Arc<Track>], edits: &mut QueueEdits, old: &str, track: &Arc<Track>) {
+    edits.retag(old, track);
+    for queued in queue {
+        if queued.id == old {
+            *queued = track.clone();
+        }
+    }
 }
 
 #[cfg(test)]
