@@ -455,7 +455,6 @@ async fn navidrome(
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
-            | "getLyricsBySongId.view"
             | "getLyrics.view"
     ) || query.keys().any(|key| {
         !matches!(

@@ -1,6 +1,6 @@
 use crate::common::ui::{Fixture, start};
 use gpui_kit::{
-    AnyWindowHandle, AppContext, ScrollDelta, TestAppContext, point, px,
+    AnyWindowHandle, AppContext, ScrollDelta, TestAppContext, point, px, size,
     test::{TestQueryExt, TestWindowExt},
 };
 use serde_json::json;
@@ -33,17 +33,87 @@ fn reveal_playlists(f: &mut Fixture, w: AnyWindowHandle, cx: &mut TestAppContext
     f.settle(w, cx);
 }
 
+fn open_smart_creation(f: &mut Fixture, w: AnyWindowHandle, cx: &mut TestAppContext) {
+    f.click(w, "new-playlist", cx);
+    f.click(w, "playlist-type-smart", cx);
+}
+
+#[gpui_kit::test]
+fn one_creation_entry_preserves_the_name_and_rules_when_switching_types(cx: &mut TestAppContext) {
+    let (_dir, mut f, w, _app) = start(cx);
+    f.backend.emit(Event::NativeAvailable(true));
+    f.settle(w, cx);
+    f.click(w, "new-playlist", cx);
+    cx.update_window(w, |_, window, _| {
+        assert!(window.try_find("new-smart-playlist").is_none());
+        assert!(window.find("playlist-type-manual").visible());
+        assert!(window.find("playlist-type-smart").visible());
+        assert_eq!(window.find("playlist-name").focused(), Some(true));
+        assert_eq!(window.find("create-playlist").disabled(), Some(true));
+        assert!(window.try_find("smart-summary").is_none());
+    })
+    .unwrap();
+    edit(&mut f, w, "playlist-name", "Evening jazz", cx);
+    f.click(w, "playlist-type-smart", cx);
+    f.click(w, "smart-field-0", cx);
+    f.menu_item(w, "Genre", cx);
+    edit(&mut f, w, "smart-value-0", "Jazz", cx);
+    f.click(w, "playlist-type-manual", cx);
+    cx.update_window(w, |_, window, _| {
+        assert!(window.try_find("smart-summary").is_none());
+        assert_eq!(window.find("playlist-name").value(), Some("Evening jazz"));
+    })
+    .unwrap();
+    f.click(w, "playlist-type-smart", cx);
+    cx.update_window(w, |_, window, _| {
+        assert_eq!(window.find("playlist-name").value(), Some("Evening jazz"));
+        assert_eq!(window.find("smart-value-0").value(), Some("Jazz"));
+    })
+    .unwrap();
+    let mut original_size = size(px(0.), px(0.));
+    cx.update_window(w, |_, window, _| original_size = window.viewport_size())
+        .unwrap();
+    cx.simulate_window_resize(w, size(px(680.), px(540.)));
+    cx.update_window(w, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("create-playlist").visible());
+        assert!(window.find("cancel-playlist-creation").visible());
+        assert!(window.find("create-playlist").bounds().bottom() <= px(540.));
+        assert_eq!(window.find("playlist-name").value(), Some("Evening jazz"));
+    })
+    .unwrap();
+    f.press(w, "escape", cx);
+    cx.update_window(w, |_, window, _| {
+        assert!(window.try_find("playlist-name").is_none());
+    })
+    .unwrap();
+    cx.simulate_window_resize(w, original_size);
+    cx.update_window(w, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("new-playlist").visible());
+    })
+    .unwrap();
+    f.click(w, "new-playlist", cx);
+    f.click(w, "playlist-type-smart", cx);
+    cx.update_window(w, |_, window, _| {
+        assert_eq!(window.find("playlist-name").value(), Some(""));
+        assert_eq!(window.find("smart-value-0").value(), Some(""));
+    })
+    .unwrap();
+    f.assert_script_finished();
+}
+
 #[gpui_kit::test]
 fn summary_and_inline_validation_follow_live_inputs(cx: &mut TestAppContext) {
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
-    f.click(w, "new-smart-playlist", cx);
+    open_smart_creation(&mut f, w, cx);
     cx.update_window(w, |_, window, _| {
-        assert_eq!(window.find("save-smart-playlist").disabled(), Some(true))
+        assert_eq!(window.find("create-playlist").disabled(), Some(true))
     })
     .unwrap();
-    edit(&mut f, w, "smart-name", "Jazz", cx);
+    edit(&mut f, w, "playlist-name", "Jazz", cx);
     f.click(w, "smart-field-0", cx);
     f.menu_item(w, "Genre", cx);
     edit(&mut f, w, "smart-value-0", "Jazz", cx);
@@ -53,7 +123,7 @@ fn summary_and_inline_validation_follow_live_inputs(cx: &mut TestAppContext) {
             window.find("smart-summary").label(),
             Some("Tracks where genre is Jazz · up to 50 tracks")
         );
-        assert_ne!(window.find("save-smart-playlist").disabled(), Some(true));
+        assert_ne!(window.find("create-playlist").disabled(), Some(true));
     })
     .unwrap();
     edit(&mut f, w, "smart-limit", "-5", cx);
@@ -63,7 +133,7 @@ fn summary_and_inline_validation_follow_live_inputs(cx: &mut TestAppContext) {
                 .find_by_label("Enter a positive whole-number limit")
                 .visible()
         );
-        assert_eq!(window.find("save-smart-playlist").disabled(), Some(true));
+        assert_eq!(window.find("create-playlist").disabled(), Some(true));
     })
     .unwrap();
     edit(&mut f, w, "smart-limit", "", cx);
@@ -84,14 +154,14 @@ fn create_validates_conditions_and_sends_rules(cx: &mut TestAppContext) {
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
-    f.click(w, "new-smart-playlist", cx);
-    f.click(w, "save-smart-playlist", cx);
+    open_smart_creation(&mut f, w, cx);
+    f.click(w, "create-playlist", cx);
     cx.update_window(w, |_, window, _| {
         assert!(window.find_by_label("Enter a playlist name").visible())
     })
     .unwrap();
-    edit(&mut f, w, "smart-name", "Jazz discoveries", cx);
-    f.click(w, "save-smart-playlist", cx);
+    edit(&mut f, w, "playlist-name", "Jazz discoveries", cx);
+    f.click(w, "create-playlist", cx);
     cx.update_window(w, |_, window, _| {
         assert!(
             window
@@ -115,9 +185,9 @@ fn create_validates_conditions_and_sends_rules(cx: &mut TestAppContext) {
         );
         vec![Event::SmartPlaylistSaved("created".into())]
     });
-    f.click(w, "save-smart-playlist", cx);
+    f.click(w, "create-playlist", cx);
     cx.update_window(w, |_, window, _| {
-        assert!(window.try_find("smart-editor").is_none())
+        assert!(window.try_find("playlist-creation").is_none())
     })
     .unwrap();
     f.assert_script_finished();
@@ -178,14 +248,14 @@ fn password_prompt_submits_once_clears_password_and_can_cancel(cx: &mut TestAppC
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
-    f.click(w, "new-smart-playlist", cx);
-    edit(&mut f, w, "smart-name", "Loved", cx);
+    open_smart_creation(&mut f, w, cx);
+    edit(&mut f, w, "playlist-name", "Loved", cx);
     f.click(w, "smart-template-3", cx);
     f.expect("password needed", |c, _| {
         assert!(matches!(c, Command::SaveSmartPlaylist { .. }));
         vec![Event::NativePasswordRequired]
     });
-    f.click(w, "save-smart-playlist", cx);
+    f.click(w, "create-playlist", cx);
     cx.update_window(w, |_, window, _| {
         assert!(window.find_by_label("Sign in to Navidrome again").visible());
         assert!(window.find_by_label("Your editing session is missing or has expired. Your password is used once to sign in again.").visible());
@@ -218,7 +288,7 @@ fn password_prompt_submits_once_clears_password_and_can_cancel(cx: &mut TestAppC
         vec![]
     });
     f.click(w, "cancel-smart-playlist", cx);
-    f.click(w, "new-smart-playlist", cx);
+    open_smart_creation(&mut f, w, cx);
     cx.update_window(w, |_, window, _| {
         assert!(window.try_find("native-password").is_none())
     })
@@ -231,13 +301,13 @@ fn failed_sign_in_can_retry_the_pending_save(cx: &mut TestAppContext) {
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
-    f.click(w, "new-smart-playlist", cx);
+    open_smart_creation(&mut f, w, cx);
     f.click(w, "smart-template-3", cx);
     f.expect("authorize save", |c, _| {
         assert!(matches!(c, Command::SaveSmartPlaylist { .. }));
         vec![Event::NativePasswordRequired]
     });
-    f.click(w, "save-smart-playlist", cx);
+    f.click(w, "create-playlist", cx);
     edit(&mut f, w, "native-password", "wrong", cx);
     f.expect("failed sign in", |c, _| {
         assert!(matches!(c, Command::NativeSignIn(_)));
@@ -256,7 +326,7 @@ fn failed_sign_in_can_retry_the_pending_save(cx: &mut TestAppContext) {
     f.backend.emit(Event::SmartPlaylistSaved("saved".into()));
     f.settle(w, cx);
     cx.update_window(w, |_, window, _| {
-        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.try_find("playlist-creation").is_none());
         assert!(window.try_find("error-banner").is_none());
     })
     .unwrap();
@@ -268,7 +338,7 @@ fn templates_groups_and_condition_controls_are_editable(cx: &mut TestAppContext)
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
-    f.click(w, "new-smart-playlist", cx);
+    open_smart_creation(&mut f, w, cx);
     f.click(w, "smart-template-1", cx);
     f.click(w, "smart-add-condition", cx);
     f.click(w, "smart-remove-1", cx);
@@ -285,17 +355,20 @@ fn templates_groups_and_condition_controls_are_editable(cx: &mut TestAppContext)
         );
         vec![]
     });
-    f.click(w, "save-smart-playlist", cx);
+    f.click(w, "create-playlist", cx);
     f.assert_script_finished();
 }
 
 #[gpui_kit::test]
 fn entry_points_require_navidrome_and_edit_requires_owner(cx: &mut TestAppContext) {
     let (_dir, mut f, w, _app) = start(cx);
+    f.click(w, "new-playlist", cx);
     cx.update_window(w, |_, window, _| {
-        assert!(window.try_find("new-smart-playlist").is_none())
+        assert!(window.find("playlist-name").visible());
+        assert!(window.try_find("playlist-type-smart").is_none());
     })
     .unwrap();
+    f.press(w, "escape", cx);
     for (native, owner) in [(false, "fixture"), (true, "someone-else")] {
         f.backend.emit(Event::NativeAvailable(native));
         let p = Playlist {
