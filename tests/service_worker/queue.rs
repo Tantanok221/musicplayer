@@ -67,6 +67,40 @@ fn disabling_shuffle_after_restart_restores_order_and_current_duplicate() {
 }
 
 #[test]
+fn restart_recovers_when_shuffle_off_was_saved_before_the_queue() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let catalog = fixture.catalog();
+    catalog
+        .set_state("preferences", &Preferences::default())
+        .unwrap();
+    catalog
+        .set_state(
+            "queue",
+            &SavedQueue {
+                ids: vec!["song".into(), "other-song".into(), "song".into()],
+                shuffle_positions: Some(vec![2, 0, 1]),
+                index: Some(0),
+                position: 23.,
+                ..SavedQueue::default()
+            },
+        )
+        .unwrap();
+    drop(catalog);
+
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    worker.shutdown(WAIT).unwrap();
+
+    let saved: SavedQueue = fixture.catalog().state("queue").unwrap();
+    assert_eq!(saved.ids, ["other-song", "song", "song"]);
+    assert_eq!(saved.index, Some(2));
+    assert_eq!(saved.position, 23.);
+    assert!(saved.shuffle_positions.is_none());
+    fixture.finish();
+}
+
+#[test]
 fn legacy_shuffled_queue_loads_without_an_original_order() {
     let fixture = Fixture::new(Library::default());
     fixture.seed();

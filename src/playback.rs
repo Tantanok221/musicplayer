@@ -1149,10 +1149,15 @@ fn run(
                         tracker.restore(listen);
                     }
                     queue = tracks;
-                    original = restored_positions
-                        .filter(|positions| prefs.shuffle && positions.len() == queue.len())
-                        .and_then(ShuffleOrder::from_saved);
                     index = (!queue.is_empty()).then_some(at.min(queue.len().saturating_sub(1)));
+                    original = restored_positions
+                        .filter(|positions| positions.len() == queue.len())
+                        .and_then(ShuffleOrder::from_saved);
+                    if !prefs.shuffle
+                        && let Some(order) = original.take()
+                    {
+                        (queue, index) = order.restore(std::mem::take(&mut queue), index);
+                    }
                     base_position = pos;
                     clock.playing.store(false, Ordering::Relaxed);
                     restart = false;
