@@ -24,6 +24,7 @@ pub struct MusicBrainz {
     http: reqwest::Client,
     base: Url,
     covers: Url,
+    acoustid: Url,
     /// MusicBrainz blocks clients that exceed one request per second.
     interval: Duration,
     last: Arc<Mutex<Option<Instant>>>,
@@ -47,6 +48,7 @@ impl MusicBrainz {
                 .build()?,
             base: Url::parse(base)?,
             covers: Url::parse("https://coverartarchive.org/")?,
+            acoustid: Url::parse("https://api.acoustid.org/v2/")?,
             interval,
             last: Arc::default(),
         })
@@ -56,6 +58,49 @@ impl MusicBrainz {
     pub fn with_covers(mut self, base: &str) -> Result<Self> {
         self.covers = Url::parse(base)?;
         Ok(self)
+    }
+
+    /// Looks fingerprints up at `base` instead of AcoustID.
+    pub fn with_acoustid(mut self, base: &str) -> Result<Self> {
+        self.acoustid = Url::parse(base)?;
+        Ok(self)
+    }
+
+    /// The MusicBrainz recording AcoustID matches a fingerprint to best.
+    pub async fn identify(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        duration: u32,
+    ) -> Result<Option<String>> {
+        let mut url = self.acoustid.join("lookup")?;
+        url.query_pairs_mut()
+            .append_pair("client", key)
+            .append_pair("meta", "recordings")
+            .append_pair("duration", &duration.to_string())
+            .append_pair("fingerprint", fingerprint)
+            .append_pair("format", "json");
+        let response = self.http.get(url).send().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot reach AcoustID")
+        })?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or_default();
+        if body["status"] != "ok" {
+            match body["error"]["message"].as_str() {
+                Some(message) => bail!("AcoustID: {message}"),
+                None => bail!("AcoustID returned HTTP {status}"),
+            }
+        }
+        let mut results: Vec<&Value> = body["results"].as_array().into_iter().flatten().collect();
+        results.sort_by(|a, b| {
+            let score = |v: &Value| v["score"].as_f64().unwrap_or_default();
+            score(b).total_cmp(&score(a))
+        });
+        Ok(results
+            .iter()
+            .filter_map(|result| result["recordings"][0]["id"].as_str())
+            .map(str::to_string)
+            .next())
     }
 
     /// A release's front cover from Cover Art Archive, as a tag value.

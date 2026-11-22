@@ -52,6 +52,7 @@ fn enable(worker: &sonora::service::test_support::Worker, folder: &Folder) {
         metadata: MetadataPreferences {
             write_tags: true,
             library_folder: folder.dir.path().to_string_lossy().into(),
+            ..Default::default()
         },
         ..Default::default()
     }));
@@ -390,6 +391,48 @@ fn cover_art_is_fetched_embedded_and_undone() {
     worker.service().send(Command::UndoTags);
     assert!(report(&worker).undo);
     assert!(read(&folder.file()).unwrap()[&TagField::CoverArt].is_empty());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn identify_by_sound_fingerprints_the_file_and_asks_acoustid() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    let identify = |key: &str| {
+        worker.service().send(Command::Preferences(Preferences {
+            metadata: MetadataPreferences {
+                write_tags: true,
+                library_folder: folder.dir.path().to_string_lossy().into(),
+                acoustid_key: key.into(),
+            },
+            ..Default::default()
+        }));
+        worker.service().send(Command::IdentifyBySound(Track {
+            id: "song".into(),
+            path: PATH.into(),
+            duration: 2.,
+            ..Default::default()
+        }));
+        let Event::SoundIdentified(id, result) =
+            event(&worker, |event| matches!(event, Event::SoundIdentified(..)))
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, "song");
+        result
+    };
+    assert_eq!(
+        identify(""),
+        Err("Add an AcoustID key in Settings first".to_string())
+    );
+    assert_eq!(
+        identify("wrong"),
+        Err("AcoustID: invalid API key".to_string())
+    );
+    assert_eq!(identify("fixture-key"), Ok("r1".to_string()));
     worker.shutdown(crate::fixture::WAIT).unwrap();
     fixture.finish();
 }

@@ -28,6 +28,8 @@ enum Lookup {
     Searching(ReleaseQuery),
     Choosing,
     Loading(String),
+    /// Waiting for AcoustID to name the song's recording.
+    Identifying(String),
     Matched {
         release: Arc<Release>,
         matches: Vec<TrackMatch>,
@@ -197,6 +199,38 @@ impl MusicApp {
         editor.lookup = Lookup::Searching(query.clone());
         self.service.send(Command::FindReleases(query));
         cx.notify();
+    }
+
+    fn identify_by_sound(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let [track] = editor.form.tracks.as_slice() else {
+            return;
+        };
+        editor.lookup = Lookup::Identifying(track.id.clone());
+        self.service.send(Command::IdentifyBySound(track.clone()));
+        cx.notify();
+    }
+
+    pub(super) fn sound_identified(&mut self, id: String, result: Result<String, String>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        if !matches!(&editor.lookup, Lookup::Identifying(asked) if *asked == id) {
+            return;
+        }
+        match result {
+            Ok(recording) => {
+                let query = ReleaseQuery {
+                    recording,
+                    ..Default::default()
+                };
+                editor.lookup = Lookup::Searching(query.clone());
+                self.service.send(Command::FindReleases(query));
+            }
+            Err(error) => editor.lookup = Lookup::Failed(error),
+        }
     }
 
     fn open_link(&mut self, cx: &mut Context<Self>) {
@@ -393,6 +427,7 @@ impl MusicApp {
             Lookup::Searching(query) => {
                 status(format!("Searching MusicBrainz for {}…", query.subject()))
             }
+            Lookup::Identifying(_) => status("Listening to the song for AcoustID…".into()),
             Lookup::Loading(id) => {
                 let title = editor
                     .candidates
@@ -786,7 +821,13 @@ impl MusicApp {
         };
         let entries = editor.entries(cx);
         let warns = editor.form.warns_ids(&editor.form.edits(&entries));
-        let searching = matches!(editor.lookup, Lookup::Searching(_) | Lookup::Loading(_));
+        let searching = matches!(
+            editor.lookup,
+            Lookup::Searching(_) | Lookup::Loading(_) | Lookup::Identifying(_)
+        );
+        let identifies = editor.review.is_none()
+            && editor.form.tracks.len() == 1
+            && !self.preferences.metadata.acoustid_key.trim().is_empty();
         let mut panel = div()
             .id("tag-editor")
             .test_support()
@@ -812,6 +853,15 @@ impl MusicApp {
                             .font_semibold()
                             .child(title),
                     )
+                    .when(identifies, |row| {
+                        row.child(
+                            Button::new("identify-sound")
+                                .small()
+                                .label("Identify by Sound")
+                                .disabled(searching)
+                                .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
+                        )
+                    })
                     .when(
                         editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks),
                         |row| {

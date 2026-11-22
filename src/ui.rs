@@ -499,6 +499,7 @@ pub struct MusicApp {
     tag_editor_album: Option<String>,
     tag_notice: Option<crate::tags::TagReport>,
     metadata_folder: Entity<InputState>,
+    acoustid_key: Entity<InputState>,
     status: String,
     connection: Connection,
     error: Option<String>,
@@ -549,6 +550,11 @@ impl MusicApp {
         let playlist_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
         let metadata_folder =
             cx.new(|cx| InputState::new(window, cx).placeholder("/Volumes/music"));
+        let acoustid_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Your AcoustID application key")
+                .masked(true)
+        });
         let slskd_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://your-slskd-host:5030"));
         let lastfm_user = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
@@ -781,6 +787,7 @@ impl MusicApp {
             tag_editor_album: None,
             tag_notice: None,
             metadata_folder,
+            acoustid_key,
             status: "Opening library…".into(),
             connection: Connection::None,
             error: None,

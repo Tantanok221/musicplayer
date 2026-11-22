@@ -42,6 +42,9 @@ impl MusicApp {
                 let folder = self.preferences.metadata.library_folder.clone();
                 self.metadata_folder
                     .update(cx, |input, cx| input.set_value(folder, window, cx));
+                let key = self.preferences.metadata.acoustid_key.clone();
+                self.acoustid_key
+                    .update(cx, |input, cx| input.set_value(key, window, cx));
                 let slskd = self.preferences.downloads.url.clone();
                 self.slskd_url
                     .update(cx, |input, cx| input.set_value(slskd, window, cx));
@@ -249,6 +252,7 @@ impl MusicApp {
             Event::TrackUpdated(track) => self.apply_track_update(track),
             Event::ReleaseCandidates(query, result) => self.releases_found(query, result),
             Event::ReleaseLoaded(id, result) => self.release_loaded(id, result),
+            Event::SoundIdentified(id, result) => self.sound_identified(id, result),
             Event::AlbumUpdated(album) => self.apply_album_update(album),
             Event::Artwork(id, path, thumbs) => {
                 self.art_failures.remove(&id);

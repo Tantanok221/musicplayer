@@ -860,6 +860,29 @@ async fn lastfm(
         .into_response()
 }
 
+async fn acoustid(
+    State(state): State<ServerState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let fingerprinted = !query.get("fingerprint").is_none_or(String::is_empty);
+    state.record(Request::new(
+        "acoustid",
+        &[
+            ("duration", query.get("duration").map_or("", String::as_str)),
+            ("fingerprinted", if fingerprinted { "yes" } else { "no" }),
+        ],
+    ));
+    if query.get("client").map(String::as_str) != Some("fixture-key") {
+        return Json(json!({"status":"error","error":{"code":4,"message":"invalid API key"}}))
+            .into_response();
+    }
+    Json(json!({"status":"ok","results":[
+        {"id":"low","score":0.4,"recordings":[{"id":"r-low"}]},
+        {"id":"best","score":0.97,"recordings":[{"id":"r1"}]}
+    ]}))
+    .into_response()
+}
+
 async fn cover_art(State(state): State<ServerState>, Path(path): Path<String>) -> Response {
     state.record(Request::new("coverart", &[("path", &path)]));
     if path == "release/ok-computer/front-500" {
@@ -1140,6 +1163,7 @@ impl Fixture {
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/coverart/{*path}", any(cover_art))
+            .route("/acoustid/lookup", any(acoustid))
             .route("/lastfm/", any(lastfm))
             .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
@@ -1237,6 +1261,9 @@ impl Fixture {
             MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
                 .and_then(|metadata| {
                     metadata.with_covers(&format!("{}coverart/", self.account.url))
+                })
+                .and_then(|metadata| {
+                    metadata.with_acoustid(&format!("{}acoustid/", self.account.url))
                 })
                 .unwrap();
         let key = self.state.data.lock().unwrap().library.lastfm_key;

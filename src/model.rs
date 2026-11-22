@@ -411,6 +411,8 @@ pub struct MetadataPreferences {
     pub write_tags: bool,
     /// The local or network folder that holds Navidrome's music library.
     pub library_folder: String,
+    /// The AcoustID application key; Identify by Sound stays off without one.
+    pub acoustid_key: String,
 }
 
 /// Where the user's slskd lives. Its API key is kept in a private file instead.

@@ -17,6 +17,7 @@ fn writes_tags(fixture: &mut Fixture, on: bool) {
     prefs.metadata = MetadataPreferences {
         write_tags: on,
         library_folder: "/Volumes/music".into(),
+        ..Default::default()
     };
     fixture.backend.emit(Event::Ready(
         Some(Account {
@@ -695,4 +696,55 @@ fn the_genre_limit_picks_how_many_genres_are_filled(cx: &mut TestAppContext) {
             "Second · Genre: Rock → Trip Hop"
         ]
     );
+}
+
+#[gpui_kit::test]
+fn identify_by_sound_needs_a_key_then_searches_the_recording(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    songs_view(&mut fixture, window, cx);
+    let open = |fixture: &mut Fixture, cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("row-flat-track-1", cx)
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        fixture.menu_item(window, "Edit Tags…", cx);
+    };
+    open(&mut fixture, cx);
+    assert!(!present(window, "identify-sound", cx));
+    let mut prefs: Preferences = fixture.catalog.state("preferences").unwrap();
+    prefs.metadata = MetadataPreferences {
+        write_tags: true,
+        library_folder: "/Volumes/music".into(),
+        acoustid_key: "key".into(),
+    };
+    fixture.backend.emit(Event::Ready(
+        Some(Account {
+            url: "https://fixture.invalid".into(),
+            username: "fixture".into(),
+        }),
+        prefs,
+    ));
+    fixture.settle(window, cx);
+    open(&mut fixture, cx);
+    fixture.expect("fingerprint the song", |command, _| {
+        let Command::IdentifyBySound(track) = command else {
+            panic!("expected an AcoustID lookup");
+        };
+        assert_eq!(track.id, "track-1");
+        vec![
+            Event::SoundIdentified("other".into(), Ok("stale".into())),
+            Event::SoundIdentified(track.id, Ok("rec-1".into())),
+        ]
+    });
+    fixture.expect("search the releases of the recording", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        assert_eq!(query.lucene(), "rid:rec-1");
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "identify-sound", cx);
+    assert!(label(window, ("release-candidate", 0_usize), cx).is_some());
+    fixture.assert_script_finished();
 }
