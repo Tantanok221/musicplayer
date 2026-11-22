@@ -135,6 +135,7 @@ pub enum Command {
     /// Finds a cover in the disk cache; with a priority, downloads it when missing.
     Artwork(String, Option<Priority>),
     ArtworkFinished(String, String, Result<PathBuf, String>),
+    ArtworkPrepared(String, String, PathBuf, bool),
     #[cfg(feature = "test-support")]
     ArtworkTime(Duration, Sender<Option<Duration>>),
     Backdrop(String),
@@ -582,7 +583,9 @@ fn begin_sync(
 /// Sends a cover once its small copies exist, making them off this thread when missing.
 fn publish_artwork(
     runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
     events: &Sender<Event>,
+    namespace: String,
     id: String,
     path: PathBuf,
 ) {
@@ -590,10 +593,10 @@ fn publish_artwork(
         let _ = events.send(Event::Artwork(id, path, true));
         return;
     }
-    let events = events.clone();
+    let tx = tx.clone();
     runtime.spawn_blocking(move || {
         let thumbs = thumbnail::ensure(&path).is_ok();
-        let _ = events.send(Event::Artwork(id, path, thumbs));
+        let _ = tx.send(Command::ArtworkPrepared(namespace, id, path, thumbs));
     });
 }
 
@@ -1879,12 +1882,13 @@ fn run(
                 }
                 Command::Artwork(id, fetch) => {
                     if let Some(account) = &account {
+                        let namespace = account.namespace();
                         let path = paths
                             .cache
-                            .join(account.namespace())
+                            .join(&namespace)
                             .join(format!("{}.art", blake3::hash(id.as_bytes()).to_hex()));
                         if path.exists() {
-                            publish_artwork(&runtime, &events, id, path);
+                            publish_artwork(&runtime, &tx, &events, namespace, id, path);
                             return Ok(());
                         }
                     }
@@ -1924,7 +1928,7 @@ fn run(
                         match result {
                             Ok(path) => {
                                 artwork_queue.finished(&id, true, artwork_clock.now());
-                                publish_artwork(&runtime, &events, id, path);
+                                publish_artwork(&runtime, &tx, &events, namespace, id, path);
                             }
                             Err(_) => {
                                 if artwork_queue.finished(&id, false, artwork_clock.now()) {
@@ -1932,6 +1936,14 @@ fn run(
                                 }
                             }
                         }
+                    }
+                }
+                Command::ArtworkPrepared(namespace, id, path, thumbs) => {
+                    if account
+                        .as_ref()
+                        .is_some_and(|account| account.namespace() == namespace)
+                    {
+                        events.send(Event::Artwork(id, path, thumbs))?;
                     }
                 }
                 Command::PlayIds(ids, at) => {

@@ -8,17 +8,11 @@ impl MusicApp {
             Event::SmartPlaylistSaved(id) => self.smart_saved(id, window, cx),
             Event::NativePasswordRequired => self.smart_password_required(window, cx),
             Event::Ready(account, prefs) => {
-                if self.account.as_ref().map(Account::namespace)
-                    != account.as_ref().map(Account::namespace)
+                if self
+                    .account_cache
+                    .reset_for_account(self.account.as_ref(), account.as_ref())
                 {
                     self.smart = Default::default();
-                    self.artwork.clear();
-                    self.backdrops.clear();
-                    self.backdrop_requested.clear();
-                    self.artist_profiles.clear();
-                    self.profile_requested.clear();
-                    self.popularity_requested.clear();
-                    self.top_songs.clear();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
@@ -193,10 +187,10 @@ impl MusicApp {
                 }
             }
             Event::ArtistProfile(key, profile) => {
-                self.artist_profiles.insert(key, profile);
+                self.account_cache.artist_profiles.insert(key, profile);
             }
             Event::TopSongs(key, top) => {
-                self.top_songs.insert(key, top);
+                self.account_cache.top_songs.insert(key, top);
             }
             Event::Discography(key, view) => {
                 self.discographies.insert(key, view);
@@ -242,18 +236,18 @@ impl MusicApp {
                 if thumbs {
                     self.art_thumbs.insert(id.clone());
                 }
-                self.artwork.insert(id, path);
+                self.account_cache.artwork.insert(id, path);
             }
             Event::Backdrop(id, backdrop) => {
-                self.backdrops.insert(id, backdrop);
+                self.account_cache.backdrops.insert(id, backdrop);
             }
             Event::ArtworkFailed(id) => {
                 self.art_failures.insert(id);
             }
             Event::ArtworkRetrying => {
                 self.art_failures.clear();
-                self.profile_requested.clear();
-                self.popularity_requested.clear();
+                self.account_cache.profile_requested.clear();
+                self.account_cache.popularity_requested.clear();
                 if let Some(name) = &self.artist_name {
                     self.service.send(Command::ArtistProfile(
                         name.clone(),
