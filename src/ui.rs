@@ -367,7 +367,6 @@ pub struct MusicApp {
     request: u64,
     search: Entity<InputState>,
     search_text: String,
-    playlist_search: String,
     queue_search: String,
     queue_ui: QueueViewState,
     titlebar_dragging: bool,
@@ -421,8 +420,7 @@ pub struct MusicApp {
     selected_album: Option<Arc<Album>>,
     pending_explorer_album: Option<String>,
     selected: Option<Arc<Track>>,
-    playlists: Vec<Playlist>,
-    playlist: Option<Playlist>,
+    playlists: crate::playlists::Playlists,
     playback: PlaybackSnapshot,
     artwork: HashMap<String, PathBuf>,
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
@@ -606,7 +604,7 @@ impl MusicApp {
                                 app.query.selection = Default::default();
                                 app.request_query(cx);
                             }
-                            Workspace::Playlists => app.playlist_search = value,
+                            Workspace::Playlists => app.playlists.set_search(value),
                             Workspace::Queue => app.queue_search = value,
                             Workspace::NowPlaying | Workspace::Discover => {
                                 app.workspace = Workspace::Explorer;
@@ -674,7 +672,6 @@ impl MusicApp {
             request,
             search,
             search_text: String::new(),
-            playlist_search: String::new(),
             queue_search: String::new(),
             queue_ui: QueueViewState::new(cx),
             titlebar_dragging: false,
@@ -723,8 +720,7 @@ impl MusicApp {
             selected_album: None,
             pending_explorer_album: None,
             selected: None,
-            playlists: vec![],
-            playlist: None,
+            playlists: Default::default(),
             playback: PlaybackSnapshot::default(),
             artwork: HashMap::new(),
             art_requested: HashMap::new(),
@@ -1058,7 +1054,7 @@ impl Render for MusicApp {
                     let origin = app.artist_origin;
                     app.switch_workspace(origin, window, cx);
                 } else if app.workspace == Workspace::Playlists {
-                    app.playlist = None;
+                    app.playlists.close();
                 } else {
                     app.query.selection = Default::default();
                     app.query.genre.clear();

@@ -14,15 +14,15 @@ impl MusicApp {
                 LibraryQuery::default()
             },
             playlist: if self.workspace == Workspace::Playlists {
-                self.playlist
-                    .as_ref()
+                self.playlists
+                    .current()
                     .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
             } else {
                 None
             },
             search: match self.workspace {
                 Workspace::Queue => self.queue_search.clone(),
-                Workspace::Playlists => self.playlist_search.clone(),
+                Workspace::Playlists => self.playlists.search().to_owned(),
                 _ => String::new(),
             },
         }
@@ -80,7 +80,7 @@ impl MusicApp {
             // switch_workspace puts these searches back into the search box.
             match location.workspace {
                 Workspace::Queue => self.queue_search = location.search.clone(),
-                Workspace::Playlists => self.playlist_search = location.search.clone(),
+                Workspace::Playlists => self.playlists.set_search(location.search.clone()),
                 _ => {}
             }
             self.switch_workspace(location.workspace, window, cx);
@@ -95,18 +95,19 @@ impl MusicApp {
                     self.request_query(cx);
                 }
                 Workspace::Playlists => {
-                    let current = self.playlist.as_ref().map(|p| p.id.clone());
+                    let current = self.playlists.current().map(|p| p.id.clone());
                     if current.as_ref() != location.playlist.as_ref().map(|(id, _)| id) {
                         self.selected = None;
                         // The full list arrives with the loaded playlist.
-                        self.playlist = location.playlist.map(|(id, name)| {
+                        self.playlists.close();
+                        if let Some((id, name)) = location.playlist {
                             self.service.send(Command::Playlist(id.clone()));
-                            Playlist {
+                            self.playlists.open(Playlist {
                                 id,
                                 name,
                                 ..Default::default()
-                            }
-                        });
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -139,7 +140,7 @@ impl MusicApp {
                 self.query = self.explorer_query.clone();
                 self.query.text.clone()
             }
-            Workspace::Playlists => self.playlist_search.clone(),
+            Workspace::Playlists => self.playlists.search().to_owned(),
             Workspace::Queue => self.queue_search.clone(),
             Workspace::NowPlaying | Workspace::Discover => String::new(),
         };

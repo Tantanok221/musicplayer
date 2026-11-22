@@ -22,7 +22,7 @@ pub(super) enum TrackPosition {
     Queue(usize),
     Playlist {
         playback: TrackPlayback,
-        editable_entry: Option<playlists::PlaylistEntry>,
+        editable_entry: Option<crate::playlists::PlaylistEntry>,
     },
 }
 

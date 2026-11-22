@@ -8,8 +8,8 @@ impl MusicApp {
             Workspace::NowPlaying => "Now Playing",
             Workspace::Discover => "Discover",
             Workspace::Playlists => self
-                .playlist
-                .as_ref()
+                .playlists
+                .current()
                 .map_or("Playlists", |p| p.name.as_str()),
             _ => self.main_view().label(),
         });

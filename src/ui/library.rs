@@ -942,7 +942,7 @@ impl MusicApp {
                                     return;
                                 }
                                 if app.playlist_editor_rename {
-                                    if let Some(playlist) = &app.playlist {
+                                    if let Some(playlist) = app.playlists.current() {
                                         app.mutate(
                                             Mutation::RenamePlaylist(playlist.id.clone(), name),
                                             cx,

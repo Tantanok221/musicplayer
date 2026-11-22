@@ -212,10 +212,9 @@ impl MusicApp {
             places: self.queue_places(),
             playlists: self
                 .playlists
+                .summaries()
                 .iter()
-                .filter(|playlist| {
-                    playlist.owner.is_empty() || Some(playlist.owner.as_str()) == user
-                })
+                .filter(|playlist| crate::playlists::Playlists::can_edit(playlist, user))
                 .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
                 .collect(),
         })
@@ -298,7 +297,7 @@ impl MusicApp {
                     .item(menu_row(Glyph::ListX, "Remove from Playlist").on_click(
                         move |_, _, cx| {
                             let _ = app.update(cx, |app, cx| {
-                                if let Some(mutation) = removal.mutation(app.playlist.as_ref()) {
+                                if let Some(mutation) = removal.mutation(app.playlists.current()) {
                                     app.mutate(mutation, cx);
                                 }
                             });
