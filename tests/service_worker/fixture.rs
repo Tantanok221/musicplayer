@@ -455,7 +455,6 @@ async fn navidrome(
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
-            | "getLyricsBySongId.view"
             | "getLyrics.view"
     ) || query.keys().any(|key| {
         !matches!(
@@ -645,9 +644,6 @@ async fn navidrome(
         },
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
             json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":data.library.artist_mbid}})
-        }
-        "getLyricsBySongId.view" if query == Request::new("", &[("id", "song")]).params => {
-            json!({"status":"ok","lyricsList":{"structuredLyrics":[{"line":[{"value":"Account A lyrics"}]}]}})
         }
         "getArtistInfo2.view"
             if query
@@ -870,6 +866,46 @@ async fn metadata(
     method: Method,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    if method == Method::GET && endpoint == "release" && query.contains_key("query") {
+        state.record(Request::new(
+            "metadata/release-search",
+            &[("query", &query["query"]), ("limit", &query["limit"])],
+        ));
+        return Json(json!({"releases":[{
+            "id":"ok-computer", "score":100, "title":"OK Computer", "date":"1997-05-21",
+            "country":"GB", "track-count":2,
+            "artist-credit":[{"name":"Radiohead","joinphrase":"","artist":{"id":"a1","name":"Radiohead"}}],
+            "label-info":[{"catalog-number":"NODATA 02","label":{"name":"Parlophone"}}],
+            "media":[{"format":"CD","track-count":2}]
+        }]}))
+        .into_response();
+    }
+    if method == Method::GET
+        && endpoint == "release/ok-computer"
+        && query.get("inc").map(String::as_str)
+            == Some("recordings artist-credits labels release-groups genres")
+    {
+        state.record(Request::new("metadata/release-lookup", &[]));
+        let credit =
+            json!([{"name":"Radiohead","joinphrase":"","artist":{"id":"a1","name":"Radiohead"}}]);
+        return Json(json!({
+            "id":"ok-computer", "title":"OK Computer", "date":"1997-05-21",
+            "artist-credit": credit,
+            "release-group":{"id":"rg","genres":[{"name":"rock","count":1}]},
+            "genres":[{"name":"alternative rock","count":5},{"name":"art rock","count":3},{"name":"rock","count":1}],
+            "media":[{"position":1,"format":"CD","tracks":[
+                {"id":"t1","position":1,"title":"Airbag","length":284000,
+                 "recording":{"id":"r1","title":"Airbag"}},
+                {"id":"t2","position":2,"title":"Paranoid Android","length":383000,
+                 "artist-credit": credit, "recording":{"id":"r2","title":"Paranoid Android"}}
+            ]}]
+        }))
+        .into_response();
+    }
+    if method == Method::GET && endpoint == "release/gone" {
+        state.record(Request::new("metadata/release-lookup", &[]));
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
     if method == Method::GET
         && endpoint == "release"
         && query

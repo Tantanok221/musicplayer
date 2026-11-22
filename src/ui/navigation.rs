@@ -98,6 +98,7 @@ impl MusicApp {
                     let current = self.playlists.current().map(|p| p.id.clone());
                     if current.as_ref() != location.playlist.as_ref().map(|(id, _)| id) {
                         self.selected = None;
+                        self.selection.clear();
                         // The full list arrives with the loaded playlist.
                         self.playlists.close();
                         if let Some((id, name)) = location.playlist {

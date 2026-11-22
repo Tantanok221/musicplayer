@@ -266,6 +266,7 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let state = self.menu_state(cx);
+        let tag_tracks = self.selection.acting_on(&track);
         let queue_index = match &position {
             Some(tracks::TrackPosition::Queue(index)) => Some(*index),
             _ => None,
@@ -292,12 +293,17 @@ impl MusicApp {
             });
             let menu = track_extras(menu, &state, &track, window, cx);
             let menu = if writes_tags(&state, cx) {
-                let (app, edit) = (state.app.clone(), track.clone());
+                let app = state.app.clone();
+                let label = match tag_tracks.len() {
+                    1 => "Edit Tags…".to_string(),
+                    count => format!("Edit Tags of {count} Songs…"),
+                };
+                let tracks: Vec<Track> = tag_tracks.iter().map(|t| (**t).clone()).collect();
                 menu.separator()
                     .item(
-                        menu_row(Glyph::Music, "Edit Tags…").on_click(move |_, window, cx| {
+                        menu_row(Glyph::Music, label).on_click(move |_, window, cx| {
                             let _ = app.update(cx, |app, cx| {
-                                app.open_tag_editor(vec![(*edit).clone()], window, cx)
+                                app.open_tag_editor(tracks.clone(), window, cx)
                             });
                         }),
                     )

@@ -1,6 +1,7 @@
 pub mod artists;
 pub mod artwork;
 mod artwork_cache;
+pub mod autotag;
 pub mod backdrop;
 pub mod browser;
 pub mod catalog;
@@ -16,6 +17,7 @@ pub mod musicbrainz;
 pub mod platform;
 pub mod playback;
 pub mod playlists;
+pub mod selection;
 pub mod server;
 pub mod service;
 pub mod slskd;

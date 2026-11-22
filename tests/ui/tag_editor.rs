@@ -1,13 +1,16 @@
 //! The opt-in tag editor: context menu entry, multi-edit form, failure and undo.
 use crate::common::ui::{Fixture, start};
-use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
+use gpui_kit::{
+    AnyWindowHandle, AppContext, ElementId, Modifiers, TestAppContext, test::TestWindowExt,
+};
 use sonora::{
+    autotag::{LookupTrack, Release, ReleaseCandidate, ReleaseQuery},
     model::{MetadataPreferences, Preferences, Track},
     platform::{Account, shortcut},
     service::{Command, Event},
-    tags::{EditValue, TagField, TagReport},
+    tags::{EditValue, TagEdit, TagField, TagReport},
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 fn writes_tags(fixture: &mut Fixture, on: bool) {
     let mut prefs: Preferences = fixture.catalog.state("preferences").unwrap();
@@ -22,6 +25,20 @@ fn writes_tags(fixture: &mut Fixture, on: bool) {
         }),
         prefs,
     ));
+}
+
+fn open_album_editor(fixture: &mut Fixture, window: AnyWindowHandle, cx: &mut TestAppContext) {
+    writes_tags(fixture, true);
+    fixture.settle(window, cx);
+    fixture.expect("album songs for the tag editor", |command, _| {
+        assert!(matches!(command, Command::Album(id) if id == "album-1"));
+        vec![Event::Album(
+            "album-1".into(),
+            vec![song("one", "First"), song("two", "Second")],
+        )]
+    });
+    album_menu(fixture, window, cx);
+    fixture.menu_item(window, "Edit Album Tags…", cx);
 }
 
 fn album_menu(fixture: &mut Fixture, window: AnyWindowHandle, cx: &mut TestAppContext) {
@@ -45,11 +62,16 @@ fn song(id: &str, title: &str) -> Arc<Track> {
     })
 }
 
-fn label(window: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> Option<String> {
+fn label(
+    window: AnyWindowHandle,
+    id: impl Into<ElementId>,
+    cx: &mut TestAppContext,
+) -> Option<String> {
+    let id = id.into();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window
-            .try_find(id.to_string())
+            .try_find(id)
             .and_then(|element| element.label().map(str::to_string))
     })
     .unwrap()
@@ -91,9 +113,11 @@ fn album_edit_sends_only_the_changed_field_then_retries_and_undoes(cx: &mut Test
         ..Default::default()
     };
     fixture.expect("write genre only", move |command, _| {
-        let Command::WriteTags(edit) = command else {
+        let Command::WriteTags(mut edits) = command else {
             panic!("expected a tag write");
         };
+        assert_eq!(edits.len(), 1);
+        let edit = edits.remove(0);
         assert_eq!(edit.tracks, vec!["one".to_string(), "two".to_string()]);
         assert_eq!(
             edit.fields.into_iter().collect::<Vec<_>>(),
@@ -110,6 +134,11 @@ fn album_edit_sends_only_the_changed_field_then_retries_and_undoes(cx: &mut Test
     fixture.settle(window, cx);
     fixture.click(window, "save-tags", cx);
     assert_eq!(
+        label(window, ("tag-change", 0_usize), cx).as_deref(),
+        Some("First · Genre: Rock → Jazz")
+    );
+    fixture.click(window, "confirm-tags", cx);
+    assert_eq!(
         label(window, "tag-failures", cx).as_deref(),
         Some("Second: Couldn't find the file")
     );
@@ -119,7 +148,7 @@ fn album_edit_sends_only_the_changed_field_then_retries_and_undoes(cx: &mut Test
     );
 
     fixture.expect("retry", |command, _| {
-        assert!(matches!(command, Command::WriteTags(edit) if edit.fields.len() == 1));
+        assert!(matches!(command, Command::WriteTags(edits) if edits[0].fields.len() == 1));
         vec![Event::TagsWritten(TagReport {
             job: 2,
             written: 2,
@@ -140,4 +169,261 @@ fn album_edit_sends_only_the_changed_field_then_retries_and_undoes(cx: &mut Test
     fixture.click(window, "undo-tags", cx);
     assert!(label(window, "tag-notice", cx).is_none());
     fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn command_click_selects_songs_and_the_table_edits_each_one(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    writes_tags(&mut fixture, true);
+    fixture.settle(window, cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    fixture.click(window, "main-view-menu", cx);
+    fixture.menu_item(window, "Tracks", cx);
+    fixture.click(window, "row-flat-track-1", cx);
+    for id in ["row-flat-track-2", "row-flat-track-3"] {
+        cx.update_window(window, |_, window, cx| {
+            window.click_with_modifiers(id, Modifiers::command(), cx)
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags of 3 Songs…", cx);
+    assert_eq!(
+        label(window, "tag-editor", cx).as_deref(),
+        Some("Edit tags of 3 songs")
+    );
+    let row = ["track-1", "track-2", "track-3"]
+        .iter()
+        .position(|id| *id == "track-2")
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click(format!("tag-cell-{row}-title"), cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("Renamed", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.click(window, "save-tags", cx);
+    assert_eq!(
+        label(window, ("tag-change", 0_usize), cx).as_deref(),
+        Some("Second song · Title: Second song → Renamed")
+    );
+    assert!(label(window, ("tag-change", 1_usize), cx).is_none());
+    fixture.click(window, "back-tags", cx);
+    assert!(label(window, "tag-table", cx).is_some());
+    fixture.expect("only the edited song is written", |command, _| {
+        let Command::WriteTags(edits) = command else {
+            panic!("expected a tag write");
+        };
+        assert_eq!(
+            edits,
+            vec![TagEdit {
+                tracks: vec!["track-2".into()],
+                fields: BTreeMap::from([(TagField::Title, EditValue::Set("Renamed".into()))]),
+            }]
+        );
+        vec![]
+    });
+    fixture.click(window, "save-tags", cx);
+    fixture.click(window, "confirm-tags", cx);
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn a_plain_click_ends_the_multi_selection(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    writes_tags(&mut fixture, true);
+    fixture.settle(window, cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    fixture.click(window, "main-view-menu", cx);
+    fixture.menu_item(window, "Tracks", cx);
+    fixture.click(window, "row-flat-track-1", cx);
+    cx.update_window(window, |_, window, cx| {
+        window.click_with_modifiers("row-flat-track-2", Modifiers::command(), cx)
+    })
+    .unwrap();
+    fixture.click(window, "row-flat-track-2", cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags…", cx);
+    assert_eq!(
+        label(window, "tag-editor", cx).as_deref(),
+        Some("Edit tags of Second song")
+    );
+}
+
+#[gpui_kit::test]
+fn clearing_a_field_writes_it_empty_on_every_song(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    fixture.click(window, "clear-tag-genre", cx);
+    fixture.click(window, "save-tags", cx);
+    assert_eq!(
+        label(window, ("tag-change", 0_usize), cx).as_deref(),
+        Some("First · Genre: Rock → (empty)")
+    );
+    fixture.expect("clear genre", |command, _| {
+        let Command::WriteTags(edits) = command else {
+            panic!("expected a tag write");
+        };
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].tracks.len(), 2);
+        assert_eq!(
+            edits[0].fields.get(&TagField::Genre),
+            Some(&EditValue::Clear)
+        );
+        vec![]
+    });
+    fixture.click(window, "confirm-tags", cx);
+    fixture.assert_script_finished();
+}
+
+fn candidate() -> ReleaseCandidate {
+    ReleaseCandidate {
+        id: "rel".into(),
+        title: "Fixture album".into(),
+        artist: "Fixture Artist".into(),
+        date: "1997-05-21".into(),
+        country: "GB".into(),
+        format: "CD".into(),
+        tracks: 2,
+        score: 100,
+        ..Default::default()
+    }
+}
+
+fn release() -> Release {
+    let track = |title: &str, number| LookupTrack {
+        id: format!("t{number}"),
+        recording_id: format!("r{number}"),
+        title: title.into(),
+        artists: vec![("Fixture Artist".into(), "a1".into())],
+        number,
+        disc: 1,
+        length_ms: None,
+    };
+    Release {
+        id: "rel".into(),
+        title: "Fixture album".into(),
+        artists: vec![("Fixture Artist".into(), "a1".into())],
+        group_id: "rg".into(),
+        date: "1997-05-21".into(),
+        genres: vec!["Trip Hop".into()],
+        tracks: vec![track("Second", 2), track("First Song", 1)],
+    }
+}
+
+#[gpui_kit::test]
+fn find_on_musicbrainz_fills_matched_songs_for_review(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    fixture.expect("search with the album's tags", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a release search");
+        };
+        assert_eq!(
+            query,
+            ReleaseQuery {
+                album: "Fixture album".into(),
+                artist: "Fixture Artist".into(),
+                tracks: 2,
+            }
+        );
+        vec![
+            Event::ReleaseCandidates(
+                ReleaseQuery {
+                    album: "An older search".into(),
+                    ..query.clone()
+                },
+                Ok(vec![]),
+            ),
+            Event::ReleaseCandidates(query, Ok(vec![candidate()])),
+        ]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    assert_eq!(
+        label(window, ("release-candidate", 0_usize), cx).as_deref(),
+        Some("Fixture album — Fixture Artist · 1997-05-21 · GB · CD · 2 tracks · 100% match")
+    );
+    fixture.expect("load the chosen edition", |command, _| {
+        assert!(matches!(&command, Command::LoadRelease(id) if id == "rel"));
+        vec![Event::ReleaseLoaded("rel".into(), Ok(Arc::new(release())))]
+    });
+    fixture.click(window, ("release-candidate", 0_usize), cx);
+    assert_eq!(
+        label(window, ("track-match", 0_usize), cx).as_deref(),
+        Some("First → First Song · 65%")
+    );
+    assert_eq!(
+        label(window, ("track-match", 1_usize), cx).as_deref(),
+        Some("Second → Second · 100%")
+    );
+    fixture.click(window, "fill-genre", cx);
+    fixture.click(window, "fill-tags", cx);
+    fixture.click(window, "save-tags", cx);
+    assert_eq!(
+        label(window, ("tag-change", 0_usize), cx).as_deref(),
+        Some("First · Title: First → First Song")
+    );
+    fixture.expect("write the filled values and IDs", |command, _| {
+        let Command::WriteTags(edits) = command else {
+            panic!("expected a tag write");
+        };
+        assert_eq!(edits.len(), 2);
+        let first = &edits[0];
+        assert_eq!(first.tracks, vec!["one".to_string()]);
+        let set = |value: &str| Some(EditValue::Set(value.into()));
+        assert_eq!(
+            first.fields.get(&TagField::Title).cloned(),
+            set("First Song")
+        );
+        assert_eq!(first.fields.get(&TagField::Track).cloned(), set("1"));
+        assert_eq!(first.fields.get(&TagField::Year).cloned(), set("1997"));
+        assert_eq!(
+            first.fields.get(&TagField::MusicBrainzTrack).cloned(),
+            set("r1")
+        );
+        assert_eq!(
+            first.fields.get(&TagField::MusicBrainzRelease).cloned(),
+            set("rel")
+        );
+        assert!(!first.fields.contains_key(&TagField::Genre));
+        assert!(!first.fields.contains_key(&TagField::Album));
+        assert_eq!(
+            edits[1].fields.get(&TagField::MusicBrainzTrack).cloned(),
+            set("r2")
+        );
+        vec![]
+    });
+    fixture.click(window, "confirm-tags", cx);
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn a_failed_search_says_why_and_keeps_the_form(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    fixture.expect("search fails", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a release search");
+        };
+        vec![Event::ReleaseCandidates(
+            query,
+            Err("MusicBrainz returned HTTP 503".into()),
+        )]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    assert_eq!(
+        label(window, "lookup-error", cx).as_deref(),
+        Some("MusicBrainz returned HTTP 503")
+    );
+    assert!(label(window, "tag-table", cx).is_some());
 }

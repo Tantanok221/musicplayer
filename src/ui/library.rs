@@ -122,6 +122,29 @@ impl MusicApp {
     }
 
     pub(super) fn select_track(&mut self, track: Arc<Track>, cx: &mut Context<Self>) {
+        self.selection.only(track.clone());
+        self.selected = Some(track);
+        cx.notify();
+    }
+
+    /// A modified click in a song list: ⌘ adds or removes the song, shift
+    /// selects the range from the last clicked song.
+    pub(super) fn select_more(
+        &mut self,
+        track: Arc<Track>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.is_empty()
+            && let Some(selected) = self.selected.clone()
+        {
+            self.selection.only(selected);
+        }
+        if modifiers.shift {
+            self.selection.extend(track.clone(), &self.tracks);
+        } else {
+            self.selection.toggle(track.clone());
+        }
         self.selected = Some(track);
         cx.notify();
     }
