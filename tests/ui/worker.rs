@@ -12,6 +12,95 @@ use sonora::{
 };
 use std::time::Instant;
 
+#[gpui_kit::test]
+fn deleted_playlist_ignores_late_detail_reply(cx: &mut TestAppContext) {
+    let playlist = sonora::model::Playlist {
+        id: "deleted".into(),
+        name: "Deleted".into(),
+        ..Default::default()
+    };
+    let fixture = Fixture::new(Library {
+        playlists: vec![playlist.clone()],
+        ..Default::default()
+    });
+    fixture.seed();
+    let (mut worker, tx, window, app) = mount_worker_with(&fixture, Preferences::default(), cx);
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Status(s) if s.starts_with("Up to date")),
+    );
+    // Collapse Library so its contents do not overlap the playlist row.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("library-disclosure", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.edit_library(|library| {
+        library.hold_endpoint = Some("getPlaylist.view");
+        library.playlist_response = Some(serde_json::json!({"status":"ok","playlist":playlist}));
+    });
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("nav-playlist-deleted").visible());
+        window.click("nav-playlist-deleted", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.wait_request(&Request::new("getPlaylist.view", &[("id", "deleted")]));
+    cx.update_window(window, |_, window, cx| window.click("playlist-options", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let target = menu.find_by_label("Delete playlist…");
+        let id = target.path().last().unwrap().clone();
+        menu.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    fixture.expect_mutation(
+        Request::new("deletePlaylist.view", &[("id", "deleted")]),
+        true,
+    );
+    cx.update_window(window, |_, window, cx| window.click("confirm-delete", cx))
+        .unwrap();
+    cx.run_until_parked();
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Playlists(p) if p.is_empty()),
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("nav-playlist-deleted").is_none())
+    })
+    .unwrap();
+    fixture.resume_held();
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    while let Ok(event) = worker.events().recv_deadline(deadline) {
+        tx.send(event).unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("nav-playlist-deleted").is_none(),
+                "deleted playlist must stay absent from sidebar"
+            );
+        })
+        .unwrap();
+    }
+    assert!(fixture.catalog().playlist("deleted").unwrap().is_none());
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
 /// Stage real events in FIFO order through MusicApp's normal receiver. This
 /// lets the test inspect the optimistic frame before releasing HTTP results.
 /// No event is synthesized, filtered, reordered or handled directly by the view.

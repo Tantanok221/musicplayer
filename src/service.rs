@@ -1074,6 +1074,7 @@ fn run(
     let mut profile_requests = HashSet::new();
     let mut profile_pending: VecDeque<(String, String, bool)> = VecDeque::new();
     let mut top_song_requests = HashSet::new();
+    let mut deleted_playlists = HashSet::new();
     let mut submission_requests = HashSet::new();
     let mut discography_requests = HashSet::new();
     let mut discover_request = 0;
@@ -2096,7 +2097,9 @@ fn run(
                     }
                 }
                 Command::PlaylistLoaded(namespace, playlist) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                    if account.as_ref().map(Account::namespace) == Some(namespace.clone())
+                        && !deleted_playlists.contains(&(namespace, playlist.id.clone()))
+                    {
                         catalog.save_playlist(&playlist)?;
                         events.send(Event::Playlist(playlist))?;
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
@@ -2375,6 +2378,9 @@ fn run(
                         return Ok(());
                     }
                     let completed = mutation.clone();
+                    if let Mutation::DeletePlaylist(id) = &mutation {
+                        deleted_playlists.insert((namespace, id.clone()));
+                    }
                     // Favorites match album feedback only in album views.
                     let album_scope = current_query
                         .ordering
