@@ -748,3 +748,28 @@ fn identify_by_sound_needs_a_key_then_searches_the_recording(cx: &mut TestAppCon
     assert!(label(window, ("release-candidate", 0_usize), cx).is_some());
     fixture.assert_script_finished();
 }
+
+#[gpui_kit::test]
+fn a_song_with_no_match_names_the_recording(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    writes_tags(&mut fixture, true);
+    songs_view(&mut fixture, window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-1", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags…", cx);
+    fixture.expect("search", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        vec![Event::ReleaseCandidates(query, Ok(Vec::new()))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    let error = label(window, "lookup-error", cx).unwrap();
+    assert!(
+        error.starts_with("MusicBrainz found no recording called "),
+        "{error}"
+    );
+}

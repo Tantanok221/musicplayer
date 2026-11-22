@@ -273,10 +273,13 @@ impl MusicApp {
             return;
         }
         editor.lookup = match result {
-            Ok(found) if found.is_empty() => Lookup::Failed(format!(
-                "MusicBrainz found no release called {}.",
-                query.album
-            )),
+            Ok(found) if found.is_empty() => Lookup::Failed(if !query.recording.is_empty() {
+                "MusicBrainz found no release with that recording.".to_string()
+            } else if query.is_song() {
+                format!("MusicBrainz found no recording called {}.", query.title)
+            } else {
+                format!("MusicBrainz found no release called {}.", query.album)
+            }),
             Ok(found) => {
                 editor.candidates = found;
                 Lookup::Choosing
