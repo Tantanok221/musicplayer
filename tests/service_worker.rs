@@ -27,6 +27,8 @@ mod queue;
 mod saved_state;
 #[path = "service_worker/scrobbles.rs"]
 mod scrobbles;
+#[path = "service_worker/slskd.rs"]
+mod slskd;
 #[path = "service_worker/smart_playlists.rs"]
 mod smart_playlists;
 #[path = "service_worker/sync.rs"]

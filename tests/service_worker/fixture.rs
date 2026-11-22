@@ -350,6 +350,7 @@ async fn navidrome(
         "ping.view"
             | "getOpenSubsonicExtensions.view"
             | "getScanStatus.view"
+            | "startScan.view"
             | "getPlaylists.view"
             | "getPlaylist.view"
             | "createPlaylist.view"
@@ -454,6 +455,9 @@ async fn navidrome(
         }
         "getOpenSubsonicExtensions.view" if query.is_empty() => {
             json!({"status":"ok","openSubsonicExtensions":[]})
+        }
+        "startScan.view" if query.is_empty() => {
+            json!({"status":"ok","scanStatus":{"scanning":true}})
         }
         "getScanStatus.view" if query.is_empty() => data
             .library
