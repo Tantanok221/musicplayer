@@ -597,10 +597,14 @@ fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) ->
 }
 
 fn catalog_path(paths: &Paths, account: Option<&Account>) -> PathBuf {
-    paths.data.join(format!(
-        "{}.sqlite",
-        account.map_or("unconnected".into(), Account::namespace)
-    ))
+    catalog_path_for_namespace(
+        paths,
+        &account.map_or("unconnected".into(), Account::namespace),
+    )
+}
+
+fn catalog_path_for_namespace(paths: &Paths, namespace: &str) -> PathBuf {
+    paths.data.join(format!("{namespace}.sqlite"))
 }
 const DOWNLOADS: &str = "downloads:v1";
 
@@ -773,8 +777,13 @@ fn begin_sync(
     events: Sender<Event>,
     runtime: &tokio::runtime::Handle,
     generation: i64,
+    recovered_ratings: Vec<tokio::task::JoinHandle<()>>,
 ) {
     runtime.spawn(async move {
+        // Read ratings only after recovered writes have settled.
+        for write in recovered_ratings {
+            let _ = write.await;
+        }
         let result:Result<(Vec<Playlist>,bool)>=async {
             let scanning_before=server.scan_status().await?;
             for kind in ["song","album"] {
@@ -989,21 +998,30 @@ fn publish_discover(
 }
 
 type QueuedMutation = (Server, Mutation);
+const UNFINISHED_RATINGS: &str = "unfinished-track-ratings:v1";
+
+struct RatingLane {
+    sent: u8,
+    pending: VecDeque<(Server, u8)>,
+}
 
 #[derive(Default)]
-struct TrackRatingWrites(HashMap<(String, String), VecDeque<QueuedMutation>>);
+struct TrackRatingWrites(HashMap<(String, String), RatingLane>);
 
 impl TrackRatingWrites {
     fn enqueue(&mut self, server: Server, mutation: Mutation) -> Option<QueuedMutation> {
-        if let Mutation::Rating(id, _) = &mutation {
+        if let Mutation::Rating(id, rating) = &mutation {
             // Reserve the lane in command order, before spawning any HTTP work.
             match self.0.entry((server.account.namespace(), id.clone())) {
                 Entry::Occupied(mut lane) => {
-                    lane.get_mut().push_back((server, mutation));
+                    lane.get_mut().pending.push_back((server, *rating));
                     return None;
                 }
                 Entry::Vacant(lane) => {
-                    lane.insert(VecDeque::new());
+                    lane.insert(RatingLane {
+                        sent: *rating,
+                        pending: VecDeque::new(),
+                    });
                 }
             }
         }
@@ -1017,12 +1035,47 @@ impl TrackRatingWrites {
         let Entry::Occupied(mut lane) = self.0.entry((namespace.to_owned(), id.clone())) else {
             return None;
         };
-        if let Some(next) = lane.get_mut().pop_front() {
-            Some(next)
+        if let Some((server, rating)) = lane.get_mut().pending.pop_front() {
+            lane.get_mut().sent = rating;
+            Some((server, Mutation::Rating(id.clone(), rating)))
         } else {
             lane.remove();
             None
         }
+    }
+
+    fn save_unfinished(
+        &self,
+        paths: &Paths,
+        account: Option<&Account>,
+        catalog: &Catalog,
+    ) -> Result<()> {
+        let active = account.map(Account::namespace);
+        let mut by_account = HashMap::<&str, HashMap<&str, u8>>::new();
+        for ((namespace, id), lane) in &self.0 {
+            let latest = lane.pending.back().map_or(lane.sent, |(_, rating)| *rating);
+            by_account.entry(namespace).or_default().insert(id, latest);
+        }
+        for (namespace, ratings) in by_account {
+            if active.as_deref() == Some(namespace) {
+                catalog.set_state(UNFINISHED_RATINGS, &ratings)?;
+            } else {
+                Catalog::open(&catalog_path_for_namespace(paths, namespace))?
+                    .set_state(UNFINISHED_RATINGS, &ratings)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn recover(&mut self, server: &Server, catalog: &Catalog) -> Result<Vec<QueuedMutation>> {
+        let ratings: HashMap<String, u8> = catalog.state(UNFINISHED_RATINGS)?;
+        if !ratings.is_empty() {
+            catalog.set_state(UNFINISHED_RATINGS, &HashMap::<String, u8>::new())?;
+        }
+        Ok(ratings
+            .into_iter()
+            .filter_map(|(id, rating)| self.enqueue(server.clone(), Mutation::Rating(id, rating)))
+            .collect())
     }
 }
 
@@ -1113,7 +1166,7 @@ fn run(
                     ));
                 }
             }
-        });
+        })
     };
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
@@ -1276,6 +1329,13 @@ fn run(
             Err(flume::RecvTimeoutError::Disconnected) => break,
         };
         if let Command::Shutdown(ack) = command {
+            if let Err(error) =
+                track_rating_writes.save_unfinished(&paths, account.as_ref(), &catalog)
+            {
+                let _ = events.send(Event::Error(format!(
+                    "Could not keep unfinished ratings: {error:#}"
+                )));
+            }
             let (reply, queue) = flume::bounded(1);
             player.send(PlayerCommand::SaveQueue(reply));
             if let Ok(queue) = queue.recv_timeout(std::time::Duration::from_secs(2)) {
@@ -1441,6 +1501,11 @@ fn run(
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
                     server = Some(value.clone());
+                    let recovered_ratings = track_rating_writes
+                        .recover(&value, &catalog)?
+                        .into_iter()
+                        .map(|(server, rating)| spawn_mutation(server, rating))
+                        .collect();
                     artwork_queue.retry_failed(artwork_clock.now());
                     events.send(Event::Connected(value.account.clone(), label))?;
                     events.send(Event::NativeAvailable(value.is_navidrome))?;
@@ -1449,7 +1514,14 @@ fn run(
                         syncing = true;
                         generation = chrono::Utc::now().timestamp_micros();
                         native_renewal.start(&value, &paths, &runtime, &tx);
-                        begin_sync(value, tx.clone(), events.clone(), &runtime, generation);
+                        begin_sync(
+                            value,
+                            tx.clone(),
+                            events.clone(),
+                            &runtime,
+                            generation,
+                            recovered_ratings,
+                        );
                     }
                 }
                 Command::Refresh => {
@@ -1461,7 +1533,14 @@ fn run(
                             syncing = true;
                             generation = chrono::Utc::now().timestamp_micros();
                             native_renewal.start(&server, &paths, &runtime, &tx);
-                            begin_sync(server, tx.clone(), events.clone(), &runtime, generation);
+                            begin_sync(
+                                server,
+                                tx.clone(),
+                                events.clone(),
+                                &runtime,
+                                generation,
+                                Vec::new(),
+                            );
                         }
                     } else {
                         anyhow::bail!("Open Settings to connect to your server");
@@ -2425,14 +2504,14 @@ fn run(
                     };
                     if let Some((server, mutation)) = track_rating_writes.enqueue(server, mutation)
                     {
-                        spawn_mutation(server, mutation);
+                        drop(spawn_mutation(server, mutation));
                     }
                 }
                 Command::Updated(namespace, mutation) => {
                     if let Some((server, next)) =
                         track_rating_writes.complete(&namespace, &mutation)
                     {
-                        spawn_mutation(server, next);
+                        drop(spawn_mutation(server, next));
                     }
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
@@ -2553,7 +2632,7 @@ fn run(
                     if let Some((server, next)) =
                         track_rating_writes.complete(&namespace, &mutation)
                     {
-                        spawn_mutation(server, next);
+                        drop(spawn_mutation(server, next));
                         // A rejected, superseded rating must not offer a stale Retry.
                         return Ok(());
                     }
@@ -2616,6 +2695,7 @@ fn run(
                                     events.clone(),
                                     &runtime,
                                     generation,
+                                    Vec::new(),
                                 );
                             }
                         }

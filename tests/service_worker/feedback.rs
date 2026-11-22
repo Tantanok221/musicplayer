@@ -108,6 +108,40 @@ fn rejected_track_rating_does_not_block_or_offer_retry_over_a_newer_rating() {
 }
 
 #[test]
+fn quitting_with_a_held_rating_keeps_the_latest_selection_for_reconnect() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let earlier = Request::new("setRating.view", &[("id", "song"), ("rating", "2")]);
+    let release = fixture.hold_rating(earlier.clone(), false);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 2)));
+    fixture.wait_request(&earlier);
+    let latest = Request::new("setRating.view", &[("id", "song"), ("rating", "5")]);
+    fixture.expect_mutation(latest.clone(), true);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 5)));
+    worker.shutdown(WAIT).unwrap();
+    assert!(!fixture.requests().contains(&latest));
+    drop(release);
+
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    fixture.wait_request(&latest);
+    event(
+        &worker,
+        |event| matches!(event, Event::MutationDone(Mutation::Rating(id, 5)) if id == "song"),
+    );
+    assert_eq!(fixture.server_track_rating("song"), Some(5));
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn album_feedback_reaches_http_catalog_and_real_events_without_editing_tracks() {
     let fixture = Fixture::new(Library::default());
     fixture.seed();
