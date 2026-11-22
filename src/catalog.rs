@@ -887,9 +887,9 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn album_tracks(&self, id: &str) -> Result<Vec<Arc<Track>>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT data FROM tracks WHERE album_id=? ORDER BY disc,track,title")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM tracks WHERE album_id=? ORDER BY coalesce(disc,1),track,title",
+        )?;
         stmt.query_map([id], |r| r.get::<_, String>(0))?
             .map(|r| Ok(Arc::new(serde_json::from_str(&r?)?)))
             .collect()
