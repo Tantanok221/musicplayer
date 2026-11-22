@@ -1,9 +1,114 @@
 use crate::fixture::{Fixture, Library, WAIT, album, event, song, view};
 use serde_json::json;
 use sonora::{
-    model::Playlist,
+    model::{NamedId, Playlist},
     service::{Command, Event},
 };
+
+#[test]
+fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
+    let mut tracks = (0..501)
+        .map(|index| song(&format!("track-{index}"), "main-album"))
+        .collect::<Vec<_>>();
+    for track in &mut tracks {
+        track.artist = "Guest".into();
+        track.artist_id = "guest".into();
+        track.album_artist = "Main".into();
+        track.album_artists = vec![NamedId {
+            id: "main".into(),
+            name: "Main".into(),
+        }];
+    }
+    tracks[1].album_id = "unknown-owner".into();
+    tracks[1].album_artists.clear();
+    tracks[2].album_id = "performer-fallback".into();
+    tracks[2].album_artists.clear();
+    tracks[2].album_artist.clear();
+    tracks[3].album_id = "joint-album".into();
+    tracks[3].album_artist = "Main feat. Other".into();
+    tracks[3].album_artists.push(NamedId {
+        id: "other".into(),
+        name: "Other".into(),
+    });
+    tracks[4].album_id = "display-performer".into();
+    tracks[4].artist = "Raw Performer".into();
+    tracks[4].artist_id = "display-performer-id".into();
+    tracks[4].display_artist = "Display Performer".into();
+    tracks[4].album_artist.clear();
+    tracks[4].album_artists.clear();
+    let fixture = Fixture::new(Library {
+        tracks,
+        albums: vec![],
+        fail_song_offset: Some(500),
+        ..Default::default()
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message.contains("Fixture later page failed")),
+    );
+    let catalog = fixture.catalog();
+    let guest = catalog.artist_releases("Guest", "guest").unwrap();
+    assert_eq!(
+        guest
+            .iter()
+            .map(|album| album.id.as_str())
+            .collect::<Vec<_>>(),
+        ["performer-fallback"],
+        "guest performers must not own another artist's placeholder albums"
+    );
+    assert_eq!(
+        catalog.album("main-album").unwrap().unwrap().artist_id,
+        "main"
+    );
+    assert!(
+        catalog
+            .album("unknown-owner")
+            .unwrap()
+            .unwrap()
+            .artist_id
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .album("performer-fallback")
+            .unwrap()
+            .unwrap()
+            .artist_id,
+        "guest"
+    );
+    let joint = catalog.album("joint-album").unwrap().unwrap();
+    assert!(
+        joint.artist_id.is_empty(),
+        "a joint label must not borrow a solo artist ID"
+    );
+    let joint_credit = joint
+        .artist_credits()
+        .into_iter()
+        .find(|credit| credit.name == "Main feat. Other")
+        .unwrap();
+    assert_eq!(
+        catalog
+            .artist_releases(&joint_credit.name, &joint_credit.id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(joint.artists.len(), 2);
+    assert_eq!(catalog.artist_releases("Main", "main").unwrap().len(), 3);
+    let display_releases = catalog
+        .artist_releases("Display Performer", "display-performer-id")
+        .unwrap();
+    assert_eq!(
+        display_releases.len(),
+        1,
+        "display-name performer page must include its placeholder album"
+    );
+    assert_eq!(display_releases[0].id, "display-performer");
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
 
 #[test]
 fn malformed_playlist_lists_fail_sync_without_deleting_cached_playlists() {
