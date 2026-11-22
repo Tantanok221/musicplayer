@@ -6,6 +6,7 @@ use gpui_kit::{
 };
 use sonora::{
     model::{FavoritesFilter, Preferences},
+    playback::{PlayerCommand, test_support::ListeningPlayer},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
 };
@@ -424,6 +425,65 @@ fn close_worker(
     drop(app);
     cx.run_until_parked();
     worker.shutdown(WAIT).unwrap();
+}
+
+#[gpui_kit::test]
+fn play_after_enqueue_empty_from_menu_starts_in_footer(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    let (worker, tx, window, app) = mount_worker_with(&fixture, Preferences::default(), cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    // The worker owns enqueue resolution; the scripted decoder avoids native audio.
+    for command in worker.player_commands().try_iter() {
+        if matches!(command, PlayerCommand::Preferences(_)) {
+            player.command(command).unwrap();
+        }
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("explorer-album-album", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let target = menu.find_by_label("Play Next");
+        let id = target.path().last().unwrap().clone();
+        menu.click(id, cx);
+    })
+    .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let command = worker.player_commands().recv_deadline(deadline).unwrap();
+        if matches!(command, PlayerCommand::Insert(..)) {
+            player.command(command).unwrap();
+            break;
+        }
+    }
+    let queued = player.snapshot(WAIT).unwrap();
+    assert_eq!(queued.queue.len(), 1);
+    assert!(!queued.playing);
+    tx.send(Event::Playback(queued)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("play-pause", cx))
+        .unwrap();
+    let command = worker.player_commands().recv_timeout(WAIT).unwrap();
+    assert!(matches!(command, PlayerCommand::Toggle));
+    player
+        .restart(command, WAIT)
+        .expect("footer Play must start queued song");
+    let playing = player.snapshot(WAIT).unwrap();
+    assert!(playing.playing);
+    assert_eq!(playing.track.as_ref().unwrap().id, "song");
+    tx.send(Event::Playback(playing)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("play-pause").label(), Some("Pause"));
+        assert!(window.find("play-pause").visible());
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 #[gpui_kit::test]
