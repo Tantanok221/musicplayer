@@ -1,8 +1,74 @@
 use crate::fixture::{Fixture, Library, WAIT, album, event, song, view};
 use sonora::{
-    model::Playlist,
+    model::{NamedId, Playlist},
     service::{Command, Event},
 };
+
+#[test]
+fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
+    let mut tracks = (0..501)
+        .map(|index| song(&format!("track-{index}"), "main-album"))
+        .collect::<Vec<_>>();
+    for track in &mut tracks {
+        track.artist = "Guest".into();
+        track.artist_id = "guest".into();
+        track.album_artist = "Main".into();
+        track.album_artists = vec![NamedId {
+            id: "main".into(),
+            name: "Main".into(),
+        }];
+    }
+    tracks[1].album_id = "unknown-owner".into();
+    tracks[1].album_artists.clear();
+    tracks[2].album_id = "performer-fallback".into();
+    tracks[2].album_artists.clear();
+    tracks[2].album_artist.clear();
+    let fixture = Fixture::new(Library {
+        tracks,
+        albums: vec![],
+        fail_song_offset: Some(500),
+        ..Default::default()
+    });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message.contains("Fixture later page failed")),
+    );
+    let catalog = fixture.catalog();
+    let guest = catalog.artist_releases("Guest", "guest").unwrap();
+    assert_eq!(
+        guest
+            .iter()
+            .map(|album| album.id.as_str())
+            .collect::<Vec<_>>(),
+        ["performer-fallback"],
+        "guest performers must not own another artist's placeholder albums"
+    );
+    assert_eq!(
+        catalog.album("main-album").unwrap().unwrap().artist_id,
+        "main"
+    );
+    assert!(
+        catalog
+            .album("unknown-owner")
+            .unwrap()
+            .unwrap()
+            .artist_id
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .album("performer-fallback")
+            .unwrap()
+            .unwrap()
+            .artist_id,
+        "guest"
+    );
+    assert_eq!(catalog.artist_releases("Main", "main").unwrap().len(), 2);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
 
 #[test]
 fn interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles() {

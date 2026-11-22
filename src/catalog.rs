@@ -345,7 +345,12 @@ impl Catalog {
                         id: track.album_id.clone(),
                         name: track.album.clone(),
                         artist: track.album_artist_label().into(),
-                        artist_id: track.artist_id.clone(),
+                        artist_id: track
+                            .album_artist_credits()
+                            .into_iter()
+                            .next()
+                            .map(|artist| artist.id)
+                            .unwrap_or_default(),
                         cover_art: track.cover_art.clone(),
                         year: track.year,
                         genre: genre.clone(),
