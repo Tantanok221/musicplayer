@@ -165,6 +165,40 @@ async fn native(
     response
 }
 
+async fn slskd_download(
+    State(state): State<ServerState>,
+    Path(endpoint): Path<String>,
+    method: Method,
+    Json(body): Json<Value>,
+) -> Response {
+    if method == Method::POST
+        && endpoint == "users/fixture-peer/directory"
+        && body == json!({"directory":"Fixture Album"})
+    {
+        state.record(Request::new("slskd/directory", &[]));
+        return Json(json!([])).into_response();
+    }
+    if method == Method::POST
+        && endpoint == "transfers/downloads/batches"
+        && body
+            == json!({"username":"fixture-peer","files":[{"filename":"Fixture Album\\song.flac","size":100}]})
+    {
+        state.record(Request::new("slskd/enqueue", &[]));
+        let hold = state.data.lock().unwrap().library.hold_endpoint == Some("slskd/enqueue");
+        if hold {
+            let _ = state.held_gate.recv_async().await;
+        }
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    state
+        .data
+        .lock()
+        .unwrap()
+        .unexpected
+        .push("unexpected slskd request");
+    StatusCode::BAD_REQUEST.into_response()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub endpoint: String,
@@ -210,7 +244,7 @@ pub struct Library {
     pub offline: bool,
     pub hold_sync: bool,
     pub hold_scrobble: bool,
-    pub hold_playlist_endpoint: Option<&'static str>,
+    pub hold_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
@@ -245,7 +279,7 @@ impl Default for Library {
             offline: false,
             hold_sync: false,
             hold_scrobble: false,
-            hold_playlist_endpoint: None,
+            hold_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
@@ -298,7 +332,7 @@ struct ServerState {
     metadata_gate: flume::Receiver<()>,
     sync_gate: flume::Receiver<()>,
     scrobble_gate: flume::Receiver<()>,
-    playlist_gate: flume::Receiver<()>,
+    held_gate: flume::Receiver<()>,
 }
 
 impl ServerState {
@@ -361,6 +395,7 @@ async fn navidrome(
             | "getArtist.view"
             | "getTopSongs.view"
             | "getArtistInfo2.view"
+            | "getLyricsBySongId.view"
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
@@ -394,21 +429,21 @@ async fn navidrome(
         song_ids,
     };
     state.record(request.clone());
-    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_playlist) = {
+    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_endpoint) = {
         let data = state.data.lock().unwrap();
         (
             data.library.offline,
             data.library.hold_sync,
             data.library.hold_scrobble,
             data.library.fail_artwork,
-            data.library.hold_playlist_endpoint == Some(endpoint.as_str()),
+            data.library.hold_endpoint == Some(endpoint.as_str()),
         )
     };
     if offline {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if hold_playlist {
-        let _ = state.playlist_gate.recv_async().await;
+    if hold_endpoint {
+        let _ = state.held_gate.recv_async().await;
     }
     if endpoint == "getScanStatus.view" && hold_sync {
         let _ = state.sync_gate.recv_async().await;
@@ -542,6 +577,9 @@ async fn navidrome(
         },
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
             json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":data.library.artist_mbid}})
+        }
+        "getLyricsBySongId.view" if query == Request::new("", &[("id", "song")]).params => {
+            json!({"status":"ok","lyricsList":{"structuredLyrics":[{"line":[{"value":"Account A lyrics"}]}]}})
         }
         "getArtistInfo2.view"
             if query
@@ -904,7 +942,7 @@ pub struct Fixture {
     release_metadata: flume::Sender<()>,
     release_sync: flume::Sender<()>,
     release_scrobble: flume::Sender<()>,
-    release_playlist: flume::Sender<()>,
+    release_held: flume::Sender<()>,
     finished: flume::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -935,7 +973,7 @@ impl Fixture {
         let (release_metadata, metadata_gate) = flume::bounded(1);
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
-        let (release_playlist, playlist_gate) = flume::unbounded();
+        let (release_held, held_gate) = flume::unbounded();
         let state = ServerState {
             data: Arc::new(Mutex::new(StateData {
                 library,
@@ -947,7 +985,7 @@ impl Fixture {
             metadata_gate,
             sync_gate,
             scrobble_gate,
-            playlist_gate,
+            held_gate,
         };
         let app = Router::new()
             .route("/auth/login", any(native))
@@ -957,6 +995,7 @@ impl Fixture {
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/lastfm/", any(lastfm))
+            .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
             .with_state(state.clone());
         let (stop, stopped) = flume::bounded(1);
@@ -989,7 +1028,7 @@ impl Fixture {
             release_metadata,
             release_sync,
             release_scrobble,
-            release_playlist,
+            release_held,
             finished,
             thread: Some(thread),
         }
@@ -1100,9 +1139,9 @@ impl Fixture {
         let _ = self.release_scrobble.send(());
     }
 
-    pub fn resume_playlist(&self) {
-        self.edit_library(|library| library.hold_playlist_endpoint = None);
-        let _ = self.release_playlist.send(());
+    pub fn resume_held(&self) {
+        self.edit_library(|library| library.hold_endpoint = None);
+        let _ = self.release_held.send(());
     }
 
     fn stop(&mut self) {
@@ -1110,7 +1149,7 @@ impl Fixture {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
             self.resume_scrobble();
-            self.resume_playlist();
+            self.resume_held();
             let _ = self.stop.try_send(());
             self.finished
                 .recv_timeout(WAIT)
