@@ -7,6 +7,68 @@ use sonora::{
 };
 
 #[test]
+fn account_switch_publishes_cached_playlists_before_sync() {
+    for cached in [false, true] {
+        let a = Fixture::new(Library::default());
+        let b = Fixture::new(Library {
+            hold_sync: true,
+            fail_song_offset: Some(0),
+            ..Default::default()
+        });
+        let mut catalog = Catalog::open(
+            &a.paths
+                .data
+                .join(format!("{}.sqlite", b.account.namespace())),
+        )
+        .unwrap();
+        let expected = if cached {
+            vec![sonora::model::Playlist {
+                id: "b-playlist".into(),
+                name: "Account B cached".into(),
+                ..Default::default()
+            }]
+        } else {
+            vec![]
+        };
+        catalog.save_playlists(&expected).unwrap();
+        let mut worker = a.start_paused();
+        synced(&worker);
+        worker.service().send(Command::Connect(
+            b.account.clone(),
+            "synthetic-password".into(),
+        ));
+        event(
+            &worker,
+            |e| matches!(e, Event::Ready(Some(account), _) if account.namespace() == b.account.namespace()),
+        );
+        let mut published = None;
+        loop {
+            match worker.events().recv_timeout(WAIT).unwrap() {
+                Event::Playlists(list) => published = Some(list),
+                Event::Connected(..) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            published
+                .as_ref()
+                .map(|list| list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>()),
+            Some(expected.iter().map(|p| p.id.as_str()).collect()),
+            "switch must publish the new account's cached playlists before Connected"
+        );
+        b.resume_sync();
+        event(
+            &worker,
+            |e| matches!(e, Event::Error(s) if s.contains("Refresh incomplete")),
+        );
+        assert_eq!(catalog.playlist_summaries().unwrap().len(), expected.len());
+        worker.shutdown(WAIT).unwrap();
+        a.finish();
+        b.finish();
+    }
+}
+
+#[test]
 fn delayed_lyrics_reply_cannot_reach_the_new_account() {
     let a = Fixture::new(Library {
         structured_lyrics: serde_json::json!([{"line":[{"value":"Account A lyrics"}]}]),
