@@ -419,10 +419,13 @@ impl MusicApp {
                                 .small()
                                 .icon(Glyph::Play)
                                 .label("Play")
+                                .disabled(play.is_empty())
                                 .on_click(cx.listener(move |app, _, _, _| {
-                                    app.service
-                                        .player
-                                        .send(PlayerCommand::Replace(play.as_ref().clone(), 0))
+                                    if !play.is_empty() {
+                                        app.service
+                                            .player
+                                            .send(PlayerCommand::Replace(play.as_ref().clone(), 0));
+                                    }
                                 })),
                         )
                         .child(

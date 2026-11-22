@@ -344,6 +344,28 @@ pub struct PlaylistEntry {
     entries: Arc<Vec<Arc<Track>>>,
 }
 
+pub fn removal_index(
+    playlist: &Playlist,
+    index: usize,
+    song: &str,
+    occurrence: usize,
+) -> Option<usize> {
+    if playlist
+        .entry
+        .get(index)
+        .is_some_and(|entry| entry.id == song)
+    {
+        return Some(index);
+    }
+    playlist
+        .entry
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.id == song)
+        .nth(occurrence)
+        .map(|(index, _)| index)
+}
+
 impl PlaylistEntry {
     pub fn drop_target(&self, target: &Self) -> Option<std::cmp::Ordering> {
         (self.id == target.id && self.index != target.index).then(|| self.index.cmp(&target.index))
@@ -365,8 +387,18 @@ impl PlaylistEntry {
 
     pub fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
         let current = current?;
-        (!current.readonly && self.matches(current))
-            .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+        (!current.readonly && self.matches(current)).then(|| {
+            let song = &self.entries[self.index].id;
+            Mutation::RemoveFromPlaylist {
+                id: self.id.clone(),
+                index: self.index,
+                song: song.clone(),
+                occurrence: self.entries[..self.index]
+                    .iter()
+                    .filter(|entry| entry.id == *song)
+                    .count(),
+            }
+        })
     }
 
     fn matches(&self, current: &Playlist) -> bool {
@@ -400,6 +432,22 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_index_keeps_matching_slot_and_resolves_reordered_occurrences() {
+        assert_eq!(
+            removal_index(&playlist(&["a", "b", "a"]), 2, "a", 1),
+            Some(2)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 0, "a", 0), Some(1));
+        assert_eq!(
+            removal_index(&playlist(&["a", "a", "b"]), 2, "a", 1),
+            Some(1)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 2, "a", 1), None);
+        assert_eq!(removal_index(&playlist(&["b"]), 0, "a", 0), None);
+        assert_eq!(removal_index(&playlist(&[]), 0, "a", 0), None);
+    }
 
     #[test]
     fn manual_creation_rejects_empty_duplicate_and_mismatched_submissions() {
@@ -736,7 +784,12 @@ mod tests {
         let removal = PlaylistEntry::new(&original, 2);
         assert_eq!(
             removal.mutation(Some(&original)),
-            Some(Mutation::RemoveFromPlaylist("playlist".into(), 2))
+            Some(Mutation::RemoveFromPlaylist {
+                id: "playlist".into(),
+                index: 2,
+                song: "a".into(),
+                occurrence: 1
+            })
         );
         assert!(removal.mutation(None).is_none());
         assert!(removal.mutation(Some(&playlist(&[]))).is_none());
