@@ -12,6 +12,28 @@ use std::{sync::Arc, time::Duration};
 const WAIT: Duration = Duration::from_secs(5);
 
 #[test]
+fn late_previous_listen_progress_does_not_duplicate_scrobbles() {
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    for _ in 0..20 {
+        let previous = player
+            .restart(PlayerCommand::Replace(tracks(&["previous"]), 0), WAIT)
+            .unwrap();
+        assert_eq!(player.progress(50., WAIT).unwrap().len(), 1);
+        let current = player
+            .restart(PlayerCommand::Replace(tracks(&["current"]), 0), WAIT)
+            .unwrap();
+        assert_eq!(player.progress(60., WAIT).unwrap().len(), 2);
+        let reports = player.previous_progress(10., WAIT).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].submission);
+        assert_eq!(reports[0].id, previous);
+        assert!(player.previous_progress(60., WAIT).unwrap().is_empty());
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+        assert_ne!(previous, current);
+    }
+}
+
+#[test]
 fn previous_after_restore_uses_saved_position() {
     for account in [false, true] {
         for (position, expected) in [(60., 1), (3., 0), (0., 0)] {

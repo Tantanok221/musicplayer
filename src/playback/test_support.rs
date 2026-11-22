@@ -188,6 +188,7 @@ pub struct ListeningPlayer {
     clock: Arc<Clock>,
     requests: Receiver<super::DecodeRequest>,
     request: Option<super::DecodeRequest>,
+    previous_request: Option<super::DecodeRequest>,
 }
 
 impl ListeningPlayer {
@@ -210,6 +211,7 @@ impl ListeningPlayer {
             clock,
             requests,
             request: None,
+            previous_request: None,
         })
     }
 
@@ -217,7 +219,7 @@ impl ListeningPlayer {
         self.player.commands.send(command)?;
         let request = self.requests.recv_timeout(timeout)?;
         let id = request.listen_id;
-        self.request = Some(request);
+        self.previous_request = self.request.replace(request);
         Ok(id)
     }
 
@@ -227,6 +229,27 @@ impl ListeningPlayer {
         timeout: Duration,
     ) -> Result<Vec<crate::listening::ListenReport>> {
         let request = self.request.as_ref().context("decoder request")?;
+        self.report_progress(request, seconds, timeout)
+    }
+
+    pub fn previous_progress(
+        &self,
+        seconds: f64,
+        timeout: Duration,
+    ) -> Result<Vec<crate::listening::ListenReport>> {
+        let request = self
+            .previous_request
+            .as_ref()
+            .context("previous decoder request")?;
+        self.report_progress(request, seconds, timeout)
+    }
+
+    fn report_progress(
+        &self,
+        request: &super::DecodeRequest,
+        seconds: f64,
+        timeout: Duration,
+    ) -> Result<Vec<crate::listening::ListenReport>> {
         let track = request.plan.lock().unwrap().queue[request.index].clone();
         self.clock.listen_tx.send(crate::listening::AudioProgress {
             listen: Arc::new(crate::listening::AudibleListen {
