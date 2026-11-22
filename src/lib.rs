@@ -14,6 +14,7 @@ pub mod model;
 pub mod musicbrainz;
 pub mod platform;
 pub mod playback;
+pub mod playlists;
 pub mod server;
 pub mod service;
 pub mod slskd;

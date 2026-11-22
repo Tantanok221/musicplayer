@@ -230,28 +230,8 @@ impl MusicApp {
                     self.highlight_album = Some((id, tracks));
                 }
             }
-            Event::Playlists(playlists) => {
-                if let Some(current) = &mut self.playlist {
-                    if let Some(summary) = playlists.iter().find(|p| p.id == current.id) {
-                        current.name.clone_from(&summary.name);
-                        current.song_count = summary.song_count;
-                    } else {
-                        self.playlist = None;
-                    }
-                }
-                self.playlists = playlists
-                    .into_iter()
-                    .map(|mut playlist| {
-                        playlist.entry = Arc::default();
-                        playlist
-                    })
-                    .collect();
-            }
-            Event::Playlist(playlist) => {
-                if self.playlist.as_ref().is_some_and(|p| p.id == playlist.id) {
-                    self.playlist = Some(playlist);
-                }
-            }
+            Event::Playlists(playlists) => self.playlists.summaries_loaded(playlists),
+            Event::Playlist(playlist) => self.playlists.detail_loaded(playlist),
             Event::TrackUpdated(track) => self.apply_track_update(track),
             Event::AlbumUpdated(album) => self.apply_album_update(album),
             Event::Artwork(id, path, thumbs) => {
@@ -342,11 +322,7 @@ impl MusicApp {
                 self.status = match &mutation {
                     Mutation::ReorderPlaylist { .. } => "Playlist order saved".into(),
                     Mutation::AddToPlaylist(id, ids) => {
-                        let name = self
-                            .playlists
-                            .iter()
-                            .find(|playlist| &playlist.id == id)
-                            .map_or("the playlist", |playlist| playlist.name.as_str());
+                        let name = self.playlists.name_of(id).unwrap_or("the playlist");
                         match ids.len() {
                             1 => format!("Added 1 song to “{name}”"),
                             count => format!("Added {count} songs to “{name}”"),

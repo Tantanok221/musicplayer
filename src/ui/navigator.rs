@@ -197,9 +197,12 @@ impl MusicApp {
             })),
         );
         if self.playlists_open {
-            for playlist in self.playlists.clone() {
+            for playlist in self.playlists.summaries().to_vec() {
                 let active = self.workspace == Workspace::Playlists
-                    && self.playlist.as_ref().is_some_and(|p| p.id == playlist.id);
+                    && self
+                        .playlists
+                        .current()
+                        .is_some_and(|p| p.id == playlist.id);
                 tree = tree.child(
                     div().pl_3().child(
                         self.navigation_row(
@@ -213,9 +216,9 @@ impl MusicApp {
                         .on_click(cx.listener(
                             move |app, _, window, cx| {
                                 app.switch_workspace(Workspace::Playlists, window, cx);
-                                app.playlist = Some(playlist.clone());
+                                let id = app.playlists.open(playlist.clone());
                                 app.selected = None;
-                                app.service.send(Command::Playlist(playlist.id.clone()));
+                                app.service.send(Command::Playlist(id));
                                 cx.notify();
                             },
                         )),

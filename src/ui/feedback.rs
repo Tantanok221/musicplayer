@@ -37,13 +37,7 @@ impl MusicApp {
                 *value = track.clone();
             }
         }
-        if let Some(playlist) = &mut self.playlist {
-            for value in Arc::make_mut(&mut playlist.entry) {
-                if value.id == track.id {
-                    *value = track.clone();
-                }
-            }
-        }
+        self.playlists.update_track(track.clone());
         if self.playback.queue.iter().any(|value| value.id == track.id) {
             for value in Arc::make_mut(&mut self.playback.queue) {
                 if value.id == track.id {
@@ -69,8 +63,9 @@ impl MusicApp {
             .chain(self.highlight_album.iter().flat_map(|(_, tracks)| tracks))
             .chain(self.playback.queue.iter())
             .chain(
-                self.playlist
-                    .iter()
+                self.playlists
+                    .current()
+                    .into_iter()
                     .flat_map(|playlist| playlist.entry.iter()),
             )
             .chain(self.artist_data.iter().flat_map(|data| &data.most_played))
