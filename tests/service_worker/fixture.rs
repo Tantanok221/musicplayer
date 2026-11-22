@@ -56,6 +56,7 @@ pub struct Library {
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
     pub fail_song_offset: Option<usize>,
+    pub sync_list: Option<(&'static str, Value)>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
@@ -84,6 +85,7 @@ impl Default for Library {
             albums: vec![album("album"), album("other-album")],
             playlists: vec![],
             fail_song_offset: None,
+            sync_list: None,
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
@@ -448,6 +450,10 @@ async fn navidrome(
             let offset = offset.unwrap();
             if kind == "song" && data.library.fail_song_offset == Some(offset) {
                 json!({"status":"failed","error":{"code":70,"message":"Fixture later page failed"}})
+            } else if let Some((field, value)) = &data.library.sync_list
+                && kind == *field
+            {
+                json!({"status":"ok","searchResult3":{kind:value}})
             } else {
                 let items = if kind == "song" {
                     serde_json::to_value(

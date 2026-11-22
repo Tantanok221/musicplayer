@@ -1,8 +1,53 @@
 use crate::fixture::{Fixture, Library, WAIT, album, event, song, view};
+use serde_json::json;
 use sonora::{
     model::Playlist,
     service::{Command, Event},
 };
+
+#[test]
+fn malformed_search3_lists_fail_sync_without_deleting_cached_music() {
+    for kind in ["song", "album"] {
+        for value in [
+            json!({"id":"single"}),
+            json!("invalid"),
+            json!(42),
+            json!(false),
+        ] {
+            let fixture = Fixture::new(Library {
+                tracks: vec![],
+                albums: vec![],
+                sync_list: Some((kind, value)),
+                ..Library::default()
+            });
+            {
+                let mut catalog = fixture.catalog();
+                catalog
+                    .put_tracks(&[song("cached", "cached-album")], 1)
+                    .unwrap();
+                catalog.put_albums(&[album("cached-album")], 1).unwrap();
+            }
+            let mut worker = fixture.start();
+            worker.wait_ready(WAIT).unwrap();
+            let outcome = event(&worker, |event| {
+                matches!(event, Event::Error(_))
+                    || matches!(event, Event::Status(message) if message.starts_with("Up to date"))
+            });
+            let catalog = fixture.catalog();
+            assert_eq!(
+                catalog.by_ids(&["cached".into()]).unwrap().len(),
+                1,
+                "malformed {kind} must not delete cached tracks"
+            );
+            assert!(catalog.album("cached-album").unwrap().is_some());
+            assert!(matches!(outcome, Event::Error(message)
+                if message.contains("search3") && message.contains(kind)
+                    && message.contains("Cached music is still available")));
+            worker.shutdown(WAIT).unwrap();
+            fixture.finish();
+        }
+    }
+}
 
 #[test]
 fn interrupted_sync_keeps_cached_music_then_a_complete_refresh_reconciles() {
