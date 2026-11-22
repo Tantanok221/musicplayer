@@ -24,6 +24,8 @@ use std::{
 pub const WAIT: Duration = Duration::from_secs(5);
 
 pub struct Native {
+    pub renewal_gate: Option<flume::Receiver<()>>,
+    renewals: usize,
     pub login_gate: Option<flume::Receiver<()>>,
     pub rules: Option<Value>,
     pub reject_token: bool,
@@ -38,6 +40,8 @@ pub struct Native {
 impl Default for Native {
     fn default() -> Self {
         Self {
+            renewal_gate: None,
+            renewals: 0,
             login_gate: None,
             rules: Some(json!({"all":[{"is":{"genre":"Jazz"}}],"sort":"random"})),
             reject_token: false,
@@ -58,6 +62,17 @@ async fn native(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let renewal = uri.path() == "/api/keepalive/session";
+    if renewal {
+        let gate = {
+            let mut data = state.data.lock().unwrap();
+            data.library.native.renewals += 1;
+            data.library.native.renewal_gate.clone()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv_async().await;
+        }
+    }
     if uri.path() == "/auth/login" {
         let gate = state.data.lock().unwrap().library.native.login_gate.clone();
         if let Some(gate) = gate {
@@ -81,9 +96,11 @@ async fn native(
         native.reject_token = false;
         return Json(json!({"token":native.token})).into_response();
     }
-    native
-        .requests
-        .push((method.clone(), uri.path().into(), body.clone()));
+    if !renewal {
+        native
+            .requests
+            .push((method.clone(), uri.path().into(), body.clone()));
+    }
     if native.reject_token
         || headers
             .get("x-nd-authorization")
@@ -104,6 +121,7 @@ async fn native(
     }
     let id = uri.path().strip_prefix("/api/playlist/").unwrap_or("smart");
     let mut response = match method {
+        Method::GET if renewal => Json(json!({"response":"ok","id":"keepalive"})).into_response(),
         Method::GET => {
             Json(json!({"id":id,"name":"Smart","ownerId":"fixture","rules":native.rules}))
                 .into_response()
@@ -902,6 +920,7 @@ impl Fixture {
         };
         let app = Router::new()
             .route("/auth/login", any(native))
+            .route("/api/keepalive/session", any(native))
             .route("/api/playlist", any(native))
             .route("/api/playlist/{id}", any(native))
             .route("/rest/{endpoint}", any(navidrome))
@@ -967,6 +986,10 @@ impl Fixture {
 
     pub fn native_login_count(&self) -> usize {
         self.state.data.lock().unwrap().library.native.logins
+    }
+
+    pub fn native_renewal_count(&self) -> usize {
+        self.state.data.lock().unwrap().library.native.renewals
     }
 
     pub fn seed(&self) {

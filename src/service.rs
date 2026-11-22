@@ -76,6 +76,11 @@ pub enum Command {
     },
     NativeSignIn(String),
     NativeSessionReady(u64),
+    NativeRenewed(
+        u64,
+        crate::platform::NativeToken,
+        Result<crate::platform::NativeToken, crate::server::NativeError>,
+    ),
     NativeCompleted(u64, Result<native::Reply, crate::server::NativeError>),
     NativeSignedIn(u64, Result<(), String>),
     NativeRefreshed(u64, Result<(Vec<Playlist>, Playlist), String>),
@@ -816,6 +821,7 @@ fn run(
     }
     let mut server: Option<Server> = None;
     let mut native_editor = native::Editor::default();
+    let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
     let mut generation = 0i64;
     let mut current_query = LibraryQuery::default();
@@ -951,6 +957,9 @@ fn run(
                     native_editor.sign_in(server, &paths, password, &runtime, &tx)?;
                 }
                 Command::NativeSignedIn(epoch, result) => native_editor.signed_in(epoch, result)?,
+                Command::NativeRenewed(epoch, original, result) => {
+                    native_renewal.complete(epoch, original, result, account.as_ref(), &paths)
+                }
                 Command::NativeSessionReady(epoch) => {
                     if epoch == native_editor.epoch {
                         native_editor.busy = false;
@@ -1048,6 +1057,7 @@ fn run(
                             );
                         }
                         native_editor.reset();
+                        native_renewal.reset();
                         if account.is_some() {
                             let (reply, saved) = flume::bounded(1);
                             player.send(PlayerCommand::SaveQueue(reply));
@@ -1086,6 +1096,7 @@ fn run(
                     if !syncing {
                         syncing = true;
                         generation = chrono::Utc::now().timestamp_micros();
+                        native_renewal.start(&value, &paths, &runtime, &tx);
                         begin_sync(value, tx.clone(), events.clone(), &runtime, generation);
                     }
                 }
@@ -1097,6 +1108,7 @@ fn run(
                         if !syncing {
                             syncing = true;
                             generation = chrono::Utc::now().timestamp_micros();
+                            native_renewal.start(&server, &paths, &runtime, &tx);
                             begin_sync(server, tx.clone(), events.clone(), &runtime, generation);
                         }
                     } else {
@@ -2243,6 +2255,7 @@ fn run(
                             if !syncing && let Some(server) = server.clone() {
                                 syncing = true;
                                 generation = chrono::Utc::now().timestamp_micros();
+                                native_renewal.start(&server, &paths, &runtime, &tx);
                                 begin_sync(
                                     server,
                                     tx.clone(),

@@ -20,6 +20,168 @@ fn rules() -> SmartRules {
     }
 }
 
+fn save_token(fixture: &Fixture) {
+    fixture
+        .paths
+        .save_native_token(
+            &fixture.account,
+            &sonora::platform::NativeToken::new("native-initial".into()).unwrap(),
+        )
+        .unwrap();
+}
+
+fn wait_for(wanted: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !wanted() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background renewal completed before deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn assert_silent(worker: &Worker) {
+    for e in worker.events().try_iter() {
+        assert!(
+            !matches!(e, Event::Error(_) | Event::NativePasswordRequired),
+            "renewal must be silent"
+        );
+    }
+}
+
+fn silent_sync(worker: &Worker) {
+    event(worker, |e| {
+        assert!(
+            !matches!(e, Event::NativePasswordRequired),
+            "renewal must not prompt"
+        );
+        matches!(e, Event::Status(message) if message.starts_with("Up to date"))
+    });
+}
+
+#[test]
+fn startup_renews_saved_native_token_without_blocking_sync() {
+    let (release, gate) = flume::bounded(1);
+    let mut library = Library::default();
+    library.native.renewal_gate = Some(gate);
+    library.native.refresh = Some("startup-refreshed".into());
+    let fixture = Fixture::new(library);
+    save_token(&fixture);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    wait_for(|| fixture.native_renewal_count() == 1);
+    assert_eq!(token(&fixture).unwrap()["token"], "native-initial");
+    release.send(()).unwrap();
+    wait_for(|| token(&fixture).is_some_and(|t| t["token"] == "startup-refreshed"));
+    assert_silent(&worker);
+    worker.service().send(Command::Refresh);
+    silent_sync(&worker);
+    assert_eq!(fixture.native_renewal_count(), 1);
+    assert_eq!(fixture.native_login_count(), 0);
+    worker.shutdown(WAIT).unwrap();
+    assert_silent(&worker);
+    fixture.finish();
+}
+
+#[test]
+fn sync_renews_a_token_added_after_startup_and_throttles_repeats() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    assert_eq!(fixture.native_renewal_count(), 0);
+    save_token(&fixture);
+    fixture.edit_library(|l| l.native.refresh = Some("sync-refreshed".into()));
+    worker.service().send(Command::Refresh);
+    silent_sync(&worker);
+    wait_for(|| token(&fixture).is_some_and(|t| t["token"] == "sync-refreshed"));
+    worker.service().send(Command::Refresh);
+    silent_sync(&worker);
+    assert_eq!(fixture.native_renewal_count(), 1);
+    worker.shutdown(WAIT).unwrap();
+    assert_silent(&worker);
+    fixture.finish();
+}
+
+#[test]
+fn renewal_unauthorized_clears_token_without_prompting_until_editor_opens() {
+    let mut library = Library::default();
+    library.native.reject_token = true;
+    let fixture = Fixture::new(library);
+    save_token(&fixture);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    wait_for(|| token(&fixture).is_none());
+    assert_silent(&worker);
+    worker
+        .service()
+        .send(Command::LoadSmartRules("smart".into()));
+    password(&worker);
+    assert_eq!(fixture.native_renewal_count(), 1);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn failed_renewal_preserves_token_and_sync_still_completes() {
+    let mut library = Library::default();
+    library.native.failure = Some(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let fixture = Fixture::new(library);
+    save_token(&fixture);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    wait_for(|| fixture.native_renewal_count() == 1);
+    let deadline = std::time::Instant::now() + WAIT;
+    while fixture.native_renewal_count() < 2 {
+        assert!(std::time::Instant::now() < deadline);
+        worker.service().send(Command::Refresh);
+        silent_sync(&worker);
+        assert_silent(&worker);
+    }
+    assert_eq!(token(&fixture).unwrap()["token"], "native-initial");
+    worker.shutdown(WAIT).unwrap();
+    assert_silent(&worker);
+    fixture.finish();
+}
+
+#[test]
+fn non_navidrome_saved_token_is_not_renewed() {
+    let fixture = Fixture::new(Library {
+        server_type: "Gonic",
+        ..Library::default()
+    });
+    save_token(&fixture);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    worker.service().send(Command::Refresh);
+    silent_sync(&worker);
+    assert_eq!(fixture.native_renewal_count(), 0);
+    assert_eq!(token(&fixture).unwrap()["token"], "native-initial");
+    worker.shutdown(WAIT).unwrap();
+    assert_silent(&worker);
+    fixture.finish();
+}
+
+#[test]
+fn missing_native_token_skips_renewal_on_startup_and_sync() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    silent_sync(&worker);
+    worker.service().send(Command::Refresh);
+    silent_sync(&worker);
+    assert_eq!(fixture.native_renewal_count(), 0);
+    assert_eq!(fixture.native_login_count(), 0);
+    worker.shutdown(WAIT).unwrap();
+    assert_silent(&worker);
+    fixture.finish();
+}
+
 #[test]
 fn password_sign_in_reuses_native_session_without_blocking_connection() {
     let (release, gate) = flume::bounded(1);

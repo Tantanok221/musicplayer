@@ -23,6 +23,12 @@ impl fmt::Display for NativeError {
 impl std::error::Error for NativeError {}
 
 impl Server {
+    pub async fn renew_native_session(&self, token: &mut NativeToken) -> Result<(), NativeError> {
+        self.native_request(token, Method::GET, &["api", "keepalive", "session"], None)
+            .await?;
+        Ok(())
+    }
+
     fn native_url(&self, segments: &[&str]) -> Result<Url, NativeError> {
         if !self.is_navidrome {
             return Err(NativeError::Message(

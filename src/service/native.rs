@@ -1,12 +1,104 @@
 use super::{Command, Event};
 use crate::{
-    platform::Paths,
+    platform::{Account, NativeToken, Paths},
     server::{NativeError, Server},
     smart_rules::SmartRules,
 };
 use anyhow::Result;
 use flume::Sender;
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+pub(super) struct Renewal {
+    epoch: u64,
+    busy: bool,
+    renewed: Option<Instant>,
+}
+
+impl Renewal {
+    fn due(&self) -> bool {
+        !self.busy
+            && self
+                .renewed
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(3600))
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self {
+            epoch: self.epoch + 1,
+            ..Self::default()
+        };
+    }
+
+    pub fn start(
+        &mut self,
+        server: &Server,
+        paths: &Paths,
+        runtime: &tokio::runtime::Handle,
+        tx: &Sender<Command>,
+    ) {
+        if !server.is_navidrome || !self.due() {
+            return;
+        }
+        let Ok(Some(original)) = paths.native_token(&server.account) else {
+            return;
+        };
+        self.busy = true;
+        let epoch = self.epoch;
+        let server = server.clone();
+        let tx = tx.clone();
+        runtime.spawn(async move {
+            let mut token = original.clone();
+            let result = match tokio::time::timeout(
+                Duration::from_secs(5),
+                server.renew_native_session(&mut token),
+            )
+            .await
+            {
+                Ok(result) => result.map(|()| token),
+                Err(_) => Err(NativeError::Message("Navidrome session renewal timed out")),
+            };
+            let _ = tx.send(Command::NativeRenewed(epoch, original, result));
+        });
+    }
+
+    pub fn complete(
+        &mut self,
+        epoch: u64,
+        original: NativeToken,
+        result: Result<NativeToken, NativeError>,
+        account: Option<&Account>,
+        paths: &Paths,
+    ) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.busy = false;
+        let Some(account) = account else {
+            return;
+        };
+        let Ok(Some(current)) = paths.native_token(account) else {
+            return;
+        };
+        if current.value() != original.value() {
+            return;
+        }
+        match result {
+            Ok(token) => {
+                if paths.save_native_token(account, &token).is_ok() {
+                    self.renewed = Some(Instant::now());
+                }
+            }
+            Err(NativeError::PasswordRequired) => {
+                let _ = paths.clear_native_token(account);
+            }
+            Err(_) => {}
+        }
+    }
+}
 
 pub(super) fn sign_in_session(
     server: &Server,
@@ -229,4 +321,79 @@ async fn perform(
         paths.save_native_token(&server.account, &token).map_err(|_| NativeError::Message("Could not save the Navidrome login locally. Check your playlists before retrying."))?;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renewal_is_throttled_for_an_hour_and_while_in_flight() {
+        let mut renewal = Renewal::default();
+        assert!(renewal.due());
+        renewal.busy = true;
+        assert!(!renewal.due());
+        renewal.busy = false;
+        renewal.renewed = Some(Instant::now());
+        assert!(!renewal.due());
+        renewal.renewed = Some(Instant::now() - Duration::from_secs(3601));
+        assert!(renewal.due());
+    }
+
+    #[test]
+    fn renewal_does_not_overwrite_or_clear_a_newer_login_or_another_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            data: directory.path().into(),
+            cache: directory.path().join("cache"),
+        };
+        let account = Account {
+            url: "http://localhost".into(),
+            username: "listener".into(),
+        };
+        let original = || NativeToken::new("original".into()).unwrap();
+        let replacement = || NativeToken::new("replacement".into()).unwrap();
+        paths.save_native_token(&account, &replacement()).unwrap();
+        let mut renewal = Renewal::default();
+        for result in [
+            Ok(original()),
+            Err(NativeError::PasswordRequired),
+            Err(NativeError::Message("Could not reach Navidrome")),
+        ] {
+            renewal.complete(0, original(), result, Some(&account), &paths);
+            assert!(
+                paths
+                    .native_token(&account)
+                    .unwrap()
+                    .is_some_and(|t| t.value() == "replacement")
+            );
+        }
+        paths.save_native_token(&account, &original()).unwrap();
+        renewal.reset();
+        renewal.busy = true;
+        for result in [Ok(replacement()), Err(NativeError::PasswordRequired)] {
+            renewal.complete(0, original(), result, Some(&account), &paths);
+            assert!(renewal.busy);
+            assert!(
+                paths
+                    .native_token(&account)
+                    .unwrap()
+                    .is_some_and(|t| t.value() == "original")
+            );
+        }
+        renewal.busy = false;
+        renewal.complete(
+            1,
+            original(),
+            Err(NativeError::Message("Could not reach Navidrome")),
+            Some(&account),
+            &paths,
+        );
+        assert!(
+            paths
+                .native_token(&account)
+                .unwrap()
+                .is_some_and(|t| t.value() == "original")
+        );
+    }
 }
