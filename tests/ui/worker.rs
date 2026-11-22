@@ -105,14 +105,7 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
     .unwrap();
     cx.run_until_parked();
     cx.update_window(window, |_, window, cx| {
-        window.click("smart-template", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(window, |_, window, cx| {
-        let mut menu = window.within("popup-menu");
-        let item = menu.find_by_label("Loved");
-        menu.click(item.path().last().unwrap().clone(), cx);
+        window.click("smart-template-3", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -126,7 +119,7 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
     cx.update_window(window, |_, window, cx| {
         window.click("native-password", cx);
         window.input("native-password", cx);
-        window.click("native-sign-in", cx);
+        window.press("enter", cx);
     })
     .unwrap();
     deliver_until(

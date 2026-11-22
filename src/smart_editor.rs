@@ -68,6 +68,31 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn validation(&self) -> Option<&'static str> {
+        build_row(self).err()
+    }
+
+    pub fn hint(&self) -> Option<&'static str> {
+        let RowKind::Condition { field, op, .. } = &self.kind else {
+            return None;
+        };
+        match (field.as_str(), op.as_str()) {
+            (_, "inTheRange") => Some("Use [minimum, maximum]"),
+            ("dateadded" | "lastplayed" | "dateloved", "inTheLast" | "notInTheLast") => {
+                Some("Relative time, e.g. 30d or 90d")
+            }
+            ("dateadded" | "lastplayed" | "dateloved", _) => Some("Date in YYYY-MM-DD format"),
+            ("duration", _) => Some("Duration in seconds"),
+            ("rating", _) => Some("Rating from 0 to 5"),
+            ("year", _) => Some("Year, e.g. 2024"),
+            ("bitrate", _) => Some("Bitrate in kbps"),
+            ("bpm", _) => Some("Beats per minute"),
+            ("playcount", _) => Some("Number of plays"),
+            ("loved", _) => Some("Use true or false"),
+            _ => None,
+        }
+    }
+
     pub fn has_advanced(&self) -> bool {
         match &self.kind {
             RowKind::Advanced(_) => true,
@@ -128,6 +153,75 @@ pub struct Editor {
 }
 
 impl Editor {
+    pub fn name_error(&self) -> Option<&'static str> {
+        self.name
+            .trim()
+            .is_empty()
+            .then_some("Enter a playlist name")
+    }
+
+    pub fn limit_error(&self) -> Option<&'static str> {
+        (!self.limit.trim().is_empty() && !self.limit.trim().parse::<u32>().is_ok_and(|n| n > 0))
+            .then_some("Enter a positive whole-number limit")
+    }
+
+    pub fn summary(&self) -> String {
+        fn rows(items: &[Row], any: bool) -> String {
+            items
+                .iter()
+                .map(|row| match &row.kind {
+                    RowKind::Condition { field, op, value } => {
+                        let label = operators(field)
+                            .iter()
+                            .find(|(k, _)| *k == op)
+                            .map(|(_, l)| *l)
+                            .unwrap_or(op);
+                        let field = FIELDS
+                            .iter()
+                            .find(|(k, _)| *k == field)
+                            .map(|(_, l)| l.to_lowercase())
+                            .unwrap_or(field.clone());
+                        let verb = if matches!(
+                            op.as_str(),
+                            "gt" | "lt"
+                                | "inTheRange"
+                                | "before"
+                                | "after"
+                                | "inTheLast"
+                                | "notInTheLast"
+                        ) {
+                            format!("is {label}")
+                        } else {
+                            label.into()
+                        };
+                        format!(
+                            "{field} {verb} {}",
+                            if value.trim().is_empty() {
+                                "…"
+                            } else {
+                                value
+                            }
+                        )
+                    }
+                    RowKind::Group { any, rows: items } => format!("({})", rows(items, *any)),
+                    RowKind::Advanced(_) => "an advanced server rule".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(if any { " or " } else { " and " })
+        }
+        let mut summary = if self.rows.is_empty() {
+            "Add a rule to get started".into()
+        } else {
+            format!("Tracks where {}", rows(&self.rows, self.any))
+        };
+        if let Ok(n) = self.limit.trim().parse::<u32>()
+            && n > 0
+        {
+            summary.push_str(&format!(" · up to {n} tracks"));
+        }
+        summary
+    }
+
     pub fn new() -> Self {
         let mut editor = Self::load(None, String::new(), SmartRules::default());
         editor.add_condition(None);
@@ -527,5 +621,59 @@ mod tests {
         e.template(Template::Loved);
         assert!(e.rows.iter().any(Row::has_advanced));
         assert_eq!(e.build().unwrap_err(), "Enter a value for every condition");
+    }
+
+    #[test]
+    fn summary_describes_groups_advanced_rules_and_empty_values() {
+        let mut e = Editor::new();
+        assert_eq!(e.summary(), "Tracks where title is …");
+        assert!(e.name_error().is_some());
+        e.field(0, "genre");
+        if let RowKind::Condition { value, .. } = &mut e.row_mut(0).unwrap().kind {
+            *value = "Jazz".into();
+        }
+        e.limit = "50".into();
+        assert_eq!(e.summary(), "Tracks where genre is Jazz · up to 50 tracks");
+        let rules=serde_json::from_value(json!({"any":[{"gt":{"rating":4}},{"all":[{"is":{"genre":"Jazz"}},{"future":{"x":1}}]}]})).unwrap();
+        let e = Editor::load(None, "Name".into(), rules);
+        assert_eq!(
+            e.summary(),
+            "Tracks where rating is greater than 4 or (genre is Jazz and an advanced server rule)"
+        );
+        let mut e = Editor::load(None, String::new(), SmartRules::default());
+        assert_eq!(e.summary(), "Add a rule to get started");
+        e.limit = "no".into();
+        assert!(e.limit_error().is_some());
+    }
+
+    #[test]
+    fn hints_and_validation_are_specific_to_the_condition() {
+        let mut e = Editor::new();
+        assert_eq!(e.rows[0].hint(), None);
+        assert_eq!(
+            e.rows[0].validation(),
+            Some("Enter a value for every condition")
+        );
+        e.field(0, "rating");
+        assert_eq!(e.rows[0].hint(), Some("Rating from 0 to 5"));
+        if let RowKind::Condition { op, value, .. } = &mut e.rows[0].kind {
+            *op = "inTheRange".into();
+            *value = "[2,5]".into();
+        }
+        assert_eq!(e.rows[0].hint(), Some("Use [minimum, maximum]"));
+        assert_eq!(e.rows[0].validation(), None);
+        e.field(0, "lastplayed");
+        assert_eq!(e.rows[0].hint(), Some("Date in YYYY-MM-DD format"));
+        if let RowKind::Condition { op, .. } = &mut e.rows[0].kind {
+            *op = "notInTheLast".into();
+        }
+        assert_eq!(e.rows[0].hint(), Some("Relative time, e.g. 30d or 90d"));
+        let e = Editor::load(
+            None,
+            "Advanced".into(),
+            serde_json::from_value(json!({"all":[{"future":{"x":1}}]})).unwrap(),
+        );
+        assert_eq!(e.rows[0].hint(), None);
+        assert_eq!(e.rows[0].validation(), None);
     }
 }

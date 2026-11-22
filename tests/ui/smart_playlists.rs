@@ -34,6 +34,52 @@ fn reveal_playlists(f: &mut Fixture, w: AnyWindowHandle, cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn summary_and_inline_validation_follow_live_inputs(cx: &mut TestAppContext) {
+    let (_dir, mut f, w, _app) = start(cx);
+    f.backend.emit(Event::NativeAvailable(true));
+    f.settle(w, cx);
+    f.click(w, "new-smart-playlist", cx);
+    cx.update_window(w, |_, window, _| {
+        assert_eq!(window.find("save-smart-playlist").disabled(), Some(true))
+    })
+    .unwrap();
+    edit(&mut f, w, "smart-name", "Jazz", cx);
+    f.click(w, "smart-field-0", cx);
+    f.menu_item(w, "Genre", cx);
+    edit(&mut f, w, "smart-value-0", "Jazz", cx);
+    edit(&mut f, w, "smart-limit", "50", cx);
+    cx.update_window(w, |_, window, _| {
+        assert_eq!(
+            window.find("smart-summary").label(),
+            Some("Tracks where genre is Jazz · up to 50 tracks")
+        );
+        assert_ne!(window.find("save-smart-playlist").disabled(), Some(true));
+    })
+    .unwrap();
+    edit(&mut f, w, "smart-limit", "-5", cx);
+    cx.update_window(w, |_, window, _| {
+        assert!(
+            window
+                .find_by_label("Enter a positive whole-number limit")
+                .visible()
+        );
+        assert_eq!(window.find("save-smart-playlist").disabled(), Some(true));
+    })
+    .unwrap();
+    edit(&mut f, w, "smart-limit", "", cx);
+    edit(&mut f, w, "smart-value-0", "", cx);
+    cx.update_window(w, |_, window, _| {
+        assert!(
+            window
+                .find_by_label("Enter a value for every condition")
+                .visible()
+        )
+    })
+    .unwrap();
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
 fn create_validates_conditions_and_sends_rules(cx: &mut TestAppContext) {
     let (_dir, mut f, w, _app) = start(cx);
     f.backend.emit(Event::NativeAvailable(true));
@@ -109,7 +155,7 @@ fn edit_preserves_advanced_rules_and_saves_update(cx: &mut TestAppContext) {
     });
     f.menu_item(w, "Edit Rules…", cx);
     cx.update_window(w, |_, window, _| {
-        assert!(window.find_by_label("Advanced rule — kept as is").visible());
+        assert!(window.find_by_label("Advanced rule (kept as-is)").visible());
         assert!(window.try_find("smart-remove-1").is_none());
     })
     .unwrap();
@@ -134,8 +180,7 @@ fn password_prompt_submits_once_clears_password_and_can_cancel(cx: &mut TestAppC
     f.settle(w, cx);
     f.click(w, "new-smart-playlist", cx);
     edit(&mut f, w, "smart-name", "Loved", cx);
-    f.click(w, "smart-template", cx);
-    f.menu_item(w, "Loved", cx);
+    f.click(w, "smart-template-3", cx);
     f.expect("password needed", |c, _| {
         assert!(matches!(c, Command::SaveSmartPlaylist { .. }));
         vec![Event::NativePasswordRequired]
@@ -185,8 +230,7 @@ fn failed_sign_in_can_retry_the_pending_save(cx: &mut TestAppContext) {
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
     f.click(w, "new-smart-playlist", cx);
-    f.click(w, "smart-template", cx);
-    f.menu_item(w, "Loved", cx);
+    f.click(w, "smart-template-3", cx);
     f.expect("authorize save", |c, _| {
         assert!(matches!(c, Command::SaveSmartPlaylist { .. }));
         vec![Event::NativePasswordRequired]
@@ -223,13 +267,11 @@ fn templates_groups_and_condition_controls_are_editable(cx: &mut TestAppContext)
     f.backend.emit(Event::NativeAvailable(true));
     f.settle(w, cx);
     f.click(w, "new-smart-playlist", cx);
-    f.click(w, "smart-template", cx);
-    f.menu_item(w, "Most Played", cx);
+    f.click(w, "smart-template-1", cx);
     f.click(w, "smart-add-condition", cx);
     f.click(w, "smart-remove-1", cx);
     f.click(w, "smart-add-group", cx);
-    f.click(w, "smart-match-2", cx);
-    f.menu_item(w, "Match any", cx);
+    f.click(w, "smart-match-2-any", cx);
     f.click(w, "smart-remove-2", cx);
     f.expect("save template", |c, _| {
         let Command::SaveSmartPlaylist { rules, .. } = c else {
