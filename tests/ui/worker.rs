@@ -30,18 +30,6 @@ fn deliver_until(
             .expect("real worker event");
         // Events/preferences can contain account settings: log only safe names.
         let name = match &event {
-            Event::Ready(..) => "Ready",
-            Event::View(..) => "View",
-            Event::Playlists(_) => "Playlists",
-            Event::Playlist(_) => "Playlist",
-            Event::Playback(_) => "Playback",
-            Event::Status(_) => "Status",
-            Event::Error(_) => "Error",
-            Event::Connection(_) => "Connection",
-            Event::Artwork(..) => "Artwork",
-            Event::ArtworkFailed(_) => "ArtworkFailed",
-            Event::Lyrics(..) => "Lyrics",
-            Event::NativeAvailable(_) => "NativeAvailable",
             Event::AlbumUpdated(_) => "AlbumUpdated",
             Event::MutationFailed(..) => "MutationFailed",
             Event::MutationDone(_) => "MutationDone",
