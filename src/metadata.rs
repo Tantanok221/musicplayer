@@ -45,7 +45,9 @@ impl HealthIssue {
                 "trim(coalesce(json_extract(tracks.data,'$.musicBrainzId'),''))=''"
             }
             Self::MixedAlbumArtist => {
-                "tracks.album_id IN (SELECT album_id FROM tracks WHERE album_id!='' GROUP BY album_id HAVING count(DISTINCT album_artist)>1)"
+                // Navidrome gives each album artist its own album ID, so one
+                // release tagged inconsistently shows up as several albums.
+                "(lower(trim(tracks.album)),coalesce(tracks.year,0)) IN (SELECT lower(trim(album)),coalesce(year,0) FROM tracks WHERE trim(album)!='' GROUP BY 1,2 HAVING count(DISTINCT album_artist)>1)"
             }
         }
     }

@@ -364,15 +364,34 @@ fn health_filters_find_tag_gaps_and_mixed_album_artists() {
         music_brainz_id: "mbid-guest".into(),
         ..sample("guest", "Guest")
     };
+    let split = Track {
+        album_id: "album-d".into(),
+        album_artist: "Guest".into(),
+        genre: "Folk".into(),
+        track: Some(3),
+        music_brainz_id: "mbid-split".into(),
+        ..sample("split", "Split")
+    };
+    let reissue = Track {
+        album_id: "album-e".into(),
+        album_artist: "Other".into(),
+        year: Some(2010),
+        genre: "Folk".into(),
+        track: Some(1),
+        music_brainz_id: "mbid-reissue".into(),
+        ..sample("reissue", "Reissue")
+    };
     let solo = Track {
         album_id: "album-c".into(),
+        album: "Solo album".into(),
         album_artist: "Solo".into(),
         genre: "Folk".into(),
         track: Some(1),
         music_brainz_id: "mbid-solo".into(),
         ..sample("solo", "Solo")
     };
-    db.put_tracks(&[complete, gaps, guest, solo], 1).unwrap();
+    db.put_tracks(&[complete, gaps, guest, split, reissue, solo], 1)
+        .unwrap();
     let matches = |health| {
         let query = LibraryQuery {
             health,
@@ -388,26 +407,31 @@ fn health_filters_find_tag_gaps_and_mixed_album_artists() {
         ids.sort();
         ids
     };
-    assert_eq!(matches(None), ["complete", "gaps", "guest", "solo"]);
+    assert_eq!(
+        matches(None),
+        ["complete", "gaps", "guest", "reissue", "solo", "split"]
+    );
     assert_eq!(matches(Some(HealthIssue::MissingYear)), ["gaps"]);
     assert_eq!(matches(Some(HealthIssue::MissingGenre)), ["gaps"]);
     assert_eq!(matches(Some(HealthIssue::MissingTrackNumber)), ["gaps"]);
     assert_eq!(matches(Some(HealthIssue::MissingMusicBrainzId)), ["gaps"]);
     assert_eq!(
         matches(Some(HealthIssue::MixedAlbumArtist)),
-        ["complete", "guest"]
+        ["complete", "guest", "split"]
     );
+    // The same title in another year is a different release, not a split.
     // Health narrows alongside other filters instead of replacing them.
     let query = LibraryQuery {
         health: Some(HealthIssue::MixedAlbumArtist),
         text: "Guest".into(),
         ..Default::default()
     };
-    let found: Vec<_> = db
+    let mut found: Vec<_> = db
         .tracks(&query, 0, 100)
         .unwrap()
         .iter()
         .map(|t| t.id.clone())
         .collect();
-    assert_eq!(found, ["guest"]);
+    found.sort();
+    assert_eq!(found, ["guest", "split"]);
 }
