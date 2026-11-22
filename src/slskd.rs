@@ -256,8 +256,13 @@ pub fn candidates(responses: &[SearchResponse], expected_tracks: Option<u32>) ->
                 username: response.username.clone(),
                 tracks,
                 locked: response.locked_file_count,
-                size: files.iter().map(|file| file.size).sum(),
-                seconds: audio.iter().filter_map(|file| file.length).sum(),
+                size: files
+                    .iter()
+                    .fold(0u64, |total, file| total.saturating_add(file.size)),
+                seconds: audio
+                    .iter()
+                    .filter_map(|file| file.length)
+                    .fold(0u32, u32::saturating_add),
                 format,
                 lossless,
                 completeness: match expected_tracks {
@@ -284,6 +289,36 @@ pub fn candidates(responses: &[SearchResponse], expected_tracks: Option<u32>) ->
             .then_with(|| a.username.cmp(&b.username))
     });
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oversized_candidate(size: u64, length: u32) -> Candidate {
+        let responses = [SearchResponse {
+            files: ["Album\\01.flac", "Album\\02.flac"]
+                .map(|filename| RemoteFile {
+                    filename: filename.into(),
+                    size,
+                    length: Some(length),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        }];
+        candidates(&responses, None).remove(0)
+    }
+
+    #[test]
+    fn candidate_size_saturates() {
+        assert_eq!(oversized_candidate(u64::MAX, 1).size, u64::MAX);
+    }
+
+    #[test]
+    fn candidate_duration_saturates() {
+        assert_eq!(oversized_candidate(1, u32::MAX).seconds, u32::MAX);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
