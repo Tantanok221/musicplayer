@@ -17,6 +17,62 @@ fn snapshot(worker: &Worker, ids: &[&str]) -> PlaybackSnapshot {
 }
 
 #[test]
+fn album_discless_tracks_follow_browser_order_in_playback() {
+    use sonora::model::LibraryQuery;
+
+    let tracks = [
+        ("disc2", "First", Some(2), 1),
+        ("tie-z", "Zulu", Some(1), 3),
+        ("discless", "Middle", None, 2),
+        ("tie-a", "Alpha", None, 3),
+        ("disc1", "First", Some(1), 1),
+    ]
+    .into_iter()
+    .map(|(id, title, disc, number)| {
+        let mut track = crate::fixture::song(id, "album");
+        track.title = title.into();
+        track.disc_number = disc;
+        track.track = Some(number);
+        track
+    })
+    .collect();
+    let fixture = Fixture::new(Library {
+        tracks,
+        ..Library::default()
+    });
+    fixture.seed();
+    let mut worker = fixture.start();
+    synced(&worker);
+    let db = fixture.catalog();
+    let ids = |tracks: Vec<std::sync::Arc<sonora::model::Track>>| {
+        tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let browser = ids(db
+        .album_tracks_matching(&LibraryQuery::default(), "album")
+        .unwrap());
+    assert_eq!(browser, ["disc1", "discless", "tie-a", "tie-z", "disc2"]);
+    assert_eq!(ids(db.album_tracks("album").unwrap()), browser);
+    assert!(db.album_tracks("missing").unwrap().is_empty());
+    assert!(db.album_queue_from("missing").is_err());
+    worker.service().send(Command::PlayAlbum("album".into()));
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let PlayerCommand::Replace(tracks, at) =
+            worker.player_commands().recv_deadline(deadline).unwrap()
+        {
+            assert_eq!(at, 0);
+            assert_eq!(ids(tracks), browser);
+            break;
+        }
+    }
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn restart_preserves_duplicate_order_index_position_and_listen() {
     let fixture = Fixture::new(Library::default());
     fixture.seed();
