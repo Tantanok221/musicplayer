@@ -218,6 +218,7 @@ pub struct Library {
     pub prolific: bool,
     /// Unix seconds the fixture Last.fm profile was created.
     pub lastfm_registered: i64,
+    pub hold_lastfm: bool,
     /// Album charts by season start: artist, album and plays.
     pub lastfm_charts: Vec<(i64, Vec<ChartEntry>)>,
     /// A Last.fm error code every Last.fm request answers with.
@@ -252,6 +253,7 @@ impl Default for Library {
             artist_mbid: "mb-artist",
             prolific: false,
             lastfm_registered: 0,
+            hold_lastfm: false,
             lastfm_charts: vec![],
             lastfm_error: None,
             lastfm_key: true,
@@ -293,6 +295,7 @@ struct StateData {
 
 #[derive(Clone)]
 struct ServerState {
+    lastfm_gate: flume::Receiver<()>,
     data: Arc<Mutex<StateData>>,
     received: flume::Sender<Request>,
     metadata_gate: flume::Receiver<()>,
@@ -684,7 +687,7 @@ async fn lastfm(
     if method != Method::GET
         || param("api_key") != LASTFM_KEY
         || param("format") != "json"
-        || param("user") != "listener"
+        || !["listener", "listener-new"].contains(&param("user").as_str())
     {
         return state.unexpected("invalid Last.fm request");
     }
@@ -709,6 +712,10 @@ async fn lastfm(
         .map(|(key, value)| (*key, value.as_str()))
         .collect::<Vec<_>>();
     state.record(Request::new(endpoint, &params));
+    let hold = state.data.lock().unwrap().library.hold_lastfm;
+    if endpoint == "lastfm/chart" && param("user") == "listener" && hold {
+        let _ = state.lastfm_gate.recv_async().await;
+    }
     if let Some(code) = error {
         let message = match code {
             6 => "User not found",
@@ -895,6 +902,7 @@ async fn unexpected(State(state): State<ServerState>) -> Response {
 }
 
 pub struct Fixture {
+    release_lastfm: flume::Sender<()>,
     _dir: tempfile::TempDir,
     pub paths: Paths,
     pub account: Account,
@@ -933,10 +941,12 @@ impl Fixture {
             .unwrap();
         let (received, requests) = flume::unbounded();
         let (release_metadata, metadata_gate) = flume::bounded(1);
+        let (release_lastfm, lastfm_gate) = flume::unbounded();
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
         let (release_playlist, playlist_gate) = flume::unbounded();
         let state = ServerState {
+            lastfm_gate,
             data: Arc::new(Mutex::new(StateData {
                 library,
                 requests: vec![],
@@ -986,6 +996,7 @@ impl Fixture {
             state,
             requests,
             stop,
+            release_lastfm,
             release_metadata,
             release_sync,
             release_scrobble,
@@ -1095,6 +1106,11 @@ impl Fixture {
         let _ = self.release_sync.send(());
     }
 
+    pub fn resume_lastfm(&self) {
+        self.edit_library(|library| library.hold_lastfm = false);
+        let _ = self.release_lastfm.send(());
+    }
+
     pub fn resume_scrobble(&self) {
         self.edit_library(|library| library.hold_scrobble = false);
         let _ = self.release_scrobble.send(());
@@ -1109,6 +1125,7 @@ impl Fixture {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
+            self.resume_lastfm();
             self.resume_scrobble();
             self.resume_playlist();
             let _ = self.stop.try_send(());
