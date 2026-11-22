@@ -160,8 +160,8 @@ pub enum Command {
     Synced(i64, Vec<Playlist>, bool),
     Updated(String, Mutation),
     MutationFailed(String, Mutation, String),
-    PlaylistLoaded(Playlist),
-    PlaylistsLoaded(Vec<Playlist>),
+    PlaylistLoaded(String, Playlist),
+    PlaylistsLoaded(String, Vec<Playlist>),
     Error(String),
     SyncFailed(i64, String),
     /// Pings the server when a check is due; `true` checks right away.
@@ -1818,7 +1818,10 @@ fn run(
                         runtime.spawn(async move {
                             match server.playlist(&id).await {
                                 Ok(playlist) => {
-                                    let _ = tx.send(Command::PlaylistLoaded(playlist));
+                                    let _ = tx.send(Command::PlaylistLoaded(
+                                        server.account.namespace(),
+                                        playlist,
+                                    ));
                                 }
                                 Err(error) => {
                                     let _ = tx.send(Command::Error(format!(
@@ -1829,14 +1832,18 @@ fn run(
                         });
                     }
                 }
-                Command::PlaylistsLoaded(playlists) => {
-                    catalog.save_playlist_summaries(&playlists, true)?;
-                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                Command::PlaylistsLoaded(namespace, playlists) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        catalog.save_playlist_summaries(&playlists, true)?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                    }
                 }
-                Command::PlaylistLoaded(playlist) => {
-                    catalog.save_playlist(&playlist)?;
-                    events.send(Event::Playlist(playlist))?;
-                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                Command::PlaylistLoaded(namespace, playlist) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        catalog.save_playlist(&playlist)?;
+                        events.send(Event::Playlist(playlist))?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                    }
                 }
                 Command::Lyrics(track) => {
                     // Older cache entries contain flattened text with timing discarded.
@@ -2177,10 +2184,16 @@ fn run(
                                 runtime.spawn(async move {
                                     let result = async {
                                         let playlists = server.playlists().await?;
-                                        let _ = tx.send(Command::PlaylistsLoaded(playlists));
+                                        let _ = tx.send(Command::PlaylistsLoaded(
+                                            server.account.namespace(),
+                                            playlists,
+                                        ));
                                         if let Some(id) = changed_id {
                                             let playlist = server.playlist(&id).await?;
-                                            let _ = tx.send(Command::PlaylistLoaded(playlist));
+                                            let _ = tx.send(Command::PlaylistLoaded(
+                                                server.account.namespace(),
+                                                playlist,
+                                            ));
                                         }
                                         Ok::<_, anyhow::Error>(())
                                     }
