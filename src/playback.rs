@@ -1168,6 +1168,8 @@ fn run(
                         (queue, index) = order.restore(std::mem::take(&mut queue), index);
                     }
                     base_position = pos;
+                    clock.samples.store(0, Ordering::Relaxed);
+                    clock.position_base.store(pos.to_bits(), Ordering::Relaxed);
                     clock.playing.store(false, Ordering::Relaxed);
                     restart = false;
                     started = false;
