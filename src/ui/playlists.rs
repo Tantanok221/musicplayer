@@ -141,7 +141,10 @@ impl MusicApp {
                                         track,
                                         index + 1,
                                         format!("playlist-{index}"),
-                                        None,
+                                        Some(super::tracks::TrackPlayback::Playlist(
+                                            playlist.entry.clone(),
+                                            index,
+                                        )),
                                         None,
                                         cx,
                                     )

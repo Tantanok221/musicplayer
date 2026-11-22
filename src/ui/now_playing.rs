@@ -766,7 +766,7 @@ impl MusicApp {
                 queue[index].clone(),
                 index + 1,
                 format!("now-up-next-{index}"),
-                Some(index),
+                Some(super::tracks::TrackPlayback::Queue(index)),
                 None,
                 cx,
             ));

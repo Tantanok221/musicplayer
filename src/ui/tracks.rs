@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) enum TrackPlayback {
+    Queue(usize),
+    Playlist(Arc<Vec<Arc<Track>>>, usize),
+}
+
+impl TrackPlayback {
+    fn command(&self) -> PlayerCommand {
+        match self {
+            Self::Queue(index) => PlayerCommand::JumpTo(*index),
+            Self::Playlist(tracks, index) => {
+                PlayerCommand::Replace(tracks.as_ref().clone(), *index)
+            }
+        }
+    }
+}
+
 impl MusicApp {
     pub(super) fn queue_places(&self) -> Rc<QueuePlaces> {
         let current = self.playback.track.as_ref();
@@ -24,7 +40,7 @@ impl MusicApp {
         track: Arc<Track>,
         number: usize,
         key: String,
-        queue_index: Option<usize>,
+        playback: Option<TrackPlayback>,
         popular: Option<bool>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -37,6 +53,10 @@ impl MusicApp {
             .is_some_and(|t| t.id == track.id);
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
+        let queue_index = match playback {
+            Some(TrackPlayback::Queue(index)) => Some(index),
+            _ => None,
+        };
         let menu = self.track_menu(track.clone(), queue_index, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
@@ -117,8 +137,8 @@ impl MusicApp {
             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                 app.select_track(now.clone(), cx);
                 if event.click_count() == 2 {
-                    if let Some(index) = queue_index {
-                        app.service.player.send(PlayerCommand::JumpTo(index));
+                    if let Some(playback) = &playback {
+                        app.service.player.send(playback.command());
                     } else {
                         app.play_track(&now);
                     }
@@ -311,5 +331,36 @@ impl MusicApp {
                 .size_full(),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, PlayerCommand, Track, TrackPlayback};
+
+    #[test]
+    fn playlist_playback_preserves_order_and_occurrence() {
+        let track = Arc::new(Track {
+            id: "duplicate".into(),
+            ..Default::default()
+        });
+        let tracks = Arc::new(vec![track.clone(), track]);
+        let PlayerCommand::Replace(queue, index) =
+            TrackPlayback::Playlist(tracks.clone(), 1).command()
+        else {
+            panic!("playlist playback must replace the queue")
+        };
+        assert_eq!(index, 1);
+        assert_eq!(queue.len(), 2);
+        assert!(Arc::ptr_eq(&queue[0], &tracks[0]));
+        assert!(Arc::ptr_eq(&queue[1], &tracks[1]));
+    }
+
+    #[test]
+    fn queue_playback_keeps_the_existing_queue() {
+        assert!(matches!(
+            TrackPlayback::Queue(3).command(),
+            PlayerCommand::JumpTo(3)
+        ));
     }
 }
