@@ -5,7 +5,7 @@ use gpui_kit::{
     test::TestWindowExt,
 };
 use sonora::{
-    model::{FavoritesFilter, Preferences},
+    model::{FavoritesFilter, Preferences, SavedQueue},
     playback::{PlayerCommand, test_support::ListeningPlayer},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
@@ -350,7 +350,21 @@ fn mount_worker(
 
 fn mount_worker_with(
     fixture: &Fixture,
+    prefs: Preferences,
+    cx: &mut TestAppContext,
+) -> (
+    Worker,
+    flume::Sender<Event>,
+    AnyWindowHandle,
+    gpui_kit::Entity<MusicApp>,
+) {
+    mount_worker_with_player(fixture, prefs, false, cx)
+}
+
+fn mount_worker_with_player(
+    fixture: &Fixture,
     mut prefs: Preferences,
+    paused: bool,
     cx: &mut TestAppContext,
 ) -> (
     Worker,
@@ -376,7 +390,11 @@ fn mount_worker_with(
         .unwrap()
         .set_state("preferences", &prefs)
         .unwrap();
-    let worker = fixture.start();
+    let worker = if paused {
+        fixture.start_paused()
+    } else {
+        fixture.start()
+    };
     let (tx, rx) = flume::unbounded();
     let (window, app) = cx.update(|cx| {
         gpui_kit::open_window(
@@ -393,6 +411,54 @@ fn mount_worker_with(
         .unwrap()
     });
     (worker, tx, window, app)
+}
+
+#[gpui_kit::test]
+fn previous_after_restore_restarts_current_track(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    fixture
+        .catalog()
+        .set_state(
+            "queue",
+            &SavedQueue {
+                ids: vec!["song".into(), "other-song".into()],
+                index: Some(1),
+                position: 60.,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (worker, tx, window, app) =
+        mount_worker_with_player(&fixture, Preferences::default(), true, cx);
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |event, _| matches!(event, Event::Playback(state) if state.index == Some(1) && state.position == 60. && !state.playing),
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(window.find("playback-elapsed").label(), Some("1:00"));
+        window.click("previous", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        if let Event::Playback(state) = event
+            && state.position == 0.
+        {
+            assert_eq!(state.index, Some(1));
+            assert_eq!(state.queue[1].id, "other-song");
+            return true;
+        }
+        false
+    });
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("playback-elapsed").label(), Some("0:00"));
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 fn wait_library(
