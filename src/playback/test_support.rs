@@ -64,6 +64,11 @@ impl PausedPlayer {
             matches!(
                 command,
                 PlayerCommand::Restore(..)
+                    | PlayerCommand::RestoreAccount(..)
+                    | PlayerCommand::SaveQueue(..)
+                    | PlayerCommand::Remove(..)
+                    | PlayerCommand::JumpTo(..)
+                    | PlayerCommand::Previous
                     | PlayerCommand::Replace(..)
                     | PlayerCommand::Next
                     | PlayerCommand::Insert(..)

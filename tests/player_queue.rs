@@ -1,4 +1,5 @@
 //! Production paused actor, with no audio-device or OS media-control adapters.
+use proptest::prelude::*;
 use sonora::{
     model::{PlaybackSnapshot, Preferences, Track},
     playback::{
@@ -9,6 +10,200 @@ use sonora::{
 use std::{sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(5);
+
+fn occurrences(queue: &[Arc<Track>]) -> Vec<String> {
+    queue.iter().map(|track| track.title.clone()).collect()
+}
+
+fn queue_property_config() -> ProptestConfig {
+    let config = ProptestConfig {
+        cases: 256,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(
+                "tests/player_queue.proptest-regressions",
+            ),
+        )),
+        ..ProptestConfig::default()
+    };
+    eprintln!("Queue property: {} generated cases", config.cases);
+    config
+}
+
+proptest! {
+    #![proptest_config(queue_property_config())]
+
+    #[test]
+    fn queue_operation_sequences(ops in prop::collection::vec((0u8..17, 0usize..24, 0usize..24), 1..80)) {
+        let mut player = PausedPlayer::start(WAIT).unwrap();
+        let mut state = player.command(PlayerCommand::ClearError, WAIT).unwrap();
+        let mut expected = Vec::<Arc<Track>>::new();
+        let mut current: Option<usize> = None;
+        let mut original: Option<Vec<String>> = None;
+        let mut undo = None;
+        let mut shuffled = false;
+        let mut serial = 0;
+        for (op, a, b) in ops {
+            let before = state.clone();
+            let selected = current.and_then(|i| expected.get(i)).map(|t| t.title.clone());
+            let mut preserves_current = true;
+            let command = match op {
+                0..=2 => {
+                    let added = (0..b % 4).map(|_| {
+                        serial += 1;
+                        Arc::new(Track { id: format!("track-{}", serial % 3), title: format!("occurrence-{serial}"), album_id: "album".into(), duration: 120., ..Default::default() })
+                    }).collect::<Vec<_>>();
+                    let placement = match op { 0 => Placement::Next, 1 => Placement::Last, _ => Placement::AfterAlbum };
+                    let at = if op == 1 || (op == 2 && current.is_some()) { expected.len() } else { current.map_or(0, |i| i + 1) };
+                    if let Some(order) = original.as_mut() {
+                        let dest = if op == 1 { order.len() } else if at == 0 { 0 } else { order.iter().position(|id| *id == expected[at - 1].title).unwrap() + 1 };
+                        order.splice(dest..dest, occurrences(&added));
+                    }
+                    expected.splice(at..at, added.clone());
+                    undo = None;
+                    PlayerCommand::Insert(added, placement)
+                }
+                3 => {
+                    if a < expected.len() && b < expected.len() {
+                        let entry = expected.remove(a);
+                        expected.insert(b, entry);
+                        current = selected.as_ref().and_then(|id| expected.iter().position(|t| &t.title == id));
+                    }
+                    undo = None;
+                    PlayerCommand::Move(a, b)
+                }
+                4 => {
+                    if a < expected.len() {
+                        let removed = expected.remove(a);
+                        if let Some(order) = original.as_mut() { order.retain(|id| id != &removed.title); }
+                        if let Some(i) = current {
+                            if a == i { preserves_current = false; current = (!expected.is_empty()).then_some(i.min(expected.len().saturating_sub(1))); }
+                            else if a < i { current = Some(i - 1); }
+                        }
+                    }
+                    undo = None;
+                    PlayerCommand::Remove(a)
+                }
+                5..=7 => {
+                    let edit = match op { 5 => QueueEdit::Remove(vec![a, b]), 6 => QueueEdit::Move { indices: vec![a], before: b }, _ => QueueEdit::ClearUpcoming };
+                    let start = current.map_or(0, |i| i + 1);
+                    let mut indices = match op { 5 => vec![a, b], 6 => vec![a], _ => (start..expected.len()).collect() };
+                    indices.sort_unstable(); indices.dedup();
+                    if !indices.is_empty() && indices.iter().all(|i| *i >= start && *i < expected.len()) && (op != 6 || (b >= start && b <= expected.len())) {
+                        let saved = (expected.clone(), original.clone());
+                        let moving = indices.iter().map(|i| expected[*i].clone()).collect::<Vec<_>>();
+                        let mut result = expected.iter().enumerate().filter(|(i, _)| !indices.contains(i)).map(|(_, t)| t.clone()).collect::<Vec<_>>();
+                        if op == 6 { let dest = (0..b).filter(|i| !indices.contains(i)).count(); result.splice(dest..dest, moving); }
+                        if occurrences(&result) != occurrences(&expected) {
+                            if let Some(order) = original.as_mut() { order.retain(|id| result.iter().any(|t| &t.title == id)); }
+                            expected = result; undo = Some(saved);
+                        }
+                    }
+                    PlayerCommand::EditQueue(state.queue_revision, edit)
+                }
+                8 => {
+                    if let Some((queue, order)) = undo.take() { expected = queue; original = order; current = selected.as_ref().and_then(|id| expected.iter().position(|t| &t.title == id)); }
+                    PlayerCommand::UndoQueue
+                }
+                9 | 10 => {
+                    let value = op == 9;
+                    if value && !shuffled { if current.is_some() { original = Some(occurrences(&expected)); } undo = None; }
+                    if !value && shuffled && let Some(order) = original.take() {
+                        expected.sort_by_key(|t| order.iter().position(|id| id == &t.title).unwrap());
+                        current = selected.as_ref().and_then(|id| expected.iter().position(|t| &t.title == id));
+                        undo = None;
+                    }
+                    shuffled = value;
+                    PlayerCommand::Preferences(Preferences { shuffle: value, ..Default::default() })
+                }
+                11 => {
+                    preserves_current = false;
+                    if a < expected.len() { current = Some(a); }
+                    PlayerCommand::JumpTo(a)
+                }
+                12 => {
+                    preserves_current = false;
+                    current = current.map(|i: usize| i.saturating_sub(1));
+                    PlayerCommand::Previous
+                }
+                13 => {
+                    // Restoring persisted IDs must preserve their order and duplicate slot.
+                    let (tx, rx) = flume::bounded(1);
+                    player.command(PlayerCommand::SaveQueue(tx), WAIT).unwrap();
+                    let saved = rx.recv_timeout(WAIT).unwrap();
+                    let saved: sonora::model::SavedQueue = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+                    prop_assert_eq!(&saved.ids, &expected.iter().map(|t| t.id.clone()).collect::<Vec<_>>());
+                    prop_assert_eq!(saved.index, current);
+                    original = None; undo = None;
+                    // The restore command selects slot zero when persistence has no selection.
+                    if current.is_none() && !expected.is_empty() { current = Some(0); preserves_current = false; }
+                    if a % 2 == 0 { PlayerCommand::Restore(expected.clone(), saved.index.unwrap_or(0), saved.position, saved.listen) }
+                    else { PlayerCommand::RestoreAccount("test-account".into(), expected.clone(), saved.index.unwrap_or(0), saved.position, saved.listen) }
+                }
+                14 => {
+                    PlayerCommand::EditQueue(state.queue_revision.wrapping_add(1), QueueEdit::ClearUpcoming)
+                }
+                16 => {
+                    preserves_current = false;
+                    current = current.and_then(|i| (i + 1 < expected.len()).then_some(i + 1));
+                    PlayerCommand::Next
+                }
+                _ => {
+                    preserves_current = false;
+                    expected = (0..b % 5).map(|_| {
+                        serial += 1;
+                        Arc::new(Track { id: format!("track-{}", serial % 3), title: format!("occurrence-{serial}"), album_id: "album".into(), duration: 120., ..Default::default() })
+                    }).collect();
+                    current = (!expected.is_empty()).then_some(a.min(expected.len().saturating_sub(1)));
+                    original = shuffled.then(|| occurrences(&expected)).filter(|order| !order.is_empty()); undo = None;
+                    let command = PlayerCommand::Replace(expected.clone(), a);
+                    if shuffled && let Some(i) = current { let track = expected.remove(i); expected.insert(0, track); current = Some(0); }
+                    command
+                }
+            };
+            state = player.command(command, WAIT).unwrap();
+            if (op == 9 && !before.queue.is_empty()) || (op == 15 && shuffled) {
+                let mut actual = occurrences(&state.queue); actual.sort();
+                let mut wanted = occurrences(&expected); wanted.sort();
+                prop_assert_eq!(actual, wanted);
+                if let Some(i) = current { prop_assert_eq!(occurrences(&state.queue[..=i]), occurrences(&expected[..=i])); }
+                expected = state.queue.as_ref().clone();
+            }
+            prop_assert_eq!(occurrences(&state.queue), occurrences(&expected), "operation {} ({}, {})", op, a, b);
+            prop_assert_eq!(state.index, current, "operation {} ({}, {})", op, a, b);
+            prop_assert!(state.index.is_none_or(|i| i < state.queue.len()));
+            prop_assert_eq!(state.queue_ids.len(), state.queue.len());
+            let mut ids = state.queue_ids.as_ref().clone(); ids.sort(); ids.dedup();
+            prop_assert_eq!(ids.len(), state.queue.len());
+            if preserves_current { prop_assert_eq!(state.index.map(|i| state.queue[i].title.clone()), selected); }
+        }
+        player.shutdown(WAIT).unwrap();
+    }
+
+    #[test]
+    fn queue_metadata_refresh_keeps_duplicate_occurrence(len in 2usize..24, chosen in any::<usize>(), moves in prop::collection::vec((0usize..24, 0usize..24), 0..30)) {
+        let mut player = PausedPlayer::start(WAIT).unwrap();
+        let shared = tracks(&["same"]).remove(0);
+        let mut current = chosen % len;
+        let mut order = (0..len).collect::<Vec<_>>();
+        let mut state = player.command(PlayerCommand::Restore(vec![shared; len], current, 17., None), WAIT).unwrap();
+        prop_assert_eq!(state.index, Some(current));
+        for (from, to) in moves {
+            if from < len && to < len { let entry = order.remove(from); order.insert(to, entry); }
+            current = order.iter().position(|i| *i == chosen % len).unwrap();
+            state = player.command(PlayerCommand::Move(from, to), WAIT).unwrap();
+            prop_assert_eq!(state.index, Some(current));
+        }
+        player.command(PlayerCommand::Preferences(Preferences { shuffle: true, ..Default::default() }), WAIT).unwrap();
+        state = player.command(PlayerCommand::UpdateTrack(Arc::new(Track { id: "same".into(), title: "Updated".into(), duration: 120., ..Default::default() })), WAIT).unwrap();
+        prop_assert_eq!(state.index, Some(current));
+        prop_assert!(state.queue.iter().all(|t| t.title == "Updated"));
+        state = player.command(PlayerCommand::Preferences(Preferences::default()), WAIT).unwrap();
+        prop_assert_eq!(state.index, Some(current));
+        prop_assert!(state.queue.iter().all(|t| t.title == "Updated"));
+        prop_assert_eq!(state.position, 17.);
+        player.shutdown(WAIT).unwrap();
+    }
+}
 
 #[test]
 fn play_after_queue_end_starts_a_fresh_listen_and_scrobble_cycle() {
