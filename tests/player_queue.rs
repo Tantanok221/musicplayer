@@ -11,6 +11,39 @@ use std::{sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(5);
 
+#[test]
+fn previous_after_restore_uses_saved_position() {
+    for account in [false, true] {
+        for (position, expected) in [(60., 1), (3., 0), (0., 0)] {
+            let mut player = PausedPlayer::start(WAIT).unwrap();
+            let queue = tracks(&["first", "current"]);
+            let command = if account {
+                PlayerCommand::RestoreAccount {
+                    namespace: "fixture".into(),
+                    tracks: queue,
+                    index: 1,
+                    position,
+                    listen: None,
+                    shuffle_positions: None,
+                }
+            } else {
+                PlayerCommand::Restore(queue, 1, position, None)
+            };
+            let restored = player.command(command, WAIT).unwrap();
+            assert_eq!(restored.position, position);
+            assert!(!restored.playing);
+            let state = player.command(PlayerCommand::Previous, WAIT).unwrap();
+            assert_eq!(state.index, Some(expected));
+            assert_eq!(
+                state.queue[expected].id,
+                if expected == 1 { "current" } else { "first" }
+            );
+            assert_eq!(state.position, 0.);
+            player.shutdown(WAIT).unwrap();
+        }
+    }
+}
+
 fn occurrences(queue: &[Arc<Track>]) -> Vec<String> {
     queue.iter().map(|track| track.title.clone()).collect()
 }
