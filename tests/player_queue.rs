@@ -3,12 +3,55 @@ use sonora::{
     model::{PlaybackSnapshot, Preferences, Track},
     playback::{
         Placement, PlayerCommand, QueueEdit,
-        test_support::{OutputPlayer, PausedPlayer},
+        test_support::{ListeningPlayer, OutputPlayer, PausedPlayer},
     },
 };
 use std::{sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(5);
+
+#[test]
+fn play_after_queue_end_starts_a_fresh_listen_and_scrobble_cycle() {
+    for replay in [PlayerCommand::Play, PlayerCommand::Toggle] {
+        let mut player = ListeningPlayer::start(WAIT).unwrap();
+        let first = player
+            .restart(PlayerCommand::Replace(tracks(&["last"]), 0), WAIT)
+            .unwrap();
+        let reports = player.progress(60., WAIT).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(!reports[0].submission);
+        assert!(reports[1].submission);
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+        let ended = player.finish(WAIT).unwrap();
+        assert!(!ended.playing);
+        assert_eq!(ended.index, Some(0));
+        assert_eq!(ended.position, 0.);
+        let second = player.restart(replay, WAIT).unwrap();
+        assert_ne!(first, second, "replay must not reuse the completed listen");
+        let reports = player.progress(60., WAIT).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(!reports[0].submission);
+        assert!(reports[1].submission);
+        assert!(reports.iter().all(|report| report.id == second));
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pause_and_retry_preserve_the_current_listen() {
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    let first = player
+        .restart(PlayerCommand::Replace(tracks(&["current"]), 0), WAIT)
+        .unwrap();
+    assert_eq!(player.progress(30., WAIT).unwrap().len(), 1);
+    player.command(PlayerCommand::Pause).unwrap();
+    player.command(PlayerCommand::Play).unwrap();
+    assert_eq!(player.restart(PlayerCommand::Retry, WAIT).unwrap(), first);
+    let reports = player.progress(30., WAIT).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].submission);
+    assert_eq!(reports[0].id, first);
+}
 
 fn tracks(ids: &[&str]) -> Vec<Arc<Track>> {
     ids.iter()
