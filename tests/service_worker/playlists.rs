@@ -10,6 +10,56 @@ use sonora::{
 use std::sync::Arc;
 
 #[test]
+fn deleted_playlist_ignores_late_detail_reply() {
+    let playlist = Playlist {
+        id: "deleted".into(),
+        name: "Deleted".into(),
+        ..Default::default()
+    };
+    let fixture = Fixture::new(Library {
+        playlists: vec![playlist.clone()],
+        ..Default::default()
+    });
+    let mut worker = fixture.start_paused();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    fixture.edit_library(|library| {
+        library.hold_endpoint = Some("getPlaylist.view");
+        library.playlist_response = Some(json!({"status":"ok","playlist":playlist}));
+    });
+    worker.service().send(Command::Playlist("deleted".into()));
+    fixture.wait_request(&Request::new("getPlaylist.view", &[("id", "deleted")]));
+    fixture.expect_mutation(
+        Request::new("deletePlaylist.view", &[("id", "deleted")]),
+        true,
+    );
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::DeletePlaylist("deleted".into())));
+    event(
+        &worker,
+        |e| matches!(e, Event::Playlists(p) if p.is_empty()),
+    );
+    assert!(fixture.catalog().playlist("deleted").unwrap().is_none());
+    fixture.resume_held();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while let Ok(e) = worker.events().recv_deadline(deadline) {
+        assert!(
+            !matches!(e, Event::Playlist(ref p) if p.id == "deleted"),
+            "deleted playlist detail must not be emitted"
+        );
+        assert!(
+            !matches!(e, Event::Playlists(ref p) if p.iter().any(|p| p.id == "deleted")),
+            "deleted playlist must not reappear in summaries"
+        );
+    }
+    crate::fixture::view(&worker);
+    assert!(fixture.catalog().playlist("deleted").unwrap().is_none());
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn album_details_load_from_the_catalog() {
     let mut library = Library::default();
     let album = &mut library.albums[0];

@@ -444,6 +444,7 @@ async fn navidrome(
             | "getPlaylist.view"
             | "createPlaylist.view"
             | "updatePlaylist.view"
+            | "deletePlaylist.view"
             | "search3.view"
             | "star.view"
             | "unstar.view"
@@ -758,6 +759,18 @@ async fn navidrome(
         "getSong.view" if query == Request::new("", &[("id", "song")]).params => {
             json!({"status":"ok", "song":data.library.tracks[0]})
         }
+        "deletePlaylist.view" => match data.expected_mutations.pop_front() {
+            Some((expected, true)) if request == expected => {
+                data.library
+                    .playlists
+                    .retain(|playlist| Some(&playlist.id) != query.get("id"));
+                json!({"status":"ok"})
+            }
+            _ => {
+                data.unexpected.push("unexpected playlist deletion");
+                json!({"status":"failed","error":{"code":70,"message":"Unexpected deletion"}})
+            }
+        },
         "star.view" | "unstar.view" | "setRating.view" => {
             match data.expected_mutations.pop_front() {
                 Some((expected, succeeds)) if request == expected => {
