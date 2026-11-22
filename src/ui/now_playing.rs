@@ -430,7 +430,7 @@ impl MusicApp {
         let album_time = album_tracks.iter().map(|track| track.duration).sum::<f64>();
 
         let cover_side = (f32::from(window.viewport_size().width) * 0.3).clamp(260., 360.);
-        let cover = match self.artwork.get(&track.cover_art) {
+        let cover = match self.account_cache.artwork.get(&track.cover_art) {
             Some(path) => img(path.clone())
                 .image_cache(&self.image_cache)
                 .size(px(cover_side))
@@ -646,6 +646,7 @@ impl MusicApp {
         let legible = self.backdrop_ink(&track.cover_art, cx.theme().is_dark());
         let _scope = legible.map(|(ink, _)| InkScope::new(ink));
         let palette = self
+            .account_cache
             .backdrops
             .get(&track.cover_art)
             .map(|backdrop| backdrop.palette);
@@ -810,7 +811,7 @@ impl MusicApp {
     /// the plate behind each column; `None` until the backdrop is ready.
     pub(super) fn backdrop_ink(&self, cover: &str, theme_dark: bool) -> Option<(Ink, [f32; 2])> {
         use crate::backdrop::{Ink as Tone, contrast, legibility};
-        let backdrop = self.backdrops.get(cover)?;
+        let backdrop = self.account_cache.backdrops.get(cover)?;
         let (light, dark) = (theme_ink(true), theme_ink(false));
         let tone = |ink: &Ink| Tone {
             text: luma_of(ink.text),
@@ -847,13 +848,17 @@ impl MusicApp {
     ) -> AnyElement {
         let colors = ink(cx);
         let dark = cx.theme().is_dark();
-        if !self.backdrops.contains_key(cover)
-            && self.artwork.contains_key(cover)
-            && self.backdrop_requested.insert(cover.to_string())
+        if !self.account_cache.backdrops.contains_key(cover)
+            && self.account_cache.artwork.contains_key(cover)
+            && self
+                .account_cache
+                .backdrop_requested
+                .insert(cover.to_string())
         {
             self.service.send(Command::Backdrop(cover.to_string()));
         }
         let ready = self
+            .account_cache
             .backdrops
             .contains_key(cover)
             .then(|| cover.to_string());
@@ -874,7 +879,12 @@ impl MusicApp {
         }
         let layer = |id: &Option<String>, opacity: f32| {
             id.as_ref()
-                .and_then(|id| self.backdrops.get(id).map(|backdrop| (id, backdrop)))
+                .and_then(|id| {
+                    self.account_cache
+                        .backdrops
+                        .get(id)
+                        .map(|backdrop| (id, backdrop))
+                })
                 .map(|(id, backdrop)| {
                     div()
                         .id(SharedString::from(format!("backdrop-layer-{}", id)))

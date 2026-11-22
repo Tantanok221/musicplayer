@@ -61,7 +61,7 @@ fn metadata_columns_can_be_changed_from_the_header_and_settings(cx: &mut TestApp
     .unwrap();
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     cx.update_window(window, |_, window, cx| {
-        window.within("settings-sidebar").click("0-5", cx)
+        window.within("settings-sidebar").click("0-6", cx)
     })
     .unwrap();
     f.settle(window, cx);

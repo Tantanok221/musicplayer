@@ -1,7 +1,7 @@
 use super::*;
 use gpui_kit::component::switch::Switch;
 
-const PLAYLIST_SETTINGS_PAGE: usize = 5;
+const PLAYLIST_SETTINGS_PAGE: usize = 6;
 
 fn gain_index(mode: &GainMode) -> usize {
     match mode {
@@ -261,6 +261,7 @@ impl MusicApp {
                     .page(self.appearance_settings(app.clone()))
                     // Keep the Layout page at LAYOUT_SETTINGS_PAGE.
                     .page(self.layout_settings(app.clone()))
+                    .page(self.metadata_settings(app.clone()))
                     .page(self.playlist_settings(app)),
             )
             .into_any_element()
@@ -534,6 +535,85 @@ impl MusicApp {
                                 }))
                         })
                         .keywords(["soulseek", "slskd", "download", "test"]),
+                    ),
+            )
+    }
+
+    pub(super) fn metadata_settings(&self, app: WeakEntity<Self>) -> SettingPage {
+        SettingPage::new("Metadata")
+            .icon(Icon::new(Glyph::SlidersHorizontal))
+            .resettable(false)
+            .group(
+                SettingGroup::new()
+                    .title("Tag editing")
+                    .description(
+                        "Navidrome can't save tags, so Sonora writes them into your files through a \
+                         folder that holds the same music: a network share or a folder on this computer. \
+                         Navidrome then rescans. Turn on Report Real Path for Sonora in Navidrome's \
+                         player settings so Sonora can find each file.",
+                    )
+                    .item(
+                        SettingItem::new(
+                            "Write tags to files",
+                            SettingField::switch(
+                                {
+                                    let app = app.clone();
+                                    move |cx: &App| {
+                                        app.read_with(cx, |app, _| {
+                                            app.preferences.metadata.write_tags
+                                        })
+                                        .unwrap_or(false)
+                                    }
+                                },
+                                {
+                                    let app = app.clone();
+                                    move |value, cx: &mut App| {
+                                        let _ = app.update(cx, |app, cx| {
+                                            app.preferences.metadata.write_tags = value;
+                                            app.preferences.metadata.library_folder = app
+                                                .metadata_folder
+                                                .read(cx)
+                                                .value()
+                                                .trim()
+                                                .to_string();
+                                            app.save_preferences();
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                            )
+                            .default_value(false),
+                        )
+                        .description(
+                            "Off by default. When off, Sonora never changes your music files.",
+                        ),
+                    )
+                    .item(credential_field(
+                        "Music folder",
+                        self.metadata_folder.clone(),
+                        Some("The folder that matches Navidrome's music library, such as a mounted share."),
+                        &["metadata", "tags", "folder", "library", "mount"],
+                    ))
+                    .item(
+                        SettingItem::render(move |_, _, _| {
+                            let app = app.clone();
+                            Button::new("save-music-folder")
+                                .small()
+                                .label("Save folder")
+                                .on_click(move |_, _, cx| {
+                                    let _ = app.update(cx, |app, cx| {
+                                        app.preferences.metadata.library_folder = app
+                                            .metadata_folder
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        app.save_preferences();
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .keywords(["metadata", "tags", "folder"]),
                     ),
             )
     }

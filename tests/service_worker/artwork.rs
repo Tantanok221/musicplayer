@@ -54,7 +54,13 @@ fn download_cache_backdrop_and_stale_account_completions() {
     w.service().send(Command::ArtworkFinished(
         "another-account".into(),
         "stale".into(),
-        Ok(path),
+        Ok(path.clone()),
+    ));
+    w.service().send(Command::ArtworkPrepared(
+        "another-account".into(),
+        "cover".into(),
+        path,
+        true,
     ));
     w.service().send(Command::BackdropFinished(
         "another-account".into(),
@@ -65,6 +71,10 @@ fn download_cache_backdrop_and_stale_account_completions() {
     let deadline = Instant::now() + WAIT;
     loop {
         let e = w.events().recv_deadline(deadline).unwrap();
+        assert!(
+            !matches!(&e, Event::Artwork(id, ..) if id == "cover"),
+            "thumbnails prepared for another account must not publish a reused cover ID"
+        );
         assert!(!matches!(&e, Event::Artwork(id, ..) | Event::Backdrop(id, _) if id == "stale"));
         if matches!(e, Event::View(request, _) if request == epoch) {
             break;

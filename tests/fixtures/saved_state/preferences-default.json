@@ -60,6 +60,10 @@
     "enabled": false,
     "url": ""
   },
+  "metadata": {
+    "write_tags": false,
+    "library_folder": ""
+  },
   "all_missing_releases": false,
   "favorites": {
     "hearted": true,

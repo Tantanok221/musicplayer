@@ -291,6 +291,19 @@ impl MusicApp {
                 service.send(Command::Enqueue(vec![id.clone()], placement))
             });
             let menu = track_extras(menu, &state, &track, window, cx);
+            let menu = if writes_tags(&state, cx) {
+                let (app, edit) = (state.app.clone(), track.clone());
+                menu.separator()
+                    .item(
+                        menu_row(Glyph::Music, "Edit Tags…").on_click(move |_, window, cx| {
+                            let _ = app.update(cx, |app, cx| {
+                                app.open_tag_editor(vec![(*edit).clone()], window, cx)
+                            });
+                        }),
+                    )
+            } else {
+                menu
+            };
             let menu = if let Some(removal) = removal.clone() {
                 let app = state.app.clone();
                 menu.separator()
@@ -362,6 +375,17 @@ impl MusicApp {
             let menu =
                 playlist_submenu(menu, &state, PlaylistItem::Album(album.clone()), window, cx);
             let menu = artist_items(menu.separator(), &state, album.artist_credits(), window, cx);
+            let menu = if writes_tags(&state, cx) {
+                let (app, id) = (state.app.clone(), album.id.clone());
+                menu.separator()
+                    .item(
+                        menu_row(Glyph::Music, "Edit Album Tags…").on_click(move |_, _, cx| {
+                            let _ = app.update(cx, |app, _| app.open_album_tag_editor(id.clone()));
+                        }),
+                    )
+            } else {
+                menu
+            };
 
             let app = state.app.clone();
             let (id, favorite) = (album.id.clone(), album.starred.is_some());
@@ -400,6 +424,13 @@ impl MusicApp {
             )
         }
     }
+}
+
+fn writes_tags(state: &MenuState, cx: &App) -> bool {
+    state
+        .app
+        .read_with(cx, |app, _| app.preferences.metadata.write_tags)
+        .unwrap_or(false)
 }
 
 /// The song's rating row and a separator, for the top of a song menu.

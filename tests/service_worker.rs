@@ -15,6 +15,8 @@ mod feedback;
 mod fixture;
 #[path = "service_worker/lifecycle.rs"]
 mod lifecycle;
+#[path = "service_worker/lyrics.rs"]
+mod lyrics;
 #[path = "service_worker/metadata.rs"]
 mod metadata;
 #[path = "service_worker/playlists.rs"]
@@ -31,3 +33,5 @@ mod scrobbles;
 mod smart_playlists;
 #[path = "service_worker/sync.rs"]
 mod sync;
+#[path = "service_worker/tag_writes.rs"]
+mod tag_writes;

@@ -6,6 +6,7 @@ use gpui_kit::{
 };
 use sonora::{
     model::{FavoritesFilter, Preferences, SavedQueue},
+    playback::{PlayerCommand, test_support::ListeningPlayer},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
 };
@@ -490,6 +491,170 @@ fn close_worker(
     drop(app);
     cx.run_until_parked();
     worker.shutdown(WAIT).unwrap();
+}
+
+#[gpui_kit::test]
+fn switching_lastfm_user_during_import_updates_memory_lane(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
+    let registered = chrono::Utc::now() - chrono::Duration::days(500);
+    let spans = sonora::discover::seasons_between(registered, chrono::Utc::now());
+    let fixture = Fixture::new(Library {
+        hold_lastfm: true,
+        lastfm_registered: registered.timestamp(),
+        lastfm_charts: vec![(spans[0].from, vec![("Fixture Artist", "Release album", 30)])],
+        ..Library::default()
+    });
+    let (worker, tx, window, app) = mount_worker_with(
+        &fixture,
+        Preferences {
+            lastfm_user: "listener".into(),
+            ..Default::default()
+        },
+        cx,
+    );
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| window.click("nav-discover", cx))
+        .unwrap();
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        matches!(e, Event::Discover(..))
+    });
+    fixture.wait_request(&Request::new(
+        "lastfm/chart",
+        &[
+            ("from", &spans[0].from.to_string()),
+            ("to", &spans[0].to.to_string()),
+        ],
+    ));
+    fixture.edit_library(|library| library.lastfm_charts = vec![]);
+    cx.update_window(window, |_, window, cx| {
+        window.press(sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("Last.fm username", cx);
+        window.press(sonora::platform::shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("listener-new", cx);
+        window.click("save-lastfm", cx);
+        window.press(sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |e, cx| {
+        if let Event::Discover(_, found) = e {
+            assert!(
+                matches!(
+                    found.history,
+                    sonora::discover::HistoryStatus::Loading { done: 0, total: 0 }
+                ),
+                "new user's history must be Loading while the old import is in flight"
+            );
+            cx.update_window(window, |_, window, _| {
+                assert_eq!(
+                    window.find("discover-history").label(),
+                    Some("Reading your Last.fm history…")
+                )
+            })
+            .unwrap();
+            true
+        } else {
+            false
+        }
+    });
+    deliver_until(&worker, &tx, window, cx, |e, cx| {
+        if matches!(e, Event::Discover(_, found) if found.history == sonora::discover::HistoryStatus::Ready)
+        {
+            cx.update_window(window, |_, window, _| {
+                assert!(window.find("discover-empty").visible())
+            })
+            .unwrap();
+            true
+        } else {
+            false
+        }
+    });
+    fixture.resume_lastfm();
+    deliver_until(&worker, &tx, window, cx, |e, cx| {
+        if let Event::Discover(_, found) = e {
+            assert_eq!(found.history, sonora::discover::HistoryStatus::Ready);
+            assert!(
+                found.lane.is_empty(),
+                "old user's late charts must stay isolated"
+            );
+            cx.update_window(window, |_, window, _| {
+                assert!(window.find("discover-empty").visible())
+            })
+            .unwrap();
+            let old: Option<sonora::discover::History> = fixture
+                .catalog()
+                .state("lastfm-history:v1:listener")
+                .unwrap();
+            old.is_some_and(|h| h.seasons.len() == spans.len())
+        } else {
+            false
+        }
+    });
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
+fn play_after_enqueue_empty_from_menu_starts_in_footer(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    let (worker, tx, window, app) = mount_worker_with(&fixture, Preferences::default(), cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    // The worker owns enqueue resolution; the scripted decoder avoids native audio.
+    for command in worker.player_commands().try_iter() {
+        if matches!(command, PlayerCommand::Preferences(_)) {
+            player.command(command).unwrap();
+        }
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("explorer-album-album", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let target = menu.find_by_label("Play Next");
+        let id = target.path().last().unwrap().clone();
+        menu.click(id, cx);
+    })
+    .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let command = worker.player_commands().recv_deadline(deadline).unwrap();
+        if matches!(command, PlayerCommand::Insert(..)) {
+            player.command(command).unwrap();
+            break;
+        }
+    }
+    let queued = player.snapshot(WAIT).unwrap();
+    assert_eq!(queued.queue.len(), 1);
+    assert!(!queued.playing);
+    tx.send(Event::Playback(queued)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("play-pause", cx))
+        .unwrap();
+    let command = worker.player_commands().recv_timeout(WAIT).unwrap();
+    assert!(matches!(command, PlayerCommand::Toggle));
+    player
+        .restart(command, WAIT)
+        .expect("footer Play must start queued song");
+    let playing = player.snapshot(WAIT).unwrap();
+    assert!(playing.playing);
+    assert_eq!(playing.track.as_ref().unwrap().id, "song");
+    tx.send(Event::Playback(playing)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("play-pause").label(), Some("Pause"));
+        assert!(window.find("play-pause").visible());
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 #[gpui_kit::test]

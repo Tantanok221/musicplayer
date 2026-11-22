@@ -1,7 +1,7 @@
 //! Listening instances are independent of decoder epochs and network attempts.
 use crate::model::Track;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListenSession {
@@ -35,21 +35,29 @@ pub(crate) struct AudioProgress {
 }
 #[derive(Default)]
 pub(crate) struct ListenTracker {
-    sessions: HashMap<u64, ListenSession>,
+    sessions: VecDeque<ListenSession>,
 }
 impl ListenTracker {
     pub fn restore(&mut self, session: ListenSession) {
-        self.sessions.insert(session.id, session);
+        self.sessions.retain(|saved| saved.id != session.id);
+        // Keep the previous listen for final progress from the old audio output.
+        if self.sessions.len() == 2 {
+            self.sessions.pop_front();
+        }
+        self.sessions.push_back(session);
     }
     pub fn session(&self, id: Option<u64>) -> Option<ListenSession> {
-        id.and_then(|id| self.sessions.get(&id).cloned())
+        id.and_then(|id| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .cloned()
+        })
     }
     pub fn observe(&mut self, progress: AudioProgress) -> Vec<ListenReport> {
         let listen = progress.listen;
-        let session = self
-            .sessions
-            .entry(listen.id)
-            .or_insert_with(|| ListenSession {
+        if !self.sessions.iter().any(|session| session.id == listen.id) {
+            self.restore(ListenSession {
                 id: listen.id,
                 account: listen.account.clone(),
                 track_id: listen.track.id.clone(),
@@ -58,6 +66,12 @@ impl ListenTracker {
                 submitted: false,
                 announced: false,
             });
+        }
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == listen.id)
+            .unwrap();
         if progress.seconds.is_finite() && progress.seconds > 0. {
             session.played_seconds += progress.seconds;
         }
@@ -106,6 +120,31 @@ mod tests {
             epoch,
             started_ms: 1700000000000 + epoch as i64,
         }
+    }
+    #[test]
+    fn retention_is_bounded_across_many_listens() {
+        let mut tracker = ListenTracker::default();
+        for id in 0..1000 {
+            assert_eq!(tracker.observe(progress(id, 50., 100., 1)).len(), 2);
+        }
+        assert!(
+            tracker.sessions.len() <= 2,
+            "retained {} sessions",
+            tracker.sessions.len()
+        );
+        assert!(tracker.session(Some(999)).unwrap().submitted);
+    }
+    #[test]
+    fn late_previous_progress_keeps_announcement_and_submission_state() {
+        let mut tracker = ListenTracker::default();
+        assert_eq!(tracker.observe(progress(1, 40., 100., 1)).len(), 1);
+        assert_eq!(tracker.observe(progress(2, 50., 100., 2)).len(), 2);
+        let reports = tracker.observe(progress(1, 10., 100., 1));
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].submission);
+        assert_eq!(reports[0].started_ms, 1700000000001);
+        assert!(tracker.observe(progress(1, 50., 100., 1)).is_empty());
+        assert!(tracker.observe(progress(2, 50., 100., 2)).is_empty());
     }
     #[test]
     fn seeks_recovery_and_resume_keep_one_submission_and_original_timestamp() {

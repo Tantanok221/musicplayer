@@ -1,9 +1,11 @@
-use crate::fixture::{Fixture, Library, Request, WAIT, event, synced};
+use crate::fixture::{
+    ALBUM_ORDER, Fixture, Library, Request, WAIT, event, multi_disc_library, synced,
+};
 use serde_json::json;
 use sonora::{
     catalog::Catalog,
     model::Playlist,
-    service::{Command, Event, Mutation},
+    service::{Command, Event, Mutation, PlaylistTarget},
 };
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
     } else {
         "getPlaylist.view"
     };
-    a.edit_library(|library| library.hold_playlist_endpoint = Some(endpoint));
+    a.edit_library(|library| library.hold_endpoint = Some(endpoint));
     if post_mutation {
         a.expect_mutation(
             Request::new(
@@ -86,7 +88,7 @@ fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
     );
     synced(&worker);
     let before = serde_json::to_value(catalog.playlist_summaries().unwrap()).unwrap();
-    a.resume_playlist();
+    a.resume_held();
     if post_mutation {
         a.wait_request(&Request::new("getPlaylist.view", &[("id", "a-playlist")]));
     }
@@ -461,5 +463,146 @@ fn removal_uses_entry_index_and_refreshes_persisted_playlist_only_on_success() {
             .entry
             .is_empty()
     );
+    fixture.finish();
+}
+
+fn album_ids() -> Vec<String> {
+    ALBUM_ORDER.map(String::from).to_vec()
+}
+
+fn album_songs(endpoint: &str, key: &str, base: &[(&str, &str)]) -> Request {
+    let mut params = base.to_vec();
+    params.extend(ALBUM_ORDER.map(|id| (key, id)));
+    Request::new(endpoint, &params)
+}
+
+#[test]
+fn album_to_new_playlist_creates_it_with_songs_in_album_order() {
+    let fixture = Fixture::new(multi_disc_library());
+    let mut worker = fixture.start();
+    synced(&worker);
+    fixture.expect_mutation(
+        album_songs("createPlaylist.view", "songId", &[("name", "Road trip")]),
+        true,
+    );
+    worker.service().send(Command::AlbumToPlaylist(
+        "album".into(),
+        PlaylistTarget::New("Road trip".into()),
+    ));
+    let created = Mutation::CreatePlaylist("Road trip".into(), album_ids());
+    event(
+        &worker,
+        |e| matches!(e, Event::MutationDone(m) if *m == created),
+    );
+    let Event::Playlists(playlists) = event(&worker, |e| matches!(e, Event::Playlists(_))) else {
+        unreachable!()
+    };
+    assert!(
+        playlists
+            .iter()
+            .any(|p| p.name == "Road trip" && p.song_count == 3)
+    );
+    assert!(
+        fixture
+            .catalog()
+            .playlist_summaries()
+            .unwrap()
+            .iter()
+            .any(|p| p.name == "Road trip")
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn album_to_existing_playlist_appends_in_album_order_and_reports_failure() {
+    let mix = Playlist {
+        id: "mix".into(),
+        name: "Mix".into(),
+        owner: "fixture".into(),
+        song_count: 1,
+        entry: vec![Arc::new(crate::fixture::song("other-song", "other-album"))].into(),
+        ..Default::default()
+    };
+    let fixture = Fixture::new(Library {
+        playlists: vec![mix],
+        ..multi_disc_library()
+    });
+    let mut worker = fixture.start();
+    synced(&worker);
+    let add = album_songs(
+        "updatePlaylist.view",
+        "songIdToAdd",
+        &[("playlistId", "mix")],
+    );
+    fixture.expect_mutation(add.clone(), true);
+    worker.service().send(Command::AlbumToPlaylist(
+        "album".into(),
+        PlaylistTarget::Existing("mix".into()),
+    ));
+    let added = Mutation::AddToPlaylist("mix".into(), album_ids());
+    event(
+        &worker,
+        |e| matches!(e, Event::MutationDone(m) if *m == added),
+    );
+    let Event::Playlist(refreshed) = event(
+        &worker,
+        |e| matches!(e, Event::Playlist(p) if p.id == "mix"),
+    ) else {
+        unreachable!()
+    };
+    let ids = |playlist: &Playlist| {
+        playlist
+            .entry
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = ["other-song", "opener", "song", "disc-two"].map(String::from);
+    assert_eq!(ids(&refreshed), expected);
+    assert_eq!(
+        ids(&fixture.catalog().playlist("mix").unwrap().unwrap()),
+        expected
+    );
+
+    fixture.expect_mutation(add, false);
+    worker.service().send(Command::AlbumToPlaylist(
+        "album".into(),
+        PlaylistTarget::Existing("mix".into()),
+    ));
+    let Event::MutationFailed(failed, error) =
+        event(&worker, |e| matches!(e, Event::MutationFailed(..)))
+    else {
+        unreachable!()
+    };
+    assert_eq!(failed, added);
+    assert!(error.contains("Retry") && !error.contains("synthetic-password"));
+    assert_eq!(
+        ids(&fixture.catalog().playlist("mix").unwrap().unwrap()),
+        expected
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn album_without_songs_in_the_library_is_refused_before_any_request() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    synced(&worker);
+    worker.service().send(Command::AlbumToPlaylist(
+        "missing-album".into(),
+        PlaylistTarget::New("Empty".into()),
+    ));
+    event(
+        &worker,
+        |e| matches!(e, Event::Error(message) if message.contains("no songs in the library")),
+    );
+    crate::fixture::view(&worker);
+    assert!(!fixture.requests().iter().any(|r| matches!(
+        r.endpoint.as_str(),
+        "createPlaylist.view" | "updatePlaylist.view"
+    )));
+    worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

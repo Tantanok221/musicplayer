@@ -19,7 +19,7 @@ use crate::{
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -126,6 +126,7 @@ pub enum Command {
     SoulseekSearch(String, String),
     Download(Box<DownloadRequest>),
     DownloadUpdate(String, DownloadJob),
+    DownloadRejected(String, String, String),
     DismissDownload(String),
     ResumeDownloads,
     ScrobbleFinished(String, u64, Result<Option<Arc<Track>>, String>),
@@ -135,6 +136,7 @@ pub enum Command {
     /// Finds a cover in the disk cache; with a priority, downloads it when missing.
     Artwork(String, Option<Priority>),
     ArtworkFinished(String, String, Result<PathBuf, String>),
+    ArtworkPrepared(String, String, PathBuf, bool),
     #[cfg(feature = "test-support")]
     ArtworkTime(Duration, Sender<Option<Duration>>),
     Backdrop(String),
@@ -150,6 +152,10 @@ pub enum Command {
     /// Album ID: save its songs, in disc/track order, to a playlist.
     AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
+    /// Writes the edit into the files under the mapped music folder.
+    WriteTags(crate::tags::TagEdit),
+    /// Puts back the tags the last edit changed.
+    UndoTags,
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
@@ -252,6 +258,7 @@ pub enum Event {
     MutationFailed(Mutation, String),
     AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
+    TagsWritten(crate::tags::TagReport),
 }
 #[derive(Clone)]
 pub struct Service {
@@ -262,6 +269,214 @@ pub struct Service {
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+/// Writes an edit into every selected file it can find, journaling each
+/// file before it is touched.
+fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::tags::TagReport> {
+    use crate::tags::{self, EditState};
+    let prefs: Preferences = catalog.state("preferences")?;
+    let mut report = tags::TagReport {
+        job: chrono::Utc::now().timestamp_micros(),
+        ..Default::default()
+    };
+    let tracks = catalog.by_ids(&edit.tracks)?;
+    if !prefs.metadata.write_tags {
+        report.failures = tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.title.clone(),
+                    "Turn on Write tags to files in Settings → Metadata first.".into(),
+                )
+            })
+            .collect();
+        return Ok(report);
+    }
+    let root = std::path::PathBuf::from(&prefs.metadata.library_folder);
+    // A file written since the last rescan no longer matches the size Navidrome has.
+    let unconfirmed = catalog.unconfirmed_tag_edits()?;
+    for track in tracks {
+        let file = match unconfirmed
+            .iter()
+            .rev()
+            .find(|entry| entry.track_id == track.id)
+        {
+            Some(entry) => Ok(std::path::PathBuf::from(&entry.file)),
+            None => tags::resolve(&root, &track),
+        };
+        let file = match file {
+            Ok(file) => file,
+            Err(reason) => {
+                report.failures.push((track.title.clone(), reason));
+                continue;
+            }
+        };
+        let before = match tags::read(&file) {
+            Ok(before) => before,
+            Err(error) => {
+                report
+                    .failures
+                    .push((track.title.clone(), format!("{error:#}")));
+                continue;
+            }
+        };
+        let id = catalog.journal_tag_edit(report.job, &track, &file, &before)?;
+        match tags::write(&file, &edit.fields) {
+            Ok((_, after)) => {
+                catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
+                report.written += 1;
+            }
+            Err(error) => {
+                catalog.finish_tag_edit(id, None, EditState::Failed)?;
+                report
+                    .failures
+                    .push((track.title.clone(), format!("{error:#}")));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Puts back what the newest job changed, as a new job so it can be undone too.
+fn undo_tags(catalog: &Catalog) -> Result<crate::tags::TagReport> {
+    use crate::tags::{self, EditState};
+    let mut report = tags::TagReport {
+        job: chrono::Utc::now().timestamp_micros(),
+        undo: true,
+        ..Default::default()
+    };
+    let Some(job) = catalog.last_tag_job()? else {
+        report
+            .failures
+            .push((String::new(), "There is no tag edit to undo.".into()));
+        return Ok(report);
+    };
+    for entry in catalog.tag_job(job)? {
+        if !matches!(entry.state, EditState::Written | EditState::Confirmed) {
+            continue;
+        }
+        let changed: tags::TagValues = entry
+            .after
+            .iter()
+            .filter(|(field, values)| entry.before.get(field) != Some(values))
+            .map(|(field, values)| (*field, values.clone()))
+            .collect();
+        let track = catalog
+            .track_by_path(&entry.path)?
+            .map(|track| (*track).clone())
+            .unwrap_or_else(|| Track {
+                id: entry.track_id.clone(),
+                path: entry.path.clone(),
+                title: entry.title.clone(),
+                starred: entry.starred.then(String::new),
+                user_rating: entry.rating,
+                ..Default::default()
+            });
+        let file = std::path::PathBuf::from(&entry.file);
+        let current = match tags::read(&file) {
+            Ok(current) => current,
+            Err(error) => {
+                report
+                    .failures
+                    .push((entry.title.clone(), format!("{error:#}")));
+                continue;
+            }
+        };
+        let id = catalog.journal_tag_edit(report.job, &track, &file, &current)?;
+        match tags::write(&file, &tags::restore(&entry.before, &changed)) {
+            Ok((_, after)) => {
+                catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
+                catalog.finish_tag_edit(entry.id, None, EditState::Undone)?;
+                report.written += 1;
+            }
+            Err(error) => {
+                catalog.finish_tag_edit(id, None, EditState::Failed)?;
+                report
+                    .failures
+                    .push((entry.title.clone(), format!("{error:#}")));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Reports a tag job and asks Navidrome to rescan. Only administrators can
+/// start a scan; for others Navidrome's file watcher picks the change up.
+fn finish_tag_job(
+    report: &crate::tags::TagReport,
+    server: Option<Server>,
+    runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
+    events: &Sender<Event>,
+) -> Result<()> {
+    events.send(Event::TagsWritten(report.clone()))?;
+    if report.written == 0 {
+        return Ok(());
+    }
+    let Some(server) = server else {
+        events.send(Event::Status(
+            "Tags saved · connect to Navidrome to rescan".into(),
+        ))?;
+        return Ok(());
+    };
+    let (tx, events) = (tx.clone(), events.clone());
+    runtime.spawn(async move {
+        if server.start_scan().await.is_err() {
+            let _ = events.send(Event::Status(
+                "Tags saved · Navidrome shows them after its next scan".into(),
+            ));
+            return;
+        }
+        let _ = events.send(Event::Status("Tags saved · Navidrome is rescanning".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for _ in 0..600 {
+            if matches!(server.scan_status().await, Ok(false)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let _ = tx.send(Command::Refresh);
+    });
+    Ok(())
+}
+
+/// After a complete sync, finds each written file by path and, when the
+/// rescan gave it a new ID, carries its favorite and rating over.
+/// Confirms written edits Navidrome has rescanned. Returns annotations to
+/// carry over to new IDs, and each rescanned song with the ID it had before.
+type Reconciled = (Vec<Mutation>, Vec<(String, Arc<Track>)>);
+
+fn reconcile_tags(catalog: &Catalog) -> Result<Reconciled> {
+    use crate::tags::EditState;
+    let mut mutations = Vec::new();
+    let mut rescanned_tracks = Vec::new();
+    for entry in catalog.unconfirmed_tag_edits()? {
+        let Some(track) = catalog.track_by_path(&entry.path)? else {
+            continue;
+        };
+        let rescanned = entry
+            .after
+            .iter()
+            .filter(|(field, values)| entry.before.get(field) != Some(values))
+            .all(|(field, values)| field.shown(&track) == values.join("; "));
+        if !rescanned {
+            continue;
+        }
+        if track.id != entry.track_id {
+            if entry.starred && track.starred.is_none() {
+                mutations.push(Mutation::Favorite(track.id.clone(), true));
+            }
+            if let Some(rating) = entry.rating.filter(|rating| *rating > 0)
+                && track.user_rating != Some(rating)
+            {
+                mutations.push(Mutation::Rating(track.id.clone(), rating));
+            }
+        }
+        catalog.finish_tag_edit(entry.id, None, EditState::Confirmed)?;
+        rescanned_tracks.push((entry.track_id, track));
+    }
+    Ok((mutations, rescanned_tracks))
+}
 
 fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
     catalog.set_state("preferences", &prefs)?;
@@ -592,7 +807,9 @@ fn begin_sync(
 /// Sends a cover once its small copies exist, making them off this thread when missing.
 fn publish_artwork(
     runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
     events: &Sender<Event>,
+    namespace: String,
     id: String,
     path: PathBuf,
 ) {
@@ -600,10 +817,10 @@ fn publish_artwork(
         let _ = events.send(Event::Artwork(id, path, true));
         return;
     }
-    let events = events.clone();
+    let tx = tx.clone();
     runtime.spawn_blocking(move || {
         let thumbs = thumbnail::ensure(&path).is_ok();
-        let _ = events.send(Event::Artwork(id, path, thumbs));
+        let _ = tx.send(Command::ArtworkPrepared(namespace, id, path, thumbs));
     });
 }
 
@@ -661,7 +878,6 @@ impl ArtworkClock {
 }
 
 struct LastFmFetch {
-    user: String,
     done: usize,
     total: usize,
 }
@@ -728,7 +944,8 @@ fn publish_discover(
     events: &Sender<Event>,
     lastfm: &crate::lastfm::LastFm,
     request: u64,
-    fetch: Option<&LastFmFetch>,
+    fetches: &HashMap<(String, String), LastFmFetch>,
+    account: Option<&Account>,
     failure: Option<&(String, String)>,
 ) -> Result<()> {
     use crate::discover::HistoryStatus;
@@ -742,6 +959,7 @@ fn publish_discover(
     } else {
         catalog.state(&lastfm_state(&user))?
     };
+    let fetch = account.and_then(|account| fetches.get(&(account.namespace(), user.clone())));
     let hidden: Option<crate::discover::Hidden> = catalog.state("discover-hidden")?;
     let mut shelves = crate::discover::rediscover(
         &catalog.rediscover_candidates()?,
@@ -753,7 +971,7 @@ fn publish_discover(
         HistoryStatus::Off
     } else if !lastfm.has_key() {
         HistoryStatus::Unavailable
-    } else if let Some(fetch) = fetch.filter(|fetch| fetch.user == user) {
+    } else if let Some(fetch) = fetch {
         HistoryStatus::Loading {
             done: fetch.done,
             total: fetch.total,
@@ -794,6 +1012,17 @@ fn run(
     )?;
     events.send(Event::Ready(account.clone(), prefs))?;
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+    let interrupted = catalog.interrupted_tag_edits()?;
+    if !interrupted.is_empty() {
+        for entry in &interrupted {
+            catalog.finish_tag_edit(entry.id, None, crate::tags::EditState::Failed)?;
+        }
+        events.send(Event::Error(format!(
+            "Sonora stopped while writing tags to {} file(s), starting with {}. Check them before editing again.",
+            interrupted.len(),
+            interrupted[0].file
+        )))?;
+    }
     events.send(Event::Status(
         if account.is_some() {
             "Cached library · connecting…"
@@ -853,7 +1082,7 @@ fn run(
     if let Ok(Some(key)) = paths.lastfm_key() {
         lastfm.set_key(key);
     }
-    let mut lastfm_fetch: Option<LastFmFetch> = None;
+    let mut lastfm_fetches = HashMap::new();
     let mut lastfm_failure: Option<(String, String)> = None;
     let mut release_requests: HashSet<String> = HashSet::new();
     let mut open_artist: Option<(u64, String, String)> = None;
@@ -1171,6 +1400,20 @@ fn run(
                             catalog.finish_sync(generation)?;
                         }
                         catalog.save_playlist_summaries(&playlists, can_delete)?;
+                        if can_delete {
+                            let (mutations, rescanned) = reconcile_tags(&catalog)?;
+                            for mutation in mutations {
+                                tx.send(Command::Mutate(mutation))?;
+                            }
+                            for (old, track) in rescanned {
+                                player.send(if old == track.id {
+                                    PlayerCommand::UpdateTrack(track.clone())
+                                } else {
+                                    PlayerCommand::RetagTrack(old, track.clone())
+                                });
+                                events.send(Event::TrackUpdated(track))?;
+                            }
+                        }
                         syncing = false;
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         for id in refresh {
@@ -1268,7 +1511,7 @@ fn run(
                     if let Some(namespace) = namespace
                         && !user.is_empty()
                         && lastfm.has_key()
-                        && lastfm_fetch.is_none()
+                        && !lastfm_fetches.contains_key(&(namespace.clone(), user.clone()))
                     {
                         let history = load_history(&catalog, &user)?;
                         if history.registered.is_none()
@@ -1276,11 +1519,10 @@ fn run(
                                 .is_empty()
                         {
                             lastfm_failure = None;
-                            lastfm_fetch = Some(LastFmFetch {
-                                user: user.clone(),
-                                done: 0,
-                                total: 0,
-                            });
+                            lastfm_fetches.insert(
+                                (namespace.clone(), user.clone()),
+                                LastFmFetch { done: 0, total: 0 },
+                            );
                             let tx = tx.clone();
                             let lastfm = lastfm.clone();
                             runtime.spawn(fetch_lastfm(lastfm, tx, namespace, user, history));
@@ -1291,7 +1533,8 @@ fn run(
                         &events,
                         &lastfm,
                         request,
-                        lastfm_fetch.as_ref(),
+                        &lastfm_fetches,
+                        account.as_ref(),
                         lastfm_failure.as_ref(),
                     )?;
                 }
@@ -1303,13 +1546,11 @@ fn run(
                     }
                 }
                 Command::LastFmSeason(namespace, user, season, chart, done, total) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                    if account.as_ref().map(Account::namespace).as_ref() == Some(&namespace) {
                         let mut history = load_history(&catalog, &user)?;
                         history.seasons.insert(season, chart);
                         catalog.set_state(&lastfm_state(&user), &Some(&history))?;
-                        if let Some(fetch) =
-                            lastfm_fetch.as_mut().filter(|fetch| fetch.user == user)
-                        {
+                        if let Some(fetch) = lastfm_fetches.get_mut(&(namespace, user)) {
                             fetch.done = done;
                             fetch.total = total;
                         }
@@ -1318,28 +1559,25 @@ fn run(
                             &events,
                             &lastfm,
                             discover_request,
-                            lastfm_fetch.as_ref(),
+                            &lastfm_fetches,
+                            account.as_ref(),
                             lastfm_failure.as_ref(),
                         )?;
                     }
                 }
                 Command::LastFmDone(namespace, user, result) => {
-                    if lastfm_fetch
-                        .as_ref()
-                        .is_some_and(|fetch| fetch.user == user)
-                    {
-                        lastfm_fetch = None;
-                    }
-                    if let Err(message) = result {
-                        lastfm_failure = Some((user, message));
-                    }
+                    lastfm_fetches.remove(&(namespace.clone(), user.clone()));
                     if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        if let Err(message) = result {
+                            lastfm_failure = Some((user, message));
+                        }
                         publish_discover(
                             &catalog,
                             &events,
                             &lastfm,
                             discover_request,
-                            lastfm_fetch.as_ref(),
+                            &lastfm_fetches,
+                            account.as_ref(),
                             lastfm_failure.as_ref(),
                         )?;
                     }
@@ -1592,7 +1830,6 @@ fn run(
                         return Ok(());
                     }
                     let tx = tx.clone();
-                    let events = events.clone();
                     let runtime_handle = runtime.clone();
                     runtime.spawn(async move {
                         // Search hits only cover files that matched the text; take the whole folder.
@@ -1625,8 +1862,8 @@ fn run(
                                 watch_download(&runtime_handle, client, tx, namespace, job);
                             }
                             Err(error) => {
-                                let _ = tx.send(Command::DismissDownload(job.release.clone()));
-                                let _ = events.send(Event::DownloadNotStarted(
+                                let _ = tx.send(Command::DownloadRejected(
+                                    namespace,
                                     job.release,
                                     format!(
                                         "{} did not accept the request: {error:#}",
@@ -1672,6 +1909,16 @@ fn run(
                                 let _ = tx.send(Command::Refresh);
                             });
                         }
+                    }
+                }
+                Command::DownloadRejected(namespace, release, message) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        watched.remove(&release);
+                        let mut jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+                        jobs.retain(|job| job.release != release);
+                        catalog.set_state(DOWNLOADS, &jobs)?;
+                        events.send(Event::Downloads(Arc::new(jobs)))?;
+                        events.send(Event::DownloadNotStarted(release, message))?;
                     }
                 }
                 Command::DismissDownload(release) => {
@@ -1896,12 +2143,13 @@ fn run(
                 }
                 Command::Artwork(id, fetch) => {
                     if let Some(account) = &account {
+                        let namespace = account.namespace();
                         let path = paths
                             .cache
-                            .join(account.namespace())
+                            .join(&namespace)
                             .join(format!("{}.art", blake3::hash(id.as_bytes()).to_hex()));
                         if path.exists() {
-                            publish_artwork(&runtime, &events, id, path);
+                            publish_artwork(&runtime, &tx, &events, namespace, id, path);
                             return Ok(());
                         }
                     }
@@ -1941,7 +2189,7 @@ fn run(
                         match result {
                             Ok(path) => {
                                 artwork_queue.finished(&id, true, artwork_clock.now());
-                                publish_artwork(&runtime, &events, id, path);
+                                publish_artwork(&runtime, &tx, &events, namespace, id, path);
                             }
                             Err(_) => {
                                 if artwork_queue.finished(&id, false, artwork_clock.now()) {
@@ -1949,6 +2197,14 @@ fn run(
                                 }
                             }
                         }
+                    }
+                }
+                Command::ArtworkPrepared(namespace, id, path, thumbs) => {
+                    if account
+                        .as_ref()
+                        .is_some_and(|account| account.namespace() == namespace)
+                    {
+                        events.send(Event::Artwork(id, path, thumbs))?;
                     }
                 }
                 Command::PlayIds(ids, at) => {
@@ -1989,6 +2245,14 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
+                Command::WriteTags(edit) => {
+                    let report = write_tags(&catalog, &edit)?;
+                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
+                Command::UndoTags => {
+                    let report = undo_tags(&catalog)?;
+                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;
                 }

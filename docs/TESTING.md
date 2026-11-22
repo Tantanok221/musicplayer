@@ -33,11 +33,12 @@ worker suite to expose flaky timing.
 | Discover (Memory lane, Last.fm history) | `discover.rs`, `settings.rs` | `discover` (`rediscover`, `stale_seasons`, `Visit`), `lastfm`, `Catalog::rediscover_candidates` | `tests/ui/discover.rs`, `tests/ui/settings.rs`, `tests/service_worker/discover.rs`, `tests/discover.rs` |
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
-| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |
+| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/{artwork,lyrics}.rs`, `server` artwork-pruning unit tests |
 | Metadata Properties tab | `information.rs` | `metadata::properties` | `tests/ui/metadata.rs`, `metadata` unit tests |
+| Opt-in tag editing, journal, undo, rescan | `tag_editor.rs`, `settings.rs`, `context_menu.rs` | `tags::{EditorForm, resolve, write}`, `Catalog::journal_tag_edit` | `tests/ui/tag_editor.rs`, `tests/service_worker/tag_writes.rs`, `tags` unit tests |
 | Playlists (track/album views, selectable metadata columns, including smart/read-only playlists) | `playlists.rs`, `tracks.rs`, `settings.rs`, `navigator.rs`, `context_menu.rs` | `playlists::{Playlists, PlaylistView, PlaylistAlbum, PlaylistColumn, PlaylistColumns, PlaylistEntry, is_smart, refresh_due}` | `tests/ui/playlists.rs`, `tests/service_worker/{playlists,preferences}.rs` |
 | Native smart playlist editor, sign-in and background session renewal | `smart_playlists.rs`, `navigator.rs`, `playlists.rs` | `smart_editor`, `smart_rules`, `server::native`, `service::native`, `platform::NativeToken` | `tests/ui/{smart_playlists,worker}.rs`, `tests/service_worker/smart_playlists.rs`, `smart_editor`, `smart_rules` and `service::native` unit tests, `tests/platform.rs` |
-| Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs` |
+| Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform`, `ui::account_cache` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs`, `ui::account_cache` unit tests |
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |

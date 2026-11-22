@@ -12,6 +12,28 @@ use std::{sync::Arc, time::Duration};
 const WAIT: Duration = Duration::from_secs(5);
 
 #[test]
+fn late_previous_listen_progress_does_not_duplicate_scrobbles() {
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    for _ in 0..20 {
+        let previous = player
+            .restart(PlayerCommand::Replace(tracks(&["previous"]), 0), WAIT)
+            .unwrap();
+        assert_eq!(player.progress(50., WAIT).unwrap().len(), 1);
+        let current = player
+            .restart(PlayerCommand::Replace(tracks(&["current"]), 0), WAIT)
+            .unwrap();
+        assert_eq!(player.progress(60., WAIT).unwrap().len(), 2);
+        let reports = player.previous_progress(10., WAIT).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].submission);
+        assert_eq!(reports[0].id, previous);
+        assert!(player.previous_progress(60., WAIT).unwrap().is_empty());
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+        assert_ne!(previous, current);
+    }
+}
+
+#[test]
 fn previous_after_restore_uses_saved_position() {
     for account in [false, true] {
         for (position, expected) in [(60., 1), (3., 0), (0., 0)] {
@@ -529,6 +551,60 @@ proptest! {
         moves in prop::collection::vec((0usize..24, 0usize..24), 0..30),
     ) {
         check_metadata_refresh(len, chosen, moves);
+    }
+}
+
+#[test]
+fn play_after_enqueue_empty_starts_first_track() {
+    for placement in [Placement::Next, Placement::Last] {
+        for play in [PlayerCommand::Play, PlayerCommand::Toggle] {
+            let mut player = ListeningPlayer::start(WAIT).unwrap();
+            player
+                .command(PlayerCommand::Insert(
+                    tracks(&["first", "second"]),
+                    placement,
+                ))
+                .unwrap();
+            let queued = player.snapshot(WAIT).unwrap();
+            assert_eq!(queued.index, None);
+            assert!(!queued.playing);
+            player.restart(play, WAIT).expect("queued track must start");
+            let playing = player.snapshot(WAIT).unwrap();
+            assert_eq!(playing.index, Some(0));
+            assert_eq!(playing.track.as_ref().unwrap().id, "first");
+            assert!(playing.playing);
+        }
+    }
+}
+
+#[test]
+fn play_after_enqueue_empty_guards_empty_queue_and_paused_selection() {
+    for play in [PlayerCommand::Play, PlayerCommand::Toggle] {
+        let player = ListeningPlayer::start(WAIT).unwrap();
+        player.command(play).unwrap();
+        let empty = player.snapshot(WAIT).unwrap();
+        assert_eq!(empty.index, None);
+        assert!(empty.track.is_none());
+        assert!(!empty.playing);
+    }
+    for play in [PlayerCommand::Play, PlayerCommand::Toggle] {
+        let mut player = ListeningPlayer::start(WAIT).unwrap();
+        player
+            .command(PlayerCommand::Restore(
+                tracks(&["first", "selected"]),
+                1,
+                17.,
+                None,
+            ))
+            .unwrap();
+        let paused = player.snapshot(WAIT).unwrap();
+        assert!(!paused.playing);
+        player.restart(play, WAIT).unwrap();
+        let resumed = player.snapshot(WAIT).unwrap();
+        assert_eq!(resumed.index, Some(1));
+        assert_eq!(resumed.track.as_ref().unwrap().id, "selected");
+        assert_eq!(resumed.position, 17.);
+        assert!(resumed.playing);
     }
 }
 

@@ -129,7 +129,8 @@ impl MusicApp {
 
     fn current_profile(&self) -> Option<Arc<ArtistProfile>> {
         let name = self.artist_name.as_deref().unwrap_or_default();
-        self.artist_profiles
+        self.account_cache
+            .artist_profiles
             .get(&cache_key(name, &self.artist_id))
             .cloned()
     }
@@ -522,6 +523,7 @@ impl MusicApp {
     pub(super) fn request_popularity(&mut self, artists: &[NamedId]) {
         for artist in artists {
             if self
+                .account_cache
                 .popularity_requested
                 .insert(cache_key(&artist.name, &artist.id))
             {
@@ -533,10 +535,11 @@ impl MusicApp {
 
     pub(super) fn popular_tracks(&self, album_id: &str, artists: &[NamedId]) -> HashSet<String> {
         let mut popular = HashSet::new();
-        for top in artists
-            .iter()
-            .filter_map(|artist| self.top_songs.get(&cache_key(&artist.name, &artist.id)))
-        {
+        for top in artists.iter().filter_map(|artist| {
+            self.account_cache
+                .top_songs
+                .get(&cache_key(&artist.name, &artist.id))
+        }) {
             for id in top.for_album(album_id, POPULAR_PER_ALBUM) {
                 if popular.len() < POPULAR_PER_ALBUM {
                     popular.insert(id);
@@ -555,11 +558,12 @@ impl MusicApp {
         cx: &App,
     ) -> AnyElement {
         let key = cache_key(name, id);
-        if self.profile_requested.insert(key.clone()) {
+        if self.account_cache.profile_requested.insert(key.clone()) {
             self.service
                 .send(Command::ArtistProfile(name.into(), id.into(), false));
         }
         let portrait = self
+            .account_cache
             .artist_profiles
             .get(&key)
             .map(|profile| profile.portrait.clone())

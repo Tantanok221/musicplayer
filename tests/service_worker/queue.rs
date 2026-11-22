@@ -1,8 +1,8 @@
-use crate::fixture::{Fixture, Library, WAIT, event, synced};
+use crate::fixture::{ALBUM_ORDER, Fixture, Library, WAIT, event, multi_disc_library, synced};
 use sonora::{
     listening::ListenSession,
     model::{PlaybackSnapshot, Preferences, SavedQueue},
-    playback::PlayerCommand,
+    playback::{Placement, PlayerCommand},
     service::{Command, Event, test_support::Worker},
 };
 
@@ -407,6 +407,52 @@ fn play_album_matching_favorites_plays_hearted_songs_or_a_favorite_album_in_full
     assert_eq!(played(&worker, "album"), ["hearted"]);
     // A favorite album is a favorite as a whole.
     assert_eq!(played(&worker, "whole"), ["whole-1", "whole-2"]);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn enqueue_album_inserts_its_songs_in_disc_and_track_order() {
+    let fixture = Fixture::new(multi_disc_library());
+    fixture.seed();
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::Player(PlayerCommand::Replace(
+            fixture.catalog().by_ids(&["other-song".into()]).unwrap(),
+            0,
+        )));
+    snapshot(&worker, &["other-song"]);
+    worker
+        .service()
+        .send(Command::EnqueueAlbum("album".into(), Placement::Last));
+    let [opener, song, disc_two] = ALBUM_ORDER;
+    snapshot(&worker, &["other-song", opener, song, disc_two]);
+    worker
+        .service()
+        .send(Command::EnqueueAlbum("other-album".into(), Placement::Next));
+    let queued = snapshot(
+        &worker,
+        &["other-song", "other-song", opener, song, disc_two],
+    );
+    assert_eq!(
+        queued.index,
+        Some(0),
+        "enqueueing must not move the current track"
+    );
+    // An album missing from the catalog enqueues nothing.
+    worker.service().send(Command::EnqueueAlbum(
+        "missing-album".into(),
+        Placement::Last,
+    ));
+    worker
+        .service()
+        .send(Command::Enqueue(vec!["opener".into()], Placement::Last));
+    snapshot(
+        &worker,
+        &["other-song", "other-song", opener, song, disc_two, opener],
+    );
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

@@ -165,6 +165,40 @@ async fn native(
     response
 }
 
+async fn slskd_download(
+    State(state): State<ServerState>,
+    Path(endpoint): Path<String>,
+    method: Method,
+    Json(body): Json<Value>,
+) -> Response {
+    if method == Method::POST
+        && endpoint == "users/fixture-peer/directory"
+        && body == json!({"directory":"Fixture Album"})
+    {
+        state.record(Request::new("slskd/directory", &[]));
+        return Json(json!([])).into_response();
+    }
+    if method == Method::POST
+        && endpoint == "transfers/downloads/batches"
+        && body
+            == json!({"username":"fixture-peer","files":[{"filename":"Fixture Album\\song.flac","size":100}]})
+    {
+        state.record(Request::new("slskd/enqueue", &[]));
+        let hold = state.data.lock().unwrap().library.hold_endpoint == Some("slskd/enqueue");
+        if hold {
+            let _ = state.held_gate.recv_async().await;
+        }
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    state
+        .data
+        .lock()
+        .unwrap()
+        .unexpected
+        .push("unexpected slskd request");
+    StatusCode::BAD_REQUEST.into_response()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub endpoint: String,
@@ -178,16 +212,21 @@ impl Request {
             endpoint: endpoint.into(),
             params: params
                 .iter()
-                .filter(|(key, _)| *key != "songId")
+                .filter(|(key, _)| !is_song_id(key))
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             song_ids: params
                 .iter()
-                .filter(|(key, _)| *key == "songId")
+                .filter(|(key, _)| is_song_id(key))
                 .map(|(_, value)| value.to_string())
                 .collect(),
         }
     }
+}
+
+/// Repeated parameters listing songs in order: playlist contents or additions.
+fn is_song_id(key: &str) -> bool {
+    matches!(key, "songId" | "songIdToAdd")
 }
 
 /// A fixture Last.fm chart entry: artist, album and plays.
@@ -210,20 +249,27 @@ pub struct Library {
     pub offline: bool,
     pub hold_sync: bool,
     pub hold_scrobble: bool,
-    pub hold_playlist_endpoint: Option<&'static str>,
+    pub hold_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
+    /// The `structuredLyrics` versions getLyricsBySongId answers with.
+    pub structured_lyrics: Value,
+    /// The text getLyrics answers with for any artist and title.
+    pub plain_lyrics: &'static str,
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
     pub artist_mbid: &'static str,
     pub prolific: bool,
     /// Unix seconds the fixture Last.fm profile was created.
     pub lastfm_registered: i64,
+    pub hold_lastfm: bool,
     /// Album charts by season start: artist, album and plays.
     pub lastfm_charts: Vec<(i64, Vec<ChartEntry>)>,
     /// A Last.fm error code every Last.fm request answers with.
     pub lastfm_error: Option<u32>,
     /// Whether the worker is built with a Last.fm API key.
     pub lastfm_key: bool,
+    /// Whether the account may start a scan, as Navidrome administrators can.
+    pub scan_admin: bool,
 }
 
 impl Default for Library {
@@ -245,18 +291,36 @@ impl Default for Library {
             offline: false,
             hold_sync: false,
             hold_scrobble: false,
-            hold_playlist_endpoint: None,
+            hold_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
+            structured_lyrics: json!([]),
+            plain_lyrics: "",
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
             artist_mbid: "mb-artist",
             prolific: false,
             lastfm_registered: 0,
+            hold_lastfm: false,
             lastfm_charts: vec![],
             lastfm_error: None,
             lastfm_key: true,
+            scan_admin: false,
         }
     }
+}
+
+impl Library {
+    fn entries(&self, ids: &[String]) -> Vec<Arc<Track>> {
+        ids.iter()
+            .map(|id| Arc::new(self.tracks.iter().find(|t| &t.id == id).unwrap().clone()))
+            .collect()
+    }
+}
+
+fn set_entries(playlist: &mut Playlist, entries: Vec<Arc<Track>>) {
+    playlist.song_count = entries.len() as u32;
+    playlist.duration = entries.iter().map(|track| track.duration).sum();
+    playlist.entry = entries.into();
 }
 
 pub fn song(id: &str, album_id: &str) -> Track {
@@ -272,6 +336,27 @@ pub fn song(id: &str, album_id: &str) -> Track {
         ..Default::default()
     }
 }
+
+/// The default library with "album" spread over two discs, stored out of
+/// play order; the album plays as `ALBUM_ORDER`.
+pub fn multi_disc_library() -> Library {
+    let track = |id: &str, disc, number| Track {
+        disc_number: Some(disc),
+        track: Some(number),
+        ..song(id, "album")
+    };
+    Library {
+        tracks: vec![
+            track("disc-two", 2, 1),
+            track("song", 1, 2),
+            song("other-song", "other-album"),
+            track("opener", 1, 1),
+        ],
+        ..Default::default()
+    }
+}
+
+pub const ALBUM_ORDER: [&str; 3] = ["opener", "song", "disc-two"];
 
 pub fn album(id: &str) -> Album {
     Album {
@@ -293,12 +378,13 @@ struct StateData {
 
 #[derive(Clone)]
 struct ServerState {
+    lastfm_gate: flume::Receiver<()>,
     data: Arc<Mutex<StateData>>,
     received: flume::Sender<Request>,
     metadata_gate: flume::Receiver<()>,
     sync_gate: flume::Receiver<()>,
     scrobble_gate: flume::Receiver<()>,
-    playlist_gate: flume::Receiver<()>,
+    held_gate: flume::Receiver<()>,
 }
 
 impl ServerState {
@@ -330,7 +416,10 @@ async fn navidrome(
     let mut query = BTreeMap::new();
     let mut song_ids = Vec::new();
     for (key, value) in url::form_urlencoded::parse(raw_query.as_deref().unwrap_or("").as_bytes()) {
-        if endpoint == "createPlaylist.view" && key == "songId" {
+        if matches!(
+            (endpoint.as_str(), &*key),
+            ("createPlaylist.view", "songId") | ("updatePlaylist.view", "songIdToAdd")
+        ) {
             song_ids.push(value.into_owned());
         } else if query.insert(key.into_owned(), value.into_owned()).is_some() {
             return state.unexpected("repeated parameter");
@@ -350,6 +439,7 @@ async fn navidrome(
         "ping.view"
             | "getOpenSubsonicExtensions.view"
             | "getScanStatus.view"
+            | "startScan.view"
             | "getPlaylists.view"
             | "getPlaylist.view"
             | "createPlaylist.view"
@@ -361,9 +451,11 @@ async fn navidrome(
             | "getArtist.view"
             | "getTopSongs.view"
             | "getArtistInfo2.view"
+            | "getLyricsBySongId.view"
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
+            | "getLyrics.view"
     ) || query.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -377,6 +469,8 @@ async fn navidrome(
                 | "albumId"
                 | "rating"
                 | "artist"
+                | "title"
+                | "name"
                 | "count"
                 | "submission"
                 | "time"
@@ -394,21 +488,21 @@ async fn navidrome(
         song_ids,
     };
     state.record(request.clone());
-    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_playlist) = {
+    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_endpoint) = {
         let data = state.data.lock().unwrap();
         (
             data.library.offline,
             data.library.hold_sync,
             data.library.hold_scrobble,
             data.library.fail_artwork,
-            data.library.hold_playlist_endpoint == Some(endpoint.as_str()),
+            data.library.hold_endpoint == Some(endpoint.as_str()),
         )
     };
     if offline {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if hold_playlist {
-        let _ = state.playlist_gate.recv_async().await;
+    if hold_endpoint {
+        let _ = state.held_gate.recv_async().await;
     }
     if endpoint == "getScanStatus.view" && hold_sync {
         let _ = state.sync_gate.recv_async().await;
@@ -462,6 +556,12 @@ async fn navidrome(
             .unwrap_or_else(
                 || json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}}),
             ),
+        "startScan.view" if query.is_empty() && data.library.scan_admin => {
+            json!({"status":"ok","scanStatus":{"scanning":false}})
+        }
+        "startScan.view" if query.is_empty() => {
+            json!({"status":"failed","error":{"code":50,"message":"Not an administrator"}})
+        }
         "getPlaylists.view" if query.is_empty() => {
             data.library.playlists_response.clone().unwrap_or_else(
                 || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),
@@ -484,27 +584,26 @@ async fn navidrome(
         "createPlaylist.view" => match data.expected_mutations.pop_front() {
             Some((expected, succeeds)) if request == expected => {
                 if succeeds {
-                    let entries: Vec<_> = request
-                        .song_ids
-                        .iter()
-                        .map(|id| {
-                            Arc::new(
-                                data.library
-                                    .tracks
-                                    .iter()
-                                    .find(|track| &track.id == id)
-                                    .unwrap()
-                                    .clone(),
-                            )
-                        })
-                        .collect();
-                    let playlist = data
-                        .library
-                        .playlists
-                        .iter_mut()
-                        .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
-                        .unwrap();
-                    playlist.entry = entries.into();
+                    let entries = data.library.entries(&request.song_ids);
+                    let playlist = match query.get("name") {
+                        Some(name) => {
+                            let id = format!("created-{}", data.library.playlists.len());
+                            data.library.playlists.push(Playlist {
+                                id,
+                                name: name.clone(),
+                                owner: "fixture".into(),
+                                ..Default::default()
+                            });
+                            data.library.playlists.last_mut().unwrap()
+                        }
+                        None => data
+                            .library
+                            .playlists
+                            .iter_mut()
+                            .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
+                            .unwrap(),
+                    };
+                    set_entries(playlist, entries);
                     json!({"status":"ok","playlist":playlist})
                 } else {
                     json!({"status":"failed","error":{"code":70,"message":"Fixture reorder rejected"}})
@@ -519,16 +618,19 @@ async fn navidrome(
         "updatePlaylist.view" => match data.expected_mutations.pop_front() {
             Some((expected, succeeds)) if request == expected => {
                 if succeeds {
+                    let added = data.library.entries(&request.song_ids);
                     let playlist = data
                         .library
                         .playlists
                         .iter_mut()
                         .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
                         .unwrap();
-                    let index: usize = query["songIndexToRemove"].parse().unwrap();
-                    Arc::make_mut(&mut playlist.entry).remove(index);
-                    playlist.song_count = playlist.entry.len() as u32;
-                    playlist.duration = playlist.entry.iter().map(|track| track.duration).sum();
+                    let mut entries = playlist.entry.to_vec();
+                    if let Some(index) = query.get("songIndexToRemove") {
+                        entries.remove(index.parse().unwrap());
+                    }
+                    entries.extend(added);
+                    set_entries(playlist, entries);
                     json!({"status":"ok"})
                 } else {
                     json!({"status":"failed","error":{"code":70,"message":"Fixture removal rejected"}})
@@ -647,6 +749,12 @@ async fn navidrome(
                 json!({"status":"ok","searchResult3":{kind:items}})
             }
         }
+        "getLyricsBySongId.view" if query.keys().eq(["id"]) => {
+            json!({"status":"ok","lyricsList":{"structuredLyrics":data.library.structured_lyrics}})
+        }
+        "getLyrics.view" if query.keys().eq(["artist", "title"]) => {
+            json!({"status":"ok","lyrics":{"value":data.library.plain_lyrics}})
+        }
         "getSong.view" if query == Request::new("", &[("id", "song")]).params => {
             json!({"status":"ok", "song":data.library.tracks[0]})
         }
@@ -684,7 +792,7 @@ async fn lastfm(
     if method != Method::GET
         || param("api_key") != LASTFM_KEY
         || param("format") != "json"
-        || param("user") != "listener"
+        || !["listener", "listener-new"].contains(&param("user").as_str())
     {
         return state.unexpected("invalid Last.fm request");
     }
@@ -709,6 +817,10 @@ async fn lastfm(
         .map(|(key, value)| (*key, value.as_str()))
         .collect::<Vec<_>>();
     state.record(Request::new(endpoint, &params));
+    let hold = state.data.lock().unwrap().library.hold_lastfm;
+    if endpoint == "lastfm/chart" && param("user") == "listener" && hold {
+        let _ = state.lastfm_gate.recv_async().await;
+    }
     if let Some(code) = error {
         let message = match code {
             6 => "User not found",
@@ -895,6 +1007,7 @@ async fn unexpected(State(state): State<ServerState>) -> Response {
 }
 
 pub struct Fixture {
+    release_lastfm: flume::Sender<()>,
     _dir: tempfile::TempDir,
     pub paths: Paths,
     pub account: Account,
@@ -904,7 +1017,7 @@ pub struct Fixture {
     release_metadata: flume::Sender<()>,
     release_sync: flume::Sender<()>,
     release_scrobble: flume::Sender<()>,
-    release_playlist: flume::Sender<()>,
+    release_held: flume::Sender<()>,
     finished: flume::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -933,10 +1046,12 @@ impl Fixture {
             .unwrap();
         let (received, requests) = flume::unbounded();
         let (release_metadata, metadata_gate) = flume::bounded(1);
+        let (release_lastfm, lastfm_gate) = flume::unbounded();
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
-        let (release_playlist, playlist_gate) = flume::unbounded();
+        let (release_held, held_gate) = flume::unbounded();
         let state = ServerState {
+            lastfm_gate,
             data: Arc::new(Mutex::new(StateData {
                 library,
                 requests: vec![],
@@ -947,7 +1062,7 @@ impl Fixture {
             metadata_gate,
             sync_gate,
             scrobble_gate,
-            playlist_gate,
+            held_gate,
         };
         let app = Router::new()
             .route("/auth/login", any(native))
@@ -957,6 +1072,7 @@ impl Fixture {
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/lastfm/", any(lastfm))
+            .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
             .with_state(state.clone());
         let (stop, stopped) = flume::bounded(1);
@@ -986,10 +1102,11 @@ impl Fixture {
             state,
             requests,
             stop,
+            release_lastfm,
             release_metadata,
             release_sync,
             release_scrobble,
-            release_playlist,
+            release_held,
             finished,
             thread: Some(thread),
         }
@@ -1095,22 +1212,28 @@ impl Fixture {
         let _ = self.release_sync.send(());
     }
 
+    pub fn resume_lastfm(&self) {
+        self.edit_library(|library| library.hold_lastfm = false);
+        let _ = self.release_lastfm.send(());
+    }
+
     pub fn resume_scrobble(&self) {
         self.edit_library(|library| library.hold_scrobble = false);
         let _ = self.release_scrobble.send(());
     }
 
-    pub fn resume_playlist(&self) {
-        self.edit_library(|library| library.hold_playlist_endpoint = None);
-        let _ = self.release_playlist.send(());
+    pub fn resume_held(&self) {
+        self.edit_library(|library| library.hold_endpoint = None);
+        let _ = self.release_held.send(());
     }
 
     fn stop(&mut self) {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
+            self.resume_lastfm();
             self.resume_scrobble();
-            self.resume_playlist();
+            self.resume_held();
             let _ = self.stop.try_send(());
             self.finished
                 .recv_timeout(WAIT)

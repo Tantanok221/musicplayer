@@ -253,7 +253,10 @@ impl MusicApp {
             }
         }
         for id in covers {
-            if id.is_empty() || self.artwork.contains_key(&id) || self.art_failures.contains(&id) {
+            if id.is_empty()
+                || self.account_cache.artwork.contains_key(&id)
+                || self.art_failures.contains(&id)
+            {
                 continue;
             }
             if self
@@ -269,7 +272,7 @@ impl MusicApp {
     }
 
     pub(super) fn art(&mut self, id: &str, side: f32, cx: &App) -> AnyElement {
-        if let Some(path) = self.artwork.get(id) {
+        if let Some(path) = self.account_cache.artwork.get(id) {
             let path = match thumbnail::size_for(side).filter(|_| self.art_thumbs.contains(id)) {
                 Some(size) => thumbnail::thumb_path(path, size),
                 None => path.clone(),
@@ -886,6 +889,12 @@ impl MusicApp {
                             }),
                         )),
                 );
+        }
+        if let Some(notice) = self.tag_notice_banner(cx) {
+            center = center.child(notice);
+        }
+        if let Some(editor) = self.tag_editor_panel(cx) {
+            center = center.child(editor);
         }
         if let Some(id) = self.pending_delete.clone() {
             center = center.child(

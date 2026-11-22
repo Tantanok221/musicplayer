@@ -1,11 +1,7 @@
 use crate::sorting::{Grouping, Preset, Scope as SortScope, SortSpec};
 use crate::{
-    artists::{
-        ArtistPageData, ArtistProfile, ReleaseHit, TopSongs, cache_key, profile_url,
-        search_releases,
-    },
+    artists::{ArtistPageData, ArtistProfile, ReleaseHit, cache_key, profile_url, search_releases},
     artwork::Priority,
-    backdrop::Backdrop,
     browser::*,
     catalog::LibraryView,
     discography::{DiscographyView, MissingRelease, ReleaseDetails, listen_links},
@@ -34,11 +30,11 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder, *};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
+mod account_cache;
 mod album_feedback;
 mod albums;
 mod artist_page;
@@ -67,6 +63,7 @@ mod queue_controls;
 mod sections;
 use sections::{Part, style};
 mod tabs;
+mod tag_editor;
 use queue_controls::QueueViewState;
 pub use tabs::tab_bindings;
 mod sorting_controls;
@@ -426,7 +423,7 @@ pub struct MusicApp {
     playlist_album_list: ListState,
     playlist_track_scroll: ScrollHandle,
     playback: PlaybackSnapshot,
-    artwork: HashMap<String, PathBuf>,
+    account_cache: account_cache::AccountCache,
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
     art_requested: HashMap<String, Instant>,
     /// First and last time each missing cover was on screen, to skip downloads for fly-bys.
@@ -471,10 +468,6 @@ pub struct MusicApp {
     discover: Option<Arc<crate::discover::Rediscover>>,
     discover_visit: crate::discover::Visit,
     artist_data: Option<ArtistPageData>,
-    artist_profiles: HashMap<String, Arc<ArtistProfile>>,
-    profile_requested: HashSet<String>,
-    popularity_requested: HashSet<String>,
-    top_songs: HashMap<String, Arc<TopSongs>>,
     biography_expanded: bool,
     popular_expanded: bool,
     most_played_expanded: bool,
@@ -489,8 +482,6 @@ pub struct MusicApp {
     highlight_requested: Option<String>,
     album_tracks_expanded: bool,
     up_next_expanded: bool,
-    backdrops: HashMap<String, Arc<Backdrop>>,
-    backdrop_requested: HashSet<String>,
     backdrop_shown: Option<String>,
     backdrop_previous: Option<String>,
     backdrop_changed: Instant,
@@ -505,6 +496,11 @@ pub struct MusicApp {
     /// Album whose songs a new playlist from the editor will hold.
     playlist_editor_album: Option<String>,
     pending_delete: Option<String>,
+    tag_editor: Option<tag_editor::TagEditor>,
+    /// Album whose songs the tag editor opens on when they arrive.
+    tag_editor_album: Option<String>,
+    tag_notice: Option<crate::tags::TagReport>,
+    metadata_folder: Entity<InputState>,
     status: String,
     connection: Connection,
     error: Option<String>,
@@ -553,6 +549,8 @@ impl MusicApp {
                 .masked(true)
         });
         let playlist_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
+        let metadata_folder =
+            cx.new(|cx| InputState::new(window, cx).placeholder("/Volumes/music"));
         let slskd_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://your-slskd-host:5030"));
         let lastfm_user = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
@@ -729,7 +727,7 @@ impl MusicApp {
             playlist_album_list: ListState::new(0, ListAlignment::Top, px(200.)),
             playlist_track_scroll: ScrollHandle::new(),
             playback: PlaybackSnapshot::default(),
-            artwork: HashMap::new(),
+            account_cache: Default::default(),
             art_requested: HashMap::new(),
             art_seen: HashMap::new(),
             art_wake: false,
@@ -757,10 +755,6 @@ impl MusicApp {
             discover: None,
             discover_visit: Default::default(),
             artist_data: None,
-            artist_profiles: HashMap::new(),
-            profile_requested: HashSet::new(),
-            popularity_requested: HashSet::new(),
-            top_songs: HashMap::new(),
             biography_expanded: false,
             popular_expanded: false,
             most_played_expanded: false,
@@ -773,8 +767,6 @@ impl MusicApp {
             highlight_requested: None,
             album_tracks_expanded: false,
             up_next_expanded: false,
-            backdrops: HashMap::new(),
-            backdrop_requested: HashSet::new(),
             backdrop_shown: None,
             backdrop_previous: None,
             backdrop_changed: Instant::now(),
@@ -788,6 +780,10 @@ impl MusicApp {
             playlist_editor_tracks: None,
             playlist_editor_album: None,
             pending_delete: None,
+            tag_editor: None,
+            tag_editor_album: None,
+            tag_notice: None,
+            metadata_folder,
             status: "Opening library…".into(),
             connection: Connection::None,
             error: None,
