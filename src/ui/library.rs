@@ -9,6 +9,29 @@ const PREFETCH_ROWS: usize = 2;
 /// Albums above and below the top of the album-and-tracks list downloaded ahead.
 const PREFETCH_ALBUMS: std::ops::Range<isize> = -3..8;
 
+pub(super) struct ArtSettle {
+    first: Instant,
+    last: Instant,
+}
+
+impl ArtSettle {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            first: now,
+            last: now,
+        }
+    }
+
+    fn observe(&mut self, now: Instant) -> bool {
+        // Allow the scheduled wake a couple of frames of event-loop jitter.
+        if now.duration_since(self.last) > ART_SETTLE * 3 {
+            self.first = now;
+        }
+        self.last = now;
+        now.duration_since(self.first) >= ART_SETTLE
+    }
+}
+
 impl MusicApp {
     pub(super) fn request_query(&mut self, cx: &mut Context<Self>) {
         self.pending_explorer_album = None;
@@ -252,6 +275,9 @@ impl MusicApp {
                 None => path.clone(),
             };
             return div()
+                .id(SharedString::from(format!("cover-image-{id}")))
+                .test_support()
+                .role(Role::Image)
                 .size(px(side))
                 .flex_shrink_0()
                 .overflow_hidden()
@@ -265,15 +291,14 @@ impl MusicApp {
                 .into_any_element();
         }
         if !id.is_empty() && !self.art_failures.contains(id) {
-            let now = Instant::now();
+            let now = cx.background_executor().now();
             // Covers already on disk show at once; only downloads wait for the tile to settle.
-            let (first, last) = self.art_seen.entry(id.to_string()).or_insert((now, now));
-            let fresh = *first == now;
-            if now.duration_since(*last) > ART_SETTLE {
-                *first = now;
-            }
-            *last = now;
-            let settled = now.duration_since(*first) >= ART_SETTLE;
+            let fresh = !self.art_seen.contains_key(id);
+            let settled = self
+                .art_seen
+                .entry(id.to_string())
+                .or_insert_with(|| ArtSettle::new(now))
+                .observe(now);
             if fresh {
                 self.service.send(Command::Artwork(id.into(), None));
             }
@@ -1019,5 +1044,40 @@ impl MusicApp {
             center = center.child(div().flex_1().min_h_0().min_w_0().child(content));
         }
         center.bg(colors.background).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ART_SETTLE, ArtSettle};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn art_waits_for_settle_even_with_frequent_frames() {
+        let start = Instant::now();
+        let mut settle = ArtSettle::new(start);
+        assert!(!settle.observe(start));
+        assert!(!settle.observe(start + Duration::from_millis(100)));
+        assert!(settle.observe(start + ART_SETTLE));
+    }
+
+    #[test]
+    fn art_accepts_its_own_late_wake_and_repeated_idle_frames() {
+        let start = Instant::now();
+        let mut settle = ArtSettle::new(start);
+        for milliseconds in [130, 260, 390] {
+            assert!(settle.observe(start + Duration::from_millis(milliseconds)));
+        }
+    }
+
+    #[test]
+    fn art_restarts_wait_after_leaving_the_screen() {
+        let start = Instant::now();
+        let mut settle = ArtSettle::new(start);
+        assert!(settle.observe(start + ART_SETTLE));
+        let returned = start + Duration::from_secs(2);
+        assert!(!settle.observe(returned));
+        assert!(!settle.observe(returned + Duration::from_millis(119)));
+        assert!(settle.observe(returned + ART_SETTLE));
     }
 }

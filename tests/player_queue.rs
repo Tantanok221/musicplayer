@@ -1,7 +1,10 @@
 //! Production paused actor, with no audio-device or OS media-control adapters.
 use sonora::{
     model::{PlaybackSnapshot, Track},
-    playback::{Placement, PlayerCommand, QueueEdit, test_support::PausedPlayer},
+    playback::{
+        Placement, PlayerCommand, QueueEdit,
+        test_support::{OutputPlayer, PausedPlayer},
+    },
 };
 use std::{sync::Arc, time::Duration};
 
@@ -157,4 +160,35 @@ fn paused_actor_insertion_clear_and_undo_preserve_current_position_and_metadata(
     assert!(player.command(PlayerCommand::Play, WAIT).is_err());
     assert!(player.command(PlayerCommand::Seek(60.), WAIT).is_err());
     player.shutdown(WAIT).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+const OUTPUT_INTERRUPTED: &str =
+    "Audio output changed or Mac woke from sleep. Press Play to resume.";
+#[cfg(not(target_os = "macos"))]
+const OUTPUT_INTERRUPTED: &str =
+    "Audio output changed or the computer woke from sleep. Press Play to resume.";
+
+#[test]
+fn output_change_while_playing_stops_with_this_platforms_wording() {
+    let player = OutputPlayer::start("speakers", WAIT).unwrap();
+    player.switch_output(Some("headphones"));
+    player.stays_clear(Duration::from_millis(1500)).unwrap();
+
+    player.start_audio();
+    player.switch_output(Some("speakers"));
+    let stopped = player.next_error(WAIT).unwrap();
+    assert!(!stopped.playing);
+    assert_eq!(stopped.error.as_deref(), Some(OUTPUT_INTERRUPTED));
+    #[cfg(not(target_os = "macos"))]
+    assert!(!OUTPUT_INTERRUPTED.contains("Mac"));
+
+    assert_eq!(player.clear_error(WAIT).unwrap().error, None);
+    player.start_audio();
+    player.switch_output(None);
+    let disconnected = player.next_error(WAIT).unwrap();
+    assert_eq!(
+        disconnected.error.as_deref(),
+        Some("Audio output disconnected. Connect a device and retry.")
+    );
 }

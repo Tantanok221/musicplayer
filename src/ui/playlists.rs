@@ -134,18 +134,14 @@ impl MusicApp {
                                     .item(PopupMenuItem::new("Append Queue").on_click(
                                         move |_, _, cx| {
                                             let _ = weak2.update(cx, |app, cx| {
-                                                let mut ids =
-                                                    app.playlist.as_ref().map_or(vec![], |p| {
-                                                        p.entry
-                                                            .iter()
-                                                            .map(|t| t.id.clone())
-                                                            .collect::<Vec<_>>()
-                                                    });
-                                                ids.extend(
-                                                    app.playback.queue.iter().map(|t| t.id.clone()),
-                                                );
+                                                let ids = app
+                                                    .playback
+                                                    .queue
+                                                    .iter()
+                                                    .map(|t| t.id.clone())
+                                                    .collect();
                                                 app.mutate(
-                                                    Mutation::ReplacePlaylist(save_id.clone(), ids),
+                                                    Mutation::AddToPlaylist(save_id.clone(), ids),
                                                     cx,
                                                 );
                                             });

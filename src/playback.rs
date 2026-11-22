@@ -24,6 +24,12 @@ const CHUNK: usize = 2048;
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// After this much buffering, pressing Play reconnects instead of waiting on the stalled stream.
 const STALL_RECONNECT: Duration = Duration::from_secs(4);
+#[cfg(target_os = "macos")]
+const OUTPUT_INTERRUPTED: &str =
+    "Audio output changed or Mac woke from sleep. Press Play to resume.";
+#[cfg(not(target_os = "macos"))]
+const OUTPUT_INTERRUPTED: &str =
+    "Audio output changed or the computer woke from sleep. Press Play to resume.";
 /// The longest wait for the server to start sending a track.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 mod output;
@@ -877,10 +883,14 @@ fn media_command(event: souvlaki::MediaControlEvent) -> Option<PlayerCommand> {
     })
 }
 
+#[cfg(feature = "test-support")]
+type HeadlessOutput = Arc<Mutex<Option<String>>>;
+
 enum PlaybackPlatform {
     Native,
+    /// No media controls; the output device id is whatever the test scripts.
     #[cfg(feature = "test-support")]
-    Headless,
+    Headless(HeadlessOutput),
 }
 
 impl PlaybackPlatform {
@@ -888,7 +898,7 @@ impl PlaybackPlatform {
         match self {
             Self::Native => default_output_id(),
             #[cfg(feature = "test-support")]
-            Self::Headless => None,
+            Self::Headless(output) => output.lock().unwrap().clone(),
         }
     }
 
@@ -901,7 +911,7 @@ impl PlaybackPlatform {
             })
             .ok(),
             #[cfg(feature = "test-support")]
-            Self::Headless => None,
+            Self::Headless(_) => None,
         }
     }
 }
@@ -1013,9 +1023,7 @@ fn run(
                 if output_id.is_none() {
                     error = Some("Audio output disconnected. Connect a device and retry.".into());
                 } else if was_playing {
-                    error = Some(
-                        "Audio output changed or Mac woke from sleep. Press Play to resume.".into(),
-                    );
+                    error = Some(OUTPUT_INTERRUPTED.into());
                 }
             }
             last_device_check = Instant::now();
