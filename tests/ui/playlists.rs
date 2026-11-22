@@ -334,6 +334,72 @@ fn empty_playlist_has_no_song_to_double_click(cx: &mut TestAppContext) {
     fixture.assert_script_finished();
 }
 
+#[gpui_kit::test]
+fn empty_playlist_play_preserves_queue(cx: &mut TestAppContext) {
+    assert_empty_play_preserves_queue(cx, false);
+}
+
+#[gpui_kit::test]
+fn loading_playlist_play_preserves_queue(cx: &mut TestAppContext) {
+    assert_empty_play_preserves_queue(cx, true);
+}
+
+fn assert_empty_play_preserves_queue(cx: &mut TestAppContext, loading: bool) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    let tracks = fixture.catalog.by_ids(&["track-1".into()]).unwrap();
+    let mut player = PausedPlayer::start(Duration::from_secs(5)).unwrap();
+    let before = player
+        .command(
+            PlayerCommand::Restore(tracks, 0, 12., None),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    fixture.backend.emit(Event::Playback(before));
+    let mut summary = playlist("Roadtrip");
+    summary.song_count = if loading { 3 } else { 0 };
+    fixture.backend.emit(Event::Playlists(vec![summary]));
+    fixture.settle(window, cx);
+    fixture.expect("open playlist", move |command, _| {
+        assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+        if loading {
+            vec![]
+        } else {
+            vec![Event::Playlist(playlist("Roadtrip"))]
+        }
+    });
+    fixture.click(window, "nav-playlist-playlist-1", cx);
+    fixture.backend.player_commands().try_iter().for_each(drop);
+    fixture.click(window, "play-playlist", cx);
+    assert!(
+        fixture.backend.player_commands().is_empty(),
+        "empty or loading playlist Play must not send Replace"
+    );
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("play-playlist").disabled(), Some(true));
+        assert!(window.find("play-pause").visible());
+    })
+    .unwrap();
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = fixture.catalog.by_ids(&["track-2".into()]).unwrap().into();
+    loaded.song_count = 1;
+    fixture.backend.emit(Event::Playlist(loaded));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_ne!(window.find("play-playlist").disabled(), Some(true));
+    })
+    .unwrap();
+    fixture.click(window, "play-playlist", cx);
+    let PlayerCommand::Replace(tracks, index) =
+        fixture.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("loaded playlist must replace the queue")
+    };
+    assert_eq!(tracks[0].id, "track-2");
+    assert_eq!(index, 0);
+    fixture.assert_script_finished();
+    player.shutdown(Duration::from_secs(5)).unwrap();
+}
+
 fn playlist(name: &str) -> Playlist {
     Playlist {
         id: "playlist-1".into(),

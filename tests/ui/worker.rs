@@ -761,6 +761,80 @@ fn play_after_enqueue_empty_from_menu_starts_in_footer(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn empty_playlist_play_preserves_queued_track(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    library.playlists.push(sonora::model::Playlist {
+        id: "empty".into(),
+        name: "Empty".into(),
+        owner: "fixture".into(),
+        ..Default::default()
+    });
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture
+        .catalog()
+        .set_state(
+            "queue",
+            &SavedQueue {
+                ids: vec!["song".into()],
+                index: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut prefs = Preferences::default();
+    prefs.tabs.tabs[0].page = Some(sonora::browser::Page {
+        workspace: sonora::browser::Workspace::Playlists,
+        playlist: Some(("empty".into(), "Empty".into())),
+        ..Default::default()
+    });
+    let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
+    let mut loaded = false;
+    let mut synced = false;
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        loaded |= matches!(event, Event::Playlist(p) if p.id == "empty");
+        synced |= matches!(event, Event::Status(s) if s.starts_with("Up to date"));
+        loaded && synced
+    });
+    let player = ListeningPlayer::start(WAIT).unwrap();
+    for command in worker.player_commands().try_iter() {
+        player.command(command).unwrap();
+    }
+    let before = player.snapshot(WAIT).unwrap();
+    assert_eq!(before.queue[0].id, "song");
+    tx.send(Event::Playback(before.clone())).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("play-playlist", cx))
+        .unwrap();
+    cx.run_until_parked();
+    for command in worker.player_commands().try_iter() {
+        player.command(command).unwrap();
+    }
+    let after = player.snapshot(WAIT).unwrap();
+    assert_eq!(
+        after.queue.len(),
+        1,
+        "empty playlist Play must preserve the queue"
+    );
+    assert_eq!(after.queue[0].id, "song");
+    assert_eq!(
+        after.track.as_ref().map(|t| &t.id),
+        before.track.as_ref().map(|t| &t.id)
+    );
+    assert_eq!(after.index, before.index);
+    assert_eq!(after.position, before.position);
+    assert_eq!(after.playing, before.playing);
+    tx.send(Event::Playback(after)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("play-pause").visible())
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn status_bar_shows_library_totals_while_search_narrows_the_explorer(cx: &mut TestAppContext) {
     let fixture = Fixture::new(Library::default());
     let (worker, tx, window, app) = mount_worker(&fixture, cx);
