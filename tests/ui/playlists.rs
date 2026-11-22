@@ -1,10 +1,13 @@
 //! Playlist interactions with scenario-local expected commands and replies.
 use crate::common::ui::{Fixture, start};
-use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
+use gpui_kit::{
+    AnyWindowHandle, AppContext, TestAppContext,
+    test::{TestQueryExt, TestWindowExt},
+};
 use sonora::{
     model::{PlaybackSnapshot, Playlist},
     platform::shortcut,
-    playback::{PlayerCommand, test_support::PausedPlayer},
+    playback::{Placement, PlayerCommand, test_support::PausedPlayer},
     service::{Command, Event, Mutation, PlaylistTarget},
 };
 use std::{sync::Arc, time::Duration};
@@ -929,4 +932,128 @@ fn confirmed_playlist_deletion_removes_the_sidebar_entry(cx: &mut TestAppContext
     .unwrap();
     fixture.assert_script_finished();
     fixture.diagnose("playlist deletion confirmed", window, &app, cx);
+}
+
+#[gpui_kit::test]
+fn playlist_context_menu_queues_an_unopened_shared_playlist(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut shared = playlist("Shared mix");
+    shared.id = "shared".into();
+    shared.owner = "another-user".into();
+    shared.readonly = true;
+    shared.song_count = 3;
+    fixture
+        .backend
+        .emit(Event::Playlists(vec![shared, playlist("Roadtrip")]));
+    let queue = fixture.catalog.by_ids(&["track-1".into()]).unwrap();
+    fixture.backend.emit(Event::Playback(PlaybackSnapshot {
+        track: queue.first().cloned(),
+        index: Some(0),
+        queue: queue.into(),
+        ..Default::default()
+    }));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("nav-playlist-shared", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        assert!(menu.find_by_label("Play Next").visible());
+        menu.press("escape", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("popup-menu").is_none());
+    })
+    .unwrap();
+    for (label, placement) in [
+        ("Play Next", Placement::Next),
+        ("Play After This Album", Placement::AfterAlbum),
+        ("Add to End of Queue", Placement::Last),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("nav-playlist-shared", cx)
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        cx.update_window(window, |_, window, _| {
+            let menu = window.within("popup-menu");
+            assert!(menu.find_by_label(label).visible());
+            assert!(menu.try_find_by_label("Delete playlist…").is_none());
+        })
+        .unwrap();
+        fixture.expect("queue the playlist under the pointer", move |command, _| {
+            assert!(matches!(command, Command::EnqueuePlaylist(id, place) if id == "shared" && place == placement));
+            vec![]
+        });
+        fixture.menu_item(window, label, cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("playlist-options").visible());
+            assert!(window.try_find("popup-menu").is_none());
+        })
+        .unwrap();
+    }
+    fixture.assert_script_finished();
+    fixture.diagnose("queued unopened shared playlist", window, &app, cx);
+}
+
+#[gpui_kit::test]
+fn playlist_context_menu_deletes_only_the_confirmed_row(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut target = playlist("Night drive");
+    target.id = "target".into();
+    fixture
+        .backend
+        .emit(Event::Playlists(vec![target, playlist("Roadtrip")]));
+    fixture.settle(window, cx);
+    for confirm in [false, true] {
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("nav-playlist-target", cx)
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        fixture.menu_item(window, "Delete playlist…", cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window
+                    .find_by_label("Delete “Night drive” from Navidrome?")
+                    .visible()
+            );
+            assert!(window.find("confirm-delete").visible());
+            assert!(window.find("playlist-options").visible());
+        })
+        .unwrap();
+        if confirm {
+            fixture.expect("delete the right-clicked playlist", |command, _| {
+                let expected = Mutation::DeletePlaylist("target".into());
+                assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+                vec![
+                    Event::Playlists(vec![playlist("Roadtrip")]),
+                    Event::MutationDone(expected),
+                ]
+            });
+        }
+        fixture.click(
+            window,
+            if confirm {
+                "confirm-delete"
+            } else {
+                "cancel-delete"
+            },
+            cx,
+        );
+        cx.update_window(window, |_, window, _| {
+            assert!(window.try_find("confirm-delete").is_none());
+            assert_eq!(window.try_find("nav-playlist-target").is_none(), confirm);
+            assert!(window.find("playlist-options").visible());
+        })
+        .unwrap();
+    }
+    fixture.assert_script_finished();
+    fixture.diagnose("deleted confirmed row", window, &app, cx);
 }

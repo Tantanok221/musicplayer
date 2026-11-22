@@ -15,6 +15,7 @@ impl MusicApp {
                     self.close_playlist_creation(window, cx);
                     self.playlist_rename = None;
                     self.smart = Default::default();
+                    self.playlists = Default::default();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;

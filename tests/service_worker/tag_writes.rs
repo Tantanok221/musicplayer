@@ -197,16 +197,27 @@ fn the_queued_song_picks_up_the_rescanned_tags_and_new_id() {
         .service()
         .send(Command::WriteTags(retitle("New title")));
     assert_eq!(report(&worker).written, 1);
-    event(
-        &worker,
-        |e| matches!(e, Event::TrackUpdated(t) if t.id == "song-new" && t.title == "New title"),
-    );
-    let Event::Playback(snapshot) = event(
-        &worker,
-        |e| matches!(e, Event::Playback(s) if s.track.as_ref().is_some_and(|t| t.id == "song-new")),
-    ) else {
-        unreachable!()
-    };
+    // The service and player publish independently after a rescan.
+    let mut track_updated = false;
+    let mut snapshot = None;
+    event(&worker, |event| {
+        match event {
+            Event::TrackUpdated(track) if track.id == "song-new" && track.title == "New title" => {
+                track_updated = true;
+            }
+            Event::Playback(playback)
+                if playback
+                    .track
+                    .as_ref()
+                    .is_some_and(|track| track.id == "song-new") =>
+            {
+                snapshot = Some(playback.clone());
+            }
+            _ => {}
+        }
+        track_updated && snapshot.is_some()
+    });
+    let snapshot = snapshot.unwrap();
     assert_eq!(snapshot.track.unwrap().title, "New title");
     let queued: Vec<_> = snapshot.queue.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(queued, ["song-new"]);

@@ -6,10 +6,10 @@ use crate::service::PlaylistTarget;
 
 /// Play Next, Play After This Album, and Add to End of Queue, each with a
 /// second line naming what the music will follow.
-fn queue_options(
+pub(super) fn queue_options(
     menu: PopupMenu,
     places: &QueuePlaces,
-    enqueue: impl Fn(Placement) + 'static,
+    enqueue: impl Fn(Placement, &mut App) + 'static,
 ) -> PopupMenu {
     let enqueue = Rc::new(enqueue);
     let mut options = vec![(
@@ -45,7 +45,8 @@ fn queue_options(
                 _ => Glyph::ListEnd,
             };
             menu.item(
-                menu_row_detail(icon, title, detail).on_click(move |_, _, _| enqueue(placement)),
+                menu_row_detail(icon, title, detail)
+                    .on_click(move |_, _, cx| enqueue(placement, cx)),
             )
         })
 }
@@ -284,7 +285,7 @@ impl MusicApp {
                 .separator();
             let service = state.service.clone();
             let id = track.id.clone();
-            let menu = queue_options(menu, &state.places, move |placement| {
+            let menu = queue_options(menu, &state.places, move |placement, _| {
                 service.send(Command::Enqueue(vec![id.clone()], placement))
             });
             let menu = track_extras(menu, &state, &track, window, cx);
@@ -366,7 +367,7 @@ impl MusicApp {
                 .separator();
             let service = state.service.clone();
             let id = album.id.clone();
-            let menu = queue_options(menu, &state.places, move |placement| {
+            let menu = queue_options(menu, &state.places, move |placement, _| {
                 service.send(Command::EnqueueAlbum(id.clone(), placement))
             });
             let menu =
