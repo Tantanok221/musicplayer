@@ -3,10 +3,16 @@ use super::*;
 impl MusicApp {
     pub(super) fn event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            Event::SmartRules(..)
-            | Event::SmartPlaylistSaved(_)
-            | Event::NativePasswordRequired => {}
+            Event::NativeAvailable(available) => self.smart.available = available,
+            Event::SmartRules(id, rules) => self.smart_rules_loaded(id, rules, window, cx),
+            Event::SmartPlaylistSaved(id) => self.smart_saved(id, window, cx),
+            Event::NativePasswordRequired => self.smart_password_required(window, cx),
             Event::Ready(account, prefs) => {
+                if self.account.as_ref().map(Account::namespace)
+                    != account.as_ref().map(Account::namespace)
+                {
+                    self.smart = Default::default();
+                }
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
                 // The first frame drew panels at default sizes before these arrived.
@@ -306,6 +312,14 @@ impl MusicApp {
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {
+                if self.smart.editor.is_some() {
+                    self.smart.error = Some(error.clone());
+                    self.smart.password_busy = false;
+                    if !self.smart.needs_password {
+                        self.smart.loading = false;
+                        self.smart.saving = false;
+                    }
+                }
                 if self.status == "Connecting…" {
                     self.status = "Could not connect".into();
                 }

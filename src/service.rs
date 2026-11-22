@@ -67,6 +67,7 @@ impl Mutation {
 }
 #[derive(Clone)]
 pub enum Command {
+    CancelSmartPlaylist,
     LoadSmartRules(String),
     SaveSmartPlaylist {
         id: Option<String>,
@@ -207,6 +208,7 @@ pub enum SearchUpdate {
 }
 #[derive(Clone, Debug)]
 pub enum Event {
+    NativeAvailable(bool),
     SmartRules(String, Option<crate::smart_rules::SmartRules>),
     SmartPlaylistSaved(String),
     NativePasswordRequired,
@@ -926,6 +928,7 @@ fn run(
         }
         let result: Result<()> = (|| {
             match command {
+                Command::CancelSmartPlaylist => native_editor.reset(),
                 Command::LoadSmartRules(id) => {
                     native::Editor::require_server(server.as_ref())?;
                     native_editor.enqueue(native::Operation::Load(id), &events)?;
@@ -990,6 +993,9 @@ fn run(
                 }
                 Command::Initialize => {
                     events.send(Event::Ready(account.clone(), catalog.state("preferences")?))?;
+                    if let Some(server) = &server {
+                        events.send(Event::NativeAvailable(server.is_navidrome))?;
+                    }
                     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                     if let Some(account) = &account {
                         match paths.credentials(account) {
@@ -1067,6 +1073,7 @@ fn run(
                     server = Some(value.clone());
                     artwork_queue.retry_failed(artwork_clock.now());
                     events.send(Event::Connected(value.account.clone(), label))?;
+                    events.send(Event::NativeAvailable(value.is_navidrome))?;
                     events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                     if !syncing {
                         syncing = true;

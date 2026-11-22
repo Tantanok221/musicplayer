@@ -20,6 +20,48 @@ fn rules() -> SmartRules {
     }
 }
 
+#[test]
+fn cancel_pending_save_does_not_retry_it_after_sign_in() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::SaveSmartPlaylist {
+        id: None,
+        name: "Cancelled".into(),
+        rules: rules(),
+    });
+    password(&worker);
+    worker.service().send(Command::CancelSmartPlaylist);
+    worker
+        .service()
+        .send(Command::LoadSmartRules("smart".into()));
+    password(&worker);
+    sign_in(&worker);
+    loaded(&worker, Some(rules()));
+    let requests = fixture.native_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, axum::http::Method::GET);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn initialize_publishes_capability_after_account_state() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::Initialize);
+    assert!(matches!(
+        worker.events().recv_timeout(WAIT).unwrap(),
+        Event::Ready(..)
+    ));
+    event(&worker, |e| matches!(e, Event::NativeAvailable(true)));
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
 fn password(worker: &Worker) {
     event(worker, |e| matches!(e, Event::NativePasswordRequired));
 }
@@ -276,7 +318,7 @@ fn switching_accounts_discards_pending_edits_and_scopes_tokens() {
     let a = Fixture::new(Library::default());
     let b = Fixture::new(Library::default());
     let mut worker = a.start_paused();
-    worker.wait_ready(WAIT).unwrap();
+    event(&worker, |e| matches!(e, Event::Ready(..)));
     synced(&worker);
     worker.service().send(Command::SaveSmartPlaylist {
         id: None,
