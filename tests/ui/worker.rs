@@ -2,10 +2,10 @@
 use crate::worker_fixture::{Fixture, Library, Request, WAIT};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size,
-    test::TestWindowExt,
+    test::{TestQueryExt, TestWindowExt},
 };
 use sonora::{
-    model::{FavoritesFilter, Preferences, SavedQueue},
+    model::{FavoritesFilter, Playlist, Preferences, SavedQueue},
     playback::{PlayerCommand, test_support::ListeningPlayer},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
@@ -69,6 +69,61 @@ fn assert_favorite(
         assert_eq!(heart.disabled() == Some(true), pending);
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn playlist_context_menu_fetches_tracks_and_updates_the_real_queue(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    let track = std::sync::Arc::new(library.tracks[1].clone());
+    library.playlists = vec![Playlist {
+        id: "roadtrip".into(),
+        name: "Roadtrip".into(),
+        song_count: 1,
+        entry: vec![track.clone()].into(),
+        ..Default::default()
+    }];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut prefs = Preferences::default();
+    prefs.layout.navigator_height = 300.;
+    let (worker, tx, window, app) = mount_worker_with_player(&fixture, prefs, true, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("nav-playlist-roadtrip", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let item = menu.find_by_label("Add to End of Queue");
+        menu.click(item.path().last().unwrap().clone(), cx);
+    })
+    .unwrap();
+    fixture.wait_request(&Request::new("getPlaylist.view", &[("id", "roadtrip")]));
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |event, _| matches!(event, Event::Playback(state) if state.queue.len() == 1 && state.queue[0].id == track.id),
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("explorer-album-album").visible());
+        assert!(window.try_find("popup-menu").is_none());
+        window.click("nav-queue", cx);
+        assert!(
+            window
+                .find_by_label(&format!(
+                    "Queue 1: {} · {}",
+                    track.title,
+                    track.artist_label()
+                ))
+                .visible()
+        );
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 #[gpui_kit::test]

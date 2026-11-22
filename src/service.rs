@@ -149,6 +149,8 @@ pub enum Command {
     PlayAlbumMatching(LibraryQuery, String),
     Enqueue(Vec<String>, Placement),
     EnqueueAlbum(String, Placement),
+    /// Loads a playlist by ID and queues its entries in playlist order.
+    EnqueuePlaylist(String, Placement),
     /// Album ID: save its songs, in disc/track order, to a playlist.
     AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
@@ -167,6 +169,7 @@ pub enum Command {
     Updated(String, Mutation),
     MutationFailed(String, Mutation, String),
     PlaylistLoaded(String, Playlist),
+    PlaylistForQueue(u64, Placement, Option<Playlist>),
     PlaylistsLoaded(String, Vec<Playlist>),
     Error(String),
     SyncFailed(i64, String),
@@ -551,6 +554,27 @@ fn forward_player_events(
             }
         }
     }
+}
+
+fn enqueue_playlist(
+    playlist: Option<Playlist>,
+    placement: Placement,
+    player: &PlayerHandle,
+    events: &Sender<Event>,
+) -> Result<()> {
+    match playlist {
+        Some(playlist) if !playlist.entry.is_empty() => {
+            player.send(PlayerCommand::Insert(
+                playlist.entry.as_ref().clone(),
+                placement,
+            ));
+        }
+        Some(_) => events.send(Event::Status("This playlist is empty.".into()))?,
+        None => events.send(Event::Error(
+            "Could not load playlist tracks to queue.".into(),
+        ))?,
+    }
+    Ok(())
 }
 
 /// Resolve saved occurrences individually so missing predecessors do not move
@@ -1059,6 +1083,7 @@ fn run(
         });
     }
     let mut server: Option<Server> = None;
+    let mut account_epoch = 0;
     let mut native_editor = native::Editor::default();
     let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
@@ -1311,6 +1336,7 @@ fn run(
                         artwork_queue = ArtworkQueue::default();
                         profile_pending.clear();
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
+                        account_epoch += 1;
                         let prefs: Preferences = catalog.state("preferences")?;
                         player.send(PlayerCommand::Preferences(prefs.clone()));
                         restore_queue(&catalog, &player, value.account.namespace())?;
@@ -2225,6 +2251,28 @@ fn run(
                 }
                 Command::EnqueueAlbum(id, placement) => {
                     player.send(PlayerCommand::Insert(catalog.album_tracks(&id)?, placement));
+                }
+                Command::EnqueuePlaylist(id, placement) => {
+                    if let Some(server) =
+                        server.clone().filter(|_| connection == Connection::Online)
+                    {
+                        let tx = tx.clone();
+                        let epoch = account_epoch;
+                        runtime.spawn(async move {
+                            let playlist = server.playlist(&id).await.ok();
+                            let _ = tx.send(Command::PlaylistForQueue(epoch, placement, playlist));
+                        });
+                    } else {
+                        let cached = catalog
+                            .playlist(&id)?
+                            .filter(|p| !p.entry.is_empty() || p.song_count == 0);
+                        enqueue_playlist(cached, placement, &player, &events)?;
+                    }
+                }
+                Command::PlaylistForQueue(epoch, placement, playlist) => {
+                    if epoch == account_epoch {
+                        enqueue_playlist(playlist, placement, &player, &events)?;
+                    }
                 }
                 Command::AlbumToPlaylist(id, target) => {
                     let ids = catalog

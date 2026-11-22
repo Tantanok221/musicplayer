@@ -13,6 +13,7 @@ impl MusicApp {
                     .reset_for_account(self.account.as_ref(), account.as_ref())
                 {
                     self.smart = Default::default();
+                    self.playlists = Default::default();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;

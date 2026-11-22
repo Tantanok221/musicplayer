@@ -63,6 +63,7 @@ pub struct Playlists {
     search: String,
     view: PlaylistView,
     expanded_album: Option<String>,
+    pending_delete: Option<String>,
 }
 
 impl Playlists {
@@ -99,6 +100,13 @@ impl Playlists {
                 playlist
             })
             .collect();
+        if self
+            .pending_delete
+            .as_deref()
+            .is_some_and(|id| self.by_id(id).is_none())
+        {
+            self.cancel_delete();
+        }
     }
 
     pub fn detail_loaded(&mut self, playlist: Playlist) {
@@ -155,6 +163,40 @@ impl Playlists {
     pub fn summaries(&self) -> &[Playlist] {
         &self.summaries
     }
+    pub(crate) fn by_id(&self, id: &str) -> Option<&Playlist> {
+        self.current
+            .as_ref()
+            .filter(|playlist| playlist.id == id)
+            .or_else(|| self.summaries.iter().find(|playlist| playlist.id == id))
+    }
+
+    pub(crate) fn request_delete(&mut self, id: &str, username: Option<&str>) -> bool {
+        if self
+            .by_id(id)
+            .is_some_and(|playlist| is_owner(playlist, username))
+        {
+            self.pending_delete = Some(id.to_owned());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn pending_deletion(&self, username: Option<&str>) -> Option<&Playlist> {
+        self.by_id(self.pending_delete.as_deref()?)
+            .filter(|playlist| is_owner(playlist, username))
+    }
+
+    pub(crate) fn confirm_delete(&mut self, username: Option<&str>) -> Option<Mutation> {
+        let id = self.pending_delete.take()?;
+        self.by_id(&id)
+            .filter(|playlist| is_owner(playlist, username))?;
+        Some(Mutation::DeletePlaylist(id))
+    }
+
+    pub(crate) fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
     pub fn name_of(&self, id: &str) -> Option<&str> {
         self.summaries
             .iter()
@@ -511,6 +553,41 @@ mod tests {
         assert_eq!(entries[0].title, "New");
         assert_eq!(entries[1].title, "");
         assert_eq!(entries[2].title, "New");
+    }
+
+    #[::core::prelude::v1::test]
+    fn deletion_requires_current_ownership_and_an_existing_playlist() {
+        let mut state = Playlists::default();
+        let mut owned = playlist(&[]);
+        owned.owner = "listener".into();
+        owned.readonly = true;
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(!state.request_delete("playlist", Some("another-user")));
+        assert!(state.request_delete("playlist", Some("listener")));
+        assert_eq!(
+            state.pending_deletion(Some("listener")).unwrap().id,
+            "playlist"
+        );
+
+        owned.owner = "another-user".into();
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(state.pending_deletion(Some("listener")).is_none());
+        assert!(state.confirm_delete(Some("listener")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.summaries_loaded(vec![]);
+        state.summaries_loaded(vec![owned]);
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.cancel_delete();
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+        assert!(state.request_delete("playlist", Some("another-user")));
+        assert_eq!(
+            state.confirm_delete(Some("another-user")),
+            Some(Mutation::DeletePlaylist("playlist".into()))
+        );
+        assert!(state.confirm_delete(Some("another-user")).is_none());
     }
 
     fn playlist(ids: &[&str]) -> Playlist {

@@ -494,7 +494,6 @@ pub struct MusicApp {
     playlist_editor_tracks: Option<Vec<String>>,
     /// Album whose songs a new playlist from the editor will hold.
     playlist_editor_album: Option<String>,
-    pending_delete: Option<String>,
     tag_editor: Option<tag_editor::TagEditor>,
     /// Album whose songs the tag editor opens on when they arrive.
     tag_editor_album: Option<String>,
@@ -777,7 +776,6 @@ impl MusicApp {
             playlist_editor_rename: false,
             playlist_editor_tracks: None,
             playlist_editor_album: None,
-            pending_delete: None,
             tag_editor: None,
             tag_editor_album: None,
             tag_notice: None,
@@ -1095,6 +1093,7 @@ impl Render for MusicApp {
                 app.switch_workspace(Workspace::Explorer, window, cx)
             }))
             .child(tabs)
+            .children(self.playlist_delete_confirmation(cx))
             .child(
                 div()
                     .flex_1()

@@ -215,6 +215,7 @@ impl MusicApp {
                         .playlists
                         .current()
                         .is_some_and(|p| p.id == playlist.id);
+                let menu = self.playlist_menu(&playlist, cx);
                 tree = tree.child(
                     div().pl_3().child(
                         self.navigation_row(
@@ -247,15 +248,14 @@ impl MusicApp {
                             },
                         )
                         .test_support()
-                        .on_click(cx.listener(
-                            move |app, _, window, cx| {
-                                app.switch_workspace(Workspace::Playlists, window, cx);
-                                let id = app.playlists.open(playlist.clone());
-                                app.selected = None;
-                                app.service.send(Command::Playlist(id));
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            app.switch_workspace(Workspace::Playlists, window, cx);
+                            let id = app.playlists.open(playlist.clone());
+                            app.selected = None;
+                            app.service.send(Command::Playlist(id));
+                            cx.notify();
+                        }))
+                        .context_menu(menu),
                     ),
                 );
             }
