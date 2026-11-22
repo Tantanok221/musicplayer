@@ -27,8 +27,14 @@ async fn handler(
         "search3.view" => {
             assert_eq!(query["query"], "");
             assert_eq!(query["songCount"], "500");
-            assert_eq!(query["songOffset"], "500");
-            json!({"status":"ok","searchResult3":{"song":[{"id":"1","title":"夜の散歩","albumId":"a"}]}})
+            match query["songOffset"].as_str() {
+                "0" => json!({"status":"ok","searchResult3":{"song":null}}),
+                "1" => json!({"status":"ok","searchResult3":{}}),
+                "500" => {
+                    json!({"status":"ok","searchResult3":{"song":[{"id":"1","title":"夜の散歩","albumId":"a"}]}})
+                }
+                _ => panic!("unexpected song offset"),
+            }
         }
         "getScanStatus.view" => json!({"status":"ok","scanStatus":{"scanning":false}}),
         "star.view" => json!({"status":"ok"}),
@@ -80,6 +86,9 @@ async fn authentication_base_path_capabilities_and_pagination() {
         Server::with_credentials(server.account.clone(), server.credentials().clone()).unwrap();
     assert!(resumed.connect().await.unwrap().contains("navidrome"));
     assert!(server.extensions.contains("songLyrics"));
+    for offset in [0, 1] {
+        assert_eq!(server.page("song", offset).await.unwrap(), json!([]));
+    }
     assert_eq!(
         server.page("song", 500).await.unwrap()[0]["title"],
         "夜の散歩"

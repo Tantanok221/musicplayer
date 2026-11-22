@@ -183,11 +183,11 @@ impl Server {
         };
         params.push((key, offset.to_string()));
         let response = self.request("search3", &params).await?;
-        Ok(response["searchResult3"][kind]
-            .as_array()
-            .cloned()
-            .map(Value::Array)
-            .unwrap_or_else(|| json!([])))
+        match &response["searchResult3"][kind] {
+            Value::Null => Ok(json!([])),
+            Value::Array(items) => Ok(Value::Array(items.clone())),
+            _ => bail!("Invalid search3 {kind} list: expected an array"),
+        }
     }
     /// Fetches every page of `kind` and hands each to `handle` in order, keeping
     /// up to `ahead` requests in flight so the library syncs without waiting on
