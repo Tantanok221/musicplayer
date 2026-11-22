@@ -256,9 +256,9 @@ impl Server {
     }
     pub async fn scan_status(&self) -> Result<bool> {
         let response = self.request("getScanStatus", &[]).await?;
-        Ok(response["scanStatus"]["scanning"]
+        response["scanStatus"]["scanning"]
             .as_bool()
-            .unwrap_or(false))
+            .context("Invalid getScanStatus response: expected a boolean scanning state")
     }
     /// Asks the server to look for new files. Only administrators may.
     pub async fn start_scan(&self) -> Result<()> {
@@ -290,15 +290,46 @@ impl Server {
     }
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let response = self.request("getPlaylists", &[]).await?;
-        match &response["playlists"]["playlist"] {
-            Value::Null => Ok(Vec::new()),
-            Value::Array(items) => Ok(serde_json::from_value(Value::Array(items.clone()))?),
+        let Some(playlists) = response.get("playlists").and_then(Value::as_object) else {
+            bail!("Invalid getPlaylists response: expected a playlists object");
+        };
+        match playlists.get("playlist") {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => {
+                let mut ids = HashSet::new();
+                for item in items {
+                    let Some(id) = item["id"].as_str().filter(|id| !id.trim().is_empty()) else {
+                        bail!("Invalid getPlaylists playlist entry: missing ID");
+                    };
+                    if !ids.insert(id) {
+                        bail!("Invalid getPlaylists playlist entry: duplicate ID");
+                    }
+                }
+                serde_json::from_value(Value::Array(items.clone()))
+                    .context("Invalid getPlaylists playlist entry")
+            }
             _ => bail!("Invalid getPlaylists playlist list: expected an array"),
         }
     }
     pub async fn playlist(&self, id: &str) -> Result<Playlist> {
-        self.value("getPlaylist", &[("id", id.into())], "playlist")
-            .await
+        let response = self.request("getPlaylist", &[("id", id.into())]).await?;
+        let value = &response["playlist"];
+        if value["id"].as_str() != Some(id) || value["songCount"].as_u64().is_none() {
+            bail!("Invalid getPlaylist response: expected the requested playlist and song count");
+        }
+        let playlist: Playlist =
+            serde_json::from_value(value.clone()).context("Invalid getPlaylist playlist entry")?;
+        if playlist.entry.len() != playlist.song_count as usize {
+            bail!("Invalid getPlaylist response: entry count does not match song count");
+        }
+        if playlist
+            .entry
+            .iter()
+            .any(|track| track.id.trim().is_empty())
+        {
+            bail!("Invalid getPlaylist response: playlist track is missing an ID");
+        }
+        Ok(playlist)
     }
     pub async fn create_playlist(&self, name: &str, ids: &[String]) -> Result<()> {
         let mut params = vec![("name", name.into())];
