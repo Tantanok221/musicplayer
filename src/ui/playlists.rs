@@ -72,6 +72,11 @@ impl MusicApp {
                 &playlist,
                 self.account.as_ref().map(|a| a.username.as_str()),
             );
+            let edit_rules = self.smart.available
+                && crate::playlists::is_smart(
+                    &playlist,
+                    self.account.as_ref().map(|a| a.username.as_str()),
+                );
             return div()
                 .size_full()
                 .min_h_0()
@@ -142,6 +147,7 @@ impl MusicApp {
                                         let weak = weak.clone();
                                         let weak2 = weak.clone();
                                         let weak3 = weak.clone();
+                                        let weak_rules = weak.clone();
                                         let name = rename.clone();
                                         let rename_id = rename_id.clone();
                                         let delete_id = delete_id.clone();
@@ -171,6 +177,15 @@ impl MusicApp {
                                                 });
                                             },
                                         ))
+                                        .when(edit_rules, |menu| {
+                                            menu.item(PopupMenuItem::new("Edit Rules…").on_click(
+                                                move |_, window, cx| {
+                                                    let _ = weak_rules.update(cx, |app, cx| {
+                                                        app.edit_smart_playlist(window, cx)
+                                                    });
+                                                },
+                                            ))
+                                        })
                                         .when(editable, |menu| {
                                             menu.item(PopupMenuItem::new("Append Queue").on_click(
                                                 move |_, _, cx| {

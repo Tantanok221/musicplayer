@@ -1,5 +1,5 @@
 use sonora::{
-    platform::{Account, Paths, ServerCredentials},
+    platform::{Account, NativeToken, Paths, ServerCredentials},
     server::Server,
 };
 
@@ -7,6 +7,82 @@ fn account() -> Account {
     Account {
         url: "https://music.example.com/".into(),
         username: "listener".into(),
+    }
+}
+
+#[test]
+fn native_tokens_are_private_account_scoped_replaceable_and_clearable() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data: directory.path().into(),
+        cache: directory.path().join("cache"),
+    };
+    let account = account();
+    assert!(paths.native_token(&account).unwrap().is_none());
+    paths
+        .save_native_token(&account, &NativeToken::new("test-token".into()).unwrap())
+        .unwrap();
+    let other = Account {
+        username: "other".into(),
+        ..account.clone()
+    };
+    assert!(paths.native_token(&other).unwrap().is_none());
+    let path = directory
+        .path()
+        .join("credentials")
+        .join(format!("{}.native.json", account.namespace()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    paths
+        .save_native_token(&account, &NativeToken::new("replacement".into()).unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["token"],
+        "replacement"
+    );
+    paths.clear_native_token(&account).unwrap();
+    paths.clear_native_token(&account).unwrap();
+    assert!(paths.native_token(&account).unwrap().is_none());
+}
+
+#[test]
+fn malformed_native_token_errors_never_quote_secret_file_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data: directory.path().into(),
+        cache: directory.path().join("cache"),
+    };
+    let account = account();
+    paths
+        .save_native_token(&account, &NativeToken::new("test-token".into()).unwrap())
+        .unwrap();
+    let path = directory
+        .path()
+        .join("credentials")
+        .join(format!("{}.native.json", account.namespace()));
+    for bytes in [
+        b"secret-invalid-json".as_slice(),
+        br#"{"token":"secret\r\nheader"}"#,
+        br#"{"token":""}"#,
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        let message = paths.native_token(&account).err().unwrap().to_string();
+        assert!(!message.contains("secret"));
+        assert!(message.contains("Sign in again"));
     }
 }
 

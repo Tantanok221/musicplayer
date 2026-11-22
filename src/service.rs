@@ -31,6 +31,8 @@ use std::{
 const SIGN_IN_NOTICE: &str =
     "Sign in once to save your login locally. Sonora no longer uses Keychain.";
 
+pub mod native;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
     Favorite(String, bool),
@@ -65,6 +67,23 @@ impl Mutation {
 }
 #[derive(Clone)]
 pub enum Command {
+    CancelSmartPlaylist,
+    LoadSmartRules(String),
+    SaveSmartPlaylist {
+        id: Option<String>,
+        name: String,
+        rules: crate::smart_rules::SmartRules,
+    },
+    NativeSignIn(String),
+    NativeSessionReady(u64),
+    NativeRenewed(
+        u64,
+        crate::platform::NativeToken,
+        Result<crate::platform::NativeToken, crate::server::NativeError>,
+    ),
+    NativeCompleted(u64, Result<native::Reply, crate::server::NativeError>),
+    NativeSignedIn(u64, Result<(), String>),
+    NativeRefreshed(u64, Result<(Vec<Playlist>, Playlist), String>),
     Connect(Account, String),
     Refresh,
     Initialize,
@@ -135,7 +154,7 @@ pub enum Command {
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
-    Connected(Server, String),
+    Connected(Server, String, Option<flume::Receiver<()>>),
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
@@ -195,6 +214,10 @@ pub enum SearchUpdate {
 }
 #[derive(Clone, Debug)]
 pub enum Event {
+    NativeAvailable(bool),
+    SmartRules(String, Option<crate::smart_rules::SmartRules>),
+    SmartPlaylistSaved(String),
+    NativePasswordRequired,
     Ready(Option<Account>, Preferences),
     SignInRequired(String),
     Connected(Account, String),
@@ -610,7 +633,7 @@ fn reconnect(
         }
         .await;
         let _ = tx.send(match result {
-            Ok((server, label)) => Command::Connected(server, label),
+            Ok((server, label)) => Command::Connected(server, label, None),
             Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
         });
     });
@@ -797,6 +820,8 @@ fn run(
         });
     }
     let mut server: Option<Server> = None;
+    let mut native_editor = native::Editor::default();
+    let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
     let mut generation = 0i64;
     let mut current_query = LibraryQuery::default();
@@ -827,6 +852,7 @@ fn run(
     let _ = tx.send(Command::ResumeDownloads);
     let mut published = 0;
     loop {
+        native_editor.start(server.as_ref(), &paths, &runtime, &tx);
         if let Some(server) = server.clone() {
             for id in artwork_queue.take_ready(artwork_clock.now()) {
                 let server = server.clone();
@@ -909,8 +935,82 @@ fn run(
         }
         let result: Result<()> = (|| {
             match command {
+                Command::CancelSmartPlaylist => native_editor.reset(),
+                Command::LoadSmartRules(id) => {
+                    native::Editor::require_server(server.as_ref())?;
+                    native_editor.enqueue(native::Operation::Load(id), &events)?;
+                }
+                Command::SaveSmartPlaylist { id, name, rules } => {
+                    native::Editor::require_server(server.as_ref())?;
+                    anyhow::ensure!(!name.trim().is_empty(), "Enter a playlist name");
+                    native_editor.enqueue(
+                        native::Operation::Save {
+                            id,
+                            name,
+                            rules: Box::new(rules),
+                        },
+                        &events,
+                    )?;
+                }
+                Command::NativeSignIn(password) => {
+                    let server = native::Editor::require_server(server.as_ref())?;
+                    native_editor.sign_in(server, &paths, password, &runtime, &tx)?;
+                }
+                Command::NativeSignedIn(epoch, result) => native_editor.signed_in(epoch, result)?,
+                Command::NativeRenewed(epoch, original, result) => {
+                    native_renewal.complete(epoch, original, result, account.as_ref(), &paths)
+                }
+                Command::NativeSessionReady(epoch) => {
+                    if epoch == native_editor.epoch {
+                        native_editor.busy = false;
+                    }
+                }
+                Command::NativeCompleted(epoch, result) => {
+                    if let Some(reply) = native_editor.complete(epoch, result, &events)? {
+                        match reply {
+                            native::Reply::Rules(id, rules) => {
+                                events.send(Event::SmartRules(id, rules))?
+                            }
+                            native::Reply::Saved(id) => {
+                                events.send(Event::SmartPlaylistSaved(id.clone()))?;
+                                let server =
+                                    native::Editor::require_server(server.as_ref())?.clone();
+                                let tx = tx.clone();
+                                native_editor.busy = true;
+                                runtime.spawn(async move {
+                                    let result = async {
+                                        let lists = server.playlists().await.map_err(|_| {
+                                            "Saved, but could not refresh playlists".to_string()
+                                        })?;
+                                        let playlist =
+                                            server.playlist(&id).await.map_err(|_| {
+                                                "Saved, but could not refresh playlist tracks"
+                                                    .to_string()
+                                            })?;
+                                        Ok((lists, playlist))
+                                    }
+                                    .await;
+                                    let _ = tx.send(Command::NativeRefreshed(epoch, result));
+                                });
+                            }
+                        }
+                    }
+                }
+                Command::NativeRefreshed(epoch, result) => {
+                    if epoch == native_editor.epoch {
+                        native_editor.busy = false;
+                        let (playlists, playlist) = result.map_err(anyhow::Error::msg)?;
+                        catalog.save_playlist_summaries(&playlists, true)?;
+                        catalog.save_playlist(&playlist)?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                        events.send(Event::Playlist(playlist))?;
+                    }
+                }
                 Command::Initialize => {
                     events.send(Event::Ready(account.clone(), catalog.state("preferences")?))?;
+                    if let Some(server) = &server {
+                        events.send(Event::NativeAvailable(server.is_navidrome))?;
+                    }
                     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                     if let Some(account) = &account {
                         match paths.credentials(account) {
@@ -939,7 +1039,8 @@ fn run(
                         .await;
                         match result {
                             Ok((server, label)) => {
-                                let _ = command_tx.send(Command::Connected(server, label));
+                                let session = native::sign_in_session(&server, &paths, password);
+                                let _ = command_tx.send(Command::Connected(server, label, session));
                             }
                             Err(error) => {
                                 let _ = command_tx
@@ -948,13 +1049,15 @@ fn run(
                         }
                     });
                 }
-                Command::Connected(value, label) => {
+                Command::Connected(value, label, session) => {
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
                                 "Wait for the current refresh to finish before changing accounts"
                             );
                         }
+                        native_editor.reset();
+                        native_renewal.reset();
                         if account.is_some() {
                             let (reply, saved) = flume::bounded(1);
                             player.send(PlayerCommand::SaveQueue(reply));
@@ -979,6 +1082,7 @@ fn run(
                         let _ = tx.send(Command::ResumeDownloads);
                     }
                     paths.save_account(&value.account)?;
+                    native_editor.session(session);
                     account = Some(value.account.clone());
                     checking = false;
                     last_check = Instant::now();
@@ -987,10 +1091,12 @@ fn run(
                     server = Some(value.clone());
                     artwork_queue.retry_failed(artwork_clock.now());
                     events.send(Event::Connected(value.account.clone(), label))?;
+                    events.send(Event::NativeAvailable(value.is_navidrome))?;
                     events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                     if !syncing {
                         syncing = true;
                         generation = chrono::Utc::now().timestamp_micros();
+                        native_renewal.start(&value, &paths, &runtime, &tx);
                         begin_sync(value, tx.clone(), events.clone(), &runtime, generation);
                     }
                 }
@@ -1002,6 +1108,7 @@ fn run(
                         if !syncing {
                             syncing = true;
                             generation = chrono::Utc::now().timestamp_micros();
+                            native_renewal.start(&server, &paths, &runtime, &tx);
                             begin_sync(server, tx.clone(), events.clone(), &runtime, generation);
                         }
                     } else {
@@ -2148,6 +2255,7 @@ fn run(
                             if !syncing && let Some(server) = server.clone() {
                                 syncing = true;
                                 generation = chrono::Utc::now().timestamp_micros();
+                                native_renewal.start(&server, &paths, &runtime, &tx);
                                 begin_sync(
                                     server,
                                     tx.clone(),
