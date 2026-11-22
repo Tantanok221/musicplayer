@@ -10,7 +10,7 @@ use sonora::{
 use std::{sync::Arc, time::Duration};
 
 #[gpui_kit::test]
-fn smart_playlist_is_marked_and_readonly_owner_cannot_edit(cx: &mut TestAppContext) {
+fn smart_playlist_owner_can_rename_but_not_edit_tracks(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, _app) = start(cx);
     let mut smart = playlist("Automatic");
     smart.readonly = true;
@@ -35,9 +35,25 @@ fn smart_playlist_is_marked_and_readonly_owner_cannot_edit(cx: &mut TestAppConte
             window.find("smart-playlist-header").label(),
             Some("Smart playlist · updates automatically")
         );
-        assert!(window.try_find("playlist-options").is_none());
+        assert!(window.find("playlist-options").visible());
     })
     .unwrap();
+    fixture.click(window, "playlist-options", cx);
+    cx.update_window(window, |_, window, _| {
+        let menu = window.within("popup-menu");
+        assert!(menu.find_by_label("Rename…").visible());
+        assert!(menu.find_by_label("Delete playlist…").visible());
+        assert!(menu.try_find_by_label("Append Queue").is_none());
+    })
+    .unwrap();
+    fixture.menu_item(window, "Rename…", cx);
+    edit_name(&mut fixture, window, "Automatic renamed", cx);
+    fixture.expect("rename owned smart playlist", |command, _| {
+        let expected = Mutation::RenamePlaylist("playlist-1".into(), "Automatic renamed".into());
+        assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+        vec![Event::MutationDone(expected)]
+    });
+    fixture.click(window, "save-playlist-editor", cx);
     fixture.assert_script_finished();
 }
 
@@ -63,7 +79,10 @@ fn readonly_playlists_have_no_edit_actions_or_add_target(cx: &mut TestAppContext
         });
         fixture.click(window, "nav-playlist-playlist-1", cx);
         cx.update_window(window, |_, window, cx| {
-            assert!(window.try_find("playlist-options").is_none());
+            assert_eq!(
+                window.try_find("playlist-options").is_some(),
+                owner == "fixture"
+            );
             window.right_click("row-playlist-0", cx);
         })
         .unwrap();

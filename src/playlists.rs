@@ -9,6 +9,10 @@ pub fn is_smart(playlist: &Playlist, username: Option<&str>) -> bool {
         && (playlist.valid_until.is_some() || username.is_some_and(|user| playlist.owner == user))
 }
 
+pub fn is_owner(playlist: &Playlist, username: Option<&str>) -> bool {
+    playlist.owner.is_empty() || Some(playlist.owner.as_str()) == username
+}
+
 pub fn refresh_due(
     playlist: &Playlist,
     username: Option<&str>,
@@ -110,8 +114,7 @@ impl Playlists {
     }
 
     pub fn can_edit(playlist: &Playlist, username: Option<&str>) -> bool {
-        !playlist.readonly
-            && (playlist.owner.is_empty() || Some(playlist.owner.as_str()) == username)
+        !playlist.readonly && is_owner(playlist, username)
     }
 
     pub fn append_queue(&self, ids: Vec<String>) -> Option<Mutation> {
@@ -194,6 +197,25 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_ignores_readonly_but_requires_empty_or_matching_owner() {
+        for readonly in [false, true] {
+            for owner in ["", "owner"] {
+                let playlist = Playlist {
+                    owner: owner.into(),
+                    readonly,
+                    ..Default::default()
+                };
+                for user in [None, Some("owner"), Some("other")] {
+                    assert_eq!(
+                        is_owner(&playlist, user),
+                        owner.is_empty() || user == Some(owner)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn smart_requires_readonly_and_expiry_or_signed_in_owner() {

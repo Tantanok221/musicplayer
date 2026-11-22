@@ -68,6 +68,10 @@ impl MusicApp {
             let editable = self
                 .playlists
                 .editable(self.account.as_ref().map(|a| a.username.as_str()));
+            let owned = crate::playlists::is_owner(
+                &playlist,
+                self.account.as_ref().map(|a| a.username.as_str()),
+            );
             return div()
                 .size_full()
                 .min_h_0()
@@ -127,7 +131,7 @@ impl MusicApp {
                                 },
                             ),
                         )
-                        .when(editable, |header| {
+                        .when(owned, |header| {
                             header.child(
                                 Button::new("playlist-options")
                                     .ghost()
@@ -167,22 +171,25 @@ impl MusicApp {
                                                 });
                                             },
                                         ))
-                                        .item(PopupMenuItem::new("Append Queue").on_click(
-                                            move |_, _, cx| {
-                                                let _ = weak2.update(cx, |app, cx| {
-                                                    let ids = app
-                                                        .playback
-                                                        .queue
-                                                        .iter()
-                                                        .map(|t| t.id.clone())
-                                                        .collect();
-                                                    if let Some(mutation) = append.append_queue(ids)
-                                                    {
-                                                        app.mutate(mutation, cx);
-                                                    }
-                                                });
-                                            },
-                                        ))
+                                        .when(editable, |menu| {
+                                            menu.item(PopupMenuItem::new("Append Queue").on_click(
+                                                move |_, _, cx| {
+                                                    let _ = weak2.update(cx, |app, cx| {
+                                                        let ids = app
+                                                            .playback
+                                                            .queue
+                                                            .iter()
+                                                            .map(|t| t.id.clone())
+                                                            .collect();
+                                                        if let Some(mutation) =
+                                                            append.append_queue(ids)
+                                                        {
+                                                            app.mutate(mutation, cx);
+                                                        }
+                                                    });
+                                                },
+                                            ))
+                                        })
                                         .separator()
                                         .item(
                                             PopupMenuItem::new("Delete playlist…").on_click(
