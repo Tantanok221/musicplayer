@@ -122,6 +122,29 @@ impl MusicApp {
     }
 
     pub(super) fn select_track(&mut self, track: Arc<Track>, cx: &mut Context<Self>) {
+        self.selection.only(track.clone());
+        self.selected = Some(track);
+        cx.notify();
+    }
+
+    /// A modified click in a song list: ⌘ adds or removes the song, shift
+    /// selects the range from the last clicked song.
+    pub(super) fn select_more(
+        &mut self,
+        track: Arc<Track>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.is_empty()
+            && let Some(selected) = self.selected.clone()
+        {
+            self.selection.only(selected);
+        }
+        if modifiers.shift {
+            self.selection.extend(track.clone(), &self.tracks);
+        } else {
+            self.selection.toggle(track.clone());
+        }
         self.selected = Some(track);
         cx.notify();
     }
@@ -895,34 +918,6 @@ impl MusicApp {
         }
         if let Some(editor) = self.tag_editor_panel(cx) {
             center = center.child(editor);
-        }
-        if let Some(id) = self.pending_delete.clone() {
-            center = center.child(
-                div()
-                    .p_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child("Delete this playlist from Navidrome?")
-                    .child(
-                        Button::new("confirm-delete")
-                            .small()
-                            .label("Delete")
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                app.pending_delete = None;
-                                app.mutate(Mutation::DeletePlaylist(id.clone()), cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("cancel-delete")
-                            .small()
-                            .label("Cancel")
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.pending_delete = None;
-                                cx.notify();
-                            })),
-                    ),
-            );
         }
         if let Some(editor) = self.playlist_rename_view(cx) {
             center = center.child(editor);

@@ -2,10 +2,10 @@
 use crate::worker_fixture::{Fixture, Library, Request, WAIT};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size,
-    test::TestWindowExt,
+    test::{TestQueryExt, TestWindowExt},
 };
 use sonora::{
-    model::{FavoritesFilter, Preferences, SavedQueue},
+    model::{FavoritesFilter, Playlist, Preferences, SavedQueue},
     playback::{PlayerCommand, test_support::ListeningPlayer},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
@@ -17,6 +17,7 @@ fn deleted_playlist_ignores_late_detail_reply(cx: &mut TestAppContext) {
     let playlist = sonora::model::Playlist {
         id: "deleted".into(),
         name: "Deleted".into(),
+        owner: "fixture".into(),
         ..Default::default()
     };
     let fixture = Fixture::new(Library {
@@ -101,6 +102,97 @@ fn deleted_playlist_ignores_late_detail_reply(cx: &mut TestAppContext) {
     fixture.finish();
 }
 
+#[gpui_kit::test]
+fn remove_after_server_reorder_removes_clicked_song(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    library.playlists = vec![sonora::model::Playlist {
+        id: "playlist".into(),
+        name: "Roadtrip".into(),
+        song_count: 2,
+        entry: library
+            .tracks
+            .iter()
+            .cloned()
+            .map(std::sync::Arc::new)
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    }];
+    let cached = library.playlists[0].clone();
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut prefs = Preferences::default();
+    prefs.tabs.active_mut().page = Some(sonora::browser::Page {
+        workspace: sonora::browser::Workspace::Playlists,
+        playlist: Some(("playlist".into(), "Roadtrip".into())),
+        ..Default::default()
+    });
+    let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
+    wait_library(&worker, &tx, window, cx, "row-playlist-1");
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("row-playlist-0").label(),
+            Some("Song song · Fixture Artist · Release album")
+        );
+    })
+    .unwrap();
+    fixture.edit_library(|library| {
+        std::sync::Arc::make_mut(&mut library.playlists[0].entry).reverse()
+    });
+    fixture.expect_mutation(
+        Request::new(
+            "updatePlaylist.view",
+            &[("playlistId", "playlist"), ("songIndexToRemove", "1")],
+        ),
+        true,
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-playlist-0", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let mut menu = window.within("popup-menu");
+        let target = menu.find_by_label("Remove from Playlist");
+        let id = target.path().last().unwrap().clone();
+        menu.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        assert!(
+            !matches!(event, Event::MutationFailed(..)),
+            "removing the clicked song must reach Navidrome"
+        );
+        matches!(event, Event::Playlist(p) if p.entry.len() == 1)
+    });
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert_eq!(
+            window.find("row-playlist-0").label(),
+            Some("Song other-song · Fixture Artist · Release other-album"),
+            "wrong song removed by clicked Remove"
+        );
+        assert!(window.try_find("row-playlist-1").is_none());
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .catalog()
+            .playlist("playlist")
+            .unwrap()
+            .unwrap()
+            .entry[0]
+            .id,
+        "other-song"
+    );
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
 /// Stage real events in FIFO order through MusicApp's normal receiver. This
 /// lets the test inspect the optimistic frame before releasing HTTP results.
 /// No event is synthesized, filtered, reordered or handled directly by the view.
@@ -158,6 +250,61 @@ fn assert_favorite(
         assert_eq!(heart.disabled() == Some(true), pending);
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn playlist_context_menu_fetches_tracks_and_updates_the_real_queue(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    let track = std::sync::Arc::new(library.tracks[1].clone());
+    library.playlists = vec![Playlist {
+        id: "roadtrip".into(),
+        name: "Roadtrip".into(),
+        song_count: 1,
+        entry: vec![track.clone()].into(),
+        ..Default::default()
+    }];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut prefs = Preferences::default();
+    prefs.layout.navigator_height = 300.;
+    let (worker, tx, window, app) = mount_worker_with_player(&fixture, prefs, true, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("nav-playlist-roadtrip", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let item = menu.find_by_label("Add to End of Queue");
+        menu.click(item.path().last().unwrap().clone(), cx);
+    })
+    .unwrap();
+    fixture.wait_request(&Request::new("getPlaylist.view", &[("id", "roadtrip")]));
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |event, _| matches!(event, Event::Playback(state) if state.queue.len() == 1 && state.queue[0].id == track.id),
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("explorer-album-album").visible());
+        assert!(window.try_find("popup-menu").is_none());
+        window.click("nav-queue", cx);
+        assert!(
+            window
+                .find_by_label(&format!(
+                    "Queue 1: {} · {}",
+                    track.title,
+                    track.artist_label()
+                ))
+                .visible()
+        );
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 #[gpui_kit::test]
@@ -742,6 +889,80 @@ fn play_after_enqueue_empty_from_menu_starts_in_footer(cx: &mut TestAppContext) 
         window.render_frame(cx);
         assert_eq!(window.find("play-pause").label(), Some("Pause"));
         assert!(window.find("play-pause").visible());
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
+fn empty_playlist_play_preserves_queued_track(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    library.playlists.push(sonora::model::Playlist {
+        id: "empty".into(),
+        name: "Empty".into(),
+        owner: "fixture".into(),
+        ..Default::default()
+    });
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture
+        .catalog()
+        .set_state(
+            "queue",
+            &SavedQueue {
+                ids: vec!["song".into()],
+                index: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut prefs = Preferences::default();
+    prefs.tabs.tabs[0].page = Some(sonora::browser::Page {
+        workspace: sonora::browser::Workspace::Playlists,
+        playlist: Some(("empty".into(), "Empty".into())),
+        ..Default::default()
+    });
+    let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
+    let mut loaded = false;
+    let mut synced = false;
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        loaded |= matches!(event, Event::Playlist(p) if p.id == "empty");
+        synced |= matches!(event, Event::Status(s) if s.starts_with("Up to date"));
+        loaded && synced
+    });
+    let player = ListeningPlayer::start(WAIT).unwrap();
+    for command in worker.player_commands().try_iter() {
+        player.command(command).unwrap();
+    }
+    let before = player.snapshot(WAIT).unwrap();
+    assert_eq!(before.queue[0].id, "song");
+    tx.send(Event::Playback(before.clone())).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("play-playlist", cx))
+        .unwrap();
+    cx.run_until_parked();
+    for command in worker.player_commands().try_iter() {
+        player.command(command).unwrap();
+    }
+    let after = player.snapshot(WAIT).unwrap();
+    assert_eq!(
+        after.queue.len(),
+        1,
+        "empty playlist Play must preserve the queue"
+    );
+    assert_eq!(after.queue[0].id, "song");
+    assert_eq!(
+        after.track.as_ref().map(|t| &t.id),
+        before.track.as_ref().map(|t| &t.id)
+    );
+    assert_eq!(after.index, before.index);
+    assert_eq!(after.position, before.position);
+    assert_eq!(after.playing, before.playing);
+    tx.send(Event::Playback(after)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("play-pause").visible())
     })
     .unwrap();
     close_worker(worker, window, app, cx);

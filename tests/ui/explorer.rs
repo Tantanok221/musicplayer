@@ -191,13 +191,20 @@ fn unicode_search_empty_results_and_clear_recover_in_explorer(cx: &mut TestAppCo
 
 fn assert_queue_unchanged(window: AnyWindowHandle, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, _| {
-        let first = window.find("love-queue-side-0");
-        let second = window.find("love-queue-side-1");
+        let first = window.find("love-queue-side-41");
+        let second = window.find("love-queue-side-42");
         assert_eq!(first.label(), Some("Favorite Fixture song"));
         assert_eq!(second.label(), Some("Favorite Another song"));
         assert!(first.visible() && second.visible());
         assert!(first.bounds().origin.y < second.bounds().origin.y);
-        assert!(window.try_find("love-queue-side-2").is_none());
+        assert_eq!(
+            window
+                .find_all_by_role(gpui_kit::Role::Group)
+                .iter()
+                .filter(|row| row.label().is_some_and(|label| label.starts_with("Queue ")))
+                .count(),
+            2
+        );
     })
     .unwrap();
 }

@@ -1,5 +1,5 @@
 use crate::{
-    model::{Playlist, Track, normalize},
+    model::{Album, Playlist, Track, normalize},
     service::{Command, Mutation, PlaylistTarget},
 };
 use std::{collections::HashMap, sync::Arc};
@@ -108,6 +108,26 @@ pub struct PlaylistAlbum {
     pub entries: Vec<usize>,
 }
 
+impl PlaylistAlbum {
+    pub(crate) fn fallback_album(&self) -> Album {
+        let track = &self.track;
+        Album {
+            id: track.album_id.clone(),
+            name: if track.album.is_empty() {
+                "Unknown album".into()
+            } else {
+                track.album.clone()
+            },
+            artist: track.album_artist_label().into(),
+            artists: track.album_artist_credits(),
+            cover_art: track.cover_art.clone(),
+            year: track.year,
+            genre: track.genres_label(),
+            ..Default::default()
+        }
+    }
+}
+
 fn album_key(track: &Track) -> String {
     if track.album_id.is_empty() {
         // Some servers omit album IDs; do not combine unrelated artists' albums.
@@ -151,14 +171,21 @@ pub struct Playlists {
     current: Option<Playlist>,
     search: String,
     view: PlaylistView,
-    expanded_album: Option<String>,
+    expanded_album: Option<ExpandedAlbum>,
+    pending_delete: Option<String>,
+}
+
+#[derive(Clone)]
+struct ExpandedAlbum {
+    key: String,
+    details: Option<Arc<Album>>,
 }
 
 impl Playlists {
     pub fn open(&mut self, summary: Playlist) -> String {
         let id = summary.id.clone();
         if self.current.as_ref().is_none_or(|current| current.id != id) {
-            self.expanded_album = None;
+            self.clear_album();
         }
         self.current = Some(summary);
         id
@@ -166,6 +193,10 @@ impl Playlists {
 
     pub fn close(&mut self) {
         self.current = None;
+        self.clear_album();
+    }
+
+    pub(crate) fn clear_album(&mut self) {
         self.expanded_album = None;
     }
 
@@ -178,7 +209,7 @@ impl Playlists {
                 current.owner.clone_from(&summary.owner);
                 current.valid_until.clone_from(&summary.valid_until);
             } else {
-                self.current = None;
+                self.close();
             }
         }
         self.summaries = summaries
@@ -188,6 +219,13 @@ impl Playlists {
                 playlist
             })
             .collect();
+        if self
+            .pending_delete
+            .as_deref()
+            .is_some_and(|id| self.by_id(id).is_none())
+        {
+            self.cancel_delete();
+        }
     }
 
     pub fn detail_loaded(&mut self, playlist: Playlist) {
@@ -215,11 +253,27 @@ impl Playlists {
     }
 
     pub fn expanded_album(&self) -> Option<&str> {
-        self.expanded_album.as_deref()
+        self.expanded_album.as_ref().map(|album| album.key.as_str())
     }
 
-    pub fn toggle_album(&mut self, key: String) {
-        self.expanded_album = (self.expanded_album.as_ref() != Some(&key)).then_some(key);
+    pub fn toggle_album(&mut self, key: String) -> Option<&str> {
+        self.expanded_album = (self.expanded_album() != Some(key.as_str()))
+            .then_some(ExpandedAlbum { key, details: None });
+        self.expanded_album()?.strip_prefix("id:")
+    }
+
+    pub(crate) fn album_details(&self) -> Option<&Arc<Album>> {
+        self.expanded_album.as_ref()?.details.as_ref()
+    }
+
+    pub(crate) fn update_album(&mut self, details: Arc<Album>) -> bool {
+        if let Some(album) = &mut self.expanded_album
+            && album.key.strip_prefix("id:") == Some(details.id.as_str())
+        {
+            album.details = Some(details);
+            return true;
+        }
+        false
     }
 
     /// Group only the matching playlist entries, never the rest of a library album.
@@ -244,6 +298,40 @@ impl Playlists {
     pub fn summaries(&self) -> &[Playlist] {
         &self.summaries
     }
+    pub(crate) fn by_id(&self, id: &str) -> Option<&Playlist> {
+        self.current
+            .as_ref()
+            .filter(|playlist| playlist.id == id)
+            .or_else(|| self.summaries.iter().find(|playlist| playlist.id == id))
+    }
+
+    pub(crate) fn request_delete(&mut self, id: &str, username: Option<&str>) -> bool {
+        if self
+            .by_id(id)
+            .is_some_and(|playlist| is_owner(playlist, username))
+        {
+            self.pending_delete = Some(id.to_owned());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn pending_deletion(&self, username: Option<&str>) -> Option<&Playlist> {
+        self.by_id(self.pending_delete.as_deref()?)
+            .filter(|playlist| is_owner(playlist, username))
+    }
+
+    pub(crate) fn confirm_delete(&mut self, username: Option<&str>) -> Option<Mutation> {
+        let id = self.pending_delete.take()?;
+        self.by_id(&id)
+            .filter(|playlist| is_owner(playlist, username))?;
+        Some(Mutation::DeletePlaylist(id))
+    }
+
+    pub(crate) fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
     pub fn name_of(&self, id: &str) -> Option<&str> {
         self.summaries
             .iter()
@@ -302,6 +390,28 @@ pub struct PlaylistEntry {
     entries: Arc<Vec<Arc<Track>>>,
 }
 
+pub fn removal_index(
+    playlist: &Playlist,
+    index: usize,
+    song: &str,
+    occurrence: usize,
+) -> Option<usize> {
+    if playlist
+        .entry
+        .get(index)
+        .is_some_and(|entry| entry.id == song)
+    {
+        return Some(index);
+    }
+    playlist
+        .entry
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.id == song)
+        .nth(occurrence)
+        .map(|(index, _)| index)
+}
+
 impl PlaylistEntry {
     pub fn drop_target(&self, target: &Self) -> Option<std::cmp::Ordering> {
         (self.id == target.id && self.index != target.index).then(|| self.index.cmp(&target.index))
@@ -323,8 +433,18 @@ impl PlaylistEntry {
 
     pub fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
         let current = current?;
-        (!current.readonly && self.matches(current))
-            .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+        (!current.readonly && self.matches(current)).then(|| {
+            let song = &self.entries[self.index].id;
+            Mutation::RemoveFromPlaylist {
+                id: self.id.clone(),
+                index: self.index,
+                song: song.clone(),
+                occurrence: self.entries[..self.index]
+                    .iter()
+                    .filter(|entry| entry.id == *song)
+                    .count(),
+            }
+        })
     }
 
     fn matches(&self, current: &Playlist) -> bool {
@@ -358,6 +478,22 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_index_keeps_matching_slot_and_resolves_reordered_occurrences() {
+        assert_eq!(
+            removal_index(&playlist(&["a", "b", "a"]), 2, "a", 1),
+            Some(2)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 0, "a", 0), Some(1));
+        assert_eq!(
+            removal_index(&playlist(&["a", "a", "b"]), 2, "a", 1),
+            Some(1)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 2, "a", 1), None);
+        assert_eq!(removal_index(&playlist(&["b"]), 0, "a", 0), None);
+        assert_eq!(removal_index(&playlist(&[]), 0, "a", 0), None);
+    }
 
     #[test]
     fn manual_creation_rejects_empty_duplicate_and_mismatched_submissions() {
@@ -450,6 +586,23 @@ mod tests {
         assert_eq!(state.current().unwrap().entry[0].id, "b");
         state.close();
         assert!(state.visible_albums().is_empty());
+    }
+
+    #[test]
+    fn album_details_belong_to_the_current_expansion() {
+        let mut state = Playlists::default();
+        let details = Arc::new(Album {
+            id: "release".into(),
+            ..Default::default()
+        });
+        assert_eq!(state.toggle_album("id:release".into()), Some("release"));
+        assert!(state.update_album(details.clone()));
+        assert_eq!(state.album_details().unwrap().id, "release");
+        assert_eq!(state.toggle_album("id:release".into()), None);
+        assert!(!state.update_album(details.clone()));
+        assert_eq!(state.toggle_album("metadata:untagged".into()), None);
+        assert!(!state.update_album(details));
+        assert!(state.album_details().is_none());
     }
 
     #[test]
@@ -635,6 +788,41 @@ mod tests {
         assert_eq!(entries[2].title, "New");
     }
 
+    #[::core::prelude::v1::test]
+    fn deletion_requires_current_ownership_and_an_existing_playlist() {
+        let mut state = Playlists::default();
+        let mut owned = playlist(&[]);
+        owned.owner = "listener".into();
+        owned.readonly = true;
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(!state.request_delete("playlist", Some("another-user")));
+        assert!(state.request_delete("playlist", Some("listener")));
+        assert_eq!(
+            state.pending_deletion(Some("listener")).unwrap().id,
+            "playlist"
+        );
+
+        owned.owner = "another-user".into();
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(state.pending_deletion(Some("listener")).is_none());
+        assert!(state.confirm_delete(Some("listener")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.summaries_loaded(vec![]);
+        state.summaries_loaded(vec![owned]);
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.cancel_delete();
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+        assert!(state.request_delete("playlist", Some("another-user")));
+        assert_eq!(
+            state.confirm_delete(Some("another-user")),
+            Some(Mutation::DeletePlaylist("playlist".into()))
+        );
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+    }
+
     fn playlist(ids: &[&str]) -> Playlist {
         Playlist {
             id: "playlist".into(),
@@ -659,7 +847,12 @@ mod tests {
         let removal = PlaylistEntry::new(&original, 2);
         assert_eq!(
             removal.mutation(Some(&original)),
-            Some(Mutation::RemoveFromPlaylist("playlist".into(), 2))
+            Some(Mutation::RemoveFromPlaylist {
+                id: "playlist".into(),
+                index: 2,
+                song: "a".into(),
+                occurrence: 1
+            })
         );
         assert!(removal.mutation(None).is_none());
         assert!(removal.mutation(Some(&playlist(&[]))).is_none());

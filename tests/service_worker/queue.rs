@@ -3,7 +3,7 @@ use sonora::{
     listening::ListenSession,
     model::{PlaybackSnapshot, Preferences, SavedQueue},
     playback::{Placement, PlayerCommand},
-    service::{Command, Event, test_support::Worker},
+    service::{Command, Connection, Event, test_support::Worker},
 };
 
 fn snapshot(worker: &Worker, ids: &[&str]) -> PlaybackSnapshot {
@@ -453,6 +453,111 @@ fn enqueue_album_inserts_its_songs_in_disc_and_track_order() {
         &worker,
         &["other-song", "other-song", opener, song, disc_two, opener],
     );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn enqueue_playlist_loads_unopened_tracks_in_playlist_order() {
+    use crate::fixture::{Request, song};
+    use sonora::model::Playlist;
+    use std::sync::Arc;
+
+    let mut library = multi_disc_library();
+    library.playlists = vec![Playlist {
+        id: "mix".into(),
+        name: "Mix".into(),
+        song_count: 3,
+        entry: ["playlist-only", "other-song", "playlist-only"]
+            .into_iter()
+            .map(|id| Arc::new(song(id, "playlist-album")))
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    }];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    let [first, second, third] = ALBUM_ORDER;
+    let original = [first, second, third, "other-song"];
+    worker
+        .service()
+        .send(Command::Player(PlayerCommand::Replace(
+            fixture
+                .catalog()
+                .by_ids(&original.map(str::to_owned))
+                .unwrap(),
+            0,
+        )));
+    snapshot(&worker, &original);
+
+    fixture.edit_library(|library| library.fail_playlist = true);
+    worker
+        .service()
+        .send(Command::EnqueuePlaylist("mix".into(), Placement::Next));
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message == "Could not load playlist tracks to queue."),
+    );
+    fixture.edit_library(|library| library.fail_playlist = false);
+    worker.service().send(Command::EnqueuePlaylist(
+        "mix".into(),
+        Placement::AfterAlbum,
+    ));
+    fixture.wait_request(&Request::new("getPlaylist.view", &[("id", "mix")]));
+    let queued = snapshot(
+        &worker,
+        &[
+            first,
+            second,
+            third,
+            "playlist-only",
+            "other-song",
+            "playlist-only",
+            "other-song",
+        ],
+    );
+    assert_eq!(queued.index, Some(0));
+    assert_eq!(queued.track.unwrap().id, first);
+
+    // The cached summary alone cannot supply tracks when the server goes offline.
+    fixture.edit_library(|library| library.offline = true);
+    worker.service().send(Command::CheckConnection(true));
+    event(&worker, |event| {
+        matches!(event, Event::Connection(Connection::Offline(_)))
+    });
+    worker
+        .service()
+        .send(Command::EnqueuePlaylist("mix".into(), Placement::Last));
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message == "Could not load playlist tracks to queue."),
+    );
+
+    // Previously loaded playlist tracks remain usable offline.
+    let catalog = fixture.catalog();
+    let mut cached = catalog.playlist("mix").unwrap().unwrap();
+    cached.entry = catalog.by_ids(&["other-song".into()]).unwrap().into();
+    cached.song_count = 1;
+    catalog.save_playlist(&cached).unwrap();
+    worker
+        .service()
+        .send(Command::EnqueuePlaylist("mix".into(), Placement::Last));
+    snapshot(
+        &worker,
+        &[
+            first,
+            second,
+            third,
+            "playlist-only",
+            "other-song",
+            "playlist-only",
+            "other-song",
+            "other-song",
+        ],
+    );
+
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

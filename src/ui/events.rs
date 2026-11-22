@@ -15,6 +15,7 @@ impl MusicApp {
                     self.close_playlist_creation(window, cx);
                     self.playlist_rename = None;
                     self.smart = Default::default();
+                    self.playlists = Default::default();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
@@ -238,9 +239,16 @@ impl MusicApp {
                     self.highlight_album = Some((id, tracks));
                 }
             }
+            Event::AlbumDetails(album) => {
+                if self.playlists.update_album(album.clone()) {
+                    self.request_popularity(&album.artist_credits());
+                }
+            }
             Event::Playlists(playlists) => self.playlists.summaries_loaded(playlists),
             Event::Playlist(playlist) => self.playlists.detail_loaded(playlist),
             Event::TrackUpdated(track) => self.apply_track_update(track),
+            Event::ReleaseCandidates(query, result) => self.releases_found(query, result),
+            Event::ReleaseLoaded(id, result) => self.release_loaded(id, result),
             Event::AlbumUpdated(album) => self.apply_album_update(album),
             Event::Artwork(id, path, thumbs) => {
                 self.art_failures.remove(&id);
@@ -301,6 +309,12 @@ impl MusicApp {
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
                 if position_only {
                     self.notify_part(Part::Player, cx);
+                    // Timed lyrics draw in their own part, so redraw it when
+                    // the line moves or the next one needs a wake armed.
+                    if self.lyrics_need_redraw() {
+                        self.notify_part(Part::NowLyrics, cx);
+                        self.notify_part(Part::InfoBody, cx);
+                    }
                     if self.workspace == Workspace::Queue && !self.blank {
                         // The playing queue row shows elapsed time.
                         self.notify_part(Part::Center, cx);
