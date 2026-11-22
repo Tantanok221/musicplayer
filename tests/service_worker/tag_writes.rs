@@ -329,14 +329,14 @@ fn writes_musicbrainz_ids_and_undo_takes_them_out() {
 #[test]
 fn one_song_finds_the_releases_its_recording_is_on() {
     let fixture = Fixture::new(Library::default());
-    let mut worker = fixture.start();
+    let worker = fixture.start();
     let query = ReleaseQuery {
         artist: "Radiohead".into(),
         title: "Airbag".into(),
         length_ms: Some(284_000),
         ..Default::default()
     };
-    worker.service().send(Command::FindReleases(query.clone()));
+    worker.service().send(Command::FindReleases(query));
     let Event::ReleaseCandidates(_, Ok(found)) = event(&worker, |event| {
         matches!(event, Event::ReleaseCandidates(..))
     }) else {

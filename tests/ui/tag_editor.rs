@@ -600,7 +600,7 @@ fn open_editor_on(
     writes_tags(fixture, true);
     fixture.settle(window, cx);
     fixture.expect("album songs for the tag editor", move |_, _| {
-        vec![Event::Album("album-1".into(), songs.clone())]
+        vec![Event::Album("album-1".into(), songs)]
     });
     album_menu(fixture, window, cx);
     fixture.menu_item(window, "Edit Album Tags…", cx);
