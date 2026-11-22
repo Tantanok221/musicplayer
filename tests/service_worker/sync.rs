@@ -191,18 +191,21 @@ fn empty_playlist_lists_complete_sync_and_remove_cached_playlists() {
 }
 
 #[test]
-fn malformed_search3_lists_fail_sync_without_deleting_cached_music() {
+fn malformed_search3_responses_fail_sync_without_deleting_cached_music() {
     for kind in ["song", "album"] {
-        for value in [
-            json!({"id":"single"}),
-            json!("invalid"),
-            json!(42),
-            json!(false),
+        for response in [
+            json!({"status":"ok"}),
+            json!({"status":"ok","searchResult3":null}),
+            json!({"status":"ok","searchResult3":[]}),
+            json!({"status":"ok","searchResult3":{kind:{"id":"single"}}}),
+            json!({"status":"ok","searchResult3":{kind:"invalid"}}),
+            json!({"status":"ok","searchResult3":{kind:42}}),
+            json!({"status":"ok","searchResult3":{kind:false}}),
         ] {
             let fixture = Fixture::new(Library {
                 tracks: vec![],
                 albums: vec![],
-                sync_list: Some((kind, value)),
+                sync_response: Some((kind, response.clone())),
                 ..Library::default()
             });
             {
@@ -222,7 +225,7 @@ fn malformed_search3_lists_fail_sync_without_deleting_cached_music() {
             assert_eq!(
                 catalog.by_ids(&["cached".into()]).unwrap().len(),
                 1,
-                "malformed {kind} must not delete cached tracks"
+                "malformed {kind} response {response} must not delete cached tracks: {outcome:?}"
             );
             assert!(catalog.album("cached-album").unwrap().is_some());
             assert!(matches!(outcome, Event::Error(message)
