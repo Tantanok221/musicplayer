@@ -164,9 +164,13 @@ pub enum Command {
     AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
     /// Writes the edit into the files under the mapped music folder.
-    WriteTags(crate::tags::TagEdit),
+    WriteTags(Vec<crate::tags::TagEdit>),
     /// Puts back the tags the last edit changed.
     UndoTags,
+    /// Searches MusicBrainz for editions of an album.
+    FindReleases(crate::autotag::ReleaseQuery),
+    /// Release ID: fetches its tracks for matching.
+    LoadRelease(String),
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
@@ -272,6 +276,11 @@ pub enum Event {
     AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
     TagsWritten(crate::tags::TagReport),
+    ReleaseCandidates(
+        crate::autotag::ReleaseQuery,
+        Result<Vec<crate::autotag::ReleaseCandidate>, String>,
+    ),
+    ReleaseLoaded(String, Result<Arc<crate::autotag::Release>, String>),
 }
 #[derive(Clone)]
 pub struct Service {
@@ -285,18 +294,23 @@ pub mod test_support;
 
 /// Writes an edit into every selected file it can find, journaling each
 /// file before it is touched.
-fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::tags::TagReport> {
+fn write_tags(catalog: &Catalog, edits: &[crate::tags::TagEdit]) -> Result<crate::tags::TagReport> {
     use crate::tags::{self, EditState};
     let prefs: Preferences = catalog.state("preferences")?;
     let mut report = tags::TagReport {
         job: chrono::Utc::now().timestamp_micros(),
         ..Default::default()
     };
-    let tracks = catalog.by_ids(&edit.tracks)?;
+    let mut tracks = vec![];
+    for edit in edits {
+        for track in catalog.by_ids(&edit.tracks)? {
+            tracks.push((track, &edit.fields));
+        }
+    }
     if !prefs.metadata.write_tags {
         report.failures = tracks
             .iter()
-            .map(|track| {
+            .map(|(track, _)| {
                 (
                     track.title.clone(),
                     "Turn on Write tags to files in Settings → Metadata first.".into(),
@@ -308,7 +322,7 @@ fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::t
     let root = std::path::PathBuf::from(&prefs.metadata.library_folder);
     // A file written since the last rescan no longer matches the size Navidrome has.
     let unconfirmed = catalog.unconfirmed_tag_edits()?;
-    for track in tracks {
+    for (track, fields) in tracks {
         let file = match unconfirmed
             .iter()
             .rev()
@@ -334,7 +348,7 @@ fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::t
             }
         };
         let id = catalog.journal_tag_edit(report.job, &track, &file, &before)?;
-        match tags::write(&file, &edit.fields) {
+        match tags::write(&file, fields) {
             Ok((_, after)) => {
                 catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
                 report.written += 1;
@@ -2305,13 +2319,34 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
-                Command::WriteTags(edit) => {
-                    let report = write_tags(&catalog, &edit)?;
+                Command::WriteTags(edits) => {
+                    let report = write_tags(&catalog, &edits)?;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
                 }
                 Command::UndoTags => {
                     let report = undo_tags(&catalog)?;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
+                Command::FindReleases(query) => {
+                    let (musicbrainz, events) = (musicbrainz.clone(), events.clone());
+                    runtime.spawn(async move {
+                        let result = musicbrainz
+                            .search_releases(&query)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::ReleaseCandidates(query, result));
+                    });
+                }
+                Command::LoadRelease(id) => {
+                    let (musicbrainz, events) = (musicbrainz.clone(), events.clone());
+                    runtime.spawn(async move {
+                        let result = musicbrainz
+                            .release(&id)
+                            .await
+                            .map(Arc::new)
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::ReleaseLoaded(id, result));
+                    });
                 }
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;

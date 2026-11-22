@@ -87,7 +87,11 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = ink(cx);
-        let selected = self.selected.as_ref().is_some_and(|t| t.id == track.id);
+        let selected = if self.selection.len() > 1 {
+            self.selection.contains(&track.id)
+        } else {
+            self.selected.as_ref().is_some_and(|t| t.id == track.id)
+        };
         let active = self
             .playback
             .track
@@ -181,6 +185,11 @@ impl MusicApp {
             )
             .child(feedback)
             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
+                let modifiers = event.modifiers();
+                if modifiers.shift || modifiers.platform || modifiers.control {
+                    app.select_more(now.clone(), modifiers, cx);
+                    return;
+                }
                 app.select_track(now.clone(), cx);
                 if event.click_count() == 2 {
                     if let Some(playback) = &playback {

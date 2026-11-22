@@ -247,6 +247,8 @@ impl MusicApp {
             Event::Playlists(playlists) => self.playlists.summaries_loaded(playlists),
             Event::Playlist(playlist) => self.playlists.detail_loaded(playlist),
             Event::TrackUpdated(track) => self.apply_track_update(track),
+            Event::ReleaseCandidates(query, result) => self.releases_found(query, result),
+            Event::ReleaseLoaded(id, result) => self.release_loaded(id, result),
             Event::AlbumUpdated(album) => self.apply_album_update(album),
             Event::Artwork(id, path, thumbs) => {
                 self.art_failures.remove(&id);

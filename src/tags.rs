@@ -27,6 +27,12 @@ pub enum TagField {
     Genre,
     Composer,
     Comment,
+    MusicBrainzTrack,
+    MusicBrainzReleaseTrack,
+    MusicBrainzRelease,
+    MusicBrainzReleaseGroup,
+    MusicBrainzArtist,
+    MusicBrainzAlbumArtist,
 }
 
 impl TagField {
@@ -43,6 +49,21 @@ impl TagField {
         TagField::Comment,
     ];
 
+    /// MusicBrainz identifiers: written by a lookup, not shown in the form.
+    pub const IDS: [TagField; 6] = [
+        TagField::MusicBrainzTrack,
+        TagField::MusicBrainzReleaseTrack,
+        TagField::MusicBrainzRelease,
+        TagField::MusicBrainzReleaseGroup,
+        TagField::MusicBrainzArtist,
+        TagField::MusicBrainzAlbumArtist,
+    ];
+
+    /// Every field Sonora reads, writes and puts back.
+    pub fn every() -> impl Iterator<Item = TagField> {
+        Self::ALL.into_iter().chain(Self::IDS)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             TagField::Title => "Title",
@@ -55,6 +76,12 @@ impl TagField {
             TagField::Genre => "Genre",
             TagField::Composer => "Composer",
             TagField::Comment => "Comment",
+            TagField::MusicBrainzTrack => "MusicBrainz recording ID",
+            TagField::MusicBrainzReleaseTrack => "MusicBrainz track ID",
+            TagField::MusicBrainzRelease => "MusicBrainz release ID",
+            TagField::MusicBrainzReleaseGroup => "MusicBrainz release group ID",
+            TagField::MusicBrainzArtist => "MusicBrainz artist ID",
+            TagField::MusicBrainzAlbumArtist => "MusicBrainz album artist ID",
         }
     }
 
@@ -70,6 +97,12 @@ impl TagField {
             TagField::Genre => "genre",
             TagField::Composer => "composer",
             TagField::Comment => "comment",
+            TagField::MusicBrainzTrack => "mb-recording",
+            TagField::MusicBrainzReleaseTrack => "mb-track",
+            TagField::MusicBrainzRelease => "mb-release",
+            TagField::MusicBrainzReleaseGroup => "mb-release-group",
+            TagField::MusicBrainzArtist => "mb-artist",
+            TagField::MusicBrainzAlbumArtist => "mb-album-artist",
         }
     }
 
@@ -77,7 +110,12 @@ impl TagField {
     pub fn multi(self) -> bool {
         matches!(
             self,
-            TagField::Artist | TagField::AlbumArtist | TagField::Genre | TagField::Composer
+            TagField::Artist
+                | TagField::AlbumArtist
+                | TagField::Genre
+                | TagField::Composer
+                | TagField::MusicBrainzArtist
+                | TagField::MusicBrainzAlbumArtist
         )
     }
 
@@ -90,6 +128,9 @@ impl TagField {
                 | TagField::AlbumArtist
                 | TagField::Track
                 | TagField::Disc
+                | TagField::MusicBrainzTrack
+                | TagField::MusicBrainzRelease
+                | TagField::MusicBrainzAlbumArtist
         )
     }
 
@@ -105,6 +146,12 @@ impl TagField {
             TagField::Genre => &[ItemKey::Genre],
             TagField::Composer => &[ItemKey::Composer],
             TagField::Comment => &[ItemKey::Comment],
+            TagField::MusicBrainzTrack => &[ItemKey::MusicBrainzRecordingId],
+            TagField::MusicBrainzReleaseTrack => &[ItemKey::MusicBrainzTrackId],
+            TagField::MusicBrainzRelease => &[ItemKey::MusicBrainzReleaseId],
+            TagField::MusicBrainzReleaseGroup => &[ItemKey::MusicBrainzReleaseGroupId],
+            TagField::MusicBrainzArtist => &[ItemKey::MusicBrainzArtistId],
+            TagField::MusicBrainzAlbumArtist => &[ItemKey::MusicBrainzReleaseArtistId],
         }
     }
 
@@ -143,6 +190,8 @@ impl TagField {
             }
             TagField::Composer => track.display_composer.clone(),
             TagField::Comment => track.comment.clone(),
+            TagField::MusicBrainzTrack => track.music_brainz_id.clone(),
+            _ => String::new(),
         }
     }
 }
@@ -200,20 +249,58 @@ pub struct TagEdit {
 /// The tag values read from or written to one file.
 pub type TagValues = BTreeMap<TagField, Vec<String>>;
 
-/// The editor's form: each field's shared value, or `None` when the
-/// selected tracks differ.
+/// The editor's form. With several songs, the per-track fields move into a
+/// table and the rest are edited once for all of them.
 #[derive(Clone, Debug)]
 pub struct EditorForm {
     pub tracks: Vec<Track>,
+    /// Each shared field's value, or `None` when the songs differ.
     pub fields: Vec<(TagField, Option<String>)>,
+    /// The table's columns; empty for a single song.
+    pub columns: Vec<TagField>,
 }
 
 pub const MULTIPLE_VALUES: &str = "<multiple values>";
 
+/// Fields that usually differ between the songs of an album.
+pub const PER_TRACK: [TagField; 4] = [
+    TagField::Track,
+    TagField::Disc,
+    TagField::Title,
+    TagField::Artist,
+];
+
+/// What the editor holds when the user saves.
+#[derive(Clone, Debug, Default)]
+pub struct Entries {
+    pub shared: Vec<(TagField, String)>,
+    /// Shared fields the user cleared on purpose: blank otherwise means keep.
+    pub cleared: std::collections::BTreeSet<TagField>,
+    /// Per song, the table's cells.
+    pub cells: Vec<Vec<(TagField, String)>>,
+    /// Per song, values a lookup filled in outside the visible inputs.
+    pub extra: Vec<BTreeMap<TagField, String>>,
+}
+
+/// One value the save would change, for the review before writing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub track: String,
+    pub field: TagField,
+    pub before: String,
+    pub after: String,
+}
+
 impl EditorForm {
     pub fn new(tracks: Vec<Track>) -> Self {
+        let columns = if tracks.len() > 1 {
+            PER_TRACK.to_vec()
+        } else {
+            vec![]
+        };
         let fields = TagField::ALL
             .iter()
+            .filter(|field| !columns.contains(field))
             .map(|&field| {
                 let mut values = tracks.iter().map(|track| field.shown(track));
                 let first = values.next().unwrap_or_default();
@@ -221,7 +308,11 @@ impl EditorForm {
                 (field, shared)
             })
             .collect();
-        Self { tracks, fields }
+        Self {
+            tracks,
+            fields,
+            columns,
+        }
     }
 
     pub fn shown(&self, field: TagField) -> Option<&str> {
@@ -231,30 +322,84 @@ impl EditorForm {
             .and_then(|(_, value)| value.as_deref())
     }
 
-    /// The edit for what the user typed: a field counts as changed only
-    /// when its text differs from what the form showed.
-    pub fn edit(&self, entered: &[(TagField, String)]) -> TagEdit {
-        let fields = entered
+    /// Each song's changes: a value counts only when it differs from what
+    /// the form showed, and a blank `<multiple values>` field is kept.
+    fn per_track(&self, entries: &Entries) -> Vec<BTreeMap<TagField, EditValue>> {
+        let shared: BTreeMap<_, _> = entries
+            .shared
             .iter()
-            .filter(|(field, text)| match self.shown(*field) {
-                Some(shown) => shown.trim() != text.trim(),
-                None => text.trim() != MULTIPLE_VALUES && !text.trim().is_empty(),
+            .filter_map(|(field, text)| {
+                let text = text.trim();
+                let changed = match self.shown(*field) {
+                    _ if text.is_empty() && entries.cleared.contains(field) => true,
+                    Some(shown) => shown.trim() != text,
+                    None => !text.is_empty() && text != MULTIPLE_VALUES,
+                };
+                changed.then(|| (*field, EditValue::parse(*field, text)))
             })
-            .map(|(field, text)| (*field, EditValue::parse(*field, text)))
             .collect();
-        TagEdit {
-            tracks: self.tracks.iter().map(|track| track.id.clone()).collect(),
-            fields,
+        self.tracks
+            .iter()
+            .enumerate()
+            .map(|(row, track)| {
+                let mut fields = shared.clone();
+                let cells = entries.cells.get(row).into_iter().flatten();
+                let extra = entries.extra.get(row).into_iter().flatten();
+                let own = cells.map(|(field, text)| (field, text)).chain(extra);
+                for (field, text) in own {
+                    if field.shown(track).trim() != text.trim() {
+                        fields.insert(*field, EditValue::parse(*field, text));
+                    }
+                }
+                fields
+            })
+            .collect()
+    }
+
+    /// The edits to write, one per group of songs getting the same changes.
+    pub fn edits(&self, entries: &Entries) -> Vec<TagEdit> {
+        let mut edits: Vec<TagEdit> = vec![];
+        for (track, fields) in self.tracks.iter().zip(self.per_track(entries)) {
+            if fields.is_empty() {
+                continue;
+            }
+            match edits.iter_mut().find(|edit| edit.fields == fields) {
+                Some(edit) => edit.tracks.push(track.id.clone()),
+                None => edits.push(TagEdit {
+                    tracks: vec![track.id.clone()],
+                    fields,
+                }),
+            }
         }
+        edits
+    }
+
+    /// Every value the save would change, song by song.
+    pub fn changes(&self, entries: &Entries) -> Vec<Change> {
+        self.tracks
+            .iter()
+            .zip(self.per_track(entries))
+            .flat_map(|(track, fields)| {
+                fields.into_iter().map(move |(field, value)| Change {
+                    track: track.title.clone(),
+                    field,
+                    before: field.shown(track),
+                    after: value.values().unwrap_or_default().join("; "),
+                })
+            })
+            .collect()
     }
 
     /// Edits that can give tracks new Navidrome IDs after the rescan.
-    pub fn warns_ids(&self, edit: &TagEdit) -> bool {
-        edit.fields.keys().any(|field| field.changes_id())
-            && self
-                .tracks
-                .iter()
-                .any(|track| track.music_brainz_id.is_empty())
+    pub fn warns_ids(&self, edits: &[TagEdit]) -> bool {
+        edits.iter().any(|edit| {
+            edit.fields.keys().any(|field| field.changes_id())
+                && self
+                    .tracks
+                    .iter()
+                    .filter(|track| edit.tracks.contains(&track.id))
+                    .any(|track| track.music_brainz_id.is_empty())
+        })
     }
 }
 
@@ -323,9 +468,8 @@ pub fn read(path: &Path) -> Result<TagValues> {
     let file =
         lofty::read_from_path(path).with_context(|| format!("Couldn't read {}", path.display()))?;
     let tag = file.primary_tag().or_else(|| file.first_tag());
-    Ok(TagField::ALL
-        .iter()
-        .map(|&field| {
+    Ok(TagField::every()
+        .map(|field| {
             let values = tag
                 .map(|tag| {
                     field
@@ -490,26 +634,38 @@ mod tests {
         }
     }
 
+    fn shared(fields: &[(TagField, &str)]) -> Entries {
+        Entries {
+            shared: fields.iter().map(|(f, t)| (*f, t.to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn form_shows_shared_values_and_multiple_values() {
+    fn form_moves_per_track_fields_into_the_table() {
         let form = EditorForm::new(vec![track("a", "Same", "One"), track("b", "Same", "Two")]);
         assert_eq!(form.shown(TagField::Album), Some("Same"));
-        assert_eq!(form.shown(TagField::Artist), None);
-        assert_eq!(form.shown(TagField::Title), None);
+        assert_eq!(form.shown(TagField::AlbumArtist), None);
+        assert_eq!(form.columns, PER_TRACK.to_vec());
+        assert!(form.fields.iter().all(|(f, _)| !PER_TRACK.contains(f)));
+        let single = EditorForm::new(vec![track("a", "Same", "One")]);
+        assert!(single.columns.is_empty());
+        assert_eq!(single.fields.len(), TagField::ALL.len());
     }
 
     #[test]
     fn edit_keeps_untouched_and_multiple_value_fields() {
         let form = EditorForm::new(vec![track("a", "Same", "One"), track("b", "Same", "Two")]);
-        let edit = form.edit(&[
-            (TagField::Album, "Same".into()),
-            (TagField::Artist, MULTIPLE_VALUES.into()),
-            (TagField::Genre, "Rock; Pop".into()),
-            (TagField::Year, " 2020 ".into()),
-        ]);
-        assert_eq!(edit.tracks, vec!["a".to_string(), "b".to_string()]);
+        let edits = form.edits(&shared(&[
+            (TagField::Album, "Same"),
+            (TagField::AlbumArtist, MULTIPLE_VALUES),
+            (TagField::Genre, "Rock; Pop"),
+            (TagField::Year, " 2020 "),
+        ]));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].tracks, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(
-            edit.fields.into_iter().collect::<Vec<_>>(),
+            edits[0].clone().fields.into_iter().collect::<Vec<_>>(),
             vec![
                 (TagField::Year, EditValue::Set("2020".into())),
                 (
@@ -521,15 +677,91 @@ mod tests {
     }
 
     #[test]
+    fn table_cells_give_each_song_its_own_edit() {
+        let form = EditorForm::new(vec![track("a", "Same", "One"), track("b", "Same", "Two")]);
+        let mut entries = shared(&[(TagField::Year, "2001")]);
+        entries.cells = vec![
+            vec![
+                (TagField::Title, "Song a".into()),
+                (TagField::Track, "1".into()),
+            ],
+            vec![
+                (TagField::Title, "Song b".into()),
+                (TagField::Track, "2".into()),
+            ],
+        ];
+        let edits = form.edits(&entries);
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].tracks, vec!["a".to_string()]);
+        assert_eq!(
+            edits[1].fields.get(&TagField::Track),
+            Some(&EditValue::Set("2".into()))
+        );
+        assert!(!edits[0].fields.contains_key(&TagField::Title));
+        assert_eq!(
+            form.changes(&entries)[1],
+            Change {
+                track: "Song a".into(),
+                field: TagField::Track,
+                before: "".into(),
+                after: "1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_blank_mixed_field_is_kept_unless_cleared() {
+        let form = EditorForm::new(vec![
+            Track {
+                comment: "x".into(),
+                ..track("a", "A", "One")
+            },
+            track("b", "A", "One"),
+        ]);
+        let mut entries = shared(&[(TagField::Comment, "")]);
+        assert!(form.edits(&entries).is_empty());
+        entries.cleared.insert(TagField::Comment);
+        let edits = form.edits(&entries);
+        assert_eq!(
+            edits[0].fields.get(&TagField::Comment),
+            Some(&EditValue::Clear)
+        );
+        assert_eq!(edits[0].tracks.len(), 2);
+    }
+
+    #[test]
     fn clearing_a_shared_field_clears_it() {
         let form = EditorForm::new(vec![Track {
             comment: "old".into(),
             ..track("a", "A", "One")
         }]);
-        let edit = form.edit(&[(TagField::Comment, "".into())]);
-        assert_eq!(edit.fields.get(&TagField::Comment), Some(&EditValue::Clear));
-        assert!(!form.warns_ids(&edit));
-        assert!(form.warns_ids(&form.edit(&[(TagField::Album, "B".into())])));
+        let edits = form.edits(&shared(&[(TagField::Comment, "")]));
+        assert_eq!(
+            edits[0].fields.get(&TagField::Comment),
+            Some(&EditValue::Clear)
+        );
+        assert!(!form.warns_ids(&edits));
+        assert!(form.warns_ids(&form.edits(&shared(&[(TagField::Album, "B")]))));
+    }
+
+    #[test]
+    fn lookup_ids_are_written_but_unchanged_ones_skipped() {
+        let form = EditorForm::new(vec![Track {
+            music_brainz_id: "rec".into(),
+            ..track("a", "A", "One")
+        }]);
+        let entries = Entries {
+            extra: vec![BTreeMap::from([
+                (TagField::MusicBrainzTrack, "rec".into()),
+                (TagField::MusicBrainzRelease, "rel".into()),
+            ])],
+            ..Default::default()
+        };
+        let edits = form.edits(&entries);
+        assert_eq!(
+            edits[0].fields.keys().copied().collect::<Vec<_>>(),
+            vec![TagField::MusicBrainzRelease]
+        );
     }
 
     #[test]

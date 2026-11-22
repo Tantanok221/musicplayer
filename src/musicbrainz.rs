@@ -1,4 +1,6 @@
-//! Read-only MusicBrainz lookups for artist discographies.
+//! Read-only MusicBrainz lookups: artist discographies and the releases
+//! the tag editor fills tags from.
+use crate::autotag::{LookupTrack, Release, ReleaseCandidate, ReleaseQuery};
 use crate::discography::{
     Discography, ListenLink, ReleaseDetails, ReleaseGroup, ReleaseTrack, fold, listen_service,
 };
@@ -312,6 +314,167 @@ impl MusicBrainz {
             }
         }
         Ok(details)
+    }
+}
+
+impl MusicBrainz {
+    /// Editions matching the album as it is tagged now, best match first.
+    pub async fn search_releases(&self, query: &ReleaseQuery) -> Result<Vec<ReleaseCandidate>> {
+        let found = self
+            .get("release", &[("query", &query.lucene()), ("limit", "10")])
+            .await?;
+        Ok(found["releases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(parse_candidate)
+            .collect())
+    }
+
+    /// A release with its tracks, credits, IDs and genres.
+    pub async fn release(&self, id: &str) -> Result<Release> {
+        let release = self
+            .get(
+                &format!("release/{id}"),
+                &[(
+                    "inc",
+                    "recordings artist-credits labels release-groups genres",
+                )],
+            )
+            .await?;
+        if release["id"].as_str().unwrap_or_default().is_empty() {
+            bail!("MusicBrainz has no release {id}");
+        }
+        Ok(parse_lookup(&release))
+    }
+}
+
+fn parse_candidate(release: &Value) -> ReleaseCandidate {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let label = release["label-info"]
+        .as_array()
+        .and_then(|labels| labels.first())
+        .cloned()
+        .unwrap_or_default();
+    let mut formats: Vec<String> = vec![];
+    for medium in release["media"].as_array().into_iter().flatten() {
+        let format = text(&medium["format"]);
+        if !format.is_empty() && !formats.contains(&format) {
+            formats.push(format);
+        }
+    }
+    let media = release["media"].as_array().map_or(0, Vec::len);
+    let format = match formats.as_slice() {
+        [one] if media > 1 => format!("{media}×{one}"),
+        _ => formats.join(" + "),
+    };
+    ReleaseCandidate {
+        id: text(&release["id"]),
+        title: text(&release["title"]),
+        artist: credit(&release["artist-credit"]),
+        date: text(&release["date"]),
+        country: text(&release["country"]),
+        format,
+        label: text(&label["label"]["name"]),
+        catalog: text(&label["catalog-number"]),
+        tracks: release["track-count"]
+            .as_u64()
+            .map(|n| n as u32)
+            .unwrap_or_else(|| edition_tracks(release)),
+        score: release["score"].as_u64().unwrap_or_default() as u32,
+    }
+}
+
+fn credits(value: &Value) -> Vec<(String, String)> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|part| {
+            let name = part["artist"]["name"]
+                .as_str()
+                .or(part["name"].as_str())
+                .unwrap_or_default();
+            let id = part["artist"]["id"].as_str().unwrap_or_default();
+            (name.to_string(), id.to_string())
+        })
+        .collect()
+}
+
+fn parse_lookup(release: &Value) -> Release {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let genres = |value: &Value| {
+        let mut genres: Vec<(u64, String)> = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|genre| {
+                Some((genre["count"].as_u64().unwrap_or(0), text(&genre["name"])))
+                    .filter(|(count, name)| *count > 0 && !name.is_empty())
+            })
+            .collect();
+        genres.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        genres
+            .into_iter()
+            .take(2)
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+    };
+    let mut release_genres = genres(&release["genres"]);
+    if release_genres.is_empty() {
+        release_genres = genres(&release["release-group"]["genres"]);
+    }
+    let artists = credits(&release["artist-credit"]);
+    let tracks = release["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(index, medium)| {
+            let disc = medium["position"].as_u64().unwrap_or(index as u64 + 1) as u32;
+            let artists = artists.clone();
+            medium["tracks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(move |(position, track)| {
+                    let mut credited = credits(&track["artist-credit"]);
+                    if credited.is_empty() {
+                        credited = credits(&track["recording"]["artist-credit"]);
+                    }
+                    if credited.is_empty() {
+                        credited = artists.clone();
+                    }
+                    LookupTrack {
+                        id: text(&track["id"]),
+                        recording_id: text(&track["recording"]["id"]),
+                        title: track["title"]
+                            .as_str()
+                            .or(track["recording"]["title"].as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        artists: credited,
+                        number: track["position"]
+                            .as_u64()
+                            .map(|n| n as u32)
+                            .unwrap_or(position as u32 + 1),
+                        disc,
+                        length_ms: track["length"]
+                            .as_u64()
+                            .or(track["recording"]["length"].as_u64()),
+                    }
+                })
+        })
+        .collect();
+    Release {
+        id: text(&release["id"]),
+        title: text(&release["title"]),
+        artists,
+        group_id: text(&release["release-group"]["id"]),
+        date: text(&release["date"]),
+        genres: release_genres,
+        tracks,
     }
 }
 
