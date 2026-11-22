@@ -29,6 +29,12 @@ fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
         id: "other".into(),
         name: "Other".into(),
     });
+    tracks[4].album_id = "display-performer".into();
+    tracks[4].artist = "Raw Performer".into();
+    tracks[4].artist_id = "display-performer-id".into();
+    tracks[4].display_artist = "Display Performer".into();
+    tracks[4].album_artist.clear();
+    tracks[4].album_artists.clear();
     let fixture = Fixture::new(Library {
         tracks,
         albums: vec![],
@@ -90,6 +96,15 @@ fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
     );
     assert_eq!(joint.artists.len(), 2);
     assert_eq!(catalog.artist_releases("Main", "main").unwrap().len(), 3);
+    let display_releases = catalog
+        .artist_releases("Display Performer", "display-performer-id")
+        .unwrap();
+    assert_eq!(
+        display_releases.len(),
+        1,
+        "display-name performer page must include its placeholder album"
+    );
+    assert_eq!(display_releases[0].id, "display-performer");
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }
