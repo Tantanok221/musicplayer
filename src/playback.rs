@@ -79,7 +79,14 @@ pub enum PlayerCommand {
     Replace(Vec<Arc<Track>>, usize),
     Restore(Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
     /// Restore an account's queue and change its persistence owner atomically.
-    RestoreAccount(String, Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
+    RestoreAccount {
+        namespace: String,
+        tracks: Vec<Arc<Track>>,
+        index: usize,
+        position: f64,
+        listen: Option<ListenSession>,
+        shuffle_positions: Option<Vec<usize>>,
+    },
     Insert(Vec<Arc<Track>>, Placement),
     Remove(usize),
     Move(usize, usize),
@@ -1020,13 +1027,13 @@ fn run(
             }
         }
         let mut restart = false;
-        for command in batch {
+        for mut command in batch {
             revision += 1;
             let mut reset_queue_edits = matches!(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
-                    | PlayerCommand::RestoreAccount(..)
+                    | PlayerCommand::RestoreAccount { .. }
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
@@ -1035,15 +1042,23 @@ fn run(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
-                    | PlayerCommand::RestoreAccount(..)
+                    | PlayerCommand::RestoreAccount { .. }
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::UpdateTrack(..)
             );
-            if let PlayerCommand::RestoreAccount(namespace, ..) = &command {
-                queue_account = namespace.clone();
-            }
+            let restored_positions = match &mut command {
+                PlayerCommand::RestoreAccount {
+                    namespace,
+                    shuffle_positions,
+                    ..
+                } => {
+                    queue_account = std::mem::take(namespace);
+                    shuffle_positions.take()
+                }
+                _ => None,
+            };
             match command {
                 PlayerCommand::Shutdown => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
@@ -1054,6 +1069,7 @@ fn run(
                         SavedQueue {
                             listen: tracker.session(listen_seed),
                             ids: queue.iter().map(|t| t.id.clone()).collect(),
+                            shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                             index,
                             position: if started {
                                 position(&clock)
@@ -1077,6 +1093,7 @@ fn run(
                     let _ = reply.send(SavedQueue {
                         listen: tracker.session(listen_seed),
                         ids: queue.iter().map(|t| t.id.clone()).collect(),
+                        shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                         index,
                         position: if started {
                             position(&clock)
@@ -1106,7 +1123,13 @@ fn run(
                     restart = true;
                 }
                 PlayerCommand::Restore(tracks, at, pos, listen)
-                | PlayerCommand::RestoreAccount(_, tracks, at, pos, listen) => {
+                | PlayerCommand::RestoreAccount {
+                    tracks,
+                    index: at,
+                    position: pos,
+                    listen,
+                    ..
+                } => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
                     drop(output.take());
                     pending_output = None;
@@ -1120,7 +1143,9 @@ fn run(
                         tracker.restore(listen);
                     }
                     queue = tracks;
-                    original = None;
+                    original = restored_positions
+                        .filter(|positions| prefs.shuffle && positions.len() == queue.len())
+                        .and_then(ShuffleOrder::from_saved);
                     index = (!queue.is_empty()).then_some(at.min(queue.len().saturating_sub(1)));
                     base_position = pos;
                     clock.playing.store(false, Ordering::Relaxed);
@@ -1537,6 +1562,7 @@ fn run(
                 SavedQueue {
                     listen: tracker.session(listen_seed),
                     ids: queue.iter().map(|t| t.id.clone()).collect(),
+                    shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                     index,
                     position: if started {
                         position(&clock)
