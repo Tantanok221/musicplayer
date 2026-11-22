@@ -132,7 +132,10 @@ impl Track {
         artist_credits(self.artist_label(), &self.artists, &self.artist_id)
     }
     pub fn album_artist_credits(&self) -> Vec<NamedId> {
-        let fallback = if normalize(self.album_artist_label()) == normalize(self.artist_label()) {
+        let album_artist = normalize(self.album_artist_label());
+        let fallback = if album_artist == normalize(self.artist_label())
+            || album_artist == normalize(&self.artist)
+        {
             self.artist_id.as_str()
         } else {
             ""
@@ -429,6 +432,8 @@ pub struct SavedQueue {
     #[serde(default)]
     pub listen: Option<crate::listening::ListenSession>,
     pub ids: Vec<TrackId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_positions: Option<Vec<usize>>,
     pub index: Option<usize>,
     pub position: f64,
 }

@@ -1,9 +1,112 @@
 use crate::fixture::{Fixture, Library, Request, WAIT, event, synced};
+use serde_json::json;
 use sonora::{
+    catalog::Catalog,
     model::Playlist,
     service::{Command, Event, Mutation},
 };
 use std::sync::Arc;
+
+#[test]
+fn delayed_playlist_reply_after_account_switch_keeps_new_accounts_catalog() {
+    delayed_playlist_reply_after_account_switch(false);
+}
+
+#[test]
+fn delayed_post_mutation_playlists_reply_after_account_switch_keeps_new_accounts_catalog() {
+    delayed_playlist_reply_after_account_switch(true);
+}
+
+fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
+    let mut old_playlist = smart_playlist("2999-01-01T00:00:00Z");
+    old_playlist.id = "a-playlist".into();
+    old_playlist.entry = vec![Arc::new(crate::fixture::song("a-song", "album"))].into();
+    let mut new_playlist = old_playlist.clone();
+    new_playlist.id = "b-playlist".into();
+    new_playlist.name = "Account B".into();
+    let a = Fixture::new(Library {
+        playlists: vec![old_playlist],
+        ..Default::default()
+    });
+    let b = Fixture::new(Library {
+        playlists: vec![new_playlist.clone()],
+        ..Default::default()
+    });
+    let mut worker = a.start_paused();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let endpoint = if post_mutation {
+        "getPlaylists.view"
+    } else {
+        "getPlaylist.view"
+    };
+    a.edit_library(|library| library.hold_playlist_endpoint = Some(endpoint));
+    if post_mutation {
+        a.expect_mutation(
+            Request::new(
+                "updatePlaylist.view",
+                &[("playlistId", "a-playlist"), ("songIndexToRemove", "0")],
+            ),
+            true,
+        );
+        worker
+            .service()
+            .send(Command::Mutate(Mutation::RemoveFromPlaylist(
+                "a-playlist".into(),
+                0,
+            )));
+        event(&worker, |event| matches!(event, Event::MutationDone(_)));
+    } else {
+        worker
+            .service()
+            .send(Command::Playlist("a-playlist".into()));
+    }
+    a.wait_request(&Request::new(
+        endpoint,
+        if post_mutation {
+            &[]
+        } else {
+            &[("id", "a-playlist")]
+        },
+    ));
+    let catalog = Catalog::open(
+        &a.paths
+            .data
+            .join(format!("{}.sqlite", b.account.namespace())),
+    )
+    .unwrap();
+    catalog.save_playlist(&new_playlist).unwrap();
+    worker.service().send(Command::Connect(
+        b.account.clone(),
+        "synthetic-password".into(),
+    ));
+    event(
+        &worker,
+        |event| matches!(event, Event::Ready(Some(account), _) if account.namespace() == b.account.namespace()),
+    );
+    synced(&worker);
+    let before = serde_json::to_value(catalog.playlist_summaries().unwrap()).unwrap();
+    a.resume_playlist();
+    if post_mutation {
+        a.wait_request(&Request::new("getPlaylist.view", &[("id", "a-playlist")]));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while worker.events().recv_deadline(deadline).is_ok() {}
+    crate::fixture::view(&worker);
+    assert_eq!(
+        serde_json::to_value(catalog.playlist_summaries().unwrap()).unwrap(),
+        before,
+        "a delayed account A reply must not add playlists or delete account B playlists"
+    );
+    assert!(catalog.playlist("a-playlist").unwrap().is_none());
+    assert_eq!(
+        serde_json::to_value(catalog.playlist("b-playlist").unwrap().unwrap()).unwrap(),
+        serde_json::to_value(new_playlist).unwrap()
+    );
+    worker.shutdown(WAIT).unwrap();
+    a.finish();
+    b.finish();
+}
 
 fn smart_playlist(until: &str) -> Playlist {
     serde_json::from_value(serde_json::json!({
@@ -93,6 +196,52 @@ fn expired_smart_refresh_failure_keeps_cache_then_empty_result_replaces_it() {
     );
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
+}
+
+#[test]
+fn incomplete_smart_refresh_preserves_cached_entries() {
+    for playlist in [
+        json!({"id":"smart","songCount":2,"entry":[{"id":"other-song"}]}),
+        json!({"id":"smart","songCount":1}),
+        json!({"id":"smart","songCount":1,"entry":[{}]}),
+        json!({"id":"smart"}),
+        json!({"id":"wrong","songCount":0}),
+    ] {
+        let mut cached = smart_playlist("2000-01-01T00:00:00Z");
+        let summary = cached.clone();
+        cached.entry = vec![Arc::new(crate::fixture::song("cached", "album"))].into();
+        let fixture = Fixture::new(Library {
+            playlists: vec![summary],
+            playlist_response: Some(json!({"status":"ok","playlist":playlist})),
+            ..Library::default()
+        });
+        fixture.seed();
+        fixture.catalog().save_playlist(&cached).unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        synced(&worker);
+        let outcome = event(&worker, |event| match event {
+            Event::Error(_) => true,
+            Event::Playlist(list) => !list
+                .entry
+                .iter()
+                .map(|track| track.id.as_str())
+                .eq(["cached"]),
+            _ => false,
+        });
+        let saved = fixture.catalog().playlist("smart").unwrap().unwrap();
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+        assert!(
+            saved
+                .entry
+                .iter()
+                .map(|track| track.id.as_str())
+                .eq(["cached"]),
+            "partial getPlaylist {playlist} overwrote cached entries"
+        );
+        assert!(matches!(outcome, Event::Error(message) if message.contains("getPlaylist")));
+    }
 }
 
 #[test]

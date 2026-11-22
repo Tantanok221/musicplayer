@@ -1,5 +1,86 @@
 use crate::model::Track;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
+
+/// Original-order ranks aligned with queue occurrences, independent of track identity.
+#[derive(Clone)]
+pub(super) struct ShuffleOrder {
+    positions: Vec<usize>,
+}
+
+impl ShuffleOrder {
+    pub fn new(len: usize) -> Self {
+        Self {
+            positions: (0..len).collect(),
+        }
+    }
+    pub fn from_saved(mut positions: Vec<usize>) -> Option<Self> {
+        // Deletions and missing catalog entries leave gaps in the saved ranks.
+        let mut ranked: Vec<_> = positions.iter().copied().enumerate().collect();
+        ranked.sort_unstable_by_key(|&(_, rank)| rank);
+        if ranked.windows(2).any(|pair| pair[0].1 == pair[1].1) {
+            return None;
+        }
+        for (rank, (index, _)) in ranked.into_iter().enumerate() {
+            positions[index] = rank;
+        }
+        Some(Self { positions })
+    }
+    pub fn saved_positions(&self) -> Vec<usize> {
+        self.positions.clone()
+    }
+    pub fn shuffle(&mut self, tracks: &mut Vec<Arc<Track>>, start: usize) {
+        let mut entries = self
+            .positions
+            .iter()
+            .copied()
+            .zip(std::mem::take(tracks))
+            .collect::<Vec<_>>();
+        entries[start..].shuffle(&mut rand::rng());
+        (self.positions, *tracks) = entries.into_iter().unzip();
+    }
+    pub fn insert(&mut self, at: usize, len: usize, last: bool) {
+        let after = if last {
+            self.positions.iter().max().map_or(0, |i| i + 1)
+        } else {
+            at.checked_sub(1).map_or(0, |i| self.positions[i] + 1)
+        };
+        for position in &mut self.positions {
+            if *position >= after {
+                *position += len;
+            }
+        }
+        self.positions.splice(at..at, after..after + len);
+    }
+    pub fn remove(&mut self, at: usize) {
+        self.positions.remove(at);
+    }
+    pub fn move_entry(&mut self, from: usize, to: usize) {
+        let position = self.positions.remove(from);
+        self.positions.insert(to, position);
+    }
+    pub fn reorder(&mut self, order: &[usize]) {
+        self.positions = order.iter().map(|i| self.positions[*i]).collect();
+    }
+    pub fn restore(
+        self,
+        tracks: Vec<Arc<Track>>,
+        current: Option<usize>,
+    ) -> (Vec<Arc<Track>>, Option<usize>) {
+        let mut entries = self
+            .positions
+            .into_iter()
+            .zip(tracks)
+            .enumerate()
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(_, (position, _))| *position);
+        let current = entries.iter().position(|(i, _)| Some(*i) == current);
+        (
+            entries.into_iter().map(|(_, (_, track))| track).collect(),
+            current,
+        )
+    }
+}
 
 /// Edits address the published play order, including when shuffle is enabled.
 #[derive(Clone, Debug)]
@@ -39,7 +120,7 @@ fn edited_order(len: usize, current: Option<usize>, edit: &QueueEdit) -> Option<
 
 struct QueueUndo {
     tracks: Vec<Arc<Track>>,
-    original: Option<Vec<Arc<Track>>>,
+    original: Option<ShuffleOrder>,
     ids: Arc<Vec<u64>>,
     /// Each post-edit index identifies its pre-edit occurrence, even for duplicates.
     order: Vec<usize>,
@@ -81,7 +162,7 @@ impl QueueEdits {
         revision: u64,
         edit: &QueueEdit,
         tracks: &mut Vec<Arc<Track>>,
-        original: &mut Option<Vec<Arc<Track>>>,
+        original: &mut Option<ShuffleOrder>,
         current: Option<usize>,
     ) -> bool {
         if revision != self.revision {
@@ -93,18 +174,8 @@ impl QueueEdits {
         let before = std::mem::take(tracks);
         let before_original = original.clone();
         *tracks = order.iter().map(|i| before[*i].clone()).collect();
-        let mut retained = vec![false; before.len()];
-        for i in &order {
-            retained[*i] = true;
-        }
         if let Some(original) = original.as_mut() {
-            for (index, removed) in before.iter().enumerate() {
-                if !retained[index]
-                    && let Some(at) = original.iter().position(|t| t.id == removed.id)
-                {
-                    original.remove(at);
-                }
-            }
+            original.reorder(&order);
         }
         let ids = self.ids.clone();
         self.ids = Arc::new(order.iter().map(|i| ids[*i]).collect());
@@ -120,7 +191,7 @@ impl QueueEdits {
     pub fn undo(
         &mut self,
         tracks: &mut Vec<Arc<Track>>,
-        original: &mut Option<Vec<Arc<Track>>>,
+        original: &mut Option<ShuffleOrder>,
         current: &mut Option<usize>,
     ) -> bool {
         let Some(undo) = self.undo.take() else {
@@ -135,11 +206,7 @@ impl QueueEdits {
     }
     pub fn update_track(&mut self, track: &Arc<Track>) {
         if let Some(undo) = self.undo.as_mut() {
-            for queued in undo
-                .tracks
-                .iter_mut()
-                .chain(undo.original.iter_mut().flatten())
-            {
+            for queued in &mut undo.tracks {
                 if queued.id == track.id {
                     *queued = track.clone();
                 }
@@ -161,6 +228,33 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn shuffle_order_tracks_shared_arcs_through_moves_and_insertions() {
+        let same = tracks(&["same"]).remove(0);
+        let mut queue = vec![same.clone(), tracks(&["middle"]).remove(0), same];
+        let mut order = ShuffleOrder::new(queue.len());
+        queue.swap(0, 2);
+        order.move_entry(2, 0);
+        order.move_entry(2, 1);
+        order.insert(1, 1, false);
+        queue.insert(1, tracks(&["next"]).remove(0));
+        order.insert(0, 1, false);
+        queue.insert(0, tracks(&["first"]).remove(0));
+        order.insert(queue.len(), 1, true);
+        queue.extend(tracks(&["last"]));
+        order.remove(4);
+        queue.remove(4);
+        let (queue, current) = order.restore(queue, Some(1));
+        assert_eq!(
+            queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "middle", "same", "next", "last"]
+        );
+        assert_eq!(current, Some(2));
     }
 
     #[test]
@@ -209,7 +303,7 @@ mod tests {
     #[test]
     fn undo_follows_the_current_occurrence_after_playback_advances() {
         let mut queue = tracks(&["a", "same", "removed", "same", "last"]);
-        let mut original = Some(queue.clone());
+        let mut original = Some(ShuffleOrder::new(queue.len()));
         let mut edits = QueueEdits::default();
         edits.reset(queue.len());
         let ids = edits.ids();
@@ -225,7 +319,7 @@ mod tests {
         assert!(edits.undo(&mut queue, &mut original, &mut current));
         assert_eq!(current, Some(3), "keep the second occurrence playing");
         assert_eq!(edits.ids(), ids);
-        assert_eq!(original.unwrap().len(), 5);
+        assert_eq!(original.unwrap().positions.len(), 5);
         assert!(!edits.can_undo());
     }
 

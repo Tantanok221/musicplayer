@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use serde_json::json;
 use sonora::{
     browser::CoverRows,
@@ -54,6 +55,32 @@ fn albums(db: &Catalog, spec: SortSpec) -> Vec<String> {
 }
 fn tracks(db: &Catalog, spec: SortSpec) -> Vec<String> {
     db.matching_ids(&query(spec)).unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/sorting.proptest-regressions"))),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_natural_keys_are_total_and_deterministic(a in ".{0,100}", b in ".{0,100}", c in ".{0,100}", seed in any::<u64>()) {
+        let (a_key, b_key, c_key) = (natural_key(&a), natural_key(&b), natural_key(&c));
+        prop_assert_eq!(&a_key, &natural_key(&a));
+        prop_assert_eq!(a_key.cmp(&b_key), b_key.cmp(&a_key).reverse());
+        prop_assert_eq!(a_key.cmp(&b_key).is_eq(), a_key == b_key);
+        if a_key <= b_key && b_key <= c_key {
+            prop_assert!(a_key <= c_key);
+        }
+        prop_assert_eq!(sonora::sorting::shuffle_key(seed, &a), sonora::sorting::shuffle_key(seed, &a));
+    }
+
+    #[test]
+    fn prop_numeric_keys_follow_integer_order(a in any::<u64>(), b in any::<u64>(), zeroes in 0usize..100) {
+        prop_assert_eq!(natural_key(&a.to_string()).cmp(&natural_key(&b.to_string())), a.cmp(&b));
+        prop_assert_eq!(natural_key(&format!("{}{a}", "0".repeat(zeroes))), natural_key(&a.to_string()));
+    }
 }
 
 #[test]

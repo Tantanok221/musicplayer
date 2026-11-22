@@ -19,6 +19,8 @@ pub mod playlists;
 pub mod server;
 pub mod service;
 pub mod slskd;
+pub mod smart_editor;
+pub mod smart_rules;
 pub mod sorting;
 pub mod thumbnail;
 pub mod ui;
