@@ -1,5 +1,34 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct PlaylistRemoval {
+    id: String,
+    index: usize,
+    entries: Arc<Vec<Arc<Track>>>,
+}
+
+impl PlaylistRemoval {
+    fn new(playlist: &Playlist, index: usize) -> Self {
+        Self {
+            id: playlist.id.clone(),
+            index,
+            entries: playlist.entry.clone(),
+        }
+    }
+
+    pub(super) fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
+        let current = current?;
+        (current.id == self.id
+            && self.index < current.entry.len()
+            && current
+                .entry
+                .iter()
+                .map(|track| &track.id)
+                .eq(self.entries.iter().map(|track| &track.id)))
+        .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+    }
+}
+
 impl MusicApp {
     pub(super) fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
@@ -27,6 +56,11 @@ impl MusicApp {
             let rename_id = playlist.id.clone();
             let delete_id = playlist.id.clone();
             let save_id = playlist.id.clone();
+            let editable = playlist.owner.is_empty()
+                || self
+                    .account
+                    .as_ref()
+                    .is_some_and(|account| account.username == playlist.owner);
             return div()
                 .size_full()
                 .min_h_0()
@@ -141,7 +175,11 @@ impl MusicApp {
                                         track,
                                         index + 1,
                                         format!("playlist-{index}"),
-                                        None,
+                                        editable.then(|| {
+                                            tracks::TrackPosition::Playlist(PlaylistRemoval::new(
+                                                &playlist, index,
+                                            ))
+                                        }),
                                         None,
                                         cx,
                                     )
@@ -193,5 +231,52 @@ impl MusicApp {
             .overflow_y_scroll()
             .child(items)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playlist(ids: &[&str]) -> Playlist {
+        Playlist {
+            id: "playlist".into(),
+            entry: Arc::new(
+                ids.iter()
+                    .map(|id| {
+                        Arc::new(Track {
+                            id: (*id).into(),
+                            ..Default::default()
+                        })
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn removal_keeps_duplicate_entry_indices_and_rejects_stale_or_empty_playlists() {
+        let original = playlist(&["a", "b", "a"]);
+        let removal = PlaylistRemoval::new(&original, 2);
+        assert_eq!(
+            removal.mutation(Some(&original)),
+            Some(Mutation::RemoveFromPlaylist("playlist".into(), 2))
+        );
+        assert!(removal.mutation(None).is_none());
+        assert!(removal.mutation(Some(&playlist(&[]))).is_none());
+        assert!(
+            removal
+                .mutation(Some(&playlist(&["a", "a", "b"])))
+                .is_none()
+        );
+        let mut other = original.clone();
+        other.id = "other".into();
+        assert!(removal.mutation(Some(&other)).is_none());
+        assert!(
+            PlaylistRemoval::new(&original, 3)
+                .mutation(Some(&original))
+                .is_none()
+        );
     }
 }

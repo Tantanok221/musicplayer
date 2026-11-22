@@ -310,6 +310,17 @@ impl Server {
         .await?;
         Ok(())
     }
+    pub async fn remove_from_playlist(&self, id: &str, index: usize) -> Result<()> {
+        self.request(
+            "updatePlaylist",
+            &[
+                ("playlistId", id.into()),
+                ("songIndexToRemove", index.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
     pub async fn delete_playlist(&self, id: &str) -> Result<()> {
         self.request("deletePlaylist", &[("id", id.into())]).await?;
         Ok(())

@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) enum TrackPosition {
+    Queue(usize),
+    Playlist(playlists::PlaylistRemoval),
+}
+
+impl TrackPosition {
+    fn queue_index(&self) -> Option<usize> {
+        match self {
+            Self::Queue(index) => Some(*index),
+            Self::Playlist(_) => None,
+        }
+    }
+}
+
 impl MusicApp {
     pub(super) fn queue_places(&self) -> Rc<QueuePlaces> {
         let current = self.playback.track.as_ref();
@@ -24,7 +39,7 @@ impl MusicApp {
         track: Arc<Track>,
         number: usize,
         key: String,
-        queue_index: Option<usize>,
+        position: Option<TrackPosition>,
         popular: Option<bool>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -37,7 +52,8 @@ impl MusicApp {
             .is_some_and(|t| t.id == track.id);
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
-        let menu = self.track_menu(track.clone(), queue_index, cx);
+        let queue_index = position.as_ref().and_then(TrackPosition::queue_index);
+        let menu = self.track_menu(track.clone(), position, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
             .test_support()
