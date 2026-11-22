@@ -13,6 +13,73 @@ use sonora::{
 use std::{sync::Arc, time::Duration};
 
 #[gpui_kit::test]
+fn metadata_links_double_click_needs_only_one_back(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent, MouseButton, MouseDownEvent, MouseUpEvent};
+    let (_dir, mut f, window, _app) = start(cx);
+    f.seed_explorer();
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = f.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    f.search(window, "Fixture", cx);
+    f.backend.player_commands().try_iter().for_each(drop);
+    for column in ["artist", "album", "genre"] {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let position = window
+                .find(format!("playlist-link-playlist-0-{column}-0"))
+                .bounds()
+                .center();
+            let modifiers = window.modifiers();
+            // Native double-click events can arrive together before the next frame.
+            for click_count in 1..=2 {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        f.settle(window, cx);
+        assert!(f.backend.player_commands().try_recv().is_err());
+        f.click(window, "history-back", cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.try_find("playlist-track-header").is_some(),
+                "one Back must return from double-clicked {column} metadata"
+            );
+            assert_eq!(window.find("music-search").value(), Some("Fixture"));
+        })
+        .unwrap();
+    }
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
 fn metadata_links_open_artist_album_and_genre_without_playing(cx: &mut TestAppContext) {
     let (_dir, mut f, window, app) = start(cx);
     f.seed_explorer();

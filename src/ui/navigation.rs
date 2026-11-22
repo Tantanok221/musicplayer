@@ -249,9 +249,11 @@ impl MusicApp {
             .cursor_pointer()
             .hover(|link| link.text_color(ink(cx).accent))
             .child(label)
-            .on_click(cx.listener(move |app, _, window, cx| {
+            .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                app.open_explorer_filter(filter.clone(), window, cx);
+                if event.click_count() == 1 {
+                    app.open_explorer_filter(filter.clone(), window, cx);
+                }
             }))
             .into_any_element()
     }
@@ -348,9 +350,11 @@ impl MusicApp {
                     .cursor_pointer()
                     .hover(|link| link.text_color(ink(cx).accent))
                     .child(name.clone())
-                    .on_click(cx.listener(move |app, _, window, cx| {
+                    .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                         cx.stop_propagation();
-                        app.open_artist(name.clone(), id.clone(), window, cx);
+                        if event.click_count() == 1 {
+                            app.open_artist(name.clone(), id.clone(), window, cx);
+                        }
                     })),
             );
         }
