@@ -891,6 +891,8 @@ enum PlaybackPlatform {
     /// No media controls; the output device id is whatever the test scripts.
     #[cfg(feature = "test-support")]
     Headless(HeadlessOutput),
+    #[cfg(feature = "test-support")]
+    Scripted(Sender<DecodeRequest>),
 }
 
 impl PlaybackPlatform {
@@ -899,6 +901,8 @@ impl PlaybackPlatform {
             Self::Native => default_output_id(),
             #[cfg(feature = "test-support")]
             Self::Headless(output) => output.lock().unwrap().clone(),
+            #[cfg(feature = "test-support")]
+            Self::Scripted(_) => Some("scripted".into()),
         }
     }
 
@@ -912,6 +916,8 @@ impl PlaybackPlatform {
             .ok(),
             #[cfg(feature = "test-support")]
             Self::Headless(_) => None,
+            #[cfg(feature = "test-support")]
+            Self::Scripted(_) => None,
         }
     }
 }
@@ -1374,9 +1380,15 @@ fn run(
                 let clock = clock.clone();
                 let errors = error_tx.clone();
                 let runtime = runtime.clone();
-                std::thread::Builder::new()
-                    .name("sonora-decoder".into())
-                    .spawn(move || decode_queue(request, tx, clock, errors, runtime))?;
+                match &platform {
+                    #[cfg(feature = "test-support")]
+                    PlaybackPlatform::Scripted(requests) => requests.send(request)?,
+                    _ => {
+                        std::thread::Builder::new()
+                            .name("sonora-decoder".into())
+                            .spawn(move || decode_queue(request, tx, clock, errors, runtime))?;
+                    }
+                }
                 started = true;
                 error = None;
             } else {
@@ -1498,6 +1510,7 @@ fn run(
         }
         clock.cancel_stale_downloads();
         if clock.finished.swap(false, Ordering::AcqRel) {
+            listen_seed = None;
             clock.playing.store(false, Ordering::Relaxed);
             clock.buffering.store(false, Ordering::Relaxed);
             started = false;
