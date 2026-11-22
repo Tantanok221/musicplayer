@@ -25,10 +25,41 @@ impl MusicApp {
         track: &Track,
         key: &str,
         column: PlaylistColumn,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let value = column.value(track);
         let tooltip = value.clone();
+        let link_key = format!("playlist-link-{key}-{}", column.key());
+        let content = match column {
+            PlaylistColumn::Artist if value != "—" => {
+                self.artist_links(track.artist_credits(), link_key, cx)
+            }
+            PlaylistColumn::AlbumArtist if value != "—" => {
+                self.artist_links(track.album_artist_credits(), link_key, cx)
+            }
+            PlaylistColumn::Genre if value != "—" => {
+                self.genre_links(&track.genres_label(), link_key, cx)
+            }
+            PlaylistColumn::Album if value != "—" && !track.album_id.trim().is_empty() => {
+                let album_id = track.album_id.clone();
+                div()
+                    .id(SharedString::from(format!("{link_key}-0")))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(format!("Open album {value}"))
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|link| link.text_color(ink(cx).accent))
+                    .child(value.clone())
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        cx.stop_propagation();
+                        app.open_album_in_explorer(album_id.clone(), window, cx);
+                    }))
+                    .into_any_element()
+            }
+            _ => div().child(value.clone()).into_any_element(),
+        };
         div()
             .id(SharedString::from(format!(
                 "playlist-cell-{key}-{}",
@@ -36,12 +67,12 @@ impl MusicApp {
             )))
             .test_support()
             .role(Role::Cell)
-            .aria_label(value.clone())
+            .aria_label(value)
             .w(px(column.width()))
             .flex_shrink_0()
             .truncate()
             .text_color(ink(cx).muted)
-            .child(value)
+            .child(content)
             .tooltip(move |window, cx| tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
             .into_any_element()
     }

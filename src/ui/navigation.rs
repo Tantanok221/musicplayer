@@ -261,7 +261,15 @@ impl MusicApp {
         key: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut links = div().flex().flex_wrap().min_w_0().items_center().gap_1();
+        let mut links = div()
+            .flex()
+            .flex_wrap()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .when(key.starts_with("playlist-link-"), |links| {
+                links.flex_nowrap().overflow_hidden()
+            });
         for (index, genre) in genres
             .split(" · ")
             .map(str::trim)
@@ -316,7 +324,7 @@ impl MusicApp {
             .gap(px(3.));
         // Fixed-height rows must stay on one line; wrapped credits would spill
         // into the next row.
-        if ["footer", "queue-artist", "card-artist"]
+        if ["footer", "queue-artist", "card-artist", "playlist-link-"]
             .iter()
             .any(|prefix| key.starts_with(prefix))
         {
@@ -331,6 +339,7 @@ impl MusicApp {
             links = links.child(
                 div()
                     .id(SharedString::from(format!("{key}-{index}")))
+                    .test_support()
                     .role(Role::Button)
                     .aria_label(format!("Open artist {name}"))
                     .min_w_0()

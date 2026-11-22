@@ -161,6 +161,8 @@ impl MusicApp {
             }))
             .child(
                 div()
+                    .id(SharedString::from(format!("row-title-{key}")))
+                    .test_support()
                     .min_w_0()
                     .when(playlist_columns.is_some(), |title| title.min_w(px(180.)))
                     .flex_1()
