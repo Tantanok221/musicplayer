@@ -239,6 +239,11 @@ impl MusicApp {
                     self.highlight_album = Some((id, tracks));
                 }
             }
+            Event::AlbumDetails(album) => {
+                if self.playlists.update_album(album.clone()) {
+                    self.request_popularity(&album.artist_credits());
+                }
+            }
             Event::Playlists(playlists) => self.playlists.summaries_loaded(playlists),
             Event::Playlist(playlist) => self.playlists.detail_loaded(playlist),
             Event::TrackUpdated(track) => self.apply_track_update(track),

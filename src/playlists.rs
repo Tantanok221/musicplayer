@@ -1,5 +1,5 @@
 use crate::{
-    model::{Playlist, Track, normalize},
+    model::{Album, Playlist, Track, normalize},
     service::{Command, Mutation, PlaylistTarget},
 };
 use std::{collections::HashMap, sync::Arc};
@@ -108,6 +108,26 @@ pub struct PlaylistAlbum {
     pub entries: Vec<usize>,
 }
 
+impl PlaylistAlbum {
+    pub(crate) fn fallback_album(&self) -> Album {
+        let track = &self.track;
+        Album {
+            id: track.album_id.clone(),
+            name: if track.album.is_empty() {
+                "Unknown album".into()
+            } else {
+                track.album.clone()
+            },
+            artist: track.album_artist_label().into(),
+            artists: track.album_artist_credits(),
+            cover_art: track.cover_art.clone(),
+            year: track.year,
+            genre: track.genres_label(),
+            ..Default::default()
+        }
+    }
+}
+
 fn album_key(track: &Track) -> String {
     if track.album_id.is_empty() {
         // Some servers omit album IDs; do not combine unrelated artists' albums.
@@ -151,15 +171,21 @@ pub struct Playlists {
     current: Option<Playlist>,
     search: String,
     view: PlaylistView,
-    expanded_album: Option<String>,
+    expanded_album: Option<ExpandedAlbum>,
     pending_delete: Option<String>,
+}
+
+#[derive(Clone)]
+struct ExpandedAlbum {
+    key: String,
+    details: Option<Arc<Album>>,
 }
 
 impl Playlists {
     pub fn open(&mut self, summary: Playlist) -> String {
         let id = summary.id.clone();
         if self.current.as_ref().is_none_or(|current| current.id != id) {
-            self.expanded_album = None;
+            self.clear_album();
         }
         self.current = Some(summary);
         id
@@ -167,6 +193,10 @@ impl Playlists {
 
     pub fn close(&mut self) {
         self.current = None;
+        self.clear_album();
+    }
+
+    pub(crate) fn clear_album(&mut self) {
         self.expanded_album = None;
     }
 
@@ -179,7 +209,7 @@ impl Playlists {
                 current.owner.clone_from(&summary.owner);
                 current.valid_until.clone_from(&summary.valid_until);
             } else {
-                self.current = None;
+                self.close();
             }
         }
         self.summaries = summaries
@@ -223,11 +253,27 @@ impl Playlists {
     }
 
     pub fn expanded_album(&self) -> Option<&str> {
-        self.expanded_album.as_deref()
+        self.expanded_album.as_ref().map(|album| album.key.as_str())
     }
 
-    pub fn toggle_album(&mut self, key: String) {
-        self.expanded_album = (self.expanded_album.as_ref() != Some(&key)).then_some(key);
+    pub fn toggle_album(&mut self, key: String) -> Option<&str> {
+        self.expanded_album = (self.expanded_album() != Some(key.as_str()))
+            .then_some(ExpandedAlbum { key, details: None });
+        self.expanded_album()?.strip_prefix("id:")
+    }
+
+    pub(crate) fn album_details(&self) -> Option<&Arc<Album>> {
+        self.expanded_album.as_ref()?.details.as_ref()
+    }
+
+    pub(crate) fn update_album(&mut self, details: Arc<Album>) -> bool {
+        if let Some(album) = &mut self.expanded_album
+            && album.key.strip_prefix("id:") == Some(details.id.as_str())
+        {
+            album.details = Some(details);
+            return true;
+        }
+        false
     }
 
     /// Group only the matching playlist entries, never the rest of a library album.
@@ -540,6 +586,23 @@ mod tests {
         assert_eq!(state.current().unwrap().entry[0].id, "b");
         state.close();
         assert!(state.visible_albums().is_empty());
+    }
+
+    #[test]
+    fn album_details_belong_to_the_current_expansion() {
+        let mut state = Playlists::default();
+        let details = Arc::new(Album {
+            id: "release".into(),
+            ..Default::default()
+        });
+        assert_eq!(state.toggle_album("id:release".into()), Some("release"));
+        assert!(state.update_album(details.clone()));
+        assert_eq!(state.album_details().unwrap().id, "release");
+        assert_eq!(state.toggle_album("id:release".into()), None);
+        assert!(!state.update_album(details.clone()));
+        assert_eq!(state.toggle_album("metadata:untagged".into()), None);
+        assert!(!state.update_album(details));
+        assert!(state.album_details().is_none());
     }
 
     #[test]
