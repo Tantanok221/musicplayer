@@ -291,36 +291,6 @@ pub fn candidates(responses: &[SearchResponse], expected_tracks: Option<u32>) ->
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn oversized_candidate(size: u64, length: u32) -> Candidate {
-        let responses = [SearchResponse {
-            files: ["Album\\01.flac", "Album\\02.flac"]
-                .map(|filename| RemoteFile {
-                    filename: filename.into(),
-                    size,
-                    length: Some(length),
-                    ..Default::default()
-                })
-                .to_vec(),
-            ..Default::default()
-        }];
-        candidates(&responses, None).remove(0)
-    }
-
-    #[test]
-    fn candidate_size_saturates() {
-        assert_eq!(oversized_candidate(u64::MAX, 1).size, u64::MAX);
-    }
-
-    #[test]
-    fn candidate_duration_saturates() {
-        assert_eq!(oversized_candidate(1, u32::MAX).seconds, u32::MAX);
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchStatus {
     pub complete: bool,

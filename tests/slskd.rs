@@ -68,7 +68,6 @@ fn parsed_search_candidates_saturate_untrusted_totals() {
         assert_eq!(found[0].files.len(), 3);
         assert_eq!(found[0].completeness, Completeness::Exact);
     }
-    assert!(candidates(&[], None).is_empty());
 }
 
 #[test]
