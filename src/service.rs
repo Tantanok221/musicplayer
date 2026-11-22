@@ -163,7 +163,11 @@ pub enum Command {
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
-    Connected(Server, String, Option<flume::Receiver<()>>),
+    ConnectFinished {
+        attempt: u64,
+        result: Result<(Server, String), String>,
+        password: Option<String>,
+    },
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
@@ -176,8 +180,8 @@ pub enum Command {
     /// Pings the server when a check is due; `true` checks right away.
     CheckConnection(bool),
     SaveWindow(crate::platform::WindowFrame),
-    /// Account namespace and whether its server answered.
-    ConnectionChecked(String, Result<(), String>),
+    /// Connection attempt and whether its server answered.
+    ConnectionChecked(u64, Result<(), String>),
     Shutdown(Sender<()>),
 }
 
@@ -836,6 +840,7 @@ fn set_connection(current: &mut Connection, next: Connection, events: &Sender<Ev
 
 /// Connects with the saved login. Returns false when there is no login to use.
 fn reconnect(
+    attempt: u64,
     account: Account,
     paths: &Paths,
     runtime: &tokio::runtime::Handle,
@@ -853,7 +858,6 @@ fn reconnect(
             return false;
         }
     };
-    let namespace = account.namespace();
     let tx = tx.clone();
     runtime.spawn(async move {
         let result = async {
@@ -862,9 +866,10 @@ fn reconnect(
             Ok::<_, anyhow::Error>((server, label))
         }
         .await;
-        let _ = tx.send(match result {
-            Ok((server, label)) => Command::Connected(server, label, None),
-            Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
+        let _ = tx.send(Command::ConnectFinished {
+            attempt,
+            result: result.map_err(|error| format!("{error:#}")),
+            password: None,
         });
     });
     true
@@ -1035,10 +1040,11 @@ fn run(
         .into(),
     ))?;
     let mut connection = Connection::None;
+    let mut connection_attempt = 0;
     let mut checking = false;
     let mut last_check = Instant::now();
     if let Some(account) = account.clone() {
-        checking = reconnect(account, &paths, &runtime, &tx, &events);
+        checking = reconnect(connection_attempt, account, &paths, &runtime, &tx, &events);
         if checking {
             set_connection(&mut connection, Connection::Connecting, &events);
         }
@@ -1267,31 +1273,65 @@ fn run(
                     }
                 }
                 Command::Connect(account, password) => {
+                    connection_attempt += 1;
+                    let attempt = connection_attempt;
+                    checking = true;
                     let command_tx = tx.clone();
                     let paths = paths.clone();
                     runtime.spawn(async move {
                         let result = async {
                             let mut server = Server::sign_in(&paths, account, &password)?;
                             let label = server.connect().await?;
-                            if !password.is_empty() {
-                                paths.save_credentials(&server.account, server.credentials())?;
-                            }
                             Ok::<_, anyhow::Error>((server, label))
                         }
                         .await;
-                        match result {
-                            Ok((server, label)) => {
-                                let session = native::sign_in_session(&server, &paths, password);
-                                let _ = command_tx.send(Command::Connected(server, label, session));
-                            }
-                            Err(error) => {
-                                let _ = command_tx
-                                    .send(Command::Error(format!("Could not connect: {error:#}")));
-                            }
-                        }
+                        let _ = command_tx.send(Command::ConnectFinished {
+                            attempt,
+                            result: result.map_err(|error| format!("{error:#}")),
+                            password: Some(password),
+                        });
                     });
                 }
-                Command::Connected(value, label, session) => {
+                Command::ConnectFinished {
+                    attempt,
+                    result,
+                    password,
+                } => {
+                    if attempt != connection_attempt {
+                        return Ok(());
+                    }
+                    checking = false;
+                    last_check = Instant::now();
+                    let result = result.and_then(|(server, label)| {
+                        if password
+                            .as_ref()
+                            .is_some_and(|password| !password.is_empty())
+                        {
+                            paths
+                                .save_credentials(&server.account, server.credentials())
+                                .map_err(|error| format!("{error:#}"))?;
+                        }
+                        Ok((server, label))
+                    });
+                    let (value, label) = match result {
+                        Ok(connected) => connected,
+                        Err(error) if password.is_some() => {
+                            if matches!(connection, Connection::Connecting) {
+                                set_connection(
+                                    &mut connection,
+                                    Connection::Offline(
+                                        "Saved server connection was interrupted".into(),
+                                    ),
+                                    &events,
+                                );
+                            }
+                            anyhow::bail!("Could not connect: {error}");
+                        }
+                        Err(error) => {
+                            set_connection(&mut connection, Connection::Offline(error), &events);
+                            return Ok(());
+                        }
+                    };
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
@@ -1324,10 +1364,10 @@ fn run(
                         let _ = tx.send(Command::ResumeDownloads);
                     }
                     paths.save_account(&value.account)?;
-                    native_editor.session(session);
+                    native_editor.session(password.and_then(|password| {
+                        native::sign_in_session(&value, &paths, &runtime, password)
+                    }));
                     account = Some(value.account.clone());
-                    checking = false;
-                    last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
                     server = Some(value.clone());
@@ -2515,31 +2555,38 @@ fn run(
                 Command::CheckConnection(now) => {
                     if !checking && (now || last_check.elapsed() >= connection.check_interval()) {
                         if let Some(server) = server.clone() {
+                            connection_attempt += 1;
+                            let attempt = connection_attempt;
                             checking = true;
                             last_check = Instant::now();
                             let tx = tx.clone();
                             runtime.spawn(async move {
                                 let result =
                                     server.ping().await.map_err(|error| format!("{error:#}"));
-                                let _ = tx.send(Command::ConnectionChecked(
-                                    server.account.namespace(),
-                                    result,
-                                ));
+                                let _ = tx.send(Command::ConnectionChecked(attempt, result));
                             });
                         } else if let Some(account) = account.clone()
                             && matches!(connection, Connection::Offline(_))
                         {
                             // The first connection failed; connecting again also starts a sync.
+                            connection_attempt += 1;
                             last_check = Instant::now();
-                            checking = reconnect(account, &paths, &runtime, &tx, &events);
+                            checking = reconnect(
+                                connection_attempt,
+                                account,
+                                &paths,
+                                &runtime,
+                                &tx,
+                                &events,
+                            );
                             if !checking {
                                 set_connection(&mut connection, Connection::None, &events);
                             }
                         }
                     }
                 }
-                Command::ConnectionChecked(namespace, result) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                Command::ConnectionChecked(attempt, result) => {
+                    if attempt == connection_attempt {
                         checking = false;
                         last_check = Instant::now();
                         let reconnected =

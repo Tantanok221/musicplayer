@@ -823,6 +823,76 @@ fn sign_in_fields_and_connect_reach_the_real_worker(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn late_startup_reconnect_leaves_the_library_selected_in_settings_visible(cx: &mut TestAppContext) {
+    use sonora::platform::shortcut;
+
+    cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
+    let a = Fixture::new(Library {
+        hold_endpoint: Some("ping.view"),
+        ..Library::default()
+    });
+    let b = Fixture::new(Library {
+        tracks: vec![crate::worker_fixture::song("b-song", "b-album")],
+        albums: vec![crate::worker_fixture::album("b-album")],
+        ..Library::default()
+    });
+    a.seed();
+    let (worker, tx, window, app) = mount_worker_with_player(&a, Preferences::default(), true, cx);
+    a.wait_request(&Request::new("ping.view", &[]));
+    deliver_until(&worker, &tx, window, cx, |_, cx| {
+        cx.update_window(window, |_, window, _| {
+            window
+                .try_find("explorer-album-album")
+                .is_some_and(|album| album.visible())
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.press(shortcut("cmd-,", "ctrl-,"), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("Server address").value(),
+            Some(a.account.url.as_str())
+        );
+        window.click("Server address", cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+        window.input(&b.account.url, cx);
+        window.click("Password", cx);
+        window.input("synthetic-password", cx);
+        window.click("connect-library", cx);
+    })
+    .unwrap();
+    wait_library(&worker, &tx, window, cx, "explorer-album-b-album");
+
+    a.resume_held();
+    a.wait_request(&Request::new("getOpenSubsonicExtensions.view", &[]));
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    while let Ok(event) = worker.events().recv_deadline(deadline) {
+        tx.send(event).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .try_find("explorer-album-b-album")
+                .is_some_and(|album| album.visible()),
+            "the library chosen in Settings must still be visible after A's reconnect"
+        );
+        window.press(shortcut("cmd-,", "ctrl-,"), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("Server address").value(),
+            Some(b.account.url.as_str())
+        );
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    a.finish();
+    b.finish();
+}
+
+#[gpui_kit::test]
 fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut TestAppContext) {
     let fixture = Fixture::new(Library::default());
     std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
