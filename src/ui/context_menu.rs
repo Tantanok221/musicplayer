@@ -272,7 +272,7 @@ impl MusicApp {
             _ => None,
         };
         let removal = match position {
-            Some(tracks::TrackPosition::Playlist(removal)) => Some(removal),
+            Some(tracks::TrackPosition::Playlist { removal, .. }) => removal,
             _ => None,
         };
         move |menu, window, cx| {

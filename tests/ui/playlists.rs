@@ -4,8 +4,103 @@ use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt}
 use sonora::{
     model::{PlaybackSnapshot, Playlist},
     platform::shortcut,
+    playback::{PlayerCommand, test_support::PausedPlayer},
     service::{Command, Event, Mutation, PlaylistTarget},
 };
+use std::{sync::Arc, time::Duration};
+
+#[gpui_kit::test]
+fn double_click_replaces_queue_with_playlist_at_clicked_occurrence(cx: &mut TestAppContext) {
+    double_click_playlist(cx, "fixture");
+}
+
+#[gpui_kit::test]
+fn double_click_read_only_playlist_still_replaces_queue(cx: &mut TestAppContext) {
+    double_click_playlist(cx, "another-owner");
+}
+
+fn double_click_playlist(cx: &mut TestAppContext, owner: &'static str) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    fixture
+        .backend
+        .emit(Event::Playlists(vec![playlist("Roadtrip")]));
+    fixture.settle(window, cx);
+    fixture.expect("open mixed playlist", move |command, catalog| {
+        assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+        let mut list = playlist("Roadtrip");
+        list.owner = owner.into();
+        list.entry = Arc::new(
+            catalog
+                .by_ids(&[
+                    "track-3".into(),
+                    "track-2".into(),
+                    "track-2".into(),
+                    "track-1".into(),
+                ])
+                .unwrap(),
+        );
+        list.song_count = 4;
+        vec![Event::Playlist(list)]
+    });
+    fixture.click(window, "nav-playlist-playlist-1", cx);
+    fixture.backend.player_commands().try_iter().for_each(drop);
+    fixture.click(window, "row-playlist-2", cx);
+    assert!(
+        fixture.backend.player_commands().is_empty(),
+        "single click must not play"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("row-playlist-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    let command = fixture
+        .backend
+        .player_commands()
+        .try_recv()
+        .expect("playlist replacement");
+    let PlayerCommand::Replace(ref tracks, index) = command else {
+        panic!("must replace queue")
+    };
+    assert_eq!(
+        tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["track-3", "track-2", "track-2", "track-1"]
+    );
+    assert_eq!(index, 2, "duplicate occurrences keep their own position");
+    let mut player = PausedPlayer::start(Duration::from_secs(5)).unwrap();
+    let snapshot = player
+        .command(
+            PlayerCommand::Restore(tracks.clone(), index, 0., None),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(snapshot.index, Some(2));
+    assert_eq!(snapshot.track.as_ref().unwrap().id, "track-2");
+    assert_eq!(snapshot.queue[3].id, "track-1");
+    fixture.backend.emit(Event::Playback(snapshot));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-2").visible());
+        assert!(window.find("play-pause").visible());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+    fixture.diagnose("playlist double click replaced queue", window, &app, cx);
+    player.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[gpui_kit::test]
+fn empty_playlist_has_no_song_to_double_click(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    fixture.backend.player_commands().try_iter().for_each(drop);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    assert!(fixture.backend.player_commands().is_empty());
+    fixture.assert_script_finished();
+}
 
 fn playlist(name: &str) -> Playlist {
     Playlist {

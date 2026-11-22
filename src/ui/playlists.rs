@@ -171,10 +171,13 @@ impl MusicApp {
                                         track,
                                         index + 1,
                                         format!("playlist-{index}"),
-                                        editable.then(|| {
-                                            tracks::TrackPosition::Playlist(PlaylistRemoval::new(
-                                                &playlist, index,
-                                            ))
+                                        Some(tracks::TrackPosition::Playlist {
+                                            playback: tracks::TrackPlayback::Playlist(
+                                                playlist.entry.clone(),
+                                                index,
+                                            ),
+                                            removal: editable
+                                                .then(|| PlaylistRemoval::new(&playlist, index)),
                                         }),
                                         None,
                                         cx,
