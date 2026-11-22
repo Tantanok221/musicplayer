@@ -17,6 +17,7 @@ pub(super) struct TagEditor {
     review: Option<Vec<Change>>,
     lookup: Lookup,
     candidates: Vec<ReleaseCandidate>,
+    link: Entity<InputState>,
     saving: bool,
     failures: Vec<(String, String)>,
 }
@@ -120,6 +121,12 @@ impl MusicApp {
             review: None,
             lookup: Lookup::Idle,
             candidates: vec![],
+            link: text_input(
+                String::new(),
+                "MusicBrainz release or recording link",
+                window,
+                cx,
+            ),
             saving: false,
             failures: vec![],
         });
@@ -185,6 +192,33 @@ impl MusicApp {
         let query = ReleaseQuery::for_tracks(&editor.form.tracks);
         editor.lookup = Lookup::Searching(query.clone());
         self.service.send(Command::FindReleases(query));
+        cx.notify();
+    }
+
+    fn open_link(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let pasted = editor.link.read(cx).value().to_string();
+        match autotag::parse_link(&pasted) {
+            Some(autotag::Link::Release(id)) => {
+                editor.candidates.clear();
+                editor.lookup = Lookup::Loading(id.clone());
+                self.service.send(Command::LoadRelease(id));
+            }
+            Some(autotag::Link::Recording(recording)) => {
+                let query = ReleaseQuery {
+                    recording,
+                    ..Default::default()
+                };
+                editor.lookup = Lookup::Searching(query.clone());
+                self.service.send(Command::FindReleases(query));
+            }
+            None => {
+                editor.lookup =
+                    Lookup::Failed("Paste a MusicBrainz release or recording link or ID".into())
+            }
+        }
         cx.notify();
     }
 
@@ -765,6 +799,27 @@ impl MusicApp {
                         },
                     ),
             );
+        if editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks) {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&editor.link).small().id("musicbrainz-link")),
+                    )
+                    .child(
+                        Button::new("open-musicbrainz-link")
+                            .small()
+                            .label("Load Link")
+                            .disabled(searching)
+                            .on_click(cx.listener(|app, _, _, cx| app.open_link(cx))),
+                    ),
+            );
+        }
         if let Some(changes) = &editor.review {
             panel = panel.child(self.review_panel(changes, cx));
         } else {

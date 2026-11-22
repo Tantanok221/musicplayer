@@ -491,3 +491,64 @@ fn songs_from_several_albums_offer_no_musicbrainz_search(cx: &mut TestAppContext
     assert!(present(window, "tag-editor", cx));
     assert!(!present(window, "find-musicbrainz", cx));
 }
+
+fn paste_link(fixture: &mut Fixture, window: AnyWindowHandle, link: &str, cx: &mut TestAppContext) {
+    cx.update_window(window, |_, window, cx| {
+        window.click("musicbrainz-link", cx);
+        window.input(link, cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.click(window, "open-musicbrainz-link", cx);
+}
+
+#[gpui_kit::test]
+fn a_pasted_release_link_loads_that_release_without_searching(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    paste_link(&mut fixture, window, "not a link", cx);
+    assert_eq!(
+        label(window, "lookup-error", cx).as_deref(),
+        Some("Paste a MusicBrainz release or recording link or ID")
+    );
+    let id = "b84ee12a-09ef-421b-82de-0441a926375b";
+    fixture.expect("load the pasted release", move |command, _| {
+        assert!(matches!(&command, Command::LoadRelease(asked) if asked == id));
+        vec![Event::ReleaseLoaded(id.into(), Ok(Arc::new(release())))]
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("musicbrainz-link", cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+    })
+    .unwrap();
+    paste_link(
+        &mut fixture,
+        window,
+        &format!("https://musicbrainz.org/release/{id}"),
+        cx,
+    );
+    assert!(present(window, "fill-tags", cx));
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn a_pasted_recording_link_offers_the_releases_it_is_on(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    let id = "4a2a2b31-0b8a-4a4d-b3d6-6a3b5e1f0d3c";
+    fixture.expect("search by recording ID", move |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        assert_eq!(query.lucene(), format!("rid:{id}"));
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    paste_link(
+        &mut fixture,
+        window,
+        &format!("https://musicbrainz.org/recording/{id}?tab=details"),
+        cx,
+    );
+    assert!(label(window, ("release-candidate", 0_usize), cx).is_some());
+    fixture.assert_script_finished();
+}

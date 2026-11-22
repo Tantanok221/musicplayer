@@ -14,6 +14,8 @@ pub struct ReleaseQuery {
     /// offers the releases it appears on.
     pub title: String,
     pub length_ms: Option<u64>,
+    /// A pasted recording ID, searched for the releases it appears on.
+    pub recording: String,
 }
 
 impl ReleaseQuery {
@@ -38,6 +40,7 @@ impl ReleaseQuery {
                 tracks: 0,
                 title: song.title.clone(),
                 length_ms: (song.duration > 0.).then(|| (song.duration * 1000.) as u64),
+                ..Default::default()
             };
         }
         let mut artist = first(|track| &track.album_artist);
@@ -62,7 +65,7 @@ impl ReleaseQuery {
     }
 
     pub fn is_song(&self) -> bool {
-        !self.title.is_empty()
+        !self.title.is_empty() || !self.recording.is_empty()
     }
 
     /// What the search is for, as the editor names it while it runs.
@@ -76,6 +79,9 @@ impl ReleaseQuery {
 
     /// The Lucene query MusicBrainz's release search takes.
     pub fn lucene(&self) -> String {
+        if !self.recording.is_empty() {
+            return format!("rid:{}", self.recording);
+        }
         if self.is_song() {
             let mut terms = vec![format!("recording:\"{}\"", escape(&self.title))];
             if !self.artist.is_empty() {
@@ -99,6 +105,37 @@ impl ReleaseQuery {
             terms.push(format!("tracks:{}", self.tracks));
         }
         terms.join(" AND ")
+    }
+}
+
+/// What a pasted MusicBrainz link or bare ID points at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+    Release(String),
+    Recording(String),
+}
+
+/// Reads a pasted release or recording URL, or a bare ID taken as a release.
+pub fn parse_link(text: &str) -> Option<Link> {
+    let text = text.trim().to_ascii_lowercase();
+    let is_id = |id: &str| {
+        id.len() == 36
+            && id.char_indices().all(|(at, c)| match at {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            })
+    };
+    if is_id(&text) {
+        return Some(Link::Release(text));
+    }
+    let path = text.split("musicbrainz.org/").nth(1)?;
+    let mut parts = path.split(['/', '?', '#']);
+    let kind = parts.next()?;
+    let id = parts.next().filter(|id| is_id(id))?.to_string();
+    match kind {
+        "release" => Some(Link::Release(id)),
+        "recording" => Some(Link::Recording(id)),
+        _ => None,
     }
 }
 
@@ -432,5 +469,29 @@ mod tests {
         };
         assert!(!ReleaseQuery::spans_albums(&[song.clone(), song.clone()]));
         assert!(ReleaseQuery::spans_albums(&[song, other]));
+    }
+
+    #[test]
+    fn pasted_links_and_ids_are_recognised() {
+        let id = "b84ee12a-09ef-421b-82de-0441a926375b";
+        assert_eq!(
+            parse_link(&format!(" https://musicbrainz.org/release/{id}/discids ")),
+            Some(Link::Release(id.into()))
+        );
+        assert_eq!(
+            parse_link(&format!("musicbrainz.org/recording/{id}")),
+            Some(Link::Recording(id.into()))
+        );
+        assert_eq!(parse_link(id), Some(Link::Release(id.into())));
+        assert_eq!(
+            parse_link(&id.to_uppercase()),
+            Some(Link::Release(id.into()))
+        );
+        assert_eq!(
+            parse_link(&format!("https://musicbrainz.org/artist/{id}")),
+            None
+        );
+        assert_eq!(parse_link("b84ee12a-09ef-421b"), None);
+        assert_eq!(parse_link(""), None);
     }
 }
