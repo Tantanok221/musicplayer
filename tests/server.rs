@@ -3,9 +3,45 @@ use axum::{
     extract::{Path, Query},
     routing::get,
 };
+use proptest::prelude::*;
 use serde_json::{Value, json};
 use sonora::{platform::Account, server::Server};
 use std::collections::HashMap;
+
+#[path = "common/parser_values.rs"]
+mod parser_values;
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/server.proptest-regressions"))),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_subsonic_envelopes_reject_invalid_status(value in prop_oneof![
+        parser_values::json_value(),
+        parser_values::json_value().prop_map(|v| json!({"subsonic-response": v})),
+        parser_values::json_value().prop_map(|v| json!({"subsonic-response": {"status": v}})),
+        Just(json!({"subsonic-response": {"status": "ok"}})),
+    ]) {
+        let valid = value.get("subsonic-response")
+            .and_then(|body| body.get("status")) == Some(&json!("ok"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(axum::serve(listener, Router::new().route(
+                "/rest/ping.view", get(move || async move { Json(value) })
+            )).into_future());
+            let server = Server::new(Account { url: format!("http://{address}"), username: "test".into() }, "secret".into()).unwrap();
+            let result = server.ping().await;
+            task.abort();
+            result
+        });
+        prop_assert_eq!(result.is_ok(), valid);
+    }
+}
 
 async fn handler(
     Path(endpoint): Path<String>,

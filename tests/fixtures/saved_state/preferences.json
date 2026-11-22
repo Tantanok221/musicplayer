@@ -1,0 +1,14 @@
+{
+  "volume": 0.25,
+  "gain": "Album",
+  "shuffle": true,
+  "repeat": "All",
+  "dark": true,
+  "layout": {"left_width": 247.0, "show_spectrum": false, "navigator_auto_hide": true},
+  "sorting": {"tracks": {"scope": "Tracks", "rules": [{"field": "OriginalDate", "descending": true}], "grouping": "None", "group_descending": true, "ignore_the": false, "seed": 17}},
+  "downloads": {"enabled": true, "url": "http://localhost:5030"},
+  "all_missing_releases": true,
+  "favorites": {"hearted": false, "min_rating": 4, "match_all": true},
+  "tabs": {"tabs": [{"id": 7, "locked": true, "page": {"workspace": "Playlists", "playlist": ["mix", "夜の散歩"]}, "home": {"workspace": "Queue", "search": "quiet"}}], "active": 0},
+  "lastfm_user": "listener"
+}

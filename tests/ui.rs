@@ -17,6 +17,8 @@ mod lyrics;
 mod playback;
 #[path = "ui/playlists.rs"]
 mod playlists;
+#[path = "ui/smart_playlists.rs"]
+mod smart_playlists;
 #[path = "ui/tabs.rs"]
 mod tabs;
 #[path = "ui/worker.rs"]

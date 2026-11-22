@@ -432,6 +432,8 @@ pub struct SavedQueue {
     #[serde(default)]
     pub listen: Option<crate::listening::ListenSession>,
     pub ids: Vec<TrackId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_positions: Option<Vec<usize>>,
     pub index: Option<usize>,
     pub position: f64,
 }

@@ -14,6 +14,21 @@ impl ShuffleOrder {
             positions: (0..len).collect(),
         }
     }
+    pub fn from_saved(mut positions: Vec<usize>) -> Option<Self> {
+        // Deletions and missing catalog entries leave gaps in the saved ranks.
+        let mut ranked: Vec<_> = positions.iter().copied().enumerate().collect();
+        ranked.sort_unstable_by_key(|&(_, rank)| rank);
+        if ranked.windows(2).any(|pair| pair[0].1 == pair[1].1) {
+            return None;
+        }
+        for (rank, (index, _)) in ranked.into_iter().enumerate() {
+            positions[index] = rank;
+        }
+        Some(Self { positions })
+    }
+    pub fn saved_positions(&self) -> Vec<usize> {
+        self.positions.clone()
+    }
     pub fn shuffle(&mut self, tracks: &mut Vec<Arc<Track>>, start: usize) {
         let mut entries = self
             .positions
