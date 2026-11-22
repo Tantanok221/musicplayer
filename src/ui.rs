@@ -55,6 +55,7 @@ mod now_playing;
 mod player_bar;
 mod playlists;
 mod settings;
+mod smart_playlists;
 mod tracks;
 mod window;
 pub use bindings::{playback_bindings, queue_bindings, settings_bindings};
@@ -377,6 +378,7 @@ pub struct MusicApp {
     username: Entity<InputState>,
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
+    smart: smart_playlists::SmartUi,
     slskd_url: Entity<InputState>,
     lastfm_user: Entity<InputState>,
     lastfm_key: Entity<InputState>,
@@ -681,6 +683,7 @@ impl MusicApp {
             username,
             password,
             playlist_name,
+            smart: Default::default(),
             slskd_url,
             lastfm_user,
             lastfm_key,
@@ -819,7 +822,9 @@ impl Render for MusicApp {
         if !self.settings {
             self.settings_page = 0;
         }
-        let body = if self.workspace == Workspace::NowPlaying && !self.settings && !self.blank {
+        let body = if self.smart.editor.is_some() {
+            self.smart_editor_view(cx)
+        } else if self.workspace == Workspace::NowPlaying && !self.settings && !self.blank {
             self.now_playing_view(window, cx)
         } else {
             let floating = self.navigator_floats();

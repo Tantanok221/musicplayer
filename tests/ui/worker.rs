@@ -71,6 +71,134 @@ fn assert_favorite(
 }
 
 #[gpui_kit::test]
+fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.bind_keys(tab_bindings());
+    });
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let mut worker = fixture.start();
+    let (ui_events, received) = flume::unbounded();
+    let (window, app) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1440.), px(900.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| MusicApp::new(worker.service().clone(), received, window, cx)),
+        )
+        .unwrap()
+    });
+    let mut native = false;
+    deliver_until(&worker, &ui_events, window, cx, |e, _| {
+        native |= matches!(e, Event::NativeAvailable(true));
+        native && matches!(e,Event::Status(s) if s.starts_with("Up to date"))
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("new-smart-playlist", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.click("smart-template-3", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.click("save-smart-playlist", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &ui_events, window, cx, |e, _| {
+        matches!(e, Event::NativePasswordRequired)
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("native-password", cx);
+        window.input("native-password", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    deliver_until(
+        &worker,
+        &ui_events,
+        window,
+        cx,
+        |e, _| matches!(e,Event::Playlist(p) if p.id=="smart" && p.entry.len()==1),
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.find("smart-playlist-header").visible());
+    })
+    .unwrap();
+    let requests = fixture.native_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, axum::http::Method::POST);
+    assert_eq!(requests[0].2["name"], "Loved");
+    assert_eq!(
+        requests[0].2["rules"],
+        serde_json::json!({"all":[{"is":{"loved":true}}],"sort":"dateloved","order":"desc","limit":100})
+    );
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[gpui_kit::test]
+fn password_sign_in_then_create_smart_playlist_needs_no_dialog(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        matches!(e, Event::SignInRequired(_))
+    });
+    cx.update_window(window, |_, window, cx| {
+        for (field, value) in [
+            ("Server address", fixture.account.url.as_str()),
+            ("Username", "fixture"),
+            ("Password", "native-password"),
+        ] {
+            window.click(field, cx);
+            window.input(value, cx);
+        }
+        window.click("connect-library", cx);
+    })
+    .unwrap();
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    for id in [
+        "new-smart-playlist",
+        "smart-template-3",
+        "save-smart-playlist",
+    ] {
+        cx.update_window(window, |_, window, cx| window.click(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        assert!(
+            !matches!(e, Event::NativePasswordRequired),
+            "sign-in must authorize smart playlist editing"
+        );
+        matches!(e,Event::Playlist(p) if p.id=="smart" && p.entry.len()==1)
+    });
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("native-password").is_none());
+        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.find("smart-playlist-header").visible());
+    })
+    .unwrap();
+    assert_eq!(fixture.native_login_count(), 1);
+    assert_eq!(fixture.native_requests()[0].0, axum::http::Method::POST);
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn favorite_http_failure_rolls_back_in_the_real_view_and_retry_recovers(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);

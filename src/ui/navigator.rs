@@ -197,6 +197,18 @@ impl MusicApp {
             })),
         );
         if self.playlists_open {
+            if self.smart.available {
+                tree = tree.child(
+                    self.navigation_row(
+                        "new-smart-playlist",
+                        "New Smart Playlist",
+                        Glyph::Plus,
+                        false,
+                        cx,
+                    )
+                    .on_click(cx.listener(|app, _, window, cx| app.new_smart_playlist(window, cx))),
+                );
+            }
             for playlist in self.playlists.summaries().to_vec() {
                 let active = self.workspace == Workspace::Playlists
                     && self
