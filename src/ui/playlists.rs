@@ -319,6 +319,43 @@ impl MusicApp {
             }))
     }
 
+    pub(super) fn playlist_rename_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let id = self.playlist_rename.clone()?;
+        Some(
+            div()
+                .p_2()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&self.playlist_name).id("playlist-name").small()),
+                )
+                .child(
+                    Button::new("save-playlist-editor")
+                        .small()
+                        .label("Rename")
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            let name = app.playlist_name.read(cx).value().to_string();
+                            if !name.trim().is_empty() {
+                                app.mutate(Mutation::RenamePlaylist(id.clone(), name), cx);
+                            }
+                        })),
+                )
+                .child(
+                    short_button("cancel-playlist-editor", Glyph::X, "Cancel").on_click(
+                        cx.listener(|app, _, _, cx| {
+                            app.playlist_rename = None;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         if let Some(playlist) = self.playlists.current().cloned() {
@@ -459,8 +496,8 @@ impl MusicApp {
                                                         .current()
                                                         .is_some_and(|p| p.id == rename_id)
                                                     {
-                                                        app.show_playlist_editor = true;
-                                                        app.playlist_editor_rename = true;
+                                                        app.playlist_rename =
+                                                            Some(rename_id.clone());
                                                         app.playlist_name.update(
                                                             cx,
                                                             |input, cx| {

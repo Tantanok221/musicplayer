@@ -214,13 +214,8 @@ impl MusicApp {
                     )
                     .child(
                         short_button("save-playing-tracks", Glyph::Save, "Save Queue as playlist")
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.show_playlist_editor = true;
-                                app.playlist_editor_rename = false;
-                                app.playlist_editor_album = None;
-                                app.playlist_editor_tracks =
-                                    Some(app.playback.queue.iter().map(|t| t.id.clone()).collect());
-                                cx.notify();
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.save_queue_playlist(false, window, cx);
                             })),
                     ),
             )

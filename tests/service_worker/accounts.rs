@@ -10,7 +10,7 @@ use sonora::{
 fn delayed_lyrics_reply_cannot_reach_the_new_account() {
     let a = Fixture::new(Library {
         structured_lyrics: serde_json::json!([{"line":[{"value":"Account A lyrics"}]}]),
-        ..Library::default()
+        ..Default::default()
     });
     let b = Fixture::new(Library::default());
     let mut worker = a.start_paused();

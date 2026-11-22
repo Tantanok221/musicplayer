@@ -602,22 +602,33 @@ fn create_failure_keeps_the_name_and_retry_creates_one_playlist(cx: &mut TestApp
     let (_dir, mut fixture, window, app) = start(cx);
     fixture.click(window, "new-playlist", cx);
     // Empty submission stays in the editor and emits no service command.
-    fixture.click(window, "save-playlist-editor", cx);
+    fixture.click(window, "create-playlist", cx);
     edit_name(&mut fixture, window, "Roadtrip 日本", cx);
-    fixture.expect("create rejected", |command, _| {
+    fixture.expect("create in progress", |command, _| {
         let expected = Mutation::CreatePlaylist("Roadtrip 日本".into(), vec![]);
         assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
-        vec![Event::MutationFailed(
-            expected,
-            "Fixture playlist save rejected".into(),
-        )]
+        vec![Event::MutationDone(Mutation::CreatePlaylist(
+            "Unrelated".into(),
+            vec![],
+        ))]
     });
-    fixture.click(window, "save-playlist-editor", cx);
+    fixture.click(window, "create-playlist", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("create-playlist").disabled(), Some(true));
+    })
+    .unwrap();
+    fixture.press(window, "enter", cx);
+    fixture.click(window, "create-playlist", cx);
+    fixture.backend.emit(Event::MutationFailed(
+        Mutation::CreatePlaylist("Roadtrip 日本".into(), vec![]),
+        "Fixture playlist save rejected".into(),
+    ));
+    fixture.settle(window, cx);
     cx.update_window(window, |_, window, _| {
         assert_eq!(window.find("playlist-name").value(), Some("Roadtrip 日本"));
-        assert!(window.find("save-playlist-editor").visible());
+        assert!(window.find("create-playlist").visible());
         assert_eq!(
-            window.find("error-banner").label(),
+            window.find("playlist-create-error").label(),
             Some("Fixture playlist save rejected")
         );
     })
@@ -630,7 +641,7 @@ fn create_failure_keeps_the_name_and_retry_creates_one_playlist(cx: &mut TestApp
             Event::MutationDone(expected),
         ]
     });
-    fixture.click(window, "retry-error", cx);
+    fixture.click(window, "create-playlist", cx);
     cx.update_window(window, |_, window, _| {
         assert_eq!(
             window.find("nav-playlist-playlist-1").label(),
@@ -643,6 +654,99 @@ fn create_failure_keeps_the_name_and_retry_creates_one_playlist(cx: &mut TestApp
     .unwrap();
     fixture.assert_script_finished();
     fixture.diagnose("playlist retry confirmed", window, &app, cx);
+}
+
+#[gpui_kit::test]
+fn creating_from_an_album_uses_the_shared_editor_and_keeps_the_album(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    fixture.backend.emit(Event::NativeAvailable(true));
+    fixture.settle(window, cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("explorer-album-album-2", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        let item = menu.find_by_label("Add to Playlist");
+        menu.hover(item.path().last().unwrap().clone(), cx);
+        menu.press("right", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut submenu = window.within("submenu");
+        let item = submenu.find_by_label("New Playlist…");
+        submenu.click(item.path().last().unwrap().clone(), cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-creation").visible());
+        assert!(window.try_find("playlist-type-smart").is_none());
+        let name = window.find("playlist-name");
+        assert!(name.value().is_some_and(|value| !value.is_empty()));
+        assert_eq!(name.focused(), Some(true));
+    })
+    .unwrap();
+    edit_name(&mut fixture, window, "Album copy", cx);
+    fixture.expect("create playlist from the chosen album", |command, _| {
+        assert!(
+            matches!(command, Command::AlbumToPlaylist(id, PlaylistTarget::New(name))
+            if id == "album-2" && name == "Album copy")
+        );
+        vec![Event::MutationDone(Mutation::CreatePlaylist(
+            "Album copy".into(),
+            vec!["track-2".into()],
+        ))]
+    });
+    fixture.press(window, "enter", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-creation").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn saving_upcoming_queue_tracks_keeps_order_and_duplicate_occurrences(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    fixture.backend.emit(Event::NativeAvailable(true));
+    let tracks = fixture
+        .catalog
+        .by_ids(&["track-1", "track-2", "track-2", "track-3"].map(String::from))
+        .unwrap();
+    fixture.backend.emit(Event::Playback(PlaybackSnapshot {
+        index: Some(0),
+        track: Some(tracks[0].clone()),
+        queue: tracks.into(),
+        queue_ids: vec![1, 2, 3, 4].into(),
+        ..Default::default()
+    }));
+    fixture.settle(window, cx);
+    fixture.click(window, "save-queue-playlist", cx);
+    fixture.menu_item(window, "Upcoming tracks…", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-creation").visible());
+        assert!(window.try_find("playlist-type-smart").is_none());
+    })
+    .unwrap();
+    edit_name(&mut fixture, window, "Later", cx);
+    fixture.expect("create playlist from the upcoming queue", |command, _| {
+        let expected = Mutation::CreatePlaylist(
+            "Later".into(),
+            ["track-2", "track-2", "track-3"].map(String::from).to_vec(),
+        );
+        assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+        vec![Event::MutationDone(expected)]
+    });
+    fixture.click(window, "create-playlist", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-creation").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
 }
 
 #[gpui_kit::test]

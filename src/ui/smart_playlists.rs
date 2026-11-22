@@ -17,14 +17,21 @@ pub(super) struct SmartUi {
 }
 
 impl MusicApp {
-    pub(super) fn new_smart_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.smart.available || self.smart.editor.is_some() {
-            return;
+    pub(super) fn start_smart_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.smart.editor.is_none() {
+            let mut editor = Editor::new();
+            editor.name = self.playlist_name.read(cx).value().to_string();
+            self.smart.editor = Some(editor);
+            self.rebuild_smart_inputs(window, cx);
         }
-        self.smart.editor = Some(Editor::new());
-        self.settings = false;
-        self.rebuild_smart_inputs(window, cx);
-        cx.notify();
+    }
+
+    fn smart_name(&self) -> Option<&Entity<InputState>> {
+        if self.playlist_creation.is_some() {
+            Some(&self.playlist_name)
+        } else {
+            self.smart.name.as_ref()
+        }
     }
 
     pub(super) fn edit_smart_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -54,10 +61,11 @@ impl MusicApp {
         cx.notify();
     }
 
-    fn sync_smart_inputs(&mut self, cx: &App) {
+    pub(super) fn sync_smart_inputs(&mut self, cx: &App) {
+        let name = self.smart_name().map(|input| input.read(cx).value());
         if let Some(editor) = &mut self.smart.editor {
-            if let Some(input) = &self.smart.name {
-                editor.name = input.read(cx).value().to_string();
+            if let Some(name) = name {
+                editor.name = name.to_string();
             }
             if let Some(input) = &self.smart.limit {
                 editor.limit = input.read(cx).value().to_string();
@@ -100,7 +108,15 @@ impl MusicApp {
         }
         self.smart.values.clear();
         if let Some(editor) = &self.smart.editor {
-            self.smart.name = Some(input(&editor.name, window, cx));
+            if self.playlist_creation.is_some() {
+                if self.playlist_name.read(cx).value().as_str() != editor.name {
+                    let name = editor.name.clone();
+                    self.playlist_name
+                        .update(cx, |input, cx| input.set_value(name, window, cx));
+                }
+            } else {
+                self.smart.name = Some(input(&editor.name, window, cx));
+            }
             self.smart.limit = Some(input(&editor.limit, window, cx));
             values(&editor.rows, &mut self.smart.values, window, cx);
         }
@@ -177,6 +193,9 @@ impl MusicApp {
                 .placeholder("Navidrome password")
                 .masked(true)
         }));
+        if let Some(password) = &self.smart.password {
+            password.update(cx, |input, cx| input.focus(window, cx));
+        }
         cx.subscribe_in(
             self.smart.password.as_ref().unwrap(),
             window,
@@ -221,11 +240,8 @@ impl MusicApp {
             .as_ref()
             .map(|e| e.name.clone())
             .unwrap_or_default();
-        let available = self.smart.available;
-        self.smart = SmartUi {
-            available,
-            ..Default::default()
-        };
+        self.close_playlist_creation(window, cx);
+        self.reset_smart();
         self.playlists.open(Playlist {
             id,
             name,
@@ -240,15 +256,46 @@ impl MusicApp {
         self.switch_workspace(Workspace::Playlists, window, cx);
     }
 
-    fn cancel_smart(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn cancel_smart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.smart.loading || self.smart.saving || self.smart.needs_password {
             self.service.send(Command::CancelSmartPlaylist);
         }
-        let available = self.smart.available;
+        self.close_playlist_creation(window, cx);
+        self.reset_smart();
+        cx.notify();
+    }
+
+    pub(super) fn reset_smart(&mut self) {
         self.smart = SmartUi {
-            available,
+            available: self.smart.available,
             ..Default::default()
         };
+    }
+
+    pub(super) fn save_smart(&mut self, cx: &mut Context<Self>) {
+        if self.smart.saving
+            || self.smart.loading
+            || self.smart.needs_password
+            || !self.smart.available
+        {
+            return;
+        }
+        self.sync_smart_inputs(cx);
+        let Some(editor) = &self.smart.editor else {
+            return;
+        };
+        match editor.build() {
+            Ok(rules) => {
+                self.service.send(Command::SaveSmartPlaylist {
+                    id: editor.id.clone(),
+                    name: editor.name.trim().into(),
+                    rules,
+                });
+                self.smart.saving = true;
+                self.smart.error = None;
+            }
+            Err(error) => self.smart.error = Some(error.into()),
+        }
         cx.notify();
     }
 
@@ -516,7 +563,11 @@ impl MusicApp {
         list.into_any_element()
     }
 
-    fn smart_validation(id: impl Into<ElementId>, message: &str, cx: &App) -> AnyElement {
+    pub(super) fn smart_validation(
+        id: impl Into<ElementId>,
+        message: &str,
+        cx: &App,
+    ) -> AnyElement {
         div()
             .id(id)
             .test_support()
@@ -557,7 +608,7 @@ impl MusicApp {
             .rounded_lg()
     }
 
-    fn smart_password_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn smart_password_form(&self, cx: &mut Context<Self>) -> Div {
         let colors = ink(cx);
         let mut dialog =
             div()
@@ -614,7 +665,7 @@ impl MusicApp {
         if let Some(error) = &self.smart.error {
             dialog = dialog.child(Self::smart_validation("native-password-error", error, cx));
         }
-        dialog = dialog
+        dialog
             .child(
                 self.smart_primary(
                     "native-sign-in",
@@ -633,22 +684,25 @@ impl MusicApp {
                 Button::new("cancel-smart-playlist")
                     .ghost()
                     .label("Cancel")
-                    .on_click(cx.listener(|app, _, _, cx| app.cancel_smart(cx))),
-            );
+                    .on_click(cx.listener(|app, _, window, cx| app.cancel_smart(window, cx))),
+            )
+    }
+
+    fn smart_password_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .absolute()
             .occlude()
             .inset_0()
-            .bg(gpui_kit::rgba(0x00000066))
+            .bg(cx.theme().overlay)
             .flex()
             .items_center()
             .justify_center()
             .p_4()
-            .child(dialog)
+            .child(self.smart_password_form(cx))
             .into_any_element()
     }
 
-    pub(super) fn smart_editor_view(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn smart_rules_form(&self, cx: &mut Context<Self>) -> Div {
         let colors = ink(cx);
         let editor = self.smart.editor.as_ref().unwrap();
         let mut templates = div().flex().flex_wrap().gap_2();
@@ -672,21 +726,6 @@ impl MusicApp {
                     })),
             );
         }
-        let name = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().font_weight(FontWeight::MEDIUM).child("Playlist name"))
-            .child(
-                Input::new(self.smart.name.as_ref().unwrap())
-                    .id("smart-name")
-                    .h(px(40.))
-                    .disabled(self.smart.loading || self.smart.saving)
-                    .text_size(px(15.)),
-            )
-            .when_some(editor.name_error(), |d, error| {
-                d.child(Self::smart_validation("smart-name-error", error, cx))
-            });
         let sort = editor
             .sort
             .as_deref()
@@ -771,6 +810,110 @@ impl MusicApp {
                         d.child(Self::smart_validation("smart-limit-error", error, cx))
                     }),
             );
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(colors.muted)
+                            .child("START WITH A TEMPLATE"),
+                    )
+                    .child(templates),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.smart_match(None, editor.any, cx))
+                    .child(self.smart_rows(&editor.rows, cx))
+                    .when(editor.rows.is_empty() && !self.smart.loading, |d| {
+                        d.child(Self::smart_validation(
+                            "smart-rules-error",
+                            "Add at least one condition",
+                            cx,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("smart-add-condition")
+                                    .ghost()
+                                    .small()
+                                    .label("+ Add rule")
+                                    .text_color(colors.accent)
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.change_smart(|e| e.add_condition(None), window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("smart-add-group")
+                                    .ghost()
+                                    .small()
+                                    .label("+ Add group")
+                                    .text_color(colors.accent)
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.change_smart(Editor::add_group, window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("smart-summary")
+                            .test_support()
+                            .aria_label(editor.summary())
+                            .text_size(px(12.))
+                            .text_color(colors.muted)
+                            .p_3()
+                            .rounded_lg()
+                            .bg(colors.panel)
+                            .child(editor.summary()),
+                    ),
+            )
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(colors.line)
+                    .pt_4()
+                    .child(options),
+            )
+            .when_some(
+                self.smart
+                    .error
+                    .as_ref()
+                    .filter(|_| !self.smart.needs_password),
+                |d, error| d.child(Self::smart_validation("smart-error", error, cx)),
+            )
+            .when(self.smart.loading, |d| d.child("Loading rules…"))
+    }
+
+    pub(super) fn smart_editor_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = ink(cx);
+        let editor = self.smart.editor.as_ref().unwrap();
+        let name = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().font_weight(FontWeight::MEDIUM).child("Playlist name"))
+            .child(
+                Input::new(self.smart.name.as_ref().unwrap())
+                    .id("smart-name")
+                    .h(px(40.))
+                    .disabled(self.smart.loading || self.smart.saving)
+                    .text_size(px(15.)),
+            )
+            .when_some(editor.name_error(), |d, error| {
+                d.child(Self::smart_validation("smart-name-error", error, cx))
+            });
         let content =
             div()
                 .id("smart-editor-scroll")
@@ -790,97 +933,14 @@ impl MusicApp {
                             div()
                                 .text_size(px(24.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(if editor.id.is_some() {
-                                    "Edit smart playlist"
-                                } else {
-                                    "New smart playlist"
-                                }),
+                                .child("Edit smart playlist"),
                         )
                         .child(div().text_color(colors.muted).text_size(px(12.)).child(
                             "Rules are evaluated by Navidrome. Tracks update automatically.",
                         )),
                 )
                 .child(name)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(colors.muted)
-                                .child("START WITH A TEMPLATE"),
-                        )
-                        .child(templates),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(self.smart_match(None, editor.any, cx))
-                        .child(self.smart_rows(&editor.rows, cx))
-                        .when(editor.rows.is_empty() && !self.smart.loading, |d| {
-                            d.child(Self::smart_validation(
-                                "smart-rules-error",
-                                "Add at least one condition",
-                                cx,
-                            ))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("smart-add-condition")
-                                        .ghost()
-                                        .small()
-                                        .label("+ Add rule")
-                                        .text_color(colors.accent)
-                                        .on_click(cx.listener(|app, _, window, cx| {
-                                            app.change_smart(|e| e.add_condition(None), window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("smart-add-group")
-                                        .ghost()
-                                        .small()
-                                        .label("+ Add group")
-                                        .text_color(colors.accent)
-                                        .on_click(cx.listener(|app, _, window, cx| {
-                                            app.change_smart(Editor::add_group, window, cx)
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("smart-summary")
-                                .test_support()
-                                .aria_label(editor.summary())
-                                .text_size(px(12.))
-                                .text_color(colors.muted)
-                                .p_3()
-                                .rounded_lg()
-                                .bg(colors.panel)
-                                .child(editor.summary()),
-                        ),
-                )
-                .child(
-                    div()
-                        .border_t_1()
-                        .border_color(colors.line)
-                        .pt_4()
-                        .child(options),
-                )
-                .when_some(
-                    self.smart
-                        .error
-                        .as_ref()
-                        .filter(|_| !self.smart.needs_password),
-                    |d, error| d.child(Self::smart_validation("smart-error", error, cx)),
-                )
-                .when(self.smart.loading, |d| d.child("Loading rules…"));
+                .child(self.smart_rules_form(cx));
         let footer = div()
             .flex()
             .items_center()
@@ -897,7 +957,7 @@ impl MusicApp {
                     .label("Cancel")
                     .rounded_lg()
                     .disabled(self.smart.saving)
-                    .on_click(cx.listener(|app, _, _, cx| app.cancel_smart(cx))),
+                    .on_click(cx.listener(|app, _, window, cx| app.cancel_smart(window, cx))),
             )
             .child(
                 self.smart_primary(
@@ -910,23 +970,7 @@ impl MusicApp {
                     self.smart.saving || self.smart.loading || editor.build().is_err(),
                     cx,
                 )
-                .on_click(cx.listener(|app, _, _, cx| {
-                    app.sync_smart_inputs(cx);
-                    let editor = app.smart.editor.as_ref().unwrap();
-                    match editor.build() {
-                        Ok(rules) => {
-                            app.service.send(Command::SaveSmartPlaylist {
-                                id: editor.id.clone(),
-                                name: editor.name.trim().into(),
-                                rules,
-                            });
-                            app.smart.saving = true;
-                            app.smart.error = None;
-                        }
-                        Err(error) => app.smart.error = Some(error.into()),
-                    }
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|app, _, _, cx| app.save_smart(cx))),
             );
         div()
             .id("smart-editor")

@@ -1,8 +1,97 @@
 use crate::{
     model::{Playlist, Track, normalize},
-    service::Mutation,
+    service::{Command, Mutation, PlaylistTarget},
 };
 use std::{collections::HashMap, sync::Arc};
+
+pub(crate) enum CreationSource {
+    Empty,
+    Tracks(Vec<String>),
+    Album(String),
+}
+
+pub(crate) struct Creation {
+    source: CreationSource,
+    smart: bool,
+    pending_name: Option<String>,
+    error: Option<String>,
+}
+
+impl Creation {
+    pub(crate) fn new(source: CreationSource) -> Self {
+        Self {
+            source,
+            smart: false,
+            pending_name: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn can_choose_type(&self, smart_available: bool) -> bool {
+        smart_available && matches!(self.source, CreationSource::Empty)
+    }
+
+    pub(crate) fn choose_smart(&mut self, smart: bool, smart_available: bool) {
+        if self.smart != smart
+            && !self.saving()
+            && (!smart || self.can_choose_type(smart_available))
+        {
+            self.smart = smart;
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn is_smart(&self) -> bool {
+        self.smart
+    }
+
+    pub(crate) fn saving(&self) -> bool {
+        self.pending_name.is_some()
+    }
+
+    pub(crate) fn source(&self) -> &CreationSource {
+        &self.source
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(crate) fn submit_manual(&mut self, name: &str) -> Option<Command> {
+        let name = name.trim();
+        if self.smart || self.saving() || name.is_empty() {
+            return None;
+        }
+        self.pending_name = Some(name.into());
+        self.error = None;
+        Some(match &self.source {
+            CreationSource::Empty => Command::Mutate(Mutation::CreatePlaylist(name.into(), vec![])),
+            CreationSource::Tracks(ids) => {
+                Command::Mutate(Mutation::CreatePlaylist(name.into(), ids.clone()))
+            }
+            CreationSource::Album(id) => {
+                Command::AlbumToPlaylist(id.clone(), PlaylistTarget::New(name.into()))
+            }
+        })
+    }
+
+    pub(crate) fn matches(&self, mutation: &Mutation) -> bool {
+        let Mutation::CreatePlaylist(name, ids) = mutation else {
+            return false;
+        };
+        self.pending_name.as_ref() == Some(name)
+            && match &self.source {
+                CreationSource::Empty => ids.is_empty(),
+                CreationSource::Tracks(expected) => expected == ids,
+                CreationSource::Album(_) => true,
+            }
+    }
+
+    pub(crate) fn fail(&mut self, error: String) {
+        self.pending_name = None;
+        self.error = Some(error);
+    }
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaylistView {
@@ -311,6 +400,39 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_creation_rejects_empty_duplicate_and_mismatched_submissions() {
+        let mut draft = Creation::new(CreationSource::Tracks(vec!["one".into(), "one".into()]));
+        draft.choose_smart(true, true);
+        assert!(!draft.is_smart());
+        assert!(draft.submit_manual(" ").is_none());
+        let expected = Mutation::CreatePlaylist("Mix".into(), vec!["one".into(), "one".into()]);
+        assert!(matches!(draft.submit_manual(" Mix "), Some(Command::Mutate(m)) if m == expected));
+        assert!(draft.submit_manual("Mix").is_none());
+        assert!(!draft.matches(&Mutation::CreatePlaylist("Mix".into(), vec!["one".into()])));
+        assert!(draft.matches(&expected));
+        draft.fail("Try again".into());
+        assert_eq!(draft.error(), Some("Try again"));
+        assert!(!draft.matches(&expected));
+        assert!(matches!(draft.submit_manual("Mix"), Some(Command::Mutate(m)) if m == expected));
+        assert_eq!(draft.error(), None);
+    }
+
+    #[test]
+    fn smart_creation_requires_an_empty_draft_and_native_support() {
+        let mut draft = Creation::new(CreationSource::Empty);
+        draft.choose_smart(true, false);
+        assert!(!draft.is_smart());
+        draft.choose_smart(true, true);
+        assert!(draft.is_smart());
+        assert!(draft.submit_manual("Mix").is_none());
+        draft.choose_smart(false, false);
+        assert!(!draft.is_smart());
+        assert!(draft.submit_manual("Mix").is_some());
+        draft.choose_smart(true, true);
+        assert!(!draft.is_smart(), "a pending save keeps its original type");
+    }
 
     #[test]
     fn album_groups_keep_first_occurrence_order_and_search_indices() {

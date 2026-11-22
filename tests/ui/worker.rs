@@ -156,7 +156,8 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
         native && matches!(e,Event::Status(s) if s.starts_with("Up to date"))
     });
     cx.update_window(window, |_, window, cx| {
-        window.click("new-smart-playlist", cx);
+        window.click("new-playlist", cx);
+        window.click("playlist-type-smart", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -166,7 +167,7 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
     .unwrap();
     cx.run_until_parked();
     cx.update_window(window, |_, window, cx| {
-        window.click("save-smart-playlist", cx);
+        window.click("create-playlist", cx);
     })
     .unwrap();
     deliver_until(&worker, &ui_events, window, cx, |e, _| {
@@ -186,7 +187,7 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
         |e, _| matches!(e,Event::Playlist(p) if p.id=="smart" && p.entry.len()==1),
     );
     cx.update_window(window, |_, window, _| {
-        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.try_find("playlist-creation").is_none());
         assert!(window.find("smart-playlist-header").visible());
     })
     .unwrap();
@@ -227,9 +228,10 @@ fn password_sign_in_then_create_smart_playlist_needs_no_dialog(cx: &mut TestAppC
     .unwrap();
     wait_library(&worker, &tx, window, cx, "explorer-album-album");
     for id in [
-        "new-smart-playlist",
+        "new-playlist",
+        "playlist-type-smart",
         "smart-template-3",
-        "save-smart-playlist",
+        "create-playlist",
     ] {
         cx.update_window(window, |_, window, cx| window.click(id, cx))
             .unwrap();
@@ -244,7 +246,7 @@ fn password_sign_in_then_create_smart_playlist_needs_no_dialog(cx: &mut TestAppC
     });
     cx.update_window(window, |_, window, _| {
         assert!(window.try_find("native-password").is_none());
-        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.try_find("playlist-creation").is_none());
         assert!(window.find("smart-playlist-header").visible());
     })
     .unwrap();

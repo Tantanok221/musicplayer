@@ -12,6 +12,8 @@ impl MusicApp {
                     .account_cache
                     .reset_for_account(self.account.as_ref(), account.as_ref())
                 {
+                    self.close_playlist_creation(window, cx);
+                    self.playlist_rename = None;
                     self.smart = Default::default();
                     self.playlists = Default::default();
                     self.artist_request += 1;
@@ -310,7 +312,13 @@ impl MusicApp {
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {
-                if self.smart.editor.is_some() {
+                if self.fail_album_playlist_creation(&error) {
+                    cx.notify();
+                    return;
+                }
+                if self.smart.editor.is_some()
+                    && (self.playlist_creation.is_none() || self.creating_smart())
+                {
                     self.smart.error = Some(error.clone());
                     self.smart.password_busy = false;
                     if !self.smart.needs_password {
@@ -328,11 +336,11 @@ impl MusicApp {
                 if self.feedback.finished(&mutation) {
                     self.error = None;
                 }
-                if matches!(
-                    mutation,
-                    Mutation::CreatePlaylist(..) | Mutation::RenamePlaylist(..)
-                ) {
-                    self.show_playlist_editor = false;
+                self.complete_playlist_creation(&mutation, window, cx);
+                if let Mutation::RenamePlaylist(ref id, _) = mutation
+                    && self.playlist_rename.as_ref() == Some(id)
+                {
+                    self.playlist_rename = None;
                 }
                 self.status = match &mutation {
                     Mutation::ReorderPlaylist { .. } => "Playlist order saved".into(),
@@ -345,13 +353,12 @@ impl MusicApp {
                     }
                     _ => "Saved to Navidrome".into(),
                 };
-                if matches!(mutation, Mutation::CreatePlaylist(..)) {
-                    self.playlist_editor_album = None;
-                }
             }
             Event::MutationFailed(mutation, error) => {
-                self.feedback.failed(mutation);
-                self.error = Some(error);
+                if !self.fail_playlist_creation(&mutation, &error) {
+                    self.feedback.failed(mutation);
+                    self.error = Some(error);
+                }
             }
         }
         cx.notify();

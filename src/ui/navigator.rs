@@ -180,14 +180,10 @@ impl MusicApp {
                 cx,
             )
             .child(
-                short_button("new-playlist", Glyph::Plus, "New playlist").on_click(cx.listener(
-                    |app, _, _, cx| {
+                short_button("new-playlist", Glyph::Plus, "New playlist…").on_click(cx.listener(
+                    |app, _, window, cx| {
                         cx.stop_propagation();
-                        app.show_playlist_editor = true;
-                        app.playlist_editor_rename = false;
-                        app.playlist_editor_album = None;
-                        app.playlist_editor_tracks = None;
-                        cx.notify();
+                        app.new_playlist(crate::playlists::CreationSource::Empty, "", window, cx);
                     },
                 )),
             )
@@ -197,18 +193,6 @@ impl MusicApp {
             })),
         );
         if self.playlists_open {
-            if self.smart.available {
-                tree = tree.child(
-                    self.navigation_row(
-                        "new-smart-playlist",
-                        "New Smart Playlist",
-                        Glyph::Plus,
-                        false,
-                        cx,
-                    )
-                    .on_click(cx.listener(|app, _, window, cx| app.new_smart_playlist(window, cx))),
-                );
-            }
             for playlist in self.playlists.summaries().to_vec() {
                 let active = self.workspace == Workspace::Playlists
                     && self
