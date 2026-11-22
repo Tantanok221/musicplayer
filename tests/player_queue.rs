@@ -32,6 +32,44 @@ fn ids(snapshot: &PlaybackSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn legacy_moves_preserve_the_current_duplicate_occurrence() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    for (current, from, to, expected, expected_ids) in [
+        (2, 1, 0, 2, ["B", "A", "A"]),
+        (2, 2, 1, 1, ["A", "A", "B"]),
+        (1, 2, 0, 2, ["A", "A", "B"]),
+        (1, 0, 2, 0, ["B", "A", "A"]),
+        (2, 1, 1, 2, ["A", "B", "A"]),
+        (2, 3, 0, 2, ["A", "B", "A"]),
+        (2, 0, 3, 2, ["A", "B", "A"]),
+    ] {
+        let initial = player
+            .command(
+                PlayerCommand::Restore(tracks(&["A", "B", "A"]), current, 17., None),
+                WAIT,
+            )
+            .unwrap();
+        let moved = player.command(PlayerCommand::Move(from, to), WAIT).unwrap();
+        assert_eq!(ids(&moved), expected_ids);
+        assert_eq!(
+            moved.index,
+            Some(expected),
+            "current {current}, move {from} to {to}"
+        );
+        assert!(Arc::ptr_eq(&moved.queue[expected], &initial.queue[current]));
+        assert_eq!(moved.position, 17.);
+        assert!(!moved.playing);
+    }
+    player
+        .command(PlayerCommand::Restore(vec![], 0, 0., None), WAIT)
+        .unwrap();
+    let empty = player.command(PlayerCommand::Move(0, 0), WAIT).unwrap();
+    assert!(empty.queue.is_empty());
+    assert_eq!(empty.index, None);
+    player.shutdown(WAIT).unwrap();
+}
+
+#[test]
 fn paused_actor_rejects_stale_edits_and_undo_keeps_the_exact_duplicate_occurrence() {
     let mut player = PausedPlayer::start(WAIT).unwrap();
     let initial = player

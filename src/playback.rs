@@ -1203,7 +1203,6 @@ fn run(
                 }
                 PlayerCommand::Move(from, to) => {
                     if from < queue.len() && to < queue.len() {
-                        let current = index.and_then(|i| queue.get(i)).map(|t| t.id.clone());
                         base_position = if started {
                             position(&clock)
                         } else {
@@ -1211,7 +1210,17 @@ fn run(
                         };
                         let track = queue.remove(from);
                         queue.insert(to, track);
-                        index = current.and_then(|id| queue.iter().position(|t| t.id == id));
+                        index = index.map(|i| {
+                            if i == from {
+                                to
+                            } else if from < i && i <= to {
+                                i - 1
+                            } else if to <= i && i < from {
+                                i + 1
+                            } else {
+                                i
+                            }
+                        });
                         restart |= started;
                     }
                 }
