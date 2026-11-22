@@ -527,6 +527,10 @@ impl Catalog {
             sql.push_str(" AND tracks.album_id IN (SELECT label_album.id FROM albums label_album WHERE EXISTS (SELECT 1 FROM json_each(label_album.data,'$.recordLabels') record_label WHERE label_matches(json_extract(record_label.value,'$.name'),?)))");
             values.push(Value::Text(query.record_label.trim().into()));
         }
+        if let Some(issue) = query.health {
+            sql.push_str(" AND ");
+            sql.push_str(issue.sql());
+        }
         if query.favorites {
             let albums = query
                 .ordering

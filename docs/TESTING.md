@@ -34,6 +34,7 @@ worker suite to expose flaky timing.
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
 | Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |
+| Metadata Properties tab, library health filters | `information.rs`, `library.rs`, `chrome.rs` | `metadata::{properties, HealthIssue}`, `Catalog::filters` | `tests/ui/{metadata,explorer}.rs`, `tests/catalog.rs`, `metadata` unit tests |
 | Playlists (including smart/read-only playlists) | `playlists.rs`, `navigator.rs`, `context_menu.rs` | `playlists::{Playlists, PlaylistEntry, is_smart, refresh_due}` | `tests/ui/playlists.rs`, `tests/service_worker/playlists.rs` |
 | Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs` |
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |

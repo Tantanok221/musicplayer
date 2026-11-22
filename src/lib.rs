@@ -10,6 +10,7 @@ pub mod feedback;
 pub mod lastfm;
 pub mod listening;
 pub mod lyrics;
+pub mod metadata;
 pub mod model;
 pub mod musicbrainz;
 pub mod platform;

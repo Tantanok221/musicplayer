@@ -10,6 +10,7 @@ use crate::{
     catalog::LibraryView,
     discography::{DiscographyView, MissingRelease, ReleaseDetails, listen_links},
     lyrics::Lyrics,
+    metadata::HealthIssue,
     model::*,
     platform::Account,
     playback::{Placement, PlayerCommand, QueueEdit},
@@ -1062,6 +1063,7 @@ impl Render for MusicApp {
                     app.query.performer.clear();
                     app.query.year = None;
                     app.query.record_label.clear();
+                    app.query.health = None;
                     app.request_query(cx);
                 }
                 app.focus.focus(window, cx);

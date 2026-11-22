@@ -334,3 +334,80 @@ fn favorites_filter_combines_hearts_and_ratings() {
     };
     assert_eq!(ids(none), ["both", "hearted"]);
 }
+
+#[test]
+fn health_filters_find_tag_gaps_and_mixed_album_artists() {
+    use sonora::metadata::HealthIssue;
+    let mut db = Catalog::memory().unwrap();
+    let complete = Track {
+        album_artist: "青葉市子".into(),
+        genre: "Folk".into(),
+        track: Some(1),
+        music_brainz_id: "mbid-complete".into(),
+        ..sample("complete", "Complete")
+    };
+    let gaps = Track {
+        id: "gaps".into(),
+        title: "Gaps".into(),
+        album_id: "album-b".into(),
+        album: "Untagged".into(),
+        album_artist: "Someone".into(),
+        genre: " ".into(),
+        year: Some(0),
+        track: Some(0),
+        ..Default::default()
+    };
+    let guest = Track {
+        album_artist: "Guest".into(),
+        genre: "Folk".into(),
+        track: Some(2),
+        music_brainz_id: "mbid-guest".into(),
+        ..sample("guest", "Guest")
+    };
+    let solo = Track {
+        album_id: "album-c".into(),
+        album_artist: "Solo".into(),
+        genre: "Folk".into(),
+        track: Some(1),
+        music_brainz_id: "mbid-solo".into(),
+        ..sample("solo", "Solo")
+    };
+    db.put_tracks(&[complete, gaps, guest, solo], 1).unwrap();
+    let matches = |health| {
+        let query = LibraryQuery {
+            health,
+            sort: Sort::Title,
+            ..Default::default()
+        };
+        let mut ids: Vec<_> = db
+            .tracks(&query, 0, 100)
+            .unwrap()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(matches(None), ["complete", "gaps", "guest", "solo"]);
+    assert_eq!(matches(Some(HealthIssue::MissingYear)), ["gaps"]);
+    assert_eq!(matches(Some(HealthIssue::MissingGenre)), ["gaps"]);
+    assert_eq!(matches(Some(HealthIssue::MissingTrackNumber)), ["gaps"]);
+    assert_eq!(matches(Some(HealthIssue::MissingMusicBrainzId)), ["gaps"]);
+    assert_eq!(
+        matches(Some(HealthIssue::MixedAlbumArtist)),
+        ["complete", "guest"]
+    );
+    // Health narrows alongside other filters instead of replacing them.
+    let query = LibraryQuery {
+        health: Some(HealthIssue::MixedAlbumArtist),
+        text: "Guest".into(),
+        ..Default::default()
+    };
+    let found: Vec<_> = db
+        .tracks(&query, 0, 100)
+        .unwrap()
+        .iter()
+        .map(|t| t.id.clone())
+        .collect();
+    assert_eq!(found, ["guest"]);
+}

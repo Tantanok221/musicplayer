@@ -6,6 +6,7 @@ use gpui_kit::{
 };
 use sonora::{
     browser::Workspace,
+    metadata::HealthIssue,
     model::{PlaybackSnapshot, Preferences},
     playback::PlayerCommand,
     service::Event,
@@ -347,6 +348,56 @@ fn explorer_metadata_filters_and_back_restore_prior_queries(cx: &mut TestAppCont
     assert_explorer(window, &app, &["album-1", "album-3"], cx);
     fixture.click(window, "history-back", cx);
     fixture.diagnose("Explorer metadata Back restored", window, &app, cx);
+    assert_explorer(window, &app, &["album-1", "album-2", "album-3"], cx);
+}
+
+#[gpui_kit::test]
+fn health_filters_narrow_explorer_and_clear_from_chip_or_menu(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start_explorer(cx);
+    let mut undated = (*fixture.catalog.by_ids(&["track-3".into()]).unwrap()[0]).clone();
+    undated.year = None;
+    let mut guest = (*fixture.catalog.by_ids(&["track-2".into()]).unwrap()[0]).clone();
+    guest.id = "track-4".into();
+    guest.title = "Guest song".into();
+    guest.album_artist = "Guest".into();
+    fixture.catalog.put_tracks(&[undated, guest], 1).unwrap();
+
+    fixture.click(window, "health-filter", cx);
+    fixture.menu_item(window, "Missing year", cx);
+    assert_eq!(fixture.last_query().health, Some(HealthIssue::MissingYear));
+    assert_explorer(window, &app, &["album-3"], cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("clear-health-filter").label(),
+            Some("Clear missing year filter")
+        );
+    })
+    .unwrap();
+
+    fixture.click(window, "health-filter", cx);
+    fixture.menu_item(window, "Mixed album artist", cx);
+    assert_eq!(
+        fixture.last_query().health,
+        Some(HealthIssue::MixedAlbumArtist)
+    );
+    assert_explorer(window, &app, &["album-2"], cx);
+
+    fixture.click(window, "clear-health-filter", cx);
+    assert_eq!(fixture.last_query().health, None);
+    assert_explorer(window, &app, &["album-1", "album-2", "album-3"], cx);
+
+    // A check nothing fails shows the empty state and recovers from the menu.
+    fixture.click(window, "health-filter", cx);
+    fixture.menu_item(window, "Missing genre", cx);
+    fixture.diagnose("health filter with no matches", window, &app, cx);
+    assert_explorer(window, &app, &[], cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("library-empty").visible());
+    })
+    .unwrap();
+    fixture.click(window, "health-filter", cx);
+    fixture.menu_item(window, "Any tags", cx);
+    assert_eq!(fixture.last_query().health, None);
     assert_explorer(window, &app, &["album-1", "album-2", "album-3"], cx);
 }
 
