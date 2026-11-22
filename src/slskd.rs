@@ -256,8 +256,13 @@ pub fn candidates(responses: &[SearchResponse], expected_tracks: Option<u32>) ->
                 username: response.username.clone(),
                 tracks,
                 locked: response.locked_file_count,
-                size: files.iter().map(|file| file.size).sum(),
-                seconds: audio.iter().filter_map(|file| file.length).sum(),
+                size: files
+                    .iter()
+                    .fold(0u64, |total, file| total.saturating_add(file.size)),
+                seconds: audio
+                    .iter()
+                    .filter_map(|file| file.length)
+                    .fold(0u32, u32::saturating_add),
                 format,
                 lossless,
                 completeness: match expected_tracks {
