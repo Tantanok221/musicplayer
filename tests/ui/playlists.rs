@@ -2,7 +2,7 @@
 use crate::common::ui::{Fixture, start};
 use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
 use sonora::{
-    model::Playlist,
+    model::{PlaybackSnapshot, Playlist},
     platform::shortcut,
     service::{Command, Event, Mutation, PlaylistTarget},
 };
@@ -36,6 +36,87 @@ fn open_playlist(fixture: &mut Fixture, window: AnyWindowHandle, cx: &mut TestAp
         vec![Event::Playlist(playlist("Roadtrip"))]
     });
     fixture.click(window, "nav-playlist-playlist-1", cx);
+}
+
+#[gpui_kit::test]
+fn append_queue_sends_only_queued_songs_and_retries_failure(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut selected = playlist("Roadtrip");
+    selected.entry = fixture.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    selected.song_count = 1;
+    fixture.backend.emit(Event::Playlist(selected));
+    let queue = fixture
+        .catalog
+        .by_ids(&["track-2".into(), "track-2".into(), "track-3".into()])
+        .unwrap();
+    fixture.backend.emit(Event::Playback(PlaybackSnapshot {
+        queue: queue.into(),
+        ..Default::default()
+    }));
+    fixture.settle(window, cx);
+    for succeeds in [false, true] {
+        fixture.expect(
+            "append queued songs without existing entries",
+            move |command, _| {
+                let expected = Mutation::AddToPlaylist(
+                    "playlist-1".into(),
+                    vec!["track-2".into(), "track-2".into(), "track-3".into()],
+                );
+                assert!(
+                    matches!(command, Command::Mutate(ref mutation) if *mutation == expected),
+                    "Append Queue must emit AddToPlaylist with only queued song IDs"
+                );
+                if succeeds {
+                    vec![Event::MutationDone(expected)]
+                } else {
+                    vec![Event::MutationFailed(expected, "Append rejected".into())]
+                }
+            },
+        );
+        if succeeds {
+            fixture.click(window, "retry-error", cx);
+        } else {
+            fixture.click(window, "playlist-options", cx);
+            fixture.menu_item(window, "Append Queue", cx);
+        }
+        cx.update_window(window, |_, window, _| {
+            if succeeds {
+                assert!(window.try_find("error-banner").is_none());
+            } else {
+                assert_eq!(window.find("error-banner").label(), Some("Append rejected"));
+            }
+            assert!(window.find("playlist-options").visible());
+        })
+        .unwrap();
+    }
+    fixture.assert_script_finished();
+    fixture.diagnose("queue append retry confirmed", window, &app, cx);
+}
+
+#[gpui_kit::test]
+fn append_empty_queue_does_not_send_existing_playlist_songs(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut selected = playlist("Roadtrip");
+    selected.entry = fixture.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    selected.song_count = 1;
+    fixture.backend.emit(Event::Playlist(selected));
+    fixture.settle(window, cx);
+    fixture.expect("append no songs", |command, _| {
+        let expected = Mutation::AddToPlaylist("playlist-1".into(), vec![]);
+        assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+        vec![Event::MutationDone(expected)]
+    });
+    fixture.click(window, "playlist-options", cx);
+    fixture.menu_item(window, "Append Queue", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-options").visible());
+        assert!(window.try_find("error-banner").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+    fixture.diagnose("empty queue append confirmed", window, &app, cx);
 }
 
 #[gpui_kit::test]
