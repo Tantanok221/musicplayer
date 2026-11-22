@@ -985,6 +985,48 @@ fn publish_discover(
     Ok(())
 }
 
+type QueuedMutation = (Server, Mutation);
+
+#[derive(Default)]
+struct TrackRatingWrites(HashMap<(String, String), VecDeque<QueuedMutation>>);
+
+impl TrackRatingWrites {
+    fn enqueue(&mut self, server: Server, mutation: Mutation) -> Option<QueuedMutation> {
+        use std::collections::hash_map::Entry;
+
+        if let Mutation::Rating(id, _) = &mutation {
+            // Reserve the lane in command order, before spawning any HTTP work.
+            match self.0.entry((server.account.namespace(), id.clone())) {
+                Entry::Occupied(mut lane) => {
+                    lane.get_mut().push_back((server, mutation));
+                    return None;
+                }
+                Entry::Vacant(lane) => {
+                    lane.insert(VecDeque::new());
+                }
+            }
+        }
+        Some((server, mutation))
+    }
+
+    fn complete(&mut self, namespace: &str, mutation: &Mutation) -> Option<QueuedMutation> {
+        let Mutation::Rating(id, _) = mutation else {
+            return None;
+        };
+        let std::collections::hash_map::Entry::Occupied(mut lane) =
+            self.0.entry((namespace.to_owned(), id.clone()))
+        else {
+            return None;
+        };
+        if let Some(next) = lane.get_mut().pop_front() {
+            Some(next)
+        } else {
+            lane.remove();
+            None
+        }
+    }
+}
+
 fn run(
     paths: Paths,
     runtime: tokio::runtime::Handle,
@@ -1002,6 +1044,56 @@ fn run(
     } = service;
     let mut account = paths.account()?;
     let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
+    let mut track_rating_writes = TrackRatingWrites::default();
+    let spawn_mutation = |server: Server, mutation: Mutation| {
+        let namespace = server.account.namespace();
+        let tx = tx.clone();
+        let playlist_edit = matches!(
+            mutation,
+            Mutation::ReorderPlaylist { .. }
+                | Mutation::AddToPlaylist(..)
+                | Mutation::RemoveFromPlaylist(..)
+                | Mutation::DeletePlaylist(..)
+        )
+        .then(|| playlist_track_edits.clone());
+        runtime.spawn(async move {
+            // Don't let another local edit interleave a reorder's read and write.
+            let _playlist_guard = match playlist_edit {
+                Some(lock) => Some(lock.lock_owned().await),
+                None => None,
+            };
+            let result = match &mutation {
+                Mutation::Favorite(id, value) => server.star(id, *value).await,
+                Mutation::Rating(id, rating) => server.rating(id, *rating).await,
+                Mutation::AlbumFavorite(id, value) => server.album_star(id, *value).await,
+                Mutation::AlbumRating(id, rating) => server.rating(id, *rating).await,
+                Mutation::CreatePlaylist(name, ids) => server.create_playlist(name, ids).await,
+                Mutation::ReorderPlaylist {
+                    id,
+                    original,
+                    reordered,
+                } => server.reorder_playlist(id, original, reordered).await,
+                Mutation::RenamePlaylist(id, name) => server.rename_playlist(id, name).await,
+                Mutation::DeletePlaylist(id) => server.delete_playlist(id).await,
+                Mutation::AddToPlaylist(id, ids) => server.add_to_playlist(id, ids).await,
+                Mutation::RemoveFromPlaylist(id, index) => {
+                    server.remove_from_playlist(id, *index).await
+                }
+            };
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(Command::Updated(namespace, mutation));
+                }
+                Err(error) => {
+                    let _ = tx.send(Command::MutationFailed(
+                        namespace,
+                        mutation,
+                        format!("Change was not saved: {error:#}. Retry when connected."),
+                    ));
+                }
+            }
+        });
+    };
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
     player.send(PlayerCommand::Preferences(prefs.clone()));
@@ -2312,65 +2404,17 @@ fn run(
                         ))?;
                         return Ok(());
                     };
-                    let namespace = server.account.namespace();
-                    let tx = tx.clone();
-                    let playlist_edit = matches!(
-                        mutation,
-                        Mutation::ReorderPlaylist { .. }
-                            | Mutation::AddToPlaylist(..)
-                            | Mutation::RemoveFromPlaylist(..)
-                            | Mutation::DeletePlaylist(..)
-                    )
-                    .then(|| playlist_track_edits.clone());
-                    runtime.spawn(async move {
-                        // Don't let another local edit interleave a reorder's read and write.
-                        let _playlist_guard = match playlist_edit {
-                            Some(lock) => Some(lock.lock_owned().await),
-                            None => None,
-                        };
-                        let result = match &mutation {
-                            Mutation::Favorite(id, value) => server.star(id, *value).await,
-                            Mutation::Rating(id, rating) => server.rating(id, *rating).await,
-                            Mutation::AlbumFavorite(id, value) => {
-                                server.album_star(id, *value).await
-                            }
-                            Mutation::AlbumRating(id, rating) => server.rating(id, *rating).await,
-                            Mutation::CreatePlaylist(name, ids) => {
-                                server.create_playlist(name, ids).await
-                            }
-                            Mutation::ReorderPlaylist {
-                                id,
-                                original,
-                                reordered,
-                            } => server.reorder_playlist(id, original, reordered).await,
-                            Mutation::RenamePlaylist(id, name) => {
-                                server.rename_playlist(id, name).await
-                            }
-                            Mutation::DeletePlaylist(id) => server.delete_playlist(id).await,
-                            Mutation::AddToPlaylist(id, ids) => {
-                                server.add_to_playlist(id, ids).await
-                            }
-                            Mutation::RemoveFromPlaylist(id, index) => {
-                                server.remove_from_playlist(id, *index).await
-                            }
-                        };
-                        match result {
-                            Ok(()) => {
-                                let _ = tx.send(Command::Updated(namespace, mutation));
-                            }
-                            Err(error) => {
-                                let _ = tx.send(Command::MutationFailed(
-                                    namespace,
-                                    mutation,
-                                    format!(
-                                        "Change was not saved: {error:#}. Retry when connected."
-                                    ),
-                                ));
-                            }
-                        }
-                    });
+                    if let Some((server, mutation)) = track_rating_writes.enqueue(server, mutation)
+                    {
+                        spawn_mutation(server, mutation);
+                    }
                 }
                 Command::Updated(namespace, mutation) => {
+                    if let Some((server, next)) =
+                        track_rating_writes.complete(&namespace, &mutation)
+                    {
+                        spawn_mutation(server, next);
+                    }
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
                     }
@@ -2487,6 +2531,13 @@ fn run(
                     }
                 }
                 Command::MutationFailed(namespace, mutation, error) => {
+                    if let Some((server, next)) =
+                        track_rating_writes.complete(&namespace, &mutation)
+                    {
+                        spawn_mutation(server, next);
+                        // A rejected, superseded rating must not offer a stale Retry.
+                        return Ok(());
+                    }
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
                     }

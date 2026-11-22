@@ -373,6 +373,7 @@ struct StateData {
     library: Library,
     requests: Vec<Request>,
     expected_mutations: VecDeque<(Request, bool)>,
+    held_rating: Option<(Request, flume::Receiver<()>)>,
     unexpected: Vec<&'static str>,
 }
 
@@ -541,6 +542,48 @@ async fn navidrome(
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         return bytes.into_inner().into_response();
+    }
+    if matches!(
+        endpoint.as_str(),
+        "star.view" | "unstar.view" | "setRating.view"
+    ) {
+        let (succeeds, gate) = {
+            let mut data = state.data.lock().unwrap();
+            let succeeds = match data.expected_mutations.pop_front() {
+                Some((expected, succeeds)) if request == expected => succeeds,
+                _ => {
+                    data.unexpected.push("unexpected mutation or parameters");
+                    return envelope(
+                        json!({"status":"failed","error":{"code":70,"message":"Unexpected mutation"}}),
+                    );
+                }
+            };
+            let gate = data
+                .held_rating
+                .take_if(|(held, _)| *held == request)
+                .map(|(_, gate)| gate);
+            (succeeds, gate)
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv_async().await;
+        }
+        return envelope(if succeeds {
+            if endpoint == "setRating.view"
+                && let Some(track) = state
+                    .data
+                    .lock()
+                    .unwrap()
+                    .library
+                    .tracks
+                    .iter_mut()
+                    .find(|track| track.id == query["id"])
+            {
+                track.user_rating = Some(query["rating"].parse().unwrap());
+            }
+            json!({"status":"ok"})
+        } else {
+            json!({"status":"failed","error":{"code":70,"message":"Fixture feedback rejected"}})
+        });
     }
     let mut data = state.data.lock().unwrap();
     let body = match endpoint.as_str() {
@@ -761,21 +804,6 @@ async fn navidrome(
         }
         "getSong.view" if query == Request::new("", &[("id", "song")]).params => {
             json!({"status":"ok", "song":data.library.tracks[0]})
-        }
-        "star.view" | "unstar.view" | "setRating.view" => {
-            match data.expected_mutations.pop_front() {
-                Some((expected, succeeds)) if request == expected => {
-                    if succeeds {
-                        json!({"status":"ok"})
-                    } else {
-                        json!({"status":"failed","error":{"code":70,"message":"Fixture feedback rejected"}})
-                    }
-                }
-                _ => {
-                    data.unexpected.push("unexpected mutation or parameters");
-                    json!({"status":"failed","error":{"code":70,"message":"Unexpected mutation"}})
-                }
-            }
         }
         _ => {
             data.unexpected.push("unexpected parameters");
@@ -1060,6 +1088,7 @@ impl Fixture {
                 library,
                 requests: vec![],
                 expected_mutations: VecDeque::new(),
+                held_rating: None,
                 unexpected: vec![],
             })),
             received,
@@ -1195,16 +1224,48 @@ impl Fixture {
     }
 
     pub fn wait_request(&self, expected: &Request) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let request = self
-                .requests
-                .recv_deadline(deadline)
-                .expect("expected safe HTTP request summary");
+        assert!(
+            self.request_arrives_within(expected, WAIT),
+            "expected safe HTTP request summary: {expected:?}"
+        );
+    }
+
+    pub fn request_arrives_within(&self, expected: &Request, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while let Ok(request) = self.requests.recv_deadline(deadline) {
             if &request == expected {
-                return;
+                return true;
             }
         }
+        false
+    }
+
+    pub fn hold_rating(&self, request: Request, succeeds: bool) -> flume::Sender<()> {
+        self.expect_mutation(request.clone(), succeeds);
+        let (release, gate) = flume::bounded(1);
+        assert!(
+            self.state
+                .data
+                .lock()
+                .unwrap()
+                .held_rating
+                .replace((request, gate))
+                .is_none()
+        );
+        release
+    }
+
+    pub fn server_track_rating(&self, id: &str) -> Option<u8> {
+        self.state
+            .data
+            .lock()
+            .unwrap()
+            .library
+            .tracks
+            .iter()
+            .find(|track| track.id == id)
+            .unwrap()
+            .user_rating
     }
 
     pub fn requests(&self) -> Vec<Request> {
