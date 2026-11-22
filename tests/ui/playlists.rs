@@ -1,7 +1,7 @@
 //! Playlist interactions with scenario-local expected commands and replies.
 use crate::common::ui::{Fixture, start};
 use gpui_kit::{
-    AnyWindowHandle, AppContext, TestAppContext,
+    AnyWindowHandle, AppContext, ScrollDelta, TestAppContext, point, px, size,
     test::{TestQueryExt, TestWindowExt},
 };
 use sonora::{
@@ -11,6 +11,424 @@ use sonora::{
     service::{Command, Event, Mutation, PlaylistTarget},
 };
 use std::{sync::Arc, time::Duration};
+
+#[gpui_kit::test]
+fn metadata_links_double_click_needs_only_one_back(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent, MouseButton, MouseDownEvent, MouseUpEvent};
+    let (_dir, mut f, window, _app) = start(cx);
+    f.seed_explorer();
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = f.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    f.search(window, "Fixture", cx);
+    f.backend.player_commands().try_iter().for_each(drop);
+    for column in ["artist", "album", "genre"] {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let position = window
+                .find(format!("playlist-link-playlist-0-{column}-0"))
+                .bounds()
+                .center();
+            let modifiers = window.modifiers();
+            // Native double-click events can arrive together before the next frame.
+            for click_count in 1..=2 {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+        f.settle(window, cx);
+        assert!(f.backend.player_commands().try_recv().is_err());
+        f.click(window, "history-back", cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.try_find("playlist-track-header").is_some(),
+                "one Back must return from double-clicked {column} metadata"
+            );
+            assert_eq!(window.find("music-search").value(), Some("Fixture"));
+        })
+        .unwrap();
+    }
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn metadata_links_open_artist_album_and_genre_without_playing(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, app) = start(cx);
+    f.seed_explorer();
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = f
+        .catalog
+        .by_ids(&["track-1".into(), "track-1".into()])
+        .unwrap()
+        .into();
+    loaded.song_count = 2;
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    f.search(window, "Fixture", cx);
+    f.backend.player_commands().try_iter().for_each(drop);
+    // Use the same cell hit area that previously selected the track.
+    f.click(window, "playlist-cell-playlist-0-artist", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("artist-release-album-1").is_some(),
+            "artist metadata should open its artist page"
+        );
+    })
+    .unwrap();
+    assert!(f.backend.player_commands().try_recv().is_err());
+    f.click(window, "history-back", cx);
+    f.click(window, "playlist-link-playlist-0-album-0", cx);
+    assert_eq!(f.last_query().selection.albums, ["album-1"]);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("album-favorite-album-1").visible())
+    })
+    .unwrap();
+    assert!(f.backend.player_commands().try_recv().is_err());
+    f.click(window, "history-back", cx);
+    // Double-clicking a metadata link must not bubble into playlist playback.
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("playlist-link-playlist-0-genre-0", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    assert_eq!(f.last_query().selection.genres, ["Rock"]);
+    assert!(f.last_query().selection.albums.is_empty());
+    assert!(f.last_query().text.is_empty());
+    assert!(f.backend.player_commands().try_recv().is_err());
+    f.click(window, "history-back", cx);
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("playlist-track-header").visible());
+        let page = app.read(cx).tab_state().active().page.as_ref().unwrap();
+        assert_eq!(page.search, "Fixture");
+        window.double_click("row-title-playlist-1", cx);
+    })
+    .unwrap();
+    f.settle(window, cx);
+    let PlayerCommand::Replace(tracks, index) = f.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("playlist playback");
+    };
+    assert_eq!((tracks.len(), index), (2, 1));
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn metadata_links_handle_multiple_credits_and_missing_values_in_readonly_playlists(
+    cx: &mut TestAppContext,
+) {
+    use sonora::model::{Genre, NamedId, Track};
+    let (_dir, mut f, window, _app) = start(cx);
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Automatic");
+    loaded.readonly = true;
+    loaded.entry = Arc::new(vec![
+        Arc::new(Track {
+            id: "credits".into(),
+            title: "Duet".into(),
+            artist: "ONE OK ROCK · 宇多田ヒカル".into(),
+            artists: vec![
+                NamedId {
+                    id: "artist-1".into(),
+                    name: "ONE OK ROCK".into(),
+                },
+                NamedId {
+                    id: "artist-2".into(),
+                    name: "宇多田ヒカル".into(),
+                },
+            ],
+            genres: vec![
+                Genre {
+                    name: "Rock".into(),
+                },
+                Genre { name: "Pop".into() },
+            ],
+            album: "Unknown release".into(),
+            ..Default::default()
+        }),
+        Arc::new(Track {
+            id: "bare".into(),
+            title: "Bare".into(),
+            ..Default::default()
+        }),
+    ]);
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    cx.simulate_window_resize(window, size(px(1800.), px(900.)));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window
+                .try_find("playlist-link-playlist-0-album-0")
+                .is_none(),
+            "an album without an ID is plain text"
+        );
+        for column in ["artist", "album", "genre"] {
+            assert_eq!(
+                window
+                    .find(format!("playlist-cell-playlist-1-{column}"))
+                    .label(),
+                Some("—")
+            );
+            assert!(
+                window
+                    .try_find(format!("playlist-link-playlist-1-{column}-0"))
+                    .is_none()
+            );
+        }
+    })
+    .unwrap();
+    f.backend.player_commands().try_iter().for_each(drop);
+    f.click(window, "playlist-link-playlist-0-artist-1", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("artist-release-album-3").visible())
+    })
+    .unwrap();
+    f.click(window, "history-back", cx);
+    f.click(window, "playlist-link-playlist-0-genre-1", cx);
+    assert_eq!(f.last_query().selection.genres, ["Pop"]);
+    assert!(f.backend.player_commands().try_recv().is_err());
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn metadata_columns_can_be_changed_from_the_header_and_settings(cx: &mut TestAppContext) {
+    let (dir, mut f, window, app) = start(cx);
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = f
+        .catalog
+        .by_ids(&["track-1".into(), "track-1".into()])
+        .unwrap()
+        .into();
+    loaded.song_count = 2;
+    for entry in Arc::make_mut(&mut loaded.entry) {
+        Arc::make_mut(entry).genre = "Jazz".into();
+    }
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("playlist-track-header").is_some(),
+            "playlist needs a metadata column header"
+        );
+        assert!(window.find("playlist-column-artist").visible());
+        assert!(window.find("playlist-cell-playlist-0-artist").visible());
+        assert!(window.try_find("playlist-column-genre").is_none());
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-column-genre").visible());
+        assert!(window.find("playlist-cell-playlist-1-genre").visible());
+        assert_eq!(
+            window.find("playlist-cell-playlist-1-genre").label(),
+            Some("Jazz")
+        );
+        assert_eq!(
+            window.find("playlist-column-genre").bounds().left(),
+            window
+                .find("playlist-cell-playlist-1-genre")
+                .bounds()
+                .left()
+        );
+    })
+    .unwrap();
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    cx.update_window(window, |_, window, cx| {
+        window.within("settings-sidebar").click("0-6", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("playlist-show-genre").checked(), Some(true));
+    })
+    .unwrap();
+    f.click(window, "playlist-show-artist", cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-column-artist").is_none());
+        assert!(window.try_find("playlist-cell-playlist-0-artist").is_none());
+        assert!(window.find("playlist-column-genre").visible());
+    })
+    .unwrap();
+    // Metadata controls cannot change the original occurrence used by playback.
+    f.backend.player_commands().try_iter().for_each(drop);
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("row-title-playlist-1", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    let PlayerCommand::Replace(tracks, index) = f.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("expected playlist playback")
+    };
+    assert_eq!(index, 1);
+    assert_eq!(tracks.len(), 2);
+    f.assert_script_finished();
+    let saved: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
+    assert!(
+        !saved
+            .playlist_columns
+            .contains(sonora::playlists::PlaylistColumn::Artist)
+    );
+    assert!(
+        saved
+            .playlist_columns
+            .contains(sonora::playlists::PlaylistColumn::Genre)
+    );
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    drop(f);
+    cx.run_until_parked();
+    let mut restarted = Fixture::open(&dir.path().join("catalog.sqlite"));
+    restarted.expect("restore open playlist", |command, _| {
+        assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+        vec![Event::Playlist(playlist("Roadtrip"))]
+    });
+    let (window, _app) = restarted.mount(cx);
+    restarted.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-column-artist").is_none());
+        assert!(window.find("playlist-column-genre").visible());
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    restarted.settle(window, cx);
+    restarted.menu_item(window, "Restore default columns", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-column-artist").visible());
+        assert!(window.try_find("playlist-column-genre").is_none());
+    })
+    .unwrap();
+    restarted.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn metadata_columns_scroll_together_and_support_readonly_and_empty_playlists(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, mut f, window, _app) = start(cx);
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Automatic");
+    loaded.readonly = true;
+    loaded.entry = f.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    for label in ["Genre", "Year", "Format", "Play count"] {
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("playlist-track-header", cx)
+        })
+        .unwrap();
+        f.settle(window, cx);
+        f.menu_item(window, label, cx);
+    }
+    cx.simulate_window_resize(window, size(px(900.), px(650.)));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "playlist-track-table",
+            ScrollDelta::Pixels(point(px(-1500.), px(0.))),
+            cx,
+        );
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let header = window.find("playlist-column-play-count");
+        let cell = window.find("playlist-cell-playlist-0-play-count");
+        assert!(header.visible());
+        assert!(cell.visible());
+        assert_eq!(cell.label(), Some("—"));
+        assert_eq!(header.bounds().left(), cell.bounds().left());
+        window.right_click("playlist-cell-playlist-0-play-count", cx);
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        assert!(menu.try_find_by_label("Remove from Playlist").is_none());
+        menu.press("escape", cx);
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.search(window, "no match", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-track-header").visible());
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    f.search(window, "", cx);
+    cx.simulate_window_resize(window, size(px(1440.), px(900.)));
+    f.settle(window, cx);
+    f.click(window, "playlist-view-albums", cx);
+    expect_album_details(&mut f, "album-1");
+    f.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert!(window.try_find("playlist-track-header").is_none());
+        assert!(window.try_find("playlist-cell-playlist-0-genre").is_none());
+    })
+    .unwrap();
+    f.click(window, "playlist-view-tracks", cx);
+    f.backend.emit(Event::Playlist(playlist("Empty")));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-track-header").visible());
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    f.assert_script_finished();
+}
 
 #[gpui_kit::test]
 fn playlist_album_opens_the_explorer_album_panel(cx: &mut TestAppContext) {
@@ -185,7 +603,7 @@ fn album_view_groups_playlist_entries_and_preserves_playback_and_readonly(cx: &m
     .unwrap();
     fixture.backend.player_commands().try_iter().for_each(drop);
     cx.update_window(window, |_, window, cx| {
-        window.double_click("row-playlist-2", cx)
+        window.double_click("row-title-playlist-2", cx)
     })
     .unwrap();
     fixture.settle(window, cx);
@@ -404,13 +822,13 @@ fn double_click_playlist(cx: &mut TestAppContext, owner: &'static str) {
     });
     fixture.click(window, "nav-playlist-playlist-1", cx);
     fixture.backend.player_commands().try_iter().for_each(drop);
-    fixture.click(window, "row-playlist-2", cx);
+    fixture.click(window, "row-title-playlist-2", cx);
     assert!(
         fixture.backend.player_commands().is_empty(),
         "single click must not play"
     );
     cx.update_window(window, |_, window, cx| {
-        window.double_click("row-playlist-2", cx)
+        window.double_click("row-title-playlist-2", cx)
     })
     .unwrap();
     fixture.settle(window, cx);
@@ -740,14 +1158,14 @@ fn drag_playlist_occurrence_saves_order_and_keeps_it_on_failure(cx: &mut TestApp
     read_only.readonly = true;
     fixture.backend.emit(Event::Playlist(read_only));
     fixture.settle(window, cx);
-    drag("row-playlist-2", "row-playlist-3", cx);
+    drag("row-title-playlist-2", "row-title-playlist-3", cx);
     fixture.settle(window, cx);
 
     fixture.backend.emit(Event::Playlist(loaded.clone()));
     fixture.settle(window, cx);
 
     // A drop on itself does not change the order or send a save.
-    drag("row-playlist-2", "row-playlist-2", cx);
+    drag("row-title-playlist-2", "row-title-playlist-2", cx);
     fixture.settle(window, cx);
 
     let reordered = ["track-1", "track-2", "track-3", "track-1"];
@@ -767,7 +1185,7 @@ fn drag_playlist_occurrence_saves_order_and_keeps_it_on_failure(cx: &mut TestApp
                 vec![Event::MutationFailed(expected, "Reorder rejected".into())]
             }
         });
-        drag("row-playlist-2", "row-playlist-3", cx);
+        drag("row-title-playlist-2", "row-title-playlist-3", cx);
         fixture.settle(window, cx);
         fixture.assert_script_finished();
         cx.update_window(window, |_, window, _| {

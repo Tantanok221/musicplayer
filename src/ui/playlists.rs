@@ -1,5 +1,6 @@
 use super::*;
-use crate::playlists::{PlaylistEntry, PlaylistView};
+use crate::playlists::{PlaylistColumn, PlaylistColumns, PlaylistEntry, PlaylistView};
+use gpui_kit::base::{Scrollbar, ScrollbarMode};
 
 #[derive(Clone)]
 struct PlaylistDrag {
@@ -8,6 +9,147 @@ struct PlaylistDrag {
 }
 
 impl MusicApp {
+    fn set_playlist_column(
+        &mut self,
+        column: PlaylistColumn,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.preferences.playlist_columns.set(column, visible);
+        self.save_preferences();
+        cx.notify();
+    }
+
+    pub(super) fn playlist_metadata_cell(
+        &self,
+        track: &Track,
+        key: &str,
+        column: PlaylistColumn,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let value = column.value(track);
+        let tooltip = value.clone();
+        let link_key = format!("playlist-link-{key}-{}", column.key());
+        let content = match column {
+            PlaylistColumn::Artist if value != "—" => {
+                self.artist_links(track.artist_credits(), link_key, cx)
+            }
+            PlaylistColumn::AlbumArtist if value != "—" => {
+                self.artist_links(track.album_artist_credits(), link_key, cx)
+            }
+            PlaylistColumn::Genre if value != "—" => {
+                self.genre_links(&track.genres_label(), link_key, cx)
+            }
+            PlaylistColumn::Album if value != "—" && !track.album_id.trim().is_empty() => {
+                let album_id = track.album_id.clone();
+                div()
+                    .id(SharedString::from(format!("{link_key}-0")))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(format!("Open album {value}"))
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|link| link.text_color(ink(cx).accent))
+                    .child(value.clone())
+                    .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if event.click_count() == 1 {
+                            app.open_album_in_explorer(album_id.clone(), window, cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+            _ => div().child(value.clone()).into_any_element(),
+        };
+        div()
+            .id(SharedString::from(format!(
+                "playlist-cell-{key}-{}",
+                column.key()
+            )))
+            .test_support()
+            .role(Role::Cell)
+            .aria_label(value)
+            .w(px(column.width()))
+            .flex_shrink_0()
+            .truncate()
+            .text_color(ink(cx).muted)
+            .child(content)
+            .tooltip(move |window, cx| tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+            .into_any_element()
+    }
+
+    fn playlist_track_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let columns = self.preferences.playlist_columns.clone();
+        let weak = cx.weak_entity();
+        div()
+            .id("playlist-track-header")
+            .test_support()
+            .role(Role::Group)
+            .aria_label("Playlist columns · right-click to choose metadata")
+            .h(px(28.))
+            .flex_shrink_0()
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(11.))
+            .text_color(ink(cx).muted)
+            .border_b_1()
+            .border_color(ink(cx).line)
+            .child(div().w(px(23.)).flex_shrink_0().child("#"))
+            .child(div().w(px(13.)).flex_shrink_0())
+            .child(div().min_w(px(180.)).flex_1().child("Title"))
+            .children(columns.iter().map(|column| {
+                div()
+                    .id(SharedString::from(format!(
+                        "playlist-column-{}",
+                        column.key()
+                    )))
+                    .test_support()
+                    .role(Role::ColumnHeader)
+                    .aria_label(column.label())
+                    .w(px(column.width()))
+                    .flex_shrink_0()
+                    .truncate()
+                    .child(column.label())
+            }))
+            // Six compact feedback buttons plus their gap, matching track_feedback.
+            .child(div().w(px(146.)).flex_shrink_0().child("Favorite / rating"))
+            .context_menu(move |mut menu, _, _| {
+                menu = menu
+                    .min_w(px(210.))
+                    .max_h(px(420.))
+                    .scrollable(true)
+                    .label("Playlist track columns");
+                for column in PlaylistColumn::ALL {
+                    let weak = weak.clone();
+                    let visible = columns.contains(column);
+                    menu = menu.item(
+                        PopupMenuItem::new(column.label())
+                            .checked(visible)
+                            .on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.set_playlist_column(column, !visible, cx)
+                                });
+                            }),
+                    );
+                }
+                let weak = weak.clone();
+                menu.separator()
+                    .item(PopupMenuItem::new("Restore default columns").on_click(
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.preferences.playlist_columns = PlaylistColumns::default();
+                                app.save_preferences();
+                                cx.notify();
+                            });
+                        },
+                    ))
+            })
+            .into_any_element()
+    }
+
     pub(super) fn playlist_menu(
         &self,
         playlist: &Playlist,
@@ -378,7 +520,7 @@ impl MusicApp {
                 let values = self.playlists.visible_entries();
                 let entity = cx.entity();
                 let playlist = playlist.clone();
-                uniform_list("playlist-tracks", values.len(), move |range, _, cx| {
+                let list = uniform_list("playlist-tracks", values.len(), move |range, _, cx| {
                     entity.update(cx, |app, cx| {
                         range
                             .map(|row| {
@@ -388,13 +530,53 @@ impl MusicApp {
                     })
                 })
                 .flex_1()
-                .size_full()
-                .px_2()
-                .into_any_element()
+                .min_h_0()
+                .w_full();
+                // The header and body share one horizontal viewport so their cells stay aligned.
+                let width = 386.
+                    + self
+                        .preferences
+                        .playlist_columns
+                        .iter()
+                        .map(|column| column.width() + 4.)
+                        .sum::<f32>();
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("playlist-track-table")
+                            .test_support()
+                            .size_full()
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.playlist_track_scroll)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w_full()
+                                    .min_w(px(width + 16.))
+                                    .px_2()
+                                    .pb(px(12.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(self.playlist_track_header(cx))
+                                    .child(list),
+                            ),
+                    )
+                    .child(
+                        Scrollbar::horizontal(&self.playlist_track_scroll)
+                            .mode(ScrollbarMode::Always),
+                    )
+                    .into_any_element()
             };
             return div()
                 .size_full()
                 .min_h_0()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(

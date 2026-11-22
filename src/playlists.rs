@@ -4,6 +4,9 @@ use crate::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+mod columns;
+pub use columns::{PlaylistColumn, PlaylistColumns};
+
 pub(crate) enum CreationSource {
     Empty,
     Tracks(Vec<String>),
