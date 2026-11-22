@@ -43,6 +43,7 @@ pub enum Mutation {
     DeletePlaylist(String),
     /// Playlist ID and the songs appended to it.
     AddToPlaylist(String, Vec<String>),
+    RemoveFromPlaylist(String, usize),
 }
 /// Where an album's songs go: a new playlist by name, or an existing one by ID.
 #[derive(Clone, Debug, PartialEq)]
@@ -1925,6 +1926,9 @@ fn run(
                             Mutation::AddToPlaylist(id, ids) => {
                                 server.add_to_playlist(id, ids).await
                             }
+                            Mutation::RemoveFromPlaylist(id, index) => {
+                                server.remove_from_playlist(id, *index).await
+                            }
                         };
                         match result {
                             Ok(()) => {
@@ -2016,6 +2020,7 @@ fn run(
                                     Mutation::ReplacePlaylist(id, _)
                                     | Mutation::RenamePlaylist(id, _)
                                     | Mutation::AddToPlaylist(id, _) => Some(id),
+                                    Mutation::RemoveFromPlaylist(id, _) => Some(id),
                                     _ => None,
                                 };
                                 runtime.spawn(async move {

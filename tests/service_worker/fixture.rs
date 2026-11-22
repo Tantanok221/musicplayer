@@ -176,6 +176,8 @@ async fn navidrome(
             | "getOpenSubsonicExtensions.view"
             | "getScanStatus.view"
             | "getPlaylists.view"
+            | "getPlaylist.view"
+            | "updatePlaylist.view"
             | "search3.view"
             | "star.view"
             | "unstar.view"
@@ -204,6 +206,8 @@ async fn navidrome(
                 | "time"
                 | "size"
                 | "includeNotPresent"
+                | "playlistId"
+                | "songIndexToRemove"
         )
     }) {
         return state.unexpected("unknown endpoint or parameter");
@@ -276,6 +280,38 @@ async fn navidrome(
         "getPlaylists.view" if query.is_empty() => {
             json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
         }
+        "getPlaylist.view" => {
+            let playlist = data
+                .library
+                .playlists
+                .iter()
+                .find(|playlist| Some(&playlist.id) == query.get("id"));
+            json!({"status":"ok","playlist":playlist})
+        }
+        "updatePlaylist.view" => match data.expected_mutations.pop_front() {
+            Some((expected, succeeds)) if request == expected => {
+                if succeeds {
+                    let playlist = data
+                        .library
+                        .playlists
+                        .iter_mut()
+                        .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
+                        .unwrap();
+                    let index: usize = query["songIndexToRemove"].parse().unwrap();
+                    Arc::make_mut(&mut playlist.entry).remove(index);
+                    playlist.song_count = playlist.entry.len() as u32;
+                    playlist.duration = playlist.entry.iter().map(|track| track.duration).sum();
+                    json!({"status":"ok"})
+                } else {
+                    json!({"status":"failed","error":{"code":70,"message":"Fixture removal rejected"}})
+                }
+            }
+            _ => {
+                data.unexpected
+                    .push("unexpected playlist mutation or parameters");
+                json!({"status":"failed","error":{"code":70,"message":"Unexpected mutation"}})
+            }
+        },
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
             json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":data.library.artist_mbid}})
         }

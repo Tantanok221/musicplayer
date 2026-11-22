@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone)]
 pub(super) enum TrackPlayback {
     Queue(usize),
     Playlist(Arc<Vec<Arc<Track>>>, usize),
@@ -12,6 +13,24 @@ impl TrackPlayback {
             Self::Playlist(tracks, index) => {
                 PlayerCommand::Replace(tracks.as_ref().clone(), *index)
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum TrackPosition {
+    Queue(usize),
+    Playlist {
+        playback: TrackPlayback,
+        removal: Option<playlists::PlaylistRemoval>,
+    },
+}
+
+impl TrackPosition {
+    fn playback(&self) -> TrackPlayback {
+        match self {
+            Self::Queue(index) => TrackPlayback::Queue(*index),
+            Self::Playlist { playback, .. } => playback.clone(),
         }
     }
 }
@@ -40,7 +59,7 @@ impl MusicApp {
         track: Arc<Track>,
         number: usize,
         key: String,
-        playback: Option<TrackPlayback>,
+        position: Option<TrackPosition>,
         popular: Option<bool>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -53,11 +72,8 @@ impl MusicApp {
             .is_some_and(|t| t.id == track.id);
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
-        let queue_index = match playback {
-            Some(TrackPlayback::Queue(index)) => Some(index),
-            _ => None,
-        };
-        let menu = self.track_menu(track.clone(), queue_index, cx);
+        let playback = position.as_ref().map(TrackPosition::playback);
+        let menu = self.track_menu(track.clone(), position, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
             .test_support()

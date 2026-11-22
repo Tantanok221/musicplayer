@@ -263,10 +263,18 @@ impl MusicApp {
     pub(super) fn track_menu(
         &self,
         track: Arc<Track>,
-        queue_index: Option<usize>,
+        position: Option<tracks::TrackPosition>,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let state = self.menu_state(cx);
+        let queue_index = match &position {
+            Some(tracks::TrackPosition::Queue(index)) => Some(*index),
+            _ => None,
+        };
+        let removal = match position {
+            Some(tracks::TrackPosition::Playlist { removal, .. }) => removal,
+            _ => None,
+        };
         move |menu, window, cx| {
             let app = state.app.clone();
             let play = track.clone();
@@ -284,6 +292,21 @@ impl MusicApp {
                 service.send(Command::Enqueue(vec![id.clone()], placement))
             });
             let menu = track_extras(menu, &state, &track, window, cx);
+            let menu = if let Some(removal) = removal.clone() {
+                let app = state.app.clone();
+                menu.separator()
+                    .item(menu_row(Glyph::ListX, "Remove from Playlist").on_click(
+                        move |_, _, cx| {
+                            let _ = app.update(cx, |app, cx| {
+                                if let Some(mutation) = removal.mutation(app.playlist.as_ref()) {
+                                    app.mutate(mutation, cx);
+                                }
+                            });
+                        },
+                    ))
+            } else {
+                menu
+            };
             match queue_index {
                 Some(index) => {
                     let app = state.app.clone();
