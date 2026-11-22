@@ -261,6 +261,112 @@ fn duplicate_queue_occurrences_select_move_remove_and_undo_through_real_player(
 }
 
 #[gpui_kit::test]
+fn sidebar_drag_reorders_upcoming_queue_occurrences(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app, mut player, initial) = start_queue(cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    let ids = &initial.queue_ids;
+    let panel_row = |index: usize| format!("queue-side-{}", ids[index]);
+    let assert_sidebar_order = |expected: &[usize], cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            let mut previous = None;
+            for (position, &index) in expected.iter().enumerate() {
+                let row = window.find(panel_row(index));
+                assert!(row.visible());
+                assert_eq!(
+                    row.label(),
+                    Some(
+                        format!("Queue {}: {}", position + 1, initial.queue[index].title).as_str()
+                    )
+                );
+                let top = row.bounds().top();
+                assert!(previous.is_none_or(|previous| previous < top));
+                previous = Some(top);
+            }
+        })
+        .unwrap();
+    };
+    assert_sidebar_order(&[0, 1, 2, 3], cx);
+
+    for (from, to) in [(0, 3), (1, 0)] {
+        cx.update_window(window, |_, window, cx| {
+            window.drag_to(panel_row(from), panel_row(to), cx);
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        assert!(
+            player_commands(&fixture).is_empty(),
+            "the playing row is fixed"
+        );
+        assert_sidebar_order(&[0, 1, 2, 3], cx);
+    }
+
+    cx.update_window(window, |_, window, cx| {
+        window.drag_to(panel_row(1), panel_row(3), cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    assert_sidebar_order(&[0, 1, 2, 3], cx);
+    let command = one_player_command(&fixture);
+    assert!(
+        matches!(&command, PlayerCommand::EditQueue(revision, QueueEdit::Move { indices, before: 4 }) if *revision == initial.queue_revision && indices == &[1])
+    );
+    let moved = player.command(command, WAIT).unwrap();
+    assert_eq!(*moved.queue_ids, [ids[0], ids[2], ids[3], ids[1]]);
+    assert_eq!(moved.index, initial.index);
+    assert_eq!(moved.position, initial.position);
+    publish(&mut fixture, &moved, window, cx);
+    assert_sidebar_order(&[0, 2, 3, 1], cx);
+
+    cx.update_window(window, |_, window, cx| {
+        window.drag_to(panel_row(1), panel_row(2), cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    let command = one_player_command(&fixture);
+    assert!(
+        matches!(&command, PlayerCommand::EditQueue(revision, QueueEdit::Move { indices, before: 1 }) if *revision == moved.queue_revision && indices == &[3])
+    );
+    let restored = player.command(command, WAIT).unwrap();
+    publish(&mut fixture, &restored, window, cx);
+    assert_sidebar_order(&[0, 1, 2, 3], cx);
+    cx.update_window(window, |_, window, cx| {
+        let from = window.find(panel_row(1)).bounds().center();
+        window.pointer_down(from, MouseButton::Left, cx);
+        window.pointer_move(from + point(px(16.), px(0.)), Some(MouseButton::Left), cx);
+        assert!(cx.has_active_drag());
+    })
+    .unwrap();
+    let changed = player
+        .command(
+            PlayerCommand::EditQueue(
+                restored.queue_revision,
+                QueueEdit::Move {
+                    indices: vec![3],
+                    before: 1,
+                },
+            ),
+            WAIT,
+        )
+        .unwrap();
+    publish(&mut fixture, &changed, window, cx);
+    cx.update_window(window, |_, window, cx| {
+        assert!(cx.has_active_drag());
+        let to = window.find(panel_row(2)).bounds().center();
+        window.pointer_move(to, Some(MouseButton::Left), cx);
+        window.pointer_up(to, MouseButton::Left, cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    assert!(
+        player_commands(&fixture).is_empty(),
+        "the drag depended on an older queue order"
+    );
+    assert_sidebar_order(&[0, 3, 1, 2], cx);
+    fixture.diagnose("sidebar queue reordered", window, &app, cx);
+    player.shutdown(WAIT).unwrap();
+}
+
+#[gpui_kit::test]
 fn obsolete_queue_menu_edits_and_snapshots_cannot_claim_success(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app, mut player, old) = start_queue(cx);
     context_menu(&mut fixture, window, row(old.queue_ids[2]), cx);
