@@ -24,6 +24,7 @@ use std::{
 pub const WAIT: Duration = Duration::from_secs(5);
 
 pub struct Native {
+    pub login_gate: Option<flume::Receiver<()>>,
     pub rules: Option<Value>,
     pub reject_token: bool,
     pub refresh: Option<String>,
@@ -37,6 +38,7 @@ pub struct Native {
 impl Default for Native {
     fn default() -> Self {
         Self {
+            login_gate: None,
             rules: Some(json!({"all":[{"is":{"genre":"Jazz"}}],"sort":"random"})),
             reject_token: false,
             refresh: None,
@@ -56,6 +58,12 @@ async fn native(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if uri.path() == "/auth/login" {
+        let gate = state.data.lock().unwrap().library.native.login_gate.clone();
+        if let Some(gate) = gate {
+            let _ = gate.recv_async().await;
+        }
+    }
     let mut data = state.data.lock().unwrap();
     let body: Value = if body.is_empty() {
         Value::Null

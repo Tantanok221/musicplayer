@@ -21,6 +21,141 @@ fn rules() -> SmartRules {
 }
 
 #[test]
+fn password_sign_in_reuses_native_session_without_blocking_connection() {
+    let (release, gate) = flume::bounded(1);
+    let mut library = Library::default();
+    library.native.login_gate = Some(gate);
+    let fixture = Fixture::new(library);
+    std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    worker.service().send(Command::Connect(
+        fixture.account.clone(),
+        "native-password".into(),
+    ));
+    event(&worker, |e| matches!(e, Event::Connected(..)));
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::LoadSmartRules("smart".into()));
+    release.send(()).unwrap();
+    event(&worker, |e| {
+        assert!(
+            !matches!(e, Event::NativePasswordRequired),
+            "sign-in should supply the native session"
+        );
+        matches!(e, Event::SmartRules(_, Some(_)))
+    });
+    assert!(
+        fixture
+            .paths
+            .native_token(&fixture.account)
+            .unwrap()
+            .is_some()
+    );
+    worker.service().send(Command::SaveSmartPlaylist {
+        id: None,
+        name: "Jazz".into(),
+        rules: rules(),
+    });
+    event(&worker, |e| {
+        assert!(!matches!(e, Event::NativePasswordRequired));
+        matches!(e, Event::SmartPlaylistSaved(_))
+    });
+    assert_eq!(fixture.native_login_count(), 1);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn native_sign_in_failure_is_silent_and_editor_falls_back() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::Connect(
+        fixture.account.clone(),
+        "subsonic-only-password".into(),
+    ));
+    event(&worker, |e| matches!(e, Event::Connected(..)));
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::LoadSmartRules("smart".into()));
+    password(&worker);
+    assert_eq!(fixture.native_login_count(), 1);
+    assert!(
+        fixture
+            .paths
+            .native_token(&fixture.account)
+            .unwrap()
+            .is_none()
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn password_account_switch_stores_the_session_only_for_the_new_account() {
+    let a = Fixture::new(Library::default());
+    let b = Fixture::new(Library::default());
+    let mut worker = a.start_paused();
+    event(&worker, |e| matches!(e, Event::Ready(..)));
+    synced(&worker);
+    worker.service().send(Command::Connect(
+        b.account.clone(),
+        "native-password".into(),
+    ));
+    event(
+        &worker,
+        |e| matches!(e,Event::Connected(account,_) if account.namespace()==b.account.namespace()),
+    );
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::LoadSmartRules("smart".into()));
+    event(&worker, |e| {
+        assert!(!matches!(e, Event::NativePasswordRequired));
+        matches!(e, Event::SmartRules(..))
+    });
+    assert!(a.paths.native_token(&a.account).unwrap().is_none());
+    assert!(a.paths.native_token(&b.account).unwrap().is_some());
+    assert_eq!(a.native_login_count(), 0);
+    assert_eq!(b.native_login_count(), 1);
+    worker.shutdown(WAIT).unwrap();
+    a.finish();
+    b.finish();
+}
+
+#[test]
+fn non_navidrome_password_sign_in_skips_native_login() {
+    let library = Library {
+        server_type: "Subsonic",
+        ..Library::default()
+    };
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::Connect(
+        fixture.account.clone(),
+        "native-password".into(),
+    ));
+    event(&worker, |e| matches!(e, Event::Connected(..)));
+    synced(&worker);
+    assert_eq!(fixture.native_login_count(), 0);
+    assert!(
+        fixture
+            .paths
+            .native_token(&fixture.account)
+            .unwrap()
+            .is_none()
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn cancel_pending_save_does_not_retry_it_after_sign_in() {
     let fixture = Fixture::new(Library::default());
     let mut worker = fixture.start();

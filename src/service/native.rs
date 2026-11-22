@@ -8,6 +8,32 @@ use anyhow::Result;
 use flume::Sender;
 use std::collections::VecDeque;
 
+pub(super) fn sign_in_session(
+    server: &Server,
+    paths: &Paths,
+    password: String,
+) -> Option<flume::Receiver<()>> {
+    if !server.is_navidrome || password.is_empty() {
+        return None;
+    }
+    let server = server.clone();
+    let paths = paths.clone();
+    let (done, finished) = flume::bounded(1);
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.native_login(&password),
+        )
+        .await;
+        drop(password);
+        if let Ok(Ok(token)) = result {
+            let _ = paths.save_native_token(&server.account, &token);
+        }
+        let _ = done.send(());
+    });
+    Some(finished)
+}
+
 #[derive(Clone)]
 pub(super) enum Operation {
     Load(String),
@@ -30,9 +56,17 @@ pub(super) struct Editor {
     pub busy: bool,
     waiting: bool,
     pending: VecDeque<Operation>,
+    session: Option<flume::Receiver<()>>,
 }
 
 impl Editor {
+    pub fn session(&mut self, session: Option<flume::Receiver<()>>) {
+        if session.is_some() {
+            self.session = session;
+            self.waiting = false;
+        }
+    }
+
     pub fn reset(&mut self) {
         *self = Self {
             epoch: self.epoch + 1,
@@ -78,6 +112,13 @@ impl Editor {
         let epoch = self.epoch;
         let paths = paths.clone();
         let tx = tx.clone();
+        if let Some(session) = self.session.take() {
+            runtime.spawn(async move {
+                let _ = session.recv_async().await;
+                let _ = tx.send(Command::NativeSessionReady(epoch));
+            });
+            return;
+        }
         runtime.spawn(async move {
             let result = perform(&server, &paths, operation).await;
             let _ = tx.send(Command::NativeCompleted(epoch, result));

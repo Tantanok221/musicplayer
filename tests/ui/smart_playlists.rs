@@ -187,6 +187,8 @@ fn password_prompt_submits_once_clears_password_and_can_cancel(cx: &mut TestAppC
     });
     f.click(w, "save-smart-playlist", cx);
     cx.update_window(w, |_, window, _| {
+        assert!(window.find_by_label("Sign in to Navidrome again").visible());
+        assert!(window.find_by_label("Your editing session is missing or has expired. Your password is used once to sign in again.").visible());
         assert!(
             window
                 .find_by_label("Your password is not stored.")

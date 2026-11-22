@@ -585,13 +585,17 @@ impl MusicApp {
                 )
                 .child(
                     div()
+                        .id("native-password-title")
+                        .test_support()
+                        .aria_label("Sign in to Navidrome again")
                         .text_size(px(20.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Connect to Navidrome"),
+                        .child("Sign in to Navidrome again"),
                 )
-                .child(div().text_color(colors.muted).child(
-                    "Authorize smart playlist editing. Your password is used once to sign in.",
-                ))
+                .child({
+                    let explanation="Your editing session is missing or has expired. Your password is used once to sign in again.";
+                    div().id("native-session-explanation").test_support().aria_label(explanation).text_color(colors.muted).child(explanation)
+                })
                 .child(
                     div()
                         .id("native-password-explanation")

@@ -150,6 +150,55 @@ fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut 
 }
 
 #[gpui_kit::test]
+fn password_sign_in_then_create_smart_playlist_needs_no_dialog(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        matches!(e, Event::SignInRequired(_))
+    });
+    cx.update_window(window, |_, window, cx| {
+        for (field, value) in [
+            ("Server address", fixture.account.url.as_str()),
+            ("Username", "fixture"),
+            ("Password", "native-password"),
+        ] {
+            window.click(field, cx);
+            window.input(value, cx);
+        }
+        window.click("connect-library", cx);
+    })
+    .unwrap();
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    for id in [
+        "new-smart-playlist",
+        "smart-template-3",
+        "save-smart-playlist",
+    ] {
+        cx.update_window(window, |_, window, cx| window.click(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    deliver_until(&worker, &tx, window, cx, |e, _| {
+        assert!(
+            !matches!(e, Event::NativePasswordRequired),
+            "sign-in must authorize smart playlist editing"
+        );
+        matches!(e,Event::Playlist(p) if p.id=="smart" && p.entry.len()==1)
+    });
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("native-password").is_none());
+        assert!(window.try_find("smart-editor").is_none());
+        assert!(window.find("smart-playlist-header").visible());
+    })
+    .unwrap();
+    assert_eq!(fixture.native_login_count(), 1);
+    assert_eq!(fixture.native_requests()[0].0, axum::http::Method::POST);
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn favorite_http_failure_rolls_back_in_the_real_view_and_retry_recovers(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);

@@ -75,6 +75,7 @@ pub enum Command {
         rules: crate::smart_rules::SmartRules,
     },
     NativeSignIn(String),
+    NativeSessionReady(u64),
     NativeCompleted(u64, Result<native::Reply, crate::server::NativeError>),
     NativeSignedIn(u64, Result<(), String>),
     NativeRefreshed(u64, Result<(Vec<Playlist>, Playlist), String>),
@@ -148,7 +149,7 @@ pub enum Command {
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
-    Connected(Server, String),
+    Connected(Server, String, Option<flume::Receiver<()>>),
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
@@ -627,7 +628,7 @@ fn reconnect(
         }
         .await;
         let _ = tx.send(match result {
-            Ok((server, label)) => Command::Connected(server, label),
+            Ok((server, label)) => Command::Connected(server, label, None),
             Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
         });
     });
@@ -950,6 +951,11 @@ fn run(
                     native_editor.sign_in(server, &paths, password, &runtime, &tx)?;
                 }
                 Command::NativeSignedIn(epoch, result) => native_editor.signed_in(epoch, result)?,
+                Command::NativeSessionReady(epoch) => {
+                    if epoch == native_editor.epoch {
+                        native_editor.busy = false;
+                    }
+                }
                 Command::NativeCompleted(epoch, result) => {
                     if let Some(reply) = native_editor.complete(epoch, result, &events)? {
                         match reply {
@@ -1024,7 +1030,8 @@ fn run(
                         .await;
                         match result {
                             Ok((server, label)) => {
-                                let _ = command_tx.send(Command::Connected(server, label));
+                                let session = native::sign_in_session(&server, &paths, password);
+                                let _ = command_tx.send(Command::Connected(server, label, session));
                             }
                             Err(error) => {
                                 let _ = command_tx
@@ -1033,7 +1040,7 @@ fn run(
                         }
                     });
                 }
-                Command::Connected(value, label) => {
+                Command::Connected(value, label, session) => {
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
@@ -1065,6 +1072,7 @@ fn run(
                         let _ = tx.send(Command::ResumeDownloads);
                     }
                     paths.save_account(&value.account)?;
+                    native_editor.session(session);
                     account = Some(value.account.clone());
                     checking = false;
                     last_check = Instant::now();
