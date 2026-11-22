@@ -1282,7 +1282,7 @@ impl Drop for Fixture {
     }
 }
 
-pub fn event(worker: &Worker, wanted: impl Fn(&Event) -> bool) -> Event {
+pub fn event(worker: &Worker, mut wanted: impl FnMut(&Event) -> bool) -> Event {
     let deadline = Instant::now() + WAIT;
     loop {
         let event = worker
