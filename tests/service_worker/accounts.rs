@@ -169,6 +169,7 @@ fn delayed_player_save_from_previous_account_cannot_replace_the_new_accounts_que
         a.account.namespace(),
         SavedQueue {
             ids: vec!["song".into(), "song".into()],
+            shuffle_positions: None,
             index: Some(1),
             position: 23.,
             listen: None,

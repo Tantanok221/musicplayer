@@ -342,6 +342,9 @@ fn forward_player_events(
 /// the current entry. A missing current entry starts its replacement at zero.
 fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) -> Result<()> {
     let queue: SavedQueue = catalog.state("queue")?;
+    let mut shuffle_positions = queue
+        .shuffle_positions
+        .filter(|positions| positions.len() == queue.ids.len());
     let current = queue.index.unwrap_or(0);
     let mut tracks = Vec::new();
     let mut index = None;
@@ -354,17 +357,24 @@ fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) ->
             if at >= current && index.is_none() {
                 index = Some(tracks.len());
             }
+            if let Some(positions) = &mut shuffle_positions {
+                positions[tracks.len()] = positions[at];
+            }
             tracks.push(track);
         }
     }
+    if let Some(positions) = &mut shuffle_positions {
+        positions.truncate(tracks.len());
+    }
     let index = index.unwrap_or(tracks.len().saturating_sub(1));
-    player.send(PlayerCommand::RestoreAccount(
+    player.send(PlayerCommand::RestoreAccount {
         namespace,
         tracks,
         index,
-        if same { queue.position } else { 0. },
-        if same { queue.listen } else { None },
-    ));
+        position: if same { queue.position } else { 0. },
+        listen: if same { queue.listen } else { None },
+        shuffle_positions,
+    });
     Ok(())
 }
 
