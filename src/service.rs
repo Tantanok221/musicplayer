@@ -19,7 +19,7 @@ use crate::{
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     path::PathBuf,
     sync::{
         Arc,
@@ -992,8 +992,6 @@ struct TrackRatingWrites(HashMap<(String, String), VecDeque<QueuedMutation>>);
 
 impl TrackRatingWrites {
     fn enqueue(&mut self, server: Server, mutation: Mutation) -> Option<QueuedMutation> {
-        use std::collections::hash_map::Entry;
-
         if let Mutation::Rating(id, _) = &mutation {
             // Reserve the lane in command order, before spawning any HTTP work.
             match self.0.entry((server.account.namespace(), id.clone())) {
@@ -1013,9 +1011,7 @@ impl TrackRatingWrites {
         let Mutation::Rating(id, _) = mutation else {
             return None;
         };
-        let std::collections::hash_map::Entry::Occupied(mut lane) =
-            self.0.entry((namespace.to_owned(), id.clone()))
-        else {
+        let Entry::Occupied(mut lane) = self.0.entry((namespace.to_owned(), id.clone())) else {
             return None;
         };
         if let Some(next) = lane.get_mut().pop_front() {
@@ -1025,6 +1021,28 @@ impl TrackRatingWrites {
             None
         }
     }
+}
+
+fn mutation_failed(
+    catalog: &Catalog,
+    player: &PlayerHandle,
+    events: &Sender<Event>,
+    mutation: Mutation,
+    error: String,
+) -> Result<()> {
+    if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
+        && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()
+    {
+        player.send(PlayerCommand::UpdateTrack(track.clone()));
+        events.send(Event::TrackUpdated(track.clone()))?;
+    }
+    if let Some(id) = mutation.album_feedback_id()
+        && let Some(album) = catalog.album(id)?
+    {
+        events.send(Event::AlbumUpdated(album))?;
+    }
+    events.send(Event::MutationFailed(mutation, error))?;
+    Ok(())
 }
 
 fn run(
@@ -2397,12 +2415,13 @@ fn run(
                 }
                 Command::Mutate(mutation) => {
                     let Some(server) = server.clone() else {
-                        tx.send(Command::MutationFailed(
-                            account.as_ref().map(Account::namespace).unwrap_or_default(),
+                        return mutation_failed(
+                            &catalog,
+                            &player,
+                            &events,
                             mutation,
                             "Connect to the server before saving changes.".into(),
-                        ))?;
-                        return Ok(());
+                        );
                     };
                     if let Some((server, mutation)) = track_rating_writes.enqueue(server, mutation)
                     {
@@ -2541,18 +2560,7 @@ fn run(
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
                     }
-                    if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
-                        && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()
-                    {
-                        player.send(PlayerCommand::UpdateTrack(track.clone()));
-                        events.send(Event::TrackUpdated(track.clone()))?;
-                    }
-                    if let Some(id) = mutation.album_feedback_id()
-                        && let Some(album) = catalog.album(id)?
-                    {
-                        events.send(Event::AlbumUpdated(album))?;
-                    }
-                    events.send(Event::MutationFailed(mutation, error))?;
+                    mutation_failed(&catalog, &player, &events, mutation, error)?;
                 }
                 Command::SyncFailed(failed, error) => {
                     failed_generations.insert(failed);
