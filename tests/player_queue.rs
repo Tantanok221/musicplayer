@@ -334,13 +334,14 @@ impl QueueModel {
             self.preserved_selection = None;
         }
         if account {
-            PlayerCommand::RestoreAccount(
-                "test-account".into(),
-                self.queue.clone(),
-                saved.index.unwrap_or(0),
-                saved.position,
-                saved.listen,
-            )
+            PlayerCommand::RestoreAccount {
+                namespace: "test-account".into(),
+                tracks: self.queue.clone(),
+                index: saved.index.unwrap_or(0),
+                position: saved.position,
+                listen: saved.listen,
+                shuffle_positions: None,
+            }
         } else {
             PlayerCommand::Restore(
                 self.queue.clone(),
