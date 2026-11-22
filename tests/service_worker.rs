@@ -15,6 +15,8 @@ mod feedback;
 mod fixture;
 #[path = "service_worker/lifecycle.rs"]
 mod lifecycle;
+#[path = "service_worker/lyrics.rs"]
+mod lyrics;
 #[path = "service_worker/metadata.rs"]
 mod metadata;
 #[path = "service_worker/playlists.rs"]

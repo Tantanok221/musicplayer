@@ -672,3 +672,76 @@ fn image_key(value: &str) -> String {
     }
     format!("remote:{url}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::prune_artwork;
+    use std::{
+        fs::File,
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime},
+    };
+
+    const MB: u64 = 1024 * 1024;
+
+    /// A sparse file, so a cache over the cap costs no disk space.
+    fn file(path: &Path, len: u64, age: u64) {
+        let file = File::create(path).unwrap();
+        file.set_len(len).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+    }
+
+    /// A cover with its thumbnails and backdrop, downloaded `age` seconds ago.
+    fn cover(dir: &Path, name: &str, len: u64, age: u64) -> Vec<PathBuf> {
+        let art = dir.join(format!("{name}.art"));
+        file(&art, len, age);
+        let mut group = crate::thumbnail::derived(&art);
+        group.push(crate::backdrop::backdrop_path(&art));
+        for path in &group {
+            file(path, MB, age);
+        }
+        group.insert(0, art);
+        group
+    }
+
+    #[test]
+    fn evicts_oldest_covers_with_their_copies_down_to_480_mb_but_keeps_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = cover(dir.path(), "current", 100 * MB, 400);
+        let oldest = cover(dir.path(), "oldest", 100 * MB, 300);
+        let older = cover(dir.path(), "older", 100 * MB, 200);
+        let newer = cover(dir.path(), "newer", 200 * MB, 100);
+        let unrelated = dir.path().join("cache.partial");
+        file(&unrelated, 30 * MB, 500);
+        // 542 MB: 500 MB of covers, 12 MB of copies and 30 MB of other files.
+        prune_artwork(dir.path(), &current[0]);
+        let exists = |group: &[PathBuf]| group.iter().map(|p| p.exists()).collect::<Vec<_>>();
+        assert_eq!(
+            exists(&current),
+            [true; 4],
+            "the current cover is never evicted"
+        );
+        assert_eq!(exists(&oldest), [false; 4]);
+        assert_eq!(
+            exists(&older),
+            [true; 4],
+            "eviction stops once under 480 MB"
+        );
+        assert_eq!(exists(&newer), [true; 4]);
+        assert!(
+            unrelated.exists(),
+            "only covers and their copies are evicted"
+        );
+    }
+
+    #[test]
+    fn leaves_a_cache_at_the_512_mb_cap_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = cover(dir.path(), "old", 300 * MB, 200);
+        // Exactly 512 MB including the 6 MB of copies.
+        let new = cover(dir.path(), "new", 206 * MB, 100);
+        prune_artwork(dir.path(), &new[0]);
+        assert!(old.iter().chain(&new).all(|path| path.exists()));
+    }
+}
