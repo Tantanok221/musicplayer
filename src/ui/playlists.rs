@@ -463,10 +463,8 @@ impl MusicApp {
                             .text_size(px(10.))
                             .child(format!("{} tracks", playlist.song_count)),
                     )
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        let id = app.playlists.open(playlist.clone());
-                        app.service.send(Command::Playlist(id));
-                        cx.notify();
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        app.open_playlist(playlist.clone(), window, cx);
                     })),
             );
         }

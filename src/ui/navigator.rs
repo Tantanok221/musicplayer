@@ -233,11 +233,7 @@ impl MusicApp {
                         .test_support()
                         .on_click(cx.listener(
                             move |app, _, window, cx| {
-                                app.switch_workspace(Workspace::Playlists, window, cx);
-                                let id = app.playlists.open(playlist.clone());
-                                app.selected = None;
-                                app.service.send(Command::Playlist(id));
-                                cx.notify();
+                                app.open_playlist(playlist.clone(), window, cx);
                             },
                         )),
                     ),

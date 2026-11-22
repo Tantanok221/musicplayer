@@ -1,6 +1,29 @@
 use super::*;
 
 impl MusicApp {
+    pub(super) fn open_playlist(
+        &mut self,
+        playlist: Playlist,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = (!self.blank).then(|| self.location());
+        let target = Page {
+            workspace: Workspace::Playlists,
+            playlist: Some((playlist.id.clone(), playlist.name.clone())),
+            search: self.playlists.search().to_owned(),
+            ..Default::default()
+        };
+        if !self.restoring_location {
+            self.history.remember_transition(current, Some(target));
+        }
+        self.switch_workspace(Workspace::Playlists, window, cx);
+        let id = self.playlists.open(playlist);
+        self.selected = None;
+        self.service.send(Command::Playlist(id));
+        cx.notify();
+    }
+
     pub(super) fn location(&self) -> Page {
         Page {
             workspace: self.workspace,

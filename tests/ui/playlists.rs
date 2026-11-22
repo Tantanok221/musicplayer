@@ -343,6 +343,59 @@ fn playlist(name: &str) -> Playlist {
     }
 }
 
+#[gpui_kit::test]
+fn playlist_history_walks_back_and_forward_without_duplicates(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    let a = playlist("Roadtrip");
+    let b = Playlist {
+        id: "playlist-2".into(),
+        name: "Evening".into(),
+        ..a.clone()
+    };
+    fixture
+        .backend
+        .emit(Event::Playlists(vec![a.clone(), b.clone()]));
+    fixture.settle(window, cx);
+    fixture.click(window, "library-disclosure", cx);
+    for (target, reply) in [
+        ("nav-playlist-playlist-1", a.clone()),
+        ("nav-playlist-playlist-2", b.clone()),
+        ("nav-playlist-playlist-2", b.clone()),
+        ("history-back", a.clone()),
+    ] {
+        fixture.expect("load history playlist", move |command, _| {
+            assert!(matches!(command, Command::Playlist(id) if id == reply.id));
+            vec![Event::Playlist(reply)]
+        });
+        fixture.click(window, target, cx);
+    }
+    assert_eq!(
+        cx.update(|cx| app.read(cx).tab_state().active().title()),
+        "Roadtrip"
+    );
+    fixture.click(window, "history-back", cx);
+    assert_eq!(
+        cx.update(|cx| app.read(cx).tab_state().active().title()),
+        "Music Explorer"
+    );
+    for reply in [a, b] {
+        let title = reply.name.clone();
+        if reply.id == "playlist-2" {
+            fixture.expect("forward playlist", move |command, _| {
+                assert!(matches!(command, Command::Playlist(id) if id == reply.id));
+                vec![Event::Playlist(reply)]
+            });
+        }
+        fixture.click(window, "history-forward", cx);
+        assert_eq!(
+            cx.update(|cx| app.read(cx).tab_state().active().title()),
+            title
+        );
+    }
+    fixture.assert_script_finished();
+}
+
 fn edit_name(fixture: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
         window.click("playlist-name", cx);
