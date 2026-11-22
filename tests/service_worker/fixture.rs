@@ -212,16 +212,21 @@ impl Request {
             endpoint: endpoint.into(),
             params: params
                 .iter()
-                .filter(|(key, _)| *key != "songId")
+                .filter(|(key, _)| !is_song_id(key))
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             song_ids: params
                 .iter()
-                .filter(|(key, _)| *key == "songId")
+                .filter(|(key, _)| is_song_id(key))
                 .map(|(_, value)| value.to_string())
                 .collect(),
         }
     }
+}
+
+/// Repeated parameters listing songs in order: playlist contents or additions.
+fn is_song_id(key: &str) -> bool {
+    matches!(key, "songId" | "songIdToAdd")
 }
 
 /// A fixture Last.fm chart entry: artist, album and plays.
@@ -247,6 +252,10 @@ pub struct Library {
     pub hold_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
+    /// The `structuredLyrics` versions getLyricsBySongId answers with.
+    pub structured_lyrics: Value,
+    /// The text getLyrics answers with for any artist and title.
+    pub plain_lyrics: &'static str,
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
     pub artist_mbid: &'static str,
     pub prolific: bool,
@@ -285,6 +294,8 @@ impl Default for Library {
             hold_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
+            structured_lyrics: json!([]),
+            plain_lyrics: "",
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
             artist_mbid: "mb-artist",
             prolific: false,
@@ -296,6 +307,20 @@ impl Default for Library {
             scan_admin: false,
         }
     }
+}
+
+impl Library {
+    fn entries(&self, ids: &[String]) -> Vec<Arc<Track>> {
+        ids.iter()
+            .map(|id| Arc::new(self.tracks.iter().find(|t| &t.id == id).unwrap().clone()))
+            .collect()
+    }
+}
+
+fn set_entries(playlist: &mut Playlist, entries: Vec<Arc<Track>>) {
+    playlist.song_count = entries.len() as u32;
+    playlist.duration = entries.iter().map(|track| track.duration).sum();
+    playlist.entry = entries.into();
 }
 
 pub fn song(id: &str, album_id: &str) -> Track {
@@ -311,6 +336,27 @@ pub fn song(id: &str, album_id: &str) -> Track {
         ..Default::default()
     }
 }
+
+/// The default library with "album" spread over two discs, stored out of
+/// play order; the album plays as `ALBUM_ORDER`.
+pub fn multi_disc_library() -> Library {
+    let track = |id: &str, disc, number| Track {
+        disc_number: Some(disc),
+        track: Some(number),
+        ..song(id, "album")
+    };
+    Library {
+        tracks: vec![
+            track("disc-two", 2, 1),
+            track("song", 1, 2),
+            song("other-song", "other-album"),
+            track("opener", 1, 1),
+        ],
+        ..Default::default()
+    }
+}
+
+pub const ALBUM_ORDER: [&str; 3] = ["opener", "song", "disc-two"];
 
 pub fn album(id: &str) -> Album {
     Album {
@@ -370,7 +416,10 @@ async fn navidrome(
     let mut query = BTreeMap::new();
     let mut song_ids = Vec::new();
     for (key, value) in url::form_urlencoded::parse(raw_query.as_deref().unwrap_or("").as_bytes()) {
-        if endpoint == "createPlaylist.view" && key == "songId" {
+        if matches!(
+            (endpoint.as_str(), &*key),
+            ("createPlaylist.view", "songId") | ("updatePlaylist.view", "songIdToAdd")
+        ) {
             song_ids.push(value.into_owned());
         } else if query.insert(key.into_owned(), value.into_owned()).is_some() {
             return state.unexpected("repeated parameter");
@@ -406,6 +455,8 @@ async fn navidrome(
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
+            | "getLyricsBySongId.view"
+            | "getLyrics.view"
     ) || query.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -419,6 +470,8 @@ async fn navidrome(
                 | "albumId"
                 | "rating"
                 | "artist"
+                | "title"
+                | "name"
                 | "count"
                 | "submission"
                 | "time"
@@ -532,27 +585,26 @@ async fn navidrome(
         "createPlaylist.view" => match data.expected_mutations.pop_front() {
             Some((expected, succeeds)) if request == expected => {
                 if succeeds {
-                    let entries: Vec<_> = request
-                        .song_ids
-                        .iter()
-                        .map(|id| {
-                            Arc::new(
-                                data.library
-                                    .tracks
-                                    .iter()
-                                    .find(|track| &track.id == id)
-                                    .unwrap()
-                                    .clone(),
-                            )
-                        })
-                        .collect();
-                    let playlist = data
-                        .library
-                        .playlists
-                        .iter_mut()
-                        .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
-                        .unwrap();
-                    playlist.entry = entries.into();
+                    let entries = data.library.entries(&request.song_ids);
+                    let playlist = match query.get("name") {
+                        Some(name) => {
+                            let id = format!("created-{}", data.library.playlists.len());
+                            data.library.playlists.push(Playlist {
+                                id,
+                                name: name.clone(),
+                                owner: "fixture".into(),
+                                ..Default::default()
+                            });
+                            data.library.playlists.last_mut().unwrap()
+                        }
+                        None => data
+                            .library
+                            .playlists
+                            .iter_mut()
+                            .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
+                            .unwrap(),
+                    };
+                    set_entries(playlist, entries);
                     json!({"status":"ok","playlist":playlist})
                 } else {
                     json!({"status":"failed","error":{"code":70,"message":"Fixture reorder rejected"}})
@@ -567,16 +619,19 @@ async fn navidrome(
         "updatePlaylist.view" => match data.expected_mutations.pop_front() {
             Some((expected, succeeds)) if request == expected => {
                 if succeeds {
+                    let added = data.library.entries(&request.song_ids);
                     let playlist = data
                         .library
                         .playlists
                         .iter_mut()
                         .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
                         .unwrap();
-                    let index: usize = query["songIndexToRemove"].parse().unwrap();
-                    Arc::make_mut(&mut playlist.entry).remove(index);
-                    playlist.song_count = playlist.entry.len() as u32;
-                    playlist.duration = playlist.entry.iter().map(|track| track.duration).sum();
+                    let mut entries = playlist.entry.to_vec();
+                    if let Some(index) = query.get("songIndexToRemove") {
+                        entries.remove(index.parse().unwrap());
+                    }
+                    entries.extend(added);
+                    set_entries(playlist, entries);
                     json!({"status":"ok"})
                 } else {
                     json!({"status":"failed","error":{"code":70,"message":"Fixture removal rejected"}})
@@ -697,6 +752,12 @@ async fn navidrome(
                 };
                 json!({"status":"ok","searchResult3":{kind:items}})
             }
+        }
+        "getLyricsBySongId.view" if query.keys().eq(["id"]) => {
+            json!({"status":"ok","lyricsList":{"structuredLyrics":data.library.structured_lyrics}})
+        }
+        "getLyrics.view" if query.keys().eq(["artist", "title"]) => {
+            json!({"status":"ok","lyrics":{"value":data.library.plain_lyrics}})
         }
         "getSong.view" if query == Request::new("", &[("id", "song")]).params => {
             json!({"status":"ok", "song":data.library.tracks[0]})

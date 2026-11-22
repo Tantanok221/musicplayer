@@ -33,7 +33,7 @@ worker suite to expose flaky timing.
 | Discover (Memory lane, Last.fm history) | `discover.rs`, `settings.rs` | `discover` (`rediscover`, `stale_seasons`, `Visit`), `lastfm`, `Catalog::rediscover_candidates` | `tests/ui/discover.rs`, `tests/ui/settings.rs`, `tests/service_worker/discover.rs`, `tests/discover.rs` |
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
-| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |
+| Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/{artwork,lyrics}.rs`, `server` artwork-pruning unit tests |
 | Metadata Properties tab | `information.rs` | `metadata::properties` | `tests/ui/metadata.rs`, `metadata` unit tests |
 | Opt-in tag editing, journal, undo, rescan | `tag_editor.rs`, `settings.rs`, `context_menu.rs` | `tags::{EditorForm, resolve, write}`, `Catalog::journal_tag_edit` | `tests/ui/tag_editor.rs`, `tests/service_worker/tag_writes.rs`, `tags` unit tests |
 | Playlists (track/album views, including smart/read-only playlists) | `playlists.rs`, `navigator.rs`, `context_menu.rs` | `playlists::{Playlists, PlaylistView, PlaylistAlbum, PlaylistEntry, is_smart, refresh_due}` | `tests/ui/playlists.rs`, `tests/service_worker/playlists.rs` |
