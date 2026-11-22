@@ -253,6 +253,7 @@ pub enum InfoTab {
     Details,
     Lyrics,
     Artwork,
+    Properties,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
