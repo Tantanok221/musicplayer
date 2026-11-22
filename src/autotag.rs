@@ -139,6 +139,100 @@ pub fn parse_link(text: &str) -> Option<Link> {
     }
 }
 
+enum Piece {
+    Text(String),
+    Field(TagField),
+}
+
+fn placeholder(name: &str) -> Option<TagField> {
+    Some(match name {
+        "title" => TagField::Title,
+        "artist" => TagField::Artist,
+        "albumartist" => TagField::AlbumArtist,
+        "album" => TagField::Album,
+        "year" => TagField::Year,
+        "track" => TagField::Track,
+        "disc" => TagField::Disc,
+        "genre" => TagField::Genre,
+        "composer" => TagField::Composer,
+        _ => return None,
+    })
+}
+
+/// Reads tags from the end of a song's path with a pattern such as
+/// `%track% - %title%` or `%album%/%track% %title%`. Empty when it doesn't fit.
+pub fn from_path(pattern: &str, path: &str) -> BTreeMap<TagField, String> {
+    let mut pieces = vec![];
+    let mut literal = String::new();
+    for (at, part) in pattern.split('%').enumerate() {
+        match placeholder(part).filter(|_| at % 2 == 1) {
+            Some(field) => {
+                if !literal.is_empty() {
+                    pieces.push(Piece::Text(std::mem::take(&mut literal)));
+                }
+                pieces.push(Piece::Field(field));
+            }
+            None if at % 2 == 1 => literal.push_str(&format!("%{part}%")),
+            None => literal.push_str(part),
+        }
+    }
+    if !literal.is_empty() {
+        pieces.push(Piece::Text(literal));
+    }
+    let path = path.replace('\\', "/");
+    let parts: Vec<&str> = path.split('/').collect();
+    let depth = pattern.matches('/').count() + 1;
+    if parts.len() < depth || !pieces.iter().any(|piece| matches!(piece, Piece::Field(_))) {
+        return BTreeMap::new();
+    }
+    let mut text = parts[parts.len() - depth..].join("/");
+    if let Some((stem, extension)) = text.rsplit_once('.')
+        && !extension.contains('/')
+        && (1..=5).contains(&extension.len())
+    {
+        text = stem.to_string();
+    }
+    let mut found = vec![];
+    if capture(&pieces, &text, &mut found) {
+        found.into_iter().collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+fn capture(pieces: &[Piece], text: &str, found: &mut Vec<(TagField, String)>) -> bool {
+    match pieces.split_first() {
+        None => text.is_empty(),
+        Some((Piece::Text(literal), rest)) => text
+            .strip_prefix(literal.as_str())
+            .is_some_and(|text| capture(rest, text, found)),
+        Some((Piece::Field(field), rest)) => {
+            let numeric = matches!(field, TagField::Track | TagField::Disc | TagField::Year);
+            for end in (1..=text.len()).filter(|end| text.is_char_boundary(*end)) {
+                let value = text[..end].trim();
+                if value.is_empty() || value.contains('/') {
+                    continue;
+                }
+                if numeric && !value.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let value = if matches!(field, TagField::Track | TagField::Disc) {
+                    let number = value.trim_start_matches('0');
+                    if number.is_empty() { "0" } else { number }
+                } else {
+                    value
+                };
+                found.push((*field, value.to_string()));
+                if capture(rest, &text[end..], found) {
+                    return true;
+                }
+                found.pop();
+            }
+            false
+        }
+    }
+}
+
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -303,7 +397,14 @@ fn ids(credits: &[(String, String)]) -> String {
 
 /// The tags a song matched to `track` would get. IDs come too, so a later
 /// rescan or lookup finds the same recording.
-pub fn proposed(release: &Release, track: &LookupTrack) -> BTreeMap<TagField, String> {
+/// How many of a release's genres, most voted first, a lookup fills in.
+pub const GENRE_LIMITS: [usize; 3] = [1, 3, usize::MAX];
+
+pub fn proposed(
+    release: &Release,
+    track: &LookupTrack,
+    genres: usize,
+) -> BTreeMap<TagField, String> {
     let mut values = BTreeMap::from([
         (TagField::Title, track.title.clone()),
         (TagField::Artist, names(&track.artists).join("; ")),
@@ -326,7 +427,13 @@ pub fn proposed(release: &Release, track: &LookupTrack) -> BTreeMap<TagField, St
         values.insert(TagField::Year, year.to_string());
     }
     if !release.genres.is_empty() {
-        values.insert(TagField::Genre, release.genres.join("; "));
+        let genres: Vec<&str> = release
+            .genres
+            .iter()
+            .take(genres)
+            .map(String::as_str)
+            .collect();
+        values.insert(TagField::Genre, genres.join("; "));
     }
     values.retain(|_, value| !value.is_empty());
     values
@@ -423,7 +530,13 @@ mod tests {
     #[test]
     fn proposals_fill_visible_tags_and_ids() {
         let release = release();
-        let values = proposed(&release, &release.tracks[1]);
+        let mut release = release;
+        release.genres.push("art rock".into());
+        assert_eq!(
+            proposed(&release, &release.tracks[1], usize::MAX)[&TagField::Genre],
+            "alternative rock; art rock"
+        );
+        let values = proposed(&release, &release.tracks[1], 1);
         assert_eq!(values[&TagField::Title], "Paranoid Android");
         assert_eq!(values[&TagField::Year], "1997");
         assert_eq!(values[&TagField::Track], "2");
@@ -498,5 +611,32 @@ mod tests {
         );
         assert_eq!(parse_link("b84ee12a-09ef-421b"), None);
         assert_eq!(parse_link(""), None);
+    }
+
+    #[test]
+    fn file_names_fill_tags_through_a_pattern() {
+        let path = "Radiohead/OK Computer/02 - Paranoid Android - Live.flac";
+        assert_eq!(
+            from_path("%track% - %title%", path),
+            BTreeMap::from([
+                (TagField::Track, "2".to_string()),
+                (TagField::Title, "Paranoid Android - Live".to_string()),
+            ])
+        );
+        assert_eq!(
+            from_path("%artist%/%album%/%track% - %title%", path)[&TagField::Album],
+            "OK Computer"
+        );
+        assert_eq!(
+            from_path("%disc%-%track% %title%", "x/1-07 Lucky.mp3"),
+            BTreeMap::from([
+                (TagField::Disc, "1".to_string()),
+                (TagField::Track, "7".to_string()),
+                (TagField::Title, "Lucky".to_string()),
+            ])
+        );
+        assert!(from_path("%track% - %title%", "Airbag.flac").is_empty());
+        assert!(from_path("no fields", path).is_empty());
+        assert!(from_path("%a%/%b%/%c%/%title%", path).is_empty());
     }
 }

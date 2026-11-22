@@ -18,6 +18,7 @@ pub(super) struct TagEditor {
     lookup: Lookup,
     candidates: Vec<ReleaseCandidate>,
     link: Entity<InputState>,
+    pattern: Entity<InputState>,
     saving: bool,
     failures: Vec<(String, String)>,
 }
@@ -32,6 +33,8 @@ enum Lookup {
         matches: Vec<TrackMatch>,
         /// Field groups the user unticked; `MusicBrainzTrack` stands for the IDs.
         skipped: BTreeSet<TagField>,
+        /// How many genres to fill in, one of `autotag::GENRE_LIMITS`.
+        genres: usize,
     },
     Failed(String),
 }
@@ -127,6 +130,7 @@ impl MusicApp {
                 window,
                 cx,
             ),
+            pattern: text_input("%track% - %title%".into(), "%track% - %title%", window, cx),
             saving: false,
             failures: vec![],
         });
@@ -267,6 +271,7 @@ impl MusicApp {
                 matches: autotag::match_tracks(&editor.form.tracks, &release),
                 release,
                 skipped: BTreeSet::from([TagField::CoverArt]),
+                genres: 3,
             },
             Err(error) => Lookup::Failed(error),
         };
@@ -294,6 +299,7 @@ impl MusicApp {
             release,
             matches,
             skipped,
+            genres,
         } = std::mem::replace(&mut editor.lookup, Lookup::Idle)
         else {
             return;
@@ -302,7 +308,7 @@ impl MusicApp {
             .iter()
             .map(|found| {
                 let (index, _) = (*found)?;
-                let mut values = autotag::proposed(&release, &release.tracks[index]);
+                let mut values = autotag::proposed(&release, &release.tracks[index], genres);
                 values.retain(|field, _| {
                     let group = if TagField::IDS.contains(field) {
                         TagField::MusicBrainzTrack
@@ -314,49 +320,38 @@ impl MusicApp {
                 Some(values)
             })
             .collect();
-        let set = |input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App| {
-            input.update(cx, |input, cx| {
-                input.set_value(value.to_string(), window, cx)
-            });
-        };
-        for (field, input) in &editor.inputs {
-            let values: Vec<Option<&String>> = proposals
-                .iter()
-                .map(|values| values.as_ref().and_then(|values| values.get(field)))
-                .collect();
-            let shared = values
-                .first()
-                .copied()
-                .flatten()
-                .filter(|first| values.iter().all(|value| value == &Some(*first)));
-            if let Some(value) = shared {
-                set(input, value, window, cx);
-                editor.cleared.remove(field);
-                for extra in &mut editor.extra {
-                    extra.remove(field);
-                }
-            } else {
-                for (row, value) in values.iter().enumerate() {
-                    if let Some(value) = value {
-                        editor.extra[row].insert(*field, (*value).clone());
-                    }
-                }
-            }
+        fill_form(editor, &proposals, window, cx);
+        cx.notify();
+    }
+
+    fn set_genres(&mut self, limit: usize, cx: &mut Context<Self>) {
+        if let Some(TagEditor {
+            lookup: Lookup::Matched { genres, .. },
+            ..
+        }) = self.tag_editor.as_mut()
+        {
+            *genres = limit;
         }
-        for (row, values) in proposals.iter().enumerate() {
-            let Some(values) = values else {
-                continue;
-            };
-            for (field, input) in &editor.cells[row] {
-                if let Some(value) = values.get(field) {
-                    set(input, value, window, cx);
-                }
-            }
-            for field in TagField::IDS.into_iter().chain([TagField::CoverArt]) {
-                if let Some(value) = values.get(&field) {
-                    editor.extra[row].insert(field, value.clone());
-                }
-            }
+        cx.notify();
+    }
+
+    /// Fills the form from each song's file name with the typed pattern.
+    fn fill_from_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let pattern = editor.pattern.read(cx).value().to_string();
+        let proposals: Vec<_> = editor
+            .form
+            .tracks
+            .iter()
+            .map(|track| Some(autotag::from_path(&pattern, &track.path)).filter(|v| !v.is_empty()))
+            .collect();
+        if proposals.iter().all(Option::is_none) {
+            editor.lookup = Lookup::Failed(format!("No file name fits {pattern}"));
+        } else {
+            editor.lookup = Lookup::Idle;
+            fill_form(editor, &proposals, window, cx);
         }
         cx.notify();
     }
@@ -470,6 +465,7 @@ impl MusicApp {
                 release,
                 matches,
                 skipped,
+                genres,
             } => {
                 let matched = matches.iter().filter(|found| found.is_some()).count();
                 let mut list = panel.child(
@@ -522,7 +518,34 @@ impl MusicApp {
                             }),
                     );
                 }
+                let mut limits = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .child("Genres:");
+                for limit in autotag::GENRE_LIMITS {
+                    let text = match limit {
+                        1 => "Top 1".to_string(),
+                        usize::MAX => "All".to_string(),
+                        n => format!("Top {n}"),
+                    };
+                    let slug = if limit == usize::MAX {
+                        "all".to_string()
+                    } else {
+                        limit.to_string()
+                    };
+                    limits = limits.child(
+                        Button::new(SharedString::from(format!("genre-limit-{slug}")))
+                            .xsmall()
+                            .when(*genres == limit, |button| button.primary())
+                            .label(text)
+                            .on_click(cx.listener(move |app, _, _, cx| app.set_genres(limit, cx))),
+                    );
+                }
                 list.child(boxes)
+                    .child(limits)
                     .child(
                         div()
                             .flex()
@@ -823,6 +846,28 @@ impl MusicApp {
                     ),
             );
         }
+        if editor.review.is_none() {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&editor.pattern).small().id("filename-pattern")),
+                    )
+                    .child(
+                        Button::new("fill-from-names")
+                            .small()
+                            .label("Fill from File Names")
+                            .on_click(
+                                cx.listener(|app, _, window, cx| app.fill_from_names(window, cx)),
+                            ),
+                    ),
+            );
+        }
         if let Some(changes) = &editor.review {
             panel = panel.child(self.review_panel(changes, cx));
         } else {
@@ -945,5 +990,60 @@ impl MusicApp {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// Puts proposed values into the form: shared fields when every song agrees,
+/// the table or hidden per-song values otherwise. Songs without a proposal
+/// keep theirs.
+fn fill_form(
+    editor: &mut TagEditor,
+    proposals: &[Option<BTreeMap<TagField, String>>],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let set = |input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App| {
+        input.update(cx, |input, cx| {
+            input.set_value(value.to_string(), window, cx)
+        });
+    };
+    for (field, input) in &editor.inputs {
+        let values: Vec<Option<&String>> = proposals
+            .iter()
+            .map(|values| values.as_ref().and_then(|values| values.get(field)))
+            .collect();
+        let shared = values
+            .first()
+            .copied()
+            .flatten()
+            .filter(|first| values.iter().all(|value| value == &Some(*first)));
+        if let Some(value) = shared {
+            set(input, value, window, cx);
+            editor.cleared.remove(field);
+            for extra in &mut editor.extra {
+                extra.remove(field);
+            }
+        } else {
+            for (row, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    editor.extra[row].insert(*field, (*value).clone());
+                }
+            }
+        }
+    }
+    for (row, values) in proposals.iter().enumerate() {
+        let Some(values) = values else {
+            continue;
+        };
+        for (field, input) in &editor.cells[row] {
+            if let Some(value) = values.get(field) {
+                set(input, value, window, cx);
+            }
+        }
+        for field in TagField::IDS.into_iter().chain([TagField::CoverArt]) {
+            if let Some(value) = values.get(&field) {
+                editor.extra[row].insert(field, value.clone());
+            }
+        }
     }
 }

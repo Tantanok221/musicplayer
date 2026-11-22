@@ -589,3 +589,110 @@ fn ticking_cover_art_asks_for_the_release_front_cover(cx: &mut TestAppContext) {
     fixture.click(window, "confirm-tags", cx);
     fixture.assert_script_finished();
 }
+
+fn open_editor_on(
+    fixture: &mut Fixture,
+    window: AnyWindowHandle,
+    songs: Vec<Arc<Track>>,
+    cx: &mut TestAppContext,
+) {
+    writes_tags(fixture, true);
+    fixture.settle(window, cx);
+    fixture.expect("album songs for the tag editor", move |_, _| {
+        vec![Event::Album("album-1".into(), songs.clone())]
+    });
+    album_menu(fixture, window, cx);
+    fixture.menu_item(window, "Edit Album Tags…", cx);
+}
+
+fn changes(window: AnyWindowHandle, cx: &mut TestAppContext) -> Vec<String> {
+    (0..40_usize)
+        .filter_map(|row| label(window, ("tag-change", row), cx))
+        .collect()
+}
+
+#[gpui_kit::test]
+fn file_names_fill_the_table_through_a_pattern(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    let named = |id: &str, title: &str, path: &str| {
+        let mut track = (*song(id, title)).clone();
+        track.path = path.into();
+        Arc::new(track)
+    };
+    open_editor_on(
+        &mut fixture,
+        window,
+        vec![
+            named(
+                "one",
+                "First",
+                "Fixture Artist/Fixture album/01 - First Song.flac",
+            ),
+            named("two", "Second", "Fixture Artist/Fixture album/notes.flac"),
+        ],
+        cx,
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("filename-pattern", cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("%track% - %title% (Live)", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.click(window, "fill-from-names", cx);
+    assert_eq!(
+        label(window, "lookup-error", cx).as_deref(),
+        Some("No file name fits %track% - %title% (Live)")
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("filename-pattern", cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("%track% - %title%", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.click(window, "fill-from-names", cx);
+    fixture.click(window, "save-tags", cx);
+    assert_eq!(
+        changes(window, cx),
+        [
+            "First · Title: First → First Song",
+            "First · Track: (empty) → 1"
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn the_genre_limit_picks_how_many_genres_are_filled(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    fixture.expect("search", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    fixture.expect("load", |_, _| {
+        let mut release = release();
+        release.genres = ["Trip Hop", "Electronic", "Downtempo", "Ambient"]
+            .map(String::from)
+            .to_vec();
+        vec![Event::ReleaseLoaded("rel".into(), Ok(Arc::new(release)))]
+    });
+    fixture.click(window, ("release-candidate", 0_usize), cx);
+    fixture.click(window, "genre-limit-1", cx);
+    fixture.click(window, "fill-tags", cx);
+    fixture.click(window, "save-tags", cx);
+    let genres: Vec<String> = changes(window, cx)
+        .into_iter()
+        .filter(|change| change.contains("Genre"))
+        .collect();
+    assert_eq!(
+        genres,
+        [
+            "First · Genre: Rock → Trip Hop",
+            "Second · Genre: Rock → Trip Hop"
+        ]
+    );
+}
