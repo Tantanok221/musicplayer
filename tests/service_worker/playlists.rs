@@ -1,4 +1,5 @@
 use crate::fixture::{Fixture, Library, Request, WAIT, event, synced};
+use serde_json::json;
 use sonora::{
     catalog::Catalog,
     model::Playlist,
@@ -195,6 +196,52 @@ fn expired_smart_refresh_failure_keeps_cache_then_empty_result_replaces_it() {
     );
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
+}
+
+#[test]
+fn incomplete_smart_refresh_preserves_cached_entries() {
+    for playlist in [
+        json!({"id":"smart","songCount":2,"entry":[{"id":"other-song"}]}),
+        json!({"id":"smart","songCount":1}),
+        json!({"id":"smart","songCount":1,"entry":[{}]}),
+        json!({"id":"smart"}),
+        json!({"id":"wrong","songCount":0}),
+    ] {
+        let mut cached = smart_playlist("2000-01-01T00:00:00Z");
+        let summary = cached.clone();
+        cached.entry = vec![Arc::new(crate::fixture::song("cached", "album"))].into();
+        let fixture = Fixture::new(Library {
+            playlists: vec![summary],
+            playlist_response: Some(json!({"status":"ok","playlist":playlist})),
+            ..Library::default()
+        });
+        fixture.seed();
+        fixture.catalog().save_playlist(&cached).unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        synced(&worker);
+        let outcome = event(&worker, |event| match event {
+            Event::Error(_) => true,
+            Event::Playlist(list) => !list
+                .entry
+                .iter()
+                .map(|track| track.id.as_str())
+                .eq(["cached"]),
+            _ => false,
+        });
+        let saved = fixture.catalog().playlist("smart").unwrap().unwrap();
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+        assert!(
+            saved
+                .entry
+                .iter()
+                .map(|track| track.id.as_str())
+                .eq(["cached"]),
+            "partial getPlaylist {playlist} overwrote cached entries"
+        );
+        assert!(matches!(outcome, Event::Error(message) if message.contains("getPlaylist")));
+    }
 }
 
 #[test]

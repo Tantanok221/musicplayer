@@ -202,6 +202,8 @@ pub struct Library {
     pub fail_song_offset: Option<usize>,
     pub sync_response: Option<(&'static str, Value)>,
     pub playlists_response: Option<Value>,
+    pub playlist_response: Option<Value>,
+    pub scan_status_responses: VecDeque<Value>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
@@ -235,6 +237,8 @@ impl Default for Library {
             fail_song_offset: None,
             sync_response: None,
             playlists_response: None,
+            playlist_response: None,
+            scan_status_responses: VecDeque::new(),
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
@@ -451,14 +455,23 @@ async fn navidrome(
         "getOpenSubsonicExtensions.view" if query.is_empty() => {
             json!({"status":"ok","openSubsonicExtensions":[]})
         }
-        "getScanStatus.view" if query.is_empty() => {
-            json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}})
-        }
+        "getScanStatus.view" if query.is_empty() => data
+            .library
+            .scan_status_responses
+            .pop_front()
+            .unwrap_or_else(
+                || json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}}),
+            ),
         "getPlaylists.view" if query.is_empty() => {
-            json!({"status":"ok","playlists":data.library.playlists_response.clone().unwrap_or_else(|| json!({"playlist":data.library.playlists}))})
+            data.library.playlists_response.clone().unwrap_or_else(
+                || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),
+            )
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
+        }
+        "getPlaylist.view" if let Some(response) = &data.library.playlist_response => {
+            response.clone()
         }
         "getPlaylist.view" => {
             let playlist = data
