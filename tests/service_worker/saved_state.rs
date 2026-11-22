@@ -48,6 +48,10 @@ fn golden_preferences_reach_the_worker_and_round_trip() {
     assert_eq!(preferences.volume, 0.25);
     assert_eq!(preferences.tabs.tabs[0].id, 7);
     assert_eq!(preferences.lastfm_user, "listener");
+    assert_eq!(
+        preferences.playlist_columns,
+        sonora::playlists::PlaylistColumns::default()
+    );
     assert_saved_fields(
         &serde_json::to_value(&preferences).unwrap(),
         &json(PREFERENCES),
@@ -145,27 +149,32 @@ fn golden_catalog_playlist_and_history_round_trip_after_reopen() {
 #[test]
 fn golden_defaults_and_missing_records_remain_compatible() {
     let catalog = Catalog::memory().unwrap();
-    for (actual, raw) in [
+    // Keep the old snapshot frozen: the new preference is an additive default.
+    let legacy_defaults = include_str!("../fixtures/saved_state/preferences-default.json");
+    let mut defaults = json(legacy_defaults);
+    defaults["playlist_columns"] = json(include_str!(
+        "../fixtures/saved_state/playlist-columns-default.json"
+    ));
+    for (actual, expected) in [
         (
             serde_json::to_value(catalog.state::<Preferences>("preferences").unwrap()).unwrap(),
-            include_str!("../fixtures/saved_state/preferences-default.json"),
+            defaults.clone(),
         ),
         (
             serde_json::to_value(catalog.state::<SavedQueue>("queue").unwrap()).unwrap(),
-            include_str!("../fixtures/saved_state/queue-empty.json"),
+            json(include_str!("../fixtures/saved_state/queue-empty.json")),
         ),
         (
             serde_json::to_value(Playlist::default()).unwrap(),
-            include_str!("../fixtures/saved_state/playlist-empty.json"),
+            json(include_str!("../fixtures/saved_state/playlist-empty.json")),
         ),
     ] {
-        assert_eq!(actual, json(raw));
+        assert_eq!(actual, expected);
     }
-    let defaults = include_str!("../fixtures/saved_state/preferences-default.json");
-    seed_state(&catalog, "preferences", defaults);
+    seed_state(&catalog, "preferences", legacy_defaults);
     assert_eq!(
         serde_json::to_value(catalog.state::<Preferences>("preferences").unwrap()).unwrap(),
-        json(defaults)
+        defaults
     );
     let empty = include_str!("../fixtures/saved_state/queue-empty.json");
     seed_state(&catalog, "queue", empty);
@@ -182,9 +191,7 @@ fn golden_defaults_and_missing_records_remain_compatible() {
     seed_state(&catalog, "preferences", "{}");
     assert_eq!(
         serde_json::to_value(catalog.state::<Preferences>("preferences").unwrap()).unwrap(),
-        json(include_str!(
-            "../fixtures/saved_state/preferences-default.json"
-        ))
+        defaults
     );
 }
 

@@ -1,6 +1,8 @@
 //! Playlist interactions with scenario-local expected commands and replies.
 use crate::common::ui::{Fixture, start};
-use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
+use gpui_kit::{
+    AnyWindowHandle, AppContext, ScrollDelta, TestAppContext, point, px, size, test::TestWindowExt,
+};
 use sonora::{
     model::{PlaybackSnapshot, Playlist},
     platform::shortcut,
@@ -8,6 +10,204 @@ use sonora::{
     service::{Command, Event, Mutation, PlaylistTarget},
 };
 use std::{sync::Arc, time::Duration};
+
+#[gpui_kit::test]
+fn metadata_columns_can_be_changed_from_the_header_and_settings(cx: &mut TestAppContext) {
+    let (dir, mut f, window, app) = start(cx);
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = f
+        .catalog
+        .by_ids(&["track-1".into(), "track-1".into()])
+        .unwrap()
+        .into();
+    loaded.song_count = 2;
+    for entry in Arc::make_mut(&mut loaded.entry) {
+        Arc::make_mut(entry).genre = "Jazz".into();
+    }
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("playlist-track-header").is_some(),
+            "playlist needs a metadata column header"
+        );
+        assert!(window.find("playlist-column-artist").visible());
+        assert!(window.find("playlist-cell-playlist-0-artist").visible());
+        assert!(window.try_find("playlist-column-genre").is_none());
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.menu_item(window, "Genre", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-column-genre").visible());
+        assert!(window.find("playlist-cell-playlist-1-genre").visible());
+        assert_eq!(
+            window.find("playlist-cell-playlist-1-genre").label(),
+            Some("Jazz")
+        );
+        assert_eq!(
+            window.find("playlist-column-genre").bounds().left(),
+            window
+                .find("playlist-cell-playlist-1-genre")
+                .bounds()
+                .left()
+        );
+    })
+    .unwrap();
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    cx.update_window(window, |_, window, cx| {
+        window.within("settings-sidebar").click("0-5", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("playlist-show-genre").checked(), Some(true));
+    })
+    .unwrap();
+    f.click(window, "playlist-show-artist", cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-column-artist").is_none());
+        assert!(window.try_find("playlist-cell-playlist-0-artist").is_none());
+        assert!(window.find("playlist-column-genre").visible());
+    })
+    .unwrap();
+    // Metadata controls cannot change the original occurrence used by playback.
+    f.backend.player_commands().try_iter().for_each(drop);
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("row-playlist-1", cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+    let PlayerCommand::Replace(tracks, index) = f.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("expected playlist playback")
+    };
+    assert_eq!(index, 1);
+    assert_eq!(tracks.len(), 2);
+    f.assert_script_finished();
+    let saved: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
+    assert!(
+        !saved
+            .playlist_columns
+            .contains(sonora::playlists::PlaylistColumn::Artist)
+    );
+    assert!(
+        saved
+            .playlist_columns
+            .contains(sonora::playlists::PlaylistColumn::Genre)
+    );
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    drop(f);
+    cx.run_until_parked();
+    let mut restarted = Fixture::open(&dir.path().join("catalog.sqlite"));
+    restarted.expect("restore open playlist", |command, _| {
+        assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+        vec![Event::Playlist(playlist("Roadtrip"))]
+    });
+    let (window, _app) = restarted.mount(cx);
+    restarted.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-column-artist").is_none());
+        assert!(window.find("playlist-column-genre").visible());
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("playlist-track-header", cx)
+    })
+    .unwrap();
+    restarted.settle(window, cx);
+    restarted.menu_item(window, "Restore default columns", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-column-artist").visible());
+        assert!(window.try_find("playlist-column-genre").is_none());
+    })
+    .unwrap();
+    restarted.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn metadata_columns_scroll_together_and_support_readonly_and_empty_playlists(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, mut f, window, _app) = start(cx);
+    open_playlist(&mut f, window, cx);
+    let mut loaded = playlist("Automatic");
+    loaded.readonly = true;
+    loaded.entry = f.catalog.by_ids(&["track-1".into()]).unwrap().into();
+    f.backend.emit(Event::Playlist(loaded));
+    f.settle(window, cx);
+    for label in ["Genre", "Year", "Format", "Play count"] {
+        cx.update_window(window, |_, window, cx| {
+            window.right_click("playlist-track-header", cx)
+        })
+        .unwrap();
+        f.settle(window, cx);
+        f.menu_item(window, label, cx);
+    }
+    cx.simulate_window_resize(window, size(px(900.), px(650.)));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.scroll(
+            "playlist-track-table",
+            ScrollDelta::Pixels(point(px(-1500.), px(0.))),
+            cx,
+        );
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let header = window.find("playlist-column-play-count");
+        let cell = window.find("playlist-cell-playlist-0-play-count");
+        assert!(header.visible());
+        assert!(cell.visible());
+        assert_eq!(cell.label(), Some("—"));
+        assert_eq!(header.bounds().left(), cell.bounds().left());
+        window.right_click("playlist-cell-playlist-0-play-count", cx);
+    })
+    .unwrap();
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        assert!(menu.try_find_by_label("Remove from Playlist").is_none());
+        menu.press("escape", cx);
+    })
+    .unwrap();
+    f.settle(window, cx);
+    f.search(window, "no match", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-track-header").visible());
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    f.search(window, "", cx);
+    cx.simulate_window_resize(window, size(px(1440.), px(900.)));
+    f.settle(window, cx);
+    f.click(window, "playlist-view-albums", cx);
+    f.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert!(window.try_find("playlist-track-header").is_none());
+        assert!(window.try_find("playlist-cell-playlist-0-genre").is_none());
+    })
+    .unwrap();
+    f.click(window, "playlist-view-tracks", cx);
+    f.backend.emit(Event::Playlist(playlist("Empty")));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-track-header").visible());
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    f.assert_script_finished();
+}
 
 #[gpui_kit::test]
 fn album_view_groups_playlist_entries_and_preserves_playback_and_readonly(cx: &mut TestAppContext) {

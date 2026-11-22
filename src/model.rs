@@ -357,6 +357,7 @@ pub struct Preferences {
     pub dark: Option<bool>,
     pub layout: crate::browser::LayoutPreferences,
     pub sorting: crate::sorting::SortingPreferences,
+    pub playlist_columns: crate::playlists::PlaylistColumns,
     pub downloads: DownloadPreferences,
     /// Show missing singles, live albums, compilations and the like on artist pages.
     pub all_missing_releases: bool,
@@ -419,6 +420,7 @@ impl Default for Preferences {
             dark: None,
             layout: crate::browser::LayoutPreferences::default(),
             sorting: crate::sorting::SortingPreferences::default(),
+            playlist_columns: crate::playlists::PlaylistColumns::default(),
             downloads: DownloadPreferences::default(),
             all_missing_releases: false,
             favorites: FavoritesFilter::default(),

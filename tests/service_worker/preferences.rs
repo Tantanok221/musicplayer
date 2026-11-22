@@ -12,6 +12,9 @@ fn preferences_save_through_the_worker_and_restore_after_clean_restart() {
     let mut worker = fixture.start();
     let (_, initial) = worker.wait_ready(WAIT).unwrap();
     synced(&worker);
+    let mut playlist_columns = sonora::playlists::PlaylistColumns::default();
+    playlist_columns.set(sonora::playlists::PlaylistColumn::Artist, false);
+    playlist_columns.set(sonora::playlists::PlaylistColumn::Genre, true);
     let preferences = Preferences {
         volume: 0.23,
         gain: GainMode::Album,
@@ -19,6 +22,7 @@ fn preferences_save_through_the_worker_and_restore_after_clean_restart() {
         repeat: RepeatMode::All,
         dark: Some(true),
         all_missing_releases: true,
+        playlist_columns,
         ..initial
     };
     let expected = serde_json::to_value(&preferences).unwrap();

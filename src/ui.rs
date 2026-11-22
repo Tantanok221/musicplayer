@@ -424,6 +424,7 @@ pub struct MusicApp {
     selected: Option<Arc<Track>>,
     playlists: crate::playlists::Playlists,
     playlist_album_list: ListState,
+    playlist_track_scroll: ScrollHandle,
     playback: PlaybackSnapshot,
     artwork: HashMap<String, PathBuf>,
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
@@ -726,6 +727,7 @@ impl MusicApp {
             selected: None,
             playlists: Default::default(),
             playlist_album_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            playlist_track_scroll: ScrollHandle::new(),
             playback: PlaybackSnapshot::default(),
             artwork: HashMap::new(),
             art_requested: HashMap::new(),

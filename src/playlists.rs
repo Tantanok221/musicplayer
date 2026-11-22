@@ -4,6 +4,9 @@ use crate::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+mod columns;
+pub use columns::{PlaylistColumn, PlaylistColumns};
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaylistView {
     #[default]

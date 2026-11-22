@@ -89,6 +89,9 @@ impl MusicApp {
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
         let playback = position.as_ref().map(TrackPosition::playback);
+        let playlist_columns = (matches!(&position, Some(TrackPosition::Playlist { .. }))
+            && self.playlists.view() == crate::playlists::PlaylistView::Tracks)
+            .then(|| self.preferences.playlist_columns.clone());
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
             .cursor_default();
@@ -159,19 +162,29 @@ impl MusicApp {
             .child(
                 div()
                     .min_w_0()
+                    .when(playlist_columns.is_some(), |title| title.min_w(px(180.)))
                     .flex_1()
                     .truncate()
                     .text_color(if active { colors.accent } else { colors.text })
                     .child(track.title.clone()),
             )
-            .child(
-                div()
-                    .w(px(38.))
-                    .flex_shrink_0()
-                    .text_color(colors.muted)
-                    .text_right()
-                    .child(duration_label(track.duration)),
-            )
+            .when_some(playlist_columns.as_ref(), |row, columns| {
+                row.children(
+                    columns
+                        .iter()
+                        .map(|column| self.playlist_metadata_cell(&track, &key, column, cx)),
+                )
+            })
+            .when(playlist_columns.is_none(), |row| {
+                row.child(
+                    div()
+                        .w(px(38.))
+                        .flex_shrink_0()
+                        .text_color(colors.muted)
+                        .text_right()
+                        .child(duration_label(track.duration)),
+                )
+            })
             .child(feedback)
             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                 app.select_track(now.clone(), cx);
