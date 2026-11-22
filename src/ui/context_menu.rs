@@ -6,10 +6,10 @@ use crate::service::PlaylistTarget;
 
 /// Play Next, Play After This Album, and Add to End of Queue, each with a
 /// second line naming what the music will follow.
-fn queue_options(
+pub(super) fn queue_options(
     menu: PopupMenu,
     places: &QueuePlaces,
-    enqueue: impl Fn(Placement) + 'static,
+    enqueue: impl Fn(Placement, &mut App) + 'static,
 ) -> PopupMenu {
     let enqueue = Rc::new(enqueue);
     let mut options = vec![(
@@ -45,7 +45,8 @@ fn queue_options(
                 _ => Glyph::ListEnd,
             };
             menu.item(
-                menu_row_detail(icon, title, detail).on_click(move |_, _, _| enqueue(placement)),
+                menu_row_detail(icon, title, detail)
+                    .on_click(move |_, _, cx| enqueue(placement, cx)),
             )
         })
 }
@@ -227,21 +228,18 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = match &item {
-            PlaylistItem::Track(_) => String::new(),
-            PlaylistItem::Album(album) => album.name.clone(),
+        use crate::playlists::CreationSource;
+
+        let (source, name) = match item {
+            PlaylistItem::Track(track) => (
+                CreationSource::Tracks(vec![track.id.clone()]),
+                String::new(),
+            ),
+            PlaylistItem::Album(album) => {
+                (CreationSource::Album(album.id.clone()), album.name.clone())
+            }
         };
-        (self.playlist_editor_tracks, self.playlist_editor_album) = match item {
-            PlaylistItem::Track(track) => (Some(vec![track.id.clone()]), None),
-            PlaylistItem::Album(album) => (None, Some(album.id.clone())),
-        };
-        self.show_playlist_editor = true;
-        self.playlist_editor_rename = false;
-        self.playlist_name.update(cx, |input, cx| {
-            input.set_value(name, window, cx);
-            input.focus(window, cx);
-        });
-        cx.notify();
+        self.new_playlist(source, &name, window, cx);
     }
 
     fn add_to_playlist(&mut self, item: PlaylistItem, playlist: String, cx: &mut Context<Self>) {
@@ -266,6 +264,7 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let state = self.menu_state(cx);
+        let tag_tracks = self.selection.acting_on(&track);
         let queue_index = match &position {
             Some(tracks::TrackPosition::Queue(index)) => Some(*index),
             _ => None,
@@ -287,17 +286,22 @@ impl MusicApp {
                 .separator();
             let service = state.service.clone();
             let id = track.id.clone();
-            let menu = queue_options(menu, &state.places, move |placement| {
+            let menu = queue_options(menu, &state.places, move |placement, _| {
                 service.send(Command::Enqueue(vec![id.clone()], placement))
             });
             let menu = track_extras(menu, &state, &track, window, cx);
             let menu = if writes_tags(&state, cx) {
-                let (app, edit) = (state.app.clone(), track.clone());
+                let app = state.app.clone();
+                let label = match tag_tracks.len() {
+                    1 => "Edit Tags…".to_string(),
+                    count => format!("Edit Tags of {count} Songs…"),
+                };
+                let tracks: Vec<Track> = tag_tracks.iter().map(|t| (**t).clone()).collect();
                 menu.separator()
                     .item(
-                        menu_row(Glyph::Music, "Edit Tags…").on_click(move |_, window, cx| {
+                        menu_row(Glyph::Music, label).on_click(move |_, window, cx| {
                             let _ = app.update(cx, |app, cx| {
-                                app.open_tag_editor(vec![(*edit).clone()], window, cx)
+                                app.open_tag_editor(tracks.clone(), window, cx)
                             });
                         }),
                     )
@@ -369,7 +373,7 @@ impl MusicApp {
                 .separator();
             let service = state.service.clone();
             let id = album.id.clone();
-            let menu = queue_options(menu, &state.places, move |placement| {
+            let menu = queue_options(menu, &state.places, move |placement, _| {
                 service.send(Command::EnqueueAlbum(id.clone(), placement))
             });
             let menu =

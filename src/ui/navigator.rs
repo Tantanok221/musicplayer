@@ -180,14 +180,10 @@ impl MusicApp {
                 cx,
             )
             .child(
-                short_button("new-playlist", Glyph::Plus, "New playlist").on_click(cx.listener(
-                    |app, _, _, cx| {
+                short_button("new-playlist", Glyph::Plus, "New playlist…").on_click(cx.listener(
+                    |app, _, window, cx| {
                         cx.stop_propagation();
-                        app.show_playlist_editor = true;
-                        app.playlist_editor_rename = false;
-                        app.playlist_editor_album = None;
-                        app.playlist_editor_tracks = None;
-                        cx.notify();
+                        app.new_playlist(crate::playlists::CreationSource::Empty, "", window, cx);
                     },
                 )),
             )
@@ -197,24 +193,13 @@ impl MusicApp {
             })),
         );
         if self.playlists_open {
-            if self.smart.available {
-                tree = tree.child(
-                    self.navigation_row(
-                        "new-smart-playlist",
-                        "New Smart Playlist",
-                        Glyph::Plus,
-                        false,
-                        cx,
-                    )
-                    .on_click(cx.listener(|app, _, window, cx| app.new_smart_playlist(window, cx))),
-                );
-            }
             for playlist in self.playlists.summaries().to_vec() {
                 let active = self.workspace == Workspace::Playlists
                     && self
                         .playlists
                         .current()
                         .is_some_and(|p| p.id == playlist.id);
+                let menu = self.playlist_menu(&playlist, cx);
                 tree = tree.child(
                     div().pl_3().child(
                         self.navigation_row(
@@ -247,15 +232,14 @@ impl MusicApp {
                             },
                         )
                         .test_support()
-                        .on_click(cx.listener(
-                            move |app, _, window, cx| {
-                                app.switch_workspace(Workspace::Playlists, window, cx);
-                                let id = app.playlists.open(playlist.clone());
-                                app.selected = None;
-                                app.service.send(Command::Playlist(id));
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            app.switch_workspace(Workspace::Playlists, window, cx);
+                            let id = app.playlists.open(playlist.clone());
+                            app.selected = None;
+                            app.service.send(Command::Playlist(id));
+                            cx.notify();
+                        }))
+                        .context_menu(menu),
                     ),
                 );
             }

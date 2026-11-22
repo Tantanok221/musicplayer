@@ -122,6 +122,29 @@ impl MusicApp {
     }
 
     pub(super) fn select_track(&mut self, track: Arc<Track>, cx: &mut Context<Self>) {
+        self.selection.only(track.clone());
+        self.selected = Some(track);
+        cx.notify();
+    }
+
+    /// A modified click in a song list: ⌘ adds or removes the song, shift
+    /// selects the range from the last clicked song.
+    pub(super) fn select_more(
+        &mut self,
+        track: Arc<Track>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.is_empty()
+            && let Some(selected) = self.selected.clone()
+        {
+            self.selection.only(selected);
+        }
+        if modifiers.shift {
+            self.selection.extend(track.clone(), &self.tracks);
+        } else {
+            self.selection.toggle(track.clone());
+        }
         self.selected = Some(track);
         cx.notify();
     }
@@ -896,90 +919,8 @@ impl MusicApp {
         if let Some(editor) = self.tag_editor_panel(cx) {
             center = center.child(editor);
         }
-        if let Some(id) = self.pending_delete.clone() {
-            center = center.child(
-                div()
-                    .p_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child("Delete this playlist from Navidrome?")
-                    .child(
-                        Button::new("confirm-delete")
-                            .small()
-                            .label("Delete")
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                app.pending_delete = None;
-                                app.mutate(Mutation::DeletePlaylist(id.clone()), cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("cancel-delete")
-                            .small()
-                            .label("Cancel")
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.pending_delete = None;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-        if self.show_playlist_editor {
-            center = center.child(
-                div()
-                    .p_2()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.playlist_name).id("playlist-name").small()),
-                    )
-                    .child(
-                        Button::new("save-playlist-editor")
-                            .small()
-                            .label(if self.playlist_editor_rename {
-                                "Rename"
-                            } else {
-                                "Create playlist"
-                            })
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                let name = app.playlist_name.read(cx).value().to_string();
-                                if name.trim().is_empty() {
-                                    return;
-                                }
-                                if app.playlist_editor_rename {
-                                    if let Some(playlist) = app.playlists.current() {
-                                        app.mutate(
-                                            Mutation::RenamePlaylist(playlist.id.clone(), name),
-                                            cx,
-                                        );
-                                    }
-                                } else if let Some(album) = app.playlist_editor_album.clone() {
-                                    app.service.send(Command::AlbumToPlaylist(
-                                        album,
-                                        crate::service::PlaylistTarget::New(name),
-                                    ));
-                                } else {
-                                    let ids =
-                                        app.playlist_editor_tracks.clone().unwrap_or_default();
-                                    app.mutate(Mutation::CreatePlaylist(name, ids), cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        short_button("cancel-playlist-editor", Glyph::X, "Cancel").on_click(
-                            cx.listener(|app, _, _, cx| {
-                                app.show_playlist_editor = false;
-                                app.playlist_editor_tracks = None;
-                                app.playlist_editor_album = None;
-                                cx.notify();
-                            }),
-                        ),
-                    ),
-            );
+        if let Some(editor) = self.playlist_rename_view(cx) {
+            center = center.child(editor);
         }
         let content = self.main_content(cx);
         let previous_width = self.library_width;

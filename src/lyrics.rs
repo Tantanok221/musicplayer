@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Seconds before a timed line starts within which the view arms a wake for
+/// it. Longer than the ~200ms between playback updates, so one always lands
+/// inside it.
+pub const WAKE_LEAD: f64 = 0.4;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Lyrics {
@@ -58,6 +63,26 @@ impl Lyrics {
         }
         let start = self.line.get(index)?.start?;
         Some(((start as f64 - self.offset as f64) / 1000.).max(0.))
+    }
+
+    /// The first timed line that starts after `position`, with its start in seconds.
+    pub fn next_line(&self, position: f64) -> Option<(usize, f64)> {
+        (0..self.line.len())
+            .filter_map(|index| Some((index, self.line_position(index)?)))
+            .filter(|(_, start)| *start > position)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Whether a position-only playback update must redraw lyrics that show
+    /// `shown` as the current line and have a wake armed for line `armed`:
+    /// the current line moved, or the next one is due before the next update
+    /// and nothing will wake the view for it.
+    pub fn needs_redraw(&self, position: f64, shown: Option<usize>, armed: Option<usize>) -> bool {
+        self.is_timed()
+            && (self.active_line(position) != shown
+                || self.next_line(position).is_some_and(|(index, start)| {
+                    start - position < WAKE_LEAD && armed != Some(index)
+                }))
     }
 
     pub fn line_is_active(&self, index: usize, active: Option<usize>) -> bool {
@@ -135,6 +160,23 @@ mod tests {
         assert_eq!(lyrics.active_line(1.), None);
         assert_eq!(lyrics.active_line(1.1), Some(0));
         assert_eq!(lyrics.line_position(0), Some(1.1));
+    }
+
+    #[test]
+    fn position_updates_redraw_only_when_the_line_moves_or_needs_a_wake() {
+        let lyrics = timed();
+        assert_eq!(lyrics.next_line(1.), Some((1, 1.9)));
+        assert_eq!(lyrics.next_line(2.9), None);
+        // Mid-line and far from the next one: the view is current.
+        assert!(!lyrics.needs_redraw(1., Some(0), None));
+        // The line moved, forward or back after a seek.
+        assert!(lyrics.needs_redraw(2., Some(0), Some(1)));
+        assert!(lyrics.needs_redraw(1., Some(2), None));
+        // The next line is close: redraw to arm its wake, unless already armed.
+        assert!(lyrics.needs_redraw(1.6, Some(0), None));
+        assert!(lyrics.needs_redraw(1.6, Some(0), Some(0)));
+        assert!(!lyrics.needs_redraw(1.6, Some(0), Some(1)));
+        assert!(!Lyrics::plain("First").needs_redraw(1., None, None));
     }
 
     #[test]

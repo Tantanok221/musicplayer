@@ -49,8 +49,16 @@ pub enum Mutation {
     DeletePlaylist(String),
     /// Playlist ID and the songs appended to it.
     AddToPlaylist(String, Vec<String>),
-    RemoveFromPlaylist(String, usize),
+    RemoveFromPlaylist {
+        id: String,
+        index: usize,
+        song: String,
+        occurrence: usize,
+    },
 }
+pub(crate) const EMPTY_ALBUM_PLAYLIST_ERROR: &str =
+    "This album has no songs in the library yet. Refresh and try again.";
+
 /// Where an album's songs go: a new playlist by name, or an existing one by ID.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaylistTarget {
@@ -90,6 +98,7 @@ pub enum Command {
     Query(u64, LibraryQuery),
     Page(u64, u64, LibraryQuery, usize),
     Album(String),
+    AlbumDetails(String),
     Artist(u64, String, String),
     Discover(u64),
     HideDiscover(String, crate::discover::Dismissal),
@@ -149,13 +158,19 @@ pub enum Command {
     PlayAlbumMatching(LibraryQuery, String),
     Enqueue(Vec<String>, Placement),
     EnqueueAlbum(String, Placement),
+    /// Loads a playlist by ID and queues its entries in playlist order.
+    EnqueuePlaylist(String, Placement),
     /// Album ID: save its songs, in disc/track order, to a playlist.
     AlbumToPlaylist(String, PlaylistTarget),
     Mutate(Mutation),
     /// Writes the edit into the files under the mapped music folder.
-    WriteTags(crate::tags::TagEdit),
+    WriteTags(Vec<crate::tags::TagEdit>),
     /// Puts back the tags the last edit changed.
     UndoTags,
+    /// Searches MusicBrainz for editions of an album.
+    FindReleases(crate::autotag::ReleaseQuery),
+    /// Release ID: fetches its tracks for matching.
+    LoadRelease(String),
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
@@ -167,6 +182,7 @@ pub enum Command {
     Updated(String, Mutation),
     MutationFailed(String, Mutation, String),
     PlaylistLoaded(String, Playlist),
+    PlaylistForQueue(u64, Placement, Option<Playlist>),
     PlaylistsLoaded(String, Vec<Playlist>),
     Error(String),
     SyncFailed(i64, String),
@@ -230,6 +246,7 @@ pub enum Event {
     View(u64, LibraryView),
     Page(u64, u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
+    AlbumDetails(Arc<Album>),
     Artist(u64, ArtistPageData),
     Discover(u64, Arc<crate::discover::Rediscover>),
     ArtistProfile(String, Arc<ArtistProfile>),
@@ -259,6 +276,11 @@ pub enum Event {
     AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
     TagsWritten(crate::tags::TagReport),
+    ReleaseCandidates(
+        crate::autotag::ReleaseQuery,
+        Result<Vec<crate::autotag::ReleaseCandidate>, String>,
+    ),
+    ReleaseLoaded(String, Result<Arc<crate::autotag::Release>, String>),
 }
 #[derive(Clone)]
 pub struct Service {
@@ -272,18 +294,23 @@ pub mod test_support;
 
 /// Writes an edit into every selected file it can find, journaling each
 /// file before it is touched.
-fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::tags::TagReport> {
+fn write_tags(catalog: &Catalog, edits: &[crate::tags::TagEdit]) -> Result<crate::tags::TagReport> {
     use crate::tags::{self, EditState};
     let prefs: Preferences = catalog.state("preferences")?;
     let mut report = tags::TagReport {
         job: chrono::Utc::now().timestamp_micros(),
         ..Default::default()
     };
-    let tracks = catalog.by_ids(&edit.tracks)?;
+    let mut tracks = vec![];
+    for edit in edits {
+        for track in catalog.by_ids(&edit.tracks)? {
+            tracks.push((track, &edit.fields));
+        }
+    }
     if !prefs.metadata.write_tags {
         report.failures = tracks
             .iter()
-            .map(|track| {
+            .map(|(track, _)| {
                 (
                     track.title.clone(),
                     "Turn on Write tags to files in Settings → Metadata first.".into(),
@@ -295,7 +322,7 @@ fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::t
     let root = std::path::PathBuf::from(&prefs.metadata.library_folder);
     // A file written since the last rescan no longer matches the size Navidrome has.
     let unconfirmed = catalog.unconfirmed_tag_edits()?;
-    for track in tracks {
+    for (track, fields) in tracks {
         let file = match unconfirmed
             .iter()
             .rev()
@@ -321,7 +348,7 @@ fn write_tags(catalog: &Catalog, edit: &crate::tags::TagEdit) -> Result<crate::t
             }
         };
         let id = catalog.journal_tag_edit(report.job, &track, &file, &before)?;
-        match tags::write(&file, &edit.fields) {
+        match tags::write(&file, fields) {
             Ok((_, after)) => {
                 catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
                 report.written += 1;
@@ -551,6 +578,27 @@ fn forward_player_events(
             }
         }
     }
+}
+
+fn enqueue_playlist(
+    playlist: Option<Playlist>,
+    placement: Placement,
+    player: &PlayerHandle,
+    events: &Sender<Event>,
+) -> Result<()> {
+    match playlist {
+        Some(playlist) if !playlist.entry.is_empty() => {
+            player.send(PlayerCommand::Insert(
+                playlist.entry.as_ref().clone(),
+                placement,
+            ));
+        }
+        Some(_) => events.send(Event::Status("This playlist is empty.".into()))?,
+        None => events.send(Event::Error(
+            "Could not load playlist tracks to queue.".into(),
+        ))?,
+    }
+    Ok(())
 }
 
 /// Resolve saved occurrences individually so missing predecessors do not move
@@ -1059,6 +1107,7 @@ fn run(
         });
     }
     let mut server: Option<Server> = None;
+    let mut account_epoch = 0;
     let mut native_editor = native::Editor::default();
     let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
@@ -1311,6 +1360,7 @@ fn run(
                         artwork_queue = ArtworkQueue::default();
                         profile_pending.clear();
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
+                        account_epoch += 1;
                         let prefs: Preferences = catalog.state("preferences")?;
                         player.send(PlayerCommand::Preferences(prefs.clone()));
                         restore_queue(&catalog, &player, value.account.namespace())?;
@@ -1483,6 +1533,11 @@ fn run(
                 }
                 Command::PlayTrack(id) => {
                     player.send(PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0));
+                }
+                Command::AlbumDetails(id) => {
+                    if let Some(album) = catalog.album(&id)? {
+                        events.send(Event::AlbumDetails(album))?;
+                    }
                 }
                 Command::Album(id) => {
                     events.send(Event::Album(id.clone(), catalog.album_tracks(&id)?))?;
@@ -2226,6 +2281,28 @@ fn run(
                 Command::EnqueueAlbum(id, placement) => {
                     player.send(PlayerCommand::Insert(catalog.album_tracks(&id)?, placement));
                 }
+                Command::EnqueuePlaylist(id, placement) => {
+                    if let Some(server) =
+                        server.clone().filter(|_| connection == Connection::Online)
+                    {
+                        let tx = tx.clone();
+                        let epoch = account_epoch;
+                        runtime.spawn(async move {
+                            let playlist = server.playlist(&id).await.ok();
+                            let _ = tx.send(Command::PlaylistForQueue(epoch, placement, playlist));
+                        });
+                    } else {
+                        let cached = catalog
+                            .playlist(&id)?
+                            .filter(|p| !p.entry.is_empty() || p.song_count == 0);
+                        enqueue_playlist(cached, placement, &player, &events)?;
+                    }
+                }
+                Command::PlaylistForQueue(epoch, placement, playlist) => {
+                    if epoch == account_epoch {
+                        enqueue_playlist(playlist, placement, &player, &events)?;
+                    }
+                }
                 Command::AlbumToPlaylist(id, target) => {
                     let ids = catalog
                         .album_tracks(&id)?
@@ -2233,10 +2310,7 @@ fn run(
                         .map(|track| track.id.clone())
                         .collect::<Vec<_>>();
                     if ids.is_empty() {
-                        events.send(Event::Error(
-                            "This album has no songs in the library yet. Refresh and try again."
-                                .into(),
-                        ))?;
+                        events.send(Event::Error(EMPTY_ALBUM_PLAYLIST_ERROR.into()))?;
                     } else {
                         tx.send(Command::Mutate(match target {
                             PlaylistTarget::New(name) => Mutation::CreatePlaylist(name, ids),
@@ -2245,13 +2319,34 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
-                Command::WriteTags(edit) => {
-                    let report = write_tags(&catalog, &edit)?;
+                Command::WriteTags(edits) => {
+                    let report = write_tags(&catalog, &edits)?;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
                 }
                 Command::UndoTags => {
                     let report = undo_tags(&catalog)?;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                }
+                Command::FindReleases(query) => {
+                    let (musicbrainz, events) = (musicbrainz.clone(), events.clone());
+                    runtime.spawn(async move {
+                        let result = musicbrainz
+                            .search_releases(&query)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::ReleaseCandidates(query, result));
+                    });
+                }
+                Command::LoadRelease(id) => {
+                    let (musicbrainz, events) = (musicbrainz.clone(), events.clone());
+                    runtime.spawn(async move {
+                        let result = musicbrainz
+                            .release(&id)
+                            .await
+                            .map(Arc::new)
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = events.send(Event::ReleaseLoaded(id, result));
+                    });
                 }
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;
@@ -2318,7 +2413,7 @@ fn run(
                         mutation,
                         Mutation::ReorderPlaylist { .. }
                             | Mutation::AddToPlaylist(..)
-                            | Mutation::RemoveFromPlaylist(..)
+                            | Mutation::RemoveFromPlaylist { .. }
                             | Mutation::DeletePlaylist(..)
                     )
                     .then(|| playlist_track_edits.clone());
@@ -2350,8 +2445,29 @@ fn run(
                             Mutation::AddToPlaylist(id, ids) => {
                                 server.add_to_playlist(id, ids).await
                             }
-                            Mutation::RemoveFromPlaylist(id, index) => {
-                                server.remove_from_playlist(id, *index).await
+                            Mutation::RemoveFromPlaylist {
+                                id,
+                                index,
+                                song,
+                                occurrence,
+                            } => {
+                                async {
+                                    let playlist = server.playlist(id).await?;
+                                    let index = crate::playlists::removal_index(
+                                        &playlist,
+                                        *index,
+                                        song,
+                                        *occurrence,
+                                    )
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "The selected song occurrence is no longer in the playlist. \
+                                             Reopen it before removing"
+                                        )
+                                    })?;
+                                    server.remove_from_playlist(id, index).await
+                                }
+                                .await
                             }
                         };
                         match result {
@@ -2452,7 +2568,7 @@ fn run(
                                     Mutation::ReorderPlaylist { id, .. }
                                     | Mutation::RenamePlaylist(id, _)
                                     | Mutation::AddToPlaylist(id, _) => Some(id),
-                                    Mutation::RemoveFromPlaylist(id, _) => Some(id),
+                                    Mutation::RemoveFromPlaylist { id, .. } => Some(id),
                                     _ => None,
                                 };
                                 runtime.spawn(async move {
@@ -2489,6 +2605,9 @@ fn run(
                 Command::MutationFailed(namespace, mutation, error) => {
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
+                    }
+                    if let Mutation::RemoveFromPlaylist { id, .. } = &mutation {
+                        tx.send(Command::Playlist(id.clone()))?;
                     }
                     if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
                         && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()
