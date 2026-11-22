@@ -90,6 +90,7 @@ pub enum Command {
     Query(u64, LibraryQuery),
     Page(u64, u64, LibraryQuery, usize),
     Album(String),
+    AlbumDetails(String),
     Artist(u64, String, String),
     Discover(u64),
     HideDiscover(String, crate::discover::Dismissal),
@@ -230,6 +231,7 @@ pub enum Event {
     View(u64, LibraryView),
     Page(u64, u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
+    AlbumDetails(Arc<Album>),
     Artist(u64, ArtistPageData),
     Discover(u64, Arc<crate::discover::Rediscover>),
     ArtistProfile(String, Arc<ArtistProfile>),
@@ -1483,6 +1485,11 @@ fn run(
                 }
                 Command::PlayTrack(id) => {
                     player.send(PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0));
+                }
+                Command::AlbumDetails(id) => {
+                    if let Some(album) = catalog.album(&id)? {
+                        events.send(Event::AlbumDetails(album))?;
+                    }
                 }
                 Command::Album(id) => {
                     events.send(Event::Album(id.clone(), catalog.album_tracks(&id)?))?;

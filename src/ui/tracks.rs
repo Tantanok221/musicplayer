@@ -27,6 +27,13 @@ pub(super) enum TrackPosition {
 }
 
 impl TrackPosition {
+    pub(super) fn playlist(playlist: &Playlist, index: usize, editable: bool) -> Self {
+        Self::Playlist {
+            playback: TrackPlayback::Playlist(playlist.entry.clone(), index),
+            editable_entry: editable.then(|| crate::playlists::PlaylistEntry::new(playlist, index)),
+        }
+    }
+
     fn playback(&self) -> TrackPlayback {
         match self {
             Self::Queue(index) => TrackPlayback::Queue(*index),

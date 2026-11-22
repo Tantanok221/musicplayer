@@ -10,6 +10,34 @@ use sonora::{
 use std::sync::Arc;
 
 #[test]
+fn album_details_load_from_the_catalog() {
+    let mut library = Library::default();
+    let album = &mut library.albums[0];
+    album.year = Some(2024);
+    album.genre = "Rock".into();
+    let id = album.id.clone();
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut worker = fixture.start_paused();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::AlbumDetails("missing-album".into()));
+    worker.service().send(Command::AlbumDetails(id.clone()));
+    let Event::AlbumDetails(album) =
+        event(&worker, |event| matches!(event, Event::AlbumDetails(_)))
+    else {
+        unreachable!()
+    };
+    assert_eq!(album.id, id);
+    assert_eq!(album.year, Some(2024));
+    assert_eq!(album.genre, "Rock");
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn delayed_playlist_reply_after_account_switch_keeps_new_accounts_catalog() {
     delayed_playlist_reply_after_account_switch(false);
 }

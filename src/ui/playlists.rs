@@ -19,10 +19,7 @@ impl MusicApp {
             playlist.entry[index].clone(),
             index + 1,
             format!("playlist-{index}"),
-            Some(tracks::TrackPosition::Playlist {
-                playback: tracks::TrackPlayback::Playlist(playlist.entry.clone(), index),
-                editable_entry: editable.then(|| PlaylistEntry::new(playlist, index)),
-            }),
+            Some(tracks::TrackPosition::playlist(playlist, index, editable)),
             None,
             cx,
         )
@@ -119,8 +116,8 @@ impl MusicApp {
                                     app.service
                                         .player
                                         .send(PlayerCommand::Replace(play.clone(), 0));
-                                } else {
-                                    app.playlists.toggle_album(key.clone());
+                                } else if let Some(id) = app.playlists.toggle_album(key.clone()) {
+                                    app.service.send(Command::AlbumDetails(id.to_owned()));
                                 }
                                 cx.notify();
                             })),
@@ -131,18 +128,15 @@ impl MusicApp {
                     .iter()
                     .find(|album| app.playlists.expanded_album() == Some(album.key.as_str()))
                 {
-                    let mut panel = div()
-                        .w_full()
-                        .min_w_0()
-                        .mt_2()
-                        .px_2()
-                        .py_2()
-                        .border_y_1()
-                        .border_color(ink(cx).line);
-                    for &index in &album.entries {
-                        panel = panel.child(app.playlist_track_row(&playlist, index, editable, cx));
-                    }
-                    item = item.child(panel);
+                    item = item.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .mt_2()
+                            .border_y_1()
+                            .border_color(ink(cx).line)
+                            .child(app.playlist_album_panel(album, &playlist, editable, cx)),
+                    );
                 }
                 item.into_any_element()
             })

@@ -13,6 +13,7 @@ impl MusicApp {
                     .reset_for_account(self.account.as_ref(), account.as_ref())
                 {
                     self.smart = Default::default();
+                    self.playlists.clear_album();
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
@@ -234,6 +235,11 @@ impl MusicApp {
             Event::Album(id, tracks) => {
                 if self.highlight_requested.as_ref() == Some(&id) {
                     self.highlight_album = Some((id, tracks));
+                }
+            }
+            Event::AlbumDetails(album) => {
+                if self.playlists.update_album(album.clone()) {
+                    self.request_popularity(&album.artist_credits());
                 }
             }
             Event::Playlists(playlists) => self.playlists.summaries_loaded(playlists),

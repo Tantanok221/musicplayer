@@ -1,6 +1,9 @@
 //! Playlist interactions with scenario-local expected commands and replies.
 use crate::common::ui::{Fixture, start};
-use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
+use gpui_kit::{
+    AnyWindowHandle, AppContext, TestAppContext,
+    test::{TestQueryExt, TestWindowExt},
+};
 use sonora::{
     model::{PlaybackSnapshot, Playlist},
     platform::shortcut,
@@ -8,6 +11,130 @@ use sonora::{
     service::{Command, Event, Mutation, PlaylistTarget},
 };
 use std::{sync::Arc, time::Duration};
+
+#[gpui_kit::test]
+fn playlist_album_opens_the_explorer_album_panel(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    fixture.seed_explorer();
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    fixture.click(window, "explorer-album-album-2", cx);
+    let panel_labels = |window: &gpui_kit::Window| {
+        let panel = window.find("album-panel-album-2");
+        assert!(panel.visible());
+        [
+            "album-favorite-album-2",
+            "album-rating-album-2-4",
+            "album-year-album-2",
+            "album-genres-album-2-0",
+            "album-label-album-2-0",
+        ]
+        .map(|id| {
+            let element = window.find(id);
+            assert!(element.visible(), "{id} should be visible");
+            element.label().unwrap().to_owned()
+        })
+    };
+    let explorer_labels = cx
+        .update_window(window, |_, window, _| panel_labels(window))
+        .unwrap();
+
+    open_playlist(&mut fixture, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = fixture.catalog.by_ids(&["track-2".into()]).unwrap().into();
+    loaded.song_count = 1;
+    fixture.backend.emit(Event::Playlist(loaded));
+    fixture.settle(window, cx);
+    fixture.click(window, "playlist-view-albums", cx);
+    expect_album_details(&mut fixture, "album-2");
+    fixture.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(panel_labels(window), explorer_labels);
+        assert!(window.find("row-playlist-0").visible());
+    })
+    .unwrap();
+
+    fixture.click(window, "album-favorite-album-2", cx);
+    assert_eq!(
+        fixture.mutations(),
+        &[Mutation::AlbumFavorite("album-2".into(), false)]
+    );
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("album-favorite-album-2").label(),
+            Some("Favorite album Second release")
+        );
+    })
+    .unwrap();
+    fixture.fail_mutation();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(panel_labels(window), explorer_labels);
+    })
+    .unwrap();
+
+    fixture.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("album-panel-album-2").is_none());
+        assert!(window.try_find("row-playlist-0").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn playlist_album_uses_track_metadata_and_ignores_details_after_switching(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let tracks = fixture
+        .catalog
+        .by_ids(&["track-2".into(), "track-1".into()])
+        .unwrap();
+    let unlinked = sonora::model::Track {
+        album_id: String::new(),
+        year: Some(2024),
+        ..(*tracks[1]).clone()
+    };
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = vec![tracks[0].clone(), Arc::new(unlinked)].into();
+    loaded.song_count = 2;
+    fixture.backend.emit(Event::Playlist(loaded));
+    fixture.settle(window, cx);
+    fixture.click(window, "playlist-view-albums", cx);
+    fixture.expect("hold first album details", |command, _| {
+        assert!(matches!(command, Command::AlbumDetails(id) if id == "album-2"));
+        vec![]
+    });
+    fixture.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("album-panel-album-2").visible());
+        assert!(window.find("row-playlist-0").visible());
+        assert!(window.try_find("album-favorite-album-2").is_none());
+    })
+    .unwrap();
+    fixture.click(window, "playlist-album-1", cx);
+    fixture.backend.emit(Event::AlbumDetails(
+        fixture.catalog.album("album-2").unwrap().unwrap(),
+    ));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("album-panel-album-2").is_none());
+        assert!(window.try_find("row-playlist-0").is_none());
+        assert!(window.find("row-playlist-1").visible());
+        assert!(window.find_by_label("Explore year: 2024").visible());
+        assert!(window.try_find("album-favorite-").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+}
+
+fn expect_album_details(fixture: &mut Fixture, expected: &'static str) {
+    fixture.expect("load album details", move |command, catalog| {
+        assert!(matches!(command, Command::AlbumDetails(id) if id == expected));
+        vec![Event::AlbumDetails(
+            catalog.album(expected).unwrap().unwrap(),
+        )]
+    });
+}
 
 #[gpui_kit::test]
 fn album_view_groups_playlist_entries_and_preserves_playback_and_readonly(cx: &mut TestAppContext) {
@@ -48,6 +175,7 @@ fn album_view_groups_playlist_entries_and_preserves_playback_and_readonly(cx: &m
         assert!(window.try_find("sort-menu").is_none());
     })
     .unwrap();
+    expect_album_details(&mut fixture, "album-2");
     fixture.click(window, "playlist-album-0", cx);
     cx.update_window(window, |_, window, _| {
         assert!(window.find("row-playlist-0").visible());

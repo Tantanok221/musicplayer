@@ -1,4 +1,19 @@
 use super::*;
+use crate::playlists::PlaylistAlbum;
+use tracks::TrackPosition;
+
+enum AlbumPanelSource<'a> {
+    Library {
+        new_artist: bool,
+        selected_panel: bool,
+    },
+    Playlist {
+        group: &'a PlaylistAlbum,
+        playlist: &'a Playlist,
+        editable: bool,
+        has_details: bool,
+    },
+}
 
 impl MusicApp {
     pub(super) fn album_group(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -99,11 +114,102 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.request_group(&album.id);
+        self.render_album_panel(
+            &album,
+            AlbumPanelSource::Library {
+                new_artist,
+                selected_panel,
+            },
+            cx,
+        )
+    }
+
+    pub(super) fn playlist_album_panel(
+        &mut self,
+        group: &PlaylistAlbum,
+        playlist: &Playlist,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let details = self.playlists.album_details().cloned();
+        let has_details = details.is_some();
+        let album = details.unwrap_or_else(|| Arc::new(group.fallback_album()));
+        self.render_album_panel(
+            &album,
+            AlbumPanelSource::Playlist {
+                group,
+                playlist,
+                editable,
+                has_details,
+            },
+            cx,
+        )
+    }
+
+    fn render_album_panel(
+        &mut self,
+        album: &Arc<Album>,
+        source: AlbumPanelSource<'_>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (new_artist, selected_panel, has_details) = match source {
+            AlbumPanelSource::Library {
+                new_artist,
+                selected_panel,
+            } => (new_artist, selected_panel, true),
+            AlbumPanelSource::Playlist { has_details, .. } => (false, true, has_details),
+        };
         let colors = ink(cx);
-        let tracks = self.group_tracks.get(&album.id).cloned();
-        let cover = self.art(&album.cover_art, 124., cx);
-        let selection = album.clone();
-        let albumtitle = album.name.clone();
+        let tracks = match source {
+            AlbumPanelSource::Library { .. } => self.group_tracks.get(&album.id).map(|tracks| {
+                tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, track)| (track.clone(), format!("group-{}-{i}", album.id), None))
+                    .collect::<Vec<_>>()
+            }),
+            AlbumPanelSource::Playlist {
+                group,
+                playlist,
+                editable,
+                ..
+            } => Some(
+                group
+                    .entries
+                    .iter()
+                    .map(|&index| {
+                        (
+                            playlist.entry[index].clone(),
+                            format!("playlist-{index}"),
+                            Some(TrackPosition::playlist(playlist, index, editable)),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        let panel_key = match source {
+            AlbumPanelSource::Playlist { group, .. } if album.id.is_empty() => &group.key,
+            _ => &album.id,
+        };
+        let cover = div()
+            .id(SharedString::from(format!("album-art-{panel_key}")))
+            .child(self.art(&album.cover_art, 124., cx))
+            .when(
+                matches!(source, AlbumPanelSource::Library { .. }),
+                |cover| {
+                    let selection = album.clone();
+                    cover.cursor_pointer().on_click(
+                        cx.listener(move |app, _, _, cx| app.select_album(selection.clone(), cx)),
+                    )
+                },
+            );
+        let cover = if has_details {
+            cover
+                .context_menu(self.album_menu(album, cx))
+                .into_any_element()
+        } else {
+            cover.into_any_element()
+        };
         let mut right = div()
             .flex_1()
             .min_w_0()
@@ -125,11 +231,13 @@ impl MusicApp {
                             .truncate()
                             .child(album.name.clone()),
                     )
-                    .child(self.album_favorite(&album, cx)),
+                    .when(has_details, |header| {
+                        header.child(self.album_favorite(album, cx))
+                    }),
             )
             .child(
                 self.album_metadata(
-                    &album,
+                    album,
                     selected_panel
                         || self
                             .query
@@ -139,7 +247,7 @@ impl MusicApp {
                     cx,
                 ),
             );
-        if let Some(job) = self.album_download(&album) {
+        if has_details && let Some(job) = self.album_download(album) {
             let arrived = match job.expected {
                 Some(expected) if album.song_count < expected => format!(
                     " · {} of {expected} tracks are in the library so far",
@@ -161,10 +269,10 @@ impl MusicApp {
             let popular = self.popular_tracks(&album.id, &album.artist_credits());
             let discs = tracks
                 .iter()
-                .filter_map(|t| t.disc_number)
+                .filter_map(|(track, _, _)| track.disc_number)
                 .collect::<HashSet<_>>();
             let mut last_disc = None;
-            for (i, track) in tracks.into_iter().enumerate() {
+            for (i, (track, key, position)) in tracks.into_iter().enumerate() {
                 if discs.len() > 1 && last_disc != track.disc_number {
                     last_disc = track.disc_number;
                     right = right.child(
@@ -177,9 +285,8 @@ impl MusicApp {
                     );
                 }
                 let number = track.track.unwrap_or(i as u32 + 1) as usize;
-                let key = format!("group-{}-{i}", album.id);
                 let flame = Some(popular.contains(&track.id));
-                right = right.child(self.track_row(track, number, key, None, flame, cx));
+                right = right.child(self.track_row(track, number, key, position, flame, cx));
             }
         } else {
             right = right.child(
@@ -191,7 +298,7 @@ impl MusicApp {
             );
         }
         div()
-            .id(SharedString::from(format!("album-panel-{}", album.id)))
+            .id(SharedString::from(format!("album-panel-{panel_key}")))
             .test_support()
             .role(Role::Group)
             .aria_label(format!("Album {} by {}", album.name, album.artist))
@@ -231,7 +338,7 @@ impl MusicApp {
                                         self.query
                                             .ordering
                                             .as_ref()
-                                            .map(|spec| spec.group_label(&album))
+                                            .map(|spec| spec.group_label(album))
                                             .unwrap_or_default(),
                                     )
                                     .into_any_element()
@@ -254,24 +361,17 @@ impl MusicApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("album-art-{}", album.id)))
-                                    .cursor_pointer()
-                                    .child(cover)
-                                    .on_click(cx.listener(move |app, _, _, cx| {
-                                        app.select_album(selection.clone(), cx)
-                                    }))
-                                    .context_menu(self.album_menu(&album, cx)),
-                            )
-                            .child(self.album_rating(&album, cx))
+                            .child(cover)
+                            .when(has_details, |cover| {
+                                cover.child(self.album_rating(album, cx))
+                            })
                             .when(!selected_panel, |cover| {
                                 cover.child(
                                     div()
                                         .text_size(px(10.))
                                         .text_color(colors.muted)
                                         .truncate()
-                                        .child(albumtitle),
+                                        .child(album.name.clone()),
                                 )
                             }),
                     )
