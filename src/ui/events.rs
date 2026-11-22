@@ -12,6 +12,16 @@ impl MusicApp {
                     != account.as_ref().map(Account::namespace)
                 {
                     self.smart = Default::default();
+                    self.artwork.clear();
+                    self.backdrops.clear();
+                    self.backdrop_requested.clear();
+                    self.artist_profiles.clear();
+                    self.profile_requested.clear();
+                    self.popularity_requested.clear();
+                    self.top_songs.clear();
+                    self.artist_request += 1;
+                    self.artist_name = None;
+                    self.artist_albums = None;
                 }
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
@@ -57,22 +67,6 @@ impl MusicApp {
                 self.error = None;
             }
             Event::Connected(account, label) => {
-                if self
-                    .account
-                    .as_ref()
-                    .is_some_and(|old| old.namespace() != account.namespace())
-                {
-                    self.artwork.clear();
-                    self.backdrops.clear();
-                    self.backdrop_requested.clear();
-                    self.artist_profiles.clear();
-                    self.profile_requested.clear();
-                    self.popularity_requested.clear();
-                    self.top_songs.clear();
-                    self.artist_request += 1;
-                    self.artist_name = None;
-                    self.artist_albums = None;
-                }
                 self.account = Some(account);
                 if self.settings {
                     self.focus.focus(window, cx);

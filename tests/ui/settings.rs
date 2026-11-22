@@ -1,9 +1,12 @@
-use crate::common::ui::{Fixture, start};
+use crate::common::ui::{ARTIST, ARTIST_TARGET, Fixture, start};
 use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
 use sonora::{
+    artists::{ArtistProfile, cache_key},
+    model::Preferences,
     platform::{Account, shortcut},
     service::{Command, Event},
 };
+use std::sync::Arc;
 
 pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
@@ -27,6 +30,70 @@ fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut Test
         window.input(value, cx);
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn reconnect_keeps_artist_profile_but_account_switch_drops_it(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, app) = start(cx);
+    f.click(window, "new-tab", cx);
+    f.click(window, ARTIST_TARGET, cx);
+    f.backend.emit(Event::ArtistProfile(
+        cache_key(ARTIST, "artist-1"),
+        Arc::new(ArtistProfile {
+            name: ARTIST.into(),
+            url: "https://fixture.invalid/artist".into(),
+            complete: true,
+            ..Default::default()
+        }),
+    ));
+    f.settle(window, cx);
+
+    let assert_profile = |expected, cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("artist-release-album-1").visible());
+            assert_eq!(
+                window.try_find("artist-source").is_some(),
+                expected,
+                "the previous account's cached artist profile must not survive an account switch"
+            );
+        })
+        .unwrap();
+    };
+    assert_profile(true, cx);
+
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    f.expect("same-account reconnect", |command, _| {
+        let Command::Connect(account, _) = command else {
+            panic!("expected connect command");
+        };
+        assert_eq!(account.username, "fixture");
+        vec![Event::Connected(account, "Connected".into())]
+    });
+    f.click(window, "connect-library", cx);
+    assert_profile(true, cx);
+
+    let prefs = Preferences {
+        // Both accounts have a saved tab for the same artist ID.
+        tabs: cx.update(|cx| app.read(cx).tab_state().clone()),
+        ..f.catalog.state("preferences").unwrap()
+    };
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    fill(window, "Username", "other-listener", cx);
+    f.expect("switch to another account", move |command, _| {
+        let Command::Connect(account, _) = command else {
+            panic!("expected connect command");
+        };
+        assert_eq!(account.username, "other-listener");
+        vec![
+            Event::Ready(Some(account.clone()), prefs),
+            Event::Connected(account, "Connected".into()),
+        ]
+    });
+    f.click(window, "connect-library", cx);
+    assert_profile(false, cx);
+    f.assert_script_finished();
 }
 
 #[gpui_kit::test]
