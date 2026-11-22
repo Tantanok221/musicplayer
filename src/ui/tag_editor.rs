@@ -1,7 +1,7 @@
 //! The opt-in tag editor, its MusicBrainz lookup, and the notice that offers
 //! to undo an edit.
 use super::*;
-use crate::autotag::{self, Release, ReleaseCandidate, ReleaseQuery, TrackMatch};
+use crate::autotag::{self, AlbumBatch, Release, ReleaseCandidate, ReleaseQuery, TrackMatch};
 use crate::tags::{Change, EditorForm, Entries, MULTIPLE_VALUES, TagField, TagReport};
 use gpui_kit::component::checkbox::Checkbox;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +16,8 @@ pub(super) struct TagEditor {
     extra: Vec<BTreeMap<TagField, String>>,
     review: Option<Vec<Change>>,
     lookup: Lookup,
+    /// Set while songs from several albums are looked up one album at a time.
+    batch: Option<AlbumBatch>,
     candidates: Vec<ReleaseCandidate>,
     link: Entity<InputState>,
     pattern: Entity<InputState>,
@@ -67,6 +69,21 @@ fn text_input(
 }
 
 impl TagEditor {
+    /// The songs a lookup works on: the current album's in a batch, or all.
+    fn rows(&self) -> Vec<usize> {
+        match &self.batch {
+            Some(batch) => batch.rows().to_vec(),
+            None => (0..self.form.tracks.len()).collect(),
+        }
+    }
+
+    fn looked_up(&self) -> Vec<Track> {
+        self.rows()
+            .into_iter()
+            .map(|row| self.form.tracks[row].clone())
+            .collect()
+    }
+
     fn entries(&self, cx: &App) -> Entries {
         let read = |inputs: &[(TagField, Entity<InputState>)]| {
             inputs
@@ -125,6 +142,7 @@ impl MusicApp {
             cleared: BTreeSet::new(),
             review: None,
             lookup: Lookup::Idle,
+            batch: None,
             candidates: vec![],
             link: text_input(
                 String::new(),
@@ -195,10 +213,29 @@ impl MusicApp {
         let Some(editor) = self.tag_editor.as_mut() else {
             return;
         };
-        let query = ReleaseQuery::for_tracks(&editor.form.tracks);
+        if editor.batch.is_none() {
+            editor.batch = AlbumBatch::new(&editor.form.tracks);
+        }
+        let query = ReleaseQuery::for_tracks(&editor.looked_up());
         editor.lookup = Lookup::Searching(query.clone());
         self.service.send(Command::FindReleases(query));
         cx.notify();
+    }
+
+    /// Leaves the current album as it is and looks up the next one, or ends
+    /// the lookup after the last.
+    fn next_album(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        editor.candidates.clear();
+        if editor.batch.as_mut().is_some_and(AlbumBatch::advance) {
+            self.find_releases(cx);
+        } else {
+            editor.batch = None;
+            editor.lookup = Lookup::Idle;
+            cx.notify();
+        }
     }
 
     fn identify_by_sound(&mut self, cx: &mut Context<Self>) {
@@ -306,7 +343,7 @@ impl MusicApp {
         }
         editor.lookup = match result {
             Ok(release) => Lookup::Matched {
-                matches: autotag::match_tracks(&editor.form.tracks, &release),
+                matches: autotag::match_tracks(&editor.looked_up(), &release),
                 release,
                 skipped: BTreeSet::from([TagField::CoverArt]),
                 genres: 3,
@@ -342,23 +379,28 @@ impl MusicApp {
         else {
             return;
         };
-        let proposals: Vec<Option<BTreeMap<TagField, String>>> = matches
-            .iter()
-            .map(|found| {
-                let (index, _) = (*found)?;
-                let mut values = autotag::proposed(&release, &release.tracks[index], genres);
-                values.retain(|field, _| {
-                    let group = if TagField::IDS.contains(field) {
-                        TagField::MusicBrainzTrack
-                    } else {
-                        *field
-                    };
-                    !skipped.contains(&group)
-                });
-                Some(values)
-            })
-            .collect();
+        let mut proposals: Vec<Option<BTreeMap<TagField, String>>> =
+            vec![None; editor.form.tracks.len()];
+        let found = matches.iter().map(|found| {
+            let (index, _) = (*found)?;
+            let mut values = autotag::proposed(&release, &release.tracks[index], genres);
+            values.retain(|field, _| {
+                let group = if TagField::IDS.contains(field) {
+                    TagField::MusicBrainzTrack
+                } else {
+                    *field
+                };
+                !skipped.contains(&group)
+            });
+            Some(values)
+        });
+        for (row, values) in editor.rows().into_iter().zip(found) {
+            proposals[row] = values;
+        }
         fill_form(editor, &proposals, window, cx);
+        if editor.batch.is_some() {
+            self.next_album(cx);
+        }
         cx.notify();
     }
 
@@ -426,7 +468,38 @@ impl MusicApp {
                 .into_any_element()
         };
         let panel = div().flex().flex_col().gap_1();
-        Some(match &editor.lookup {
+        let header = editor.batch.as_ref().map(|batch| {
+            let (number, albums) = batch.position();
+            let album = &editor.form.tracks[batch.rows()[0]].album;
+            let text = format!("Album {number} of {albums}: {album}");
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("lookup-album")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(text.clone())
+                        .flex_1()
+                        .text_size(px(11.))
+                        .font_semibold()
+                        .child(text),
+                )
+                .child(
+                    Button::new("skip-album")
+                        .xsmall()
+                        .label(if number < albums {
+                            "Skip Album"
+                        } else {
+                            "Skip and Finish"
+                        })
+                        .on_click(cx.listener(|app, _, _, cx| app.next_album(cx))),
+                )
+        });
+
+        let body = match &editor.lookup {
             Lookup::Idle => return None,
             Lookup::Searching(query) => {
                 status(format!("Searching MusicBrainz for {}…", query.subject()))
@@ -517,8 +590,9 @@ impl MusicApp {
                             release.title
                         )),
                 );
+                let rows = editor.rows();
                 for (row, found) in matches.iter().enumerate() {
-                    let song = &editor.form.tracks[row].title;
+                    let song = &editor.form.tracks[rows[row]].title;
                     let label = match found {
                         Some((index, score)) => format!(
                             "{song} → {} · {:.0}%",
@@ -613,7 +687,16 @@ impl MusicApp {
                     )
                     .into_any_element()
             }
-        })
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(header)
+                .child(body)
+                .into_any_element(),
+        )
     }
 
     fn shared_fields(&self, editor: &TagEditor, cx: &mut Context<Self>) -> AnyElement {
@@ -829,6 +912,7 @@ impl MusicApp {
             editor.lookup,
             Lookup::Searching(_) | Lookup::Loading(_) | Lookup::Identifying(_)
         );
+        let spans = ReleaseQuery::spans_albums(&editor.form.tracks);
         let identifies = editor.review.is_none()
             && editor.form.tracks.len() == 1
             && !self.preferences.metadata.acoustid_key.trim().is_empty();
@@ -866,20 +950,21 @@ impl MusicApp {
                                 .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
                         )
                     })
-                    .when(
-                        editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks),
-                        |row| {
-                            row.child(
-                                Button::new("find-musicbrainz")
-                                    .small()
-                                    .label("Find on MusicBrainz")
-                                    .loading(searching)
-                                    .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
-                            )
-                        },
-                    ),
+                    .when(editor.review.is_none(), |row| {
+                        row.child(
+                            Button::new("find-musicbrainz")
+                                .small()
+                                .label(if spans {
+                                    "Find Each Album"
+                                } else {
+                                    "Find on MusicBrainz"
+                                })
+                                .loading(searching)
+                                .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
+                        )
+                    }),
             );
-        if editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks) {
+        if editor.review.is_none() && !spans {
             panel = panel.child(
                 div()
                     .flex()

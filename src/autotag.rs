@@ -55,8 +55,8 @@ impl ReleaseQuery {
         }
     }
 
-    /// Whether songs from more than one album are selected, which neither
-    /// an album nor a song search can fill in one go.
+    /// Whether songs from more than one album are selected, which are then
+    /// looked up one album at a time.
     pub fn spans_albums(tracks: &[Track]) -> bool {
         tracks.len() > 1
             && tracks
@@ -105,6 +105,53 @@ impl ReleaseQuery {
             terms.push(format!("tracks:{}", self.tracks));
         }
         terms.join(" AND ")
+    }
+}
+
+/// A lookup over songs from several albums, which goes through them one
+/// album at a time, as Picard does with its clusters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlbumBatch {
+    /// Each album's songs, as indexes into the selection, in the order the
+    /// albums first appear.
+    groups: Vec<Vec<usize>>,
+    current: usize,
+}
+
+impl AlbumBatch {
+    /// `None` unless the songs span more than one album.
+    pub fn new(tracks: &[Track]) -> Option<Self> {
+        let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (index, track) in tracks.iter().enumerate() {
+            match groups.iter_mut().find(|(id, _)| *id == track.album_id) {
+                Some((_, rows)) => rows.push(index),
+                None => groups.push((&track.album_id, vec![index])),
+            }
+        }
+        (groups.len() > 1).then(|| Self {
+            groups: groups.into_iter().map(|(_, rows)| rows).collect(),
+            current: 0,
+        })
+    }
+
+    /// The current album's songs, as indexes into the selection.
+    pub fn rows(&self) -> &[usize] {
+        &self.groups[self.current]
+    }
+
+    /// Moves to the next album; `false` when there is none left.
+    pub fn advance(&mut self) -> bool {
+        if self.current + 1 < self.groups.len() {
+            self.current += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The current album's number, counting from one, and how many there are.
+    pub fn position(&self) -> (usize, usize) {
+        (self.current + 1, self.groups.len())
     }
 }
 
@@ -442,6 +489,23 @@ pub fn proposed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_batch_groups_songs_by_album_in_order() {
+        let track = |album: &str| Track {
+            album_id: album.into(),
+            ..Default::default()
+        };
+        assert_eq!(AlbumBatch::new(&[track("a"), track("a")]), None);
+        let mut batch = AlbumBatch::new(&[track("a"), track("b"), track("a")]).unwrap();
+        assert_eq!(batch.rows(), &[0, 2]);
+        assert_eq!(batch.position(), (1, 2));
+        assert!(batch.advance());
+        assert_eq!(batch.rows(), &[1]);
+        assert_eq!(batch.position(), (2, 2));
+        assert!(!batch.advance());
+        assert_eq!(batch.rows(), &[1]);
+    }
 
     fn song(title: &str, number: u32, seconds: f64) -> Track {
         Track {
