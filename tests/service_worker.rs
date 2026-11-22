@@ -23,6 +23,8 @@ mod playlists;
 mod preferences;
 #[path = "service_worker/queue.rs"]
 mod queue;
+#[path = "service_worker/saved_state.rs"]
+mod saved_state;
 #[path = "service_worker/scrobbles.rs"]
 mod scrobbles;
 #[path = "service_worker/smart_playlists.rs"]

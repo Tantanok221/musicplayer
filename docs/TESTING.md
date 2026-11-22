@@ -41,6 +41,7 @@ worker suite to expose flaky timing.
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
+| Saved-state format compatibility | | `model`, `catalog`, `service::restore_queue` | `tests/service_worker/saved_state.rs`, `tests/fixtures/saved_state/` |
 | Sync, scrobbles, shutdown | | `service`, `catalog`, `listening` | `tests/service_worker/{sync,scrobbles,lifecycle}.rs` |
 
 `src/ui.rs` holds only the `MusicApp` struct, `new()`, actions and `Render`.

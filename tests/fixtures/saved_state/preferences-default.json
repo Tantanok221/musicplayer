@@ -1,0 +1,207 @@
+{
+  "volume": 0.699999988079071,
+  "gain": "Smart",
+  "shuffle": false,
+  "repeat": "Off",
+  "dark": null,
+  "layout": {
+    "navigator_mode": "AlbumArtist",
+    "explorer_view": "AlbumCovers",
+    "show_navigator": true,
+    "navigator_auto_hide": false,
+    "show_information": true,
+    "explorer_browser": true,
+    "show_spectrum": true,
+    "left_width": 216.0,
+    "right_width": 300.0,
+    "browser_height": 156.0,
+    "queue_height": 280.0,
+    "navigator_height": 236.0,
+    "info_source": "Selected",
+    "info_tab": "Details"
+  },
+  "sorting": {
+    "albums": {
+      "scope": "Albums",
+      "rules": [
+        {
+          "field": "AlbumArtist",
+          "descending": false
+        },
+        {
+          "field": "Album",
+          "descending": false
+        }
+      ],
+      "grouping": "None",
+      "group_descending": false,
+      "ignore_the": true,
+      "seed": 0
+    },
+    "tracks": {
+      "scope": "Tracks",
+      "rules": [
+        {
+          "field": "Title",
+          "descending": false
+        },
+        {
+          "field": "Artist",
+          "descending": false
+        }
+      ],
+      "grouping": "None",
+      "group_descending": false,
+      "ignore_the": true,
+      "seed": 0
+    }
+  },
+  "downloads": {
+    "enabled": false,
+    "url": ""
+  },
+  "all_missing_releases": false,
+  "favorites": {
+    "hearted": true,
+    "min_rating": 0,
+    "match_all": false
+  },
+  "tabs": {
+    "tabs": [
+      {
+        "id": 1,
+        "page": {
+          "workspace": "Explorer",
+          "artist": null,
+          "query": {
+            "text": "",
+            "selection": {
+              "genres": [],
+              "artists": [],
+              "albums": []
+            },
+            "artist": "",
+            "performer": "",
+            "genre": "",
+            "year": null,
+            "record_label": "",
+            "favorites": false,
+            "favorite_filter": {
+              "hearted": true,
+              "min_rating": 0,
+              "match_all": false
+            },
+            "sort": "Album",
+            "descending": false,
+            "ordering": null
+          },
+          "playlist": null,
+          "search": ""
+        },
+        "locked": false,
+        "home": null
+      },
+      {
+        "id": 2,
+        "page": {
+          "workspace": "Queue",
+          "artist": null,
+          "query": {
+            "text": "",
+            "selection": {
+              "genres": [],
+              "artists": [],
+              "albums": []
+            },
+            "artist": "",
+            "performer": "",
+            "genre": "",
+            "year": null,
+            "record_label": "",
+            "favorites": false,
+            "favorite_filter": {
+              "hearted": true,
+              "min_rating": 0,
+              "match_all": false
+            },
+            "sort": "Album",
+            "descending": false,
+            "ordering": null
+          },
+          "playlist": null,
+          "search": ""
+        },
+        "locked": false,
+        "home": null
+      },
+      {
+        "id": 3,
+        "page": {
+          "workspace": "Playlists",
+          "artist": null,
+          "query": {
+            "text": "",
+            "selection": {
+              "genres": [],
+              "artists": [],
+              "albums": []
+            },
+            "artist": "",
+            "performer": "",
+            "genre": "",
+            "year": null,
+            "record_label": "",
+            "favorites": false,
+            "favorite_filter": {
+              "hearted": true,
+              "min_rating": 0,
+              "match_all": false
+            },
+            "sort": "Album",
+            "descending": false,
+            "ordering": null
+          },
+          "playlist": null,
+          "search": ""
+        },
+        "locked": false,
+        "home": null
+      },
+      {
+        "id": 4,
+        "page": {
+          "workspace": "NowPlaying",
+          "artist": null,
+          "query": {
+            "text": "",
+            "selection": {
+              "genres": [],
+              "artists": [],
+              "albums": []
+            },
+            "artist": "",
+            "performer": "",
+            "genre": "",
+            "year": null,
+            "record_label": "",
+            "favorites": false,
+            "favorite_filter": {
+              "hearted": true,
+              "min_rating": 0,
+              "match_all": false
+            },
+            "sort": "Album",
+            "descending": false,
+            "ordering": null
+          },
+          "playlist": null,
+          "search": ""
+        },
+        "locked": false,
+        "home": null
+      }
+    ],
+    "active": 0
+  },
+  "lastfm_user": ""
+}
