@@ -167,6 +167,7 @@ fn filters_pagination_order_and_saved_state_survive_reopen() {
         let queue = SavedQueue {
             listen: None,
             ids: vec!["test-0".into(), "test-1".into()],
+            shuffle_positions: None,
             index: Some(1),
             position: 42.,
         };

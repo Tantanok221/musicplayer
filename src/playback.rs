@@ -6,11 +6,10 @@ use crate::{
 };
 use anyhow::Result;
 use flume::{Receiver, Sender};
-use rand::seq::SliceRandom;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, Source};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -35,7 +34,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 mod output;
 mod queue;
 pub use queue::QueueEdit;
-use queue::QueueEdits;
+use queue::{QueueEdits, ShuffleOrder};
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -80,7 +79,14 @@ pub enum PlayerCommand {
     Replace(Vec<Arc<Track>>, usize),
     Restore(Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
     /// Restore an account's queue and change its persistence owner atomically.
-    RestoreAccount(String, Vec<Arc<Track>>, usize, f64, Option<ListenSession>),
+    RestoreAccount {
+        namespace: String,
+        tracks: Vec<Arc<Track>>,
+        index: usize,
+        position: f64,
+        listen: Option<ListenSession>,
+        shuffle_positions: Option<Vec<usize>>,
+    },
     Insert(Vec<Arc<Track>>, Placement),
     Remove(usize),
     Move(usize, usize),
@@ -476,6 +482,10 @@ pub fn effective_gain_mode(mode: &GainMode, queue: &[Arc<Track>]) -> GainMode {
     }
 }
 
+/// Real tags sit far inside this range; clamping keeps a corrupt tag from
+/// overflowing the gain factor to infinity and turning samples into NaN.
+const MAX_REPLAY_GAIN_DB: f32 = 60.;
+
 pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
     let Some(gain) = gain else {
         return 1.;
@@ -491,7 +501,10 @@ pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
             }
         }
     };
-    let mut factor = 10f32.powf(db.filter(|v| v.is_finite()).unwrap_or(0.) / 20.);
+    let db = db
+        .filter(|v| v.is_finite())
+        .map_or(0., |v| v.clamp(-MAX_REPLAY_GAIN_DB, MAX_REPLAY_GAIN_DB));
+    let mut factor = 10f32.powf(db / 20.);
     if let Some(peak) = peak.filter(|p| p.is_finite() && *p > 0.) {
         factor = factor.min(1. / peak);
     }
@@ -630,36 +643,6 @@ fn insertion_point(queue: &[Arc<Track>], index: Option<usize>, placement: Placem
         }
         Placement::Last => queue.len(),
     }
-}
-
-/// Restores the pre-shuffle order using the current entries, so tracks added
-/// or updated while shuffled are kept. Returns the queue and the new index of
-/// the current entry.
-fn unshuffle(
-    queue: Vec<Arc<Track>>,
-    original: &[Arc<Track>],
-    index: Option<usize>,
-) -> (Vec<Arc<Track>>, Option<usize>) {
-    let current = index.and_then(|i| queue.get(i)).cloned();
-    let mut pool: HashMap<&str, VecDeque<&Arc<Track>>> = HashMap::new();
-    for track in &queue {
-        pool.entry(&track.id).or_default().push_back(track);
-    }
-    let mut ordered = Vec::with_capacity(queue.len());
-    for track in original.iter().chain(&queue) {
-        if let Some(entry) = pool
-            .get_mut(track.id.as_str())
-            .and_then(VecDeque::pop_front)
-        {
-            ordered.push(entry.clone());
-        }
-    }
-    let index = current.and_then(|current| {
-        ordered
-            .iter()
-            .position(|track| Arc::ptr_eq(track, &current))
-    });
-    (ordered, index)
 }
 
 struct DecodeRequest {
@@ -893,6 +876,8 @@ enum PlaybackPlatform {
     /// No media controls; the output device id is whatever the test scripts.
     #[cfg(feature = "test-support")]
     Headless(HeadlessOutput),
+    #[cfg(feature = "test-support")]
+    Scripted(Sender<DecodeRequest>),
 }
 
 impl PlaybackPlatform {
@@ -901,6 +886,8 @@ impl PlaybackPlatform {
             Self::Native => default_output_id(),
             #[cfg(feature = "test-support")]
             Self::Headless(output) => output.lock().unwrap().clone(),
+            #[cfg(feature = "test-support")]
+            Self::Scripted(_) => Some("scripted".into()),
         }
     }
 
@@ -914,6 +901,8 @@ impl PlaybackPlatform {
             .ok(),
             #[cfg(feature = "test-support")]
             Self::Headless(_) => None,
+            #[cfg(feature = "test-support")]
+            Self::Scripted(_) => None,
         }
     }
 }
@@ -960,7 +949,7 @@ fn run(
     let mut started = false;
     let mut plan = Plan::shared(Vec::new(), RepeatMode::Off);
     // The queue order before shuffling, kept in step with later edits.
-    let mut original: Option<Vec<Arc<Track>>> = None;
+    let mut original: Option<ShuffleOrder> = None;
     let mut plan_boundary = 0;
     let mut pending_output: Option<(Packet, Instant)> = None;
     // When the current stream started waiting for audio; cleared once samples flow.
@@ -1053,13 +1042,13 @@ fn run(
             }
         }
         let mut restart = false;
-        for command in batch {
+        for mut command in batch {
             revision += 1;
             let mut reset_queue_edits = matches!(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
-                    | PlayerCommand::RestoreAccount(..)
+                    | PlayerCommand::RestoreAccount { .. }
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
@@ -1068,16 +1057,24 @@ fn run(
                 &command,
                 PlayerCommand::Replace(..)
                     | PlayerCommand::Restore(..)
-                    | PlayerCommand::RestoreAccount(..)
+                    | PlayerCommand::RestoreAccount { .. }
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Remove(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::UpdateTrack(..)
                     | PlayerCommand::RetagTrack(..)
             );
-            if let PlayerCommand::RestoreAccount(namespace, ..) = &command {
-                queue_account = namespace.clone();
-            }
+            let restored_positions = match &mut command {
+                PlayerCommand::RestoreAccount {
+                    namespace,
+                    shuffle_positions,
+                    ..
+                } => {
+                    queue_account = std::mem::take(namespace);
+                    shuffle_positions.take()
+                }
+                _ => None,
+            };
             match command {
                 PlayerCommand::Shutdown => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
@@ -1088,6 +1085,7 @@ fn run(
                         SavedQueue {
                             listen: tracker.session(listen_seed),
                             ids: queue.iter().map(|t| t.id.clone()).collect(),
+                            shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                             index,
                             position: if started {
                                 position(&clock)
@@ -1110,6 +1108,7 @@ fn run(
                     let _ = reply.send(SavedQueue {
                         listen: tracker.session(listen_seed),
                         ids: queue.iter().map(|t| t.id.clone()).collect(),
+                        shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                         index,
                         position: if started {
                             position(&clock)
@@ -1122,10 +1121,12 @@ fn run(
                     let at = at.min(tracks.len().saturating_sub(1));
                     original = None;
                     if prefs.shuffle && !tracks.is_empty() {
-                        original = Some(tracks.clone());
+                        let mut order = ShuffleOrder::new(tracks.len());
                         let current = tracks.remove(at);
-                        tracks.shuffle(&mut rand::rng());
                         tracks.insert(0, current);
+                        order.move_entry(at, 0);
+                        order.shuffle(&mut tracks, 1);
+                        original = Some(order);
                         index = Some(0);
                     } else {
                         index = (!tracks.is_empty()).then_some(at);
@@ -1137,7 +1138,13 @@ fn run(
                     restart = true;
                 }
                 PlayerCommand::Restore(tracks, at, pos, listen)
-                | PlayerCommand::RestoreAccount(_, tracks, at, pos, listen) => {
+                | PlayerCommand::RestoreAccount {
+                    tracks,
+                    index: at,
+                    position: pos,
+                    listen,
+                    ..
+                } => {
                     clock.epoch.fetch_add(1, Ordering::AcqRel);
                     drop(output.take());
                     pending_output = None;
@@ -1151,8 +1158,15 @@ fn run(
                         tracker.restore(listen);
                     }
                     queue = tracks;
-                    original = None;
                     index = (!queue.is_empty()).then_some(at.min(queue.len().saturating_sub(1)));
+                    original = restored_positions
+                        .filter(|positions| positions.len() == queue.len())
+                        .and_then(ShuffleOrder::from_saved);
+                    if !prefs.shuffle
+                        && let Some(order) = original.take()
+                    {
+                        (queue, index) = order.restore(std::mem::take(&mut queue), index);
+                    }
                     base_position = pos;
                     clock.playing.store(false, Ordering::Relaxed);
                     restart = false;
@@ -1161,15 +1175,7 @@ fn run(
                 PlayerCommand::Insert(tracks, placement) => {
                     let at = insertion_point(&queue, index, placement);
                     if let Some(original) = original.as_mut() {
-                        let after = match at.checked_sub(1).and_then(|anchor| queue.get(anchor)) {
-                            Some(anchor) if placement != Placement::Last => original
-                                .iter()
-                                .position(|t| t.id == anchor.id)
-                                .map_or(original.len(), |i| i + 1),
-                            None if placement != Placement::Last => 0,
-                            _ => original.len(),
-                        };
-                        original.splice(after..after, tracks.iter().cloned());
+                        original.insert(at, tracks.len(), placement == Placement::Last);
                     }
                     queue.splice(at..at, tracks);
                     if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
@@ -1184,11 +1190,9 @@ fn run(
                         } else {
                             base_position
                         };
-                        let removed = queue.remove(at);
-                        if let Some(original) = original.as_mut()
-                            && let Some(i) = original.iter().position(|t| t.id == removed.id)
-                        {
-                            original.remove(i);
+                        queue.remove(at);
+                        if let Some(original) = original.as_mut() {
+                            original.remove(at);
                         }
                         if let Some(i) = index {
                             if at < i {
@@ -1205,7 +1209,6 @@ fn run(
                 }
                 PlayerCommand::Move(from, to) => {
                     if from < queue.len() && to < queue.len() {
-                        let current = index.and_then(|i| queue.get(i)).map(|t| t.id.clone());
                         base_position = if started {
                             position(&clock)
                         } else {
@@ -1213,7 +1216,20 @@ fn run(
                         };
                         let track = queue.remove(from);
                         queue.insert(to, track);
-                        index = current.and_then(|id| queue.iter().position(|t| t.id == id));
+                        if let Some(original) = original.as_mut() {
+                            original.move_entry(from, to);
+                        }
+                        index = index.map(|i| {
+                            if i == from {
+                                to
+                            } else if from < i && i <= to {
+                                i - 1
+                            } else if to <= i && i < from {
+                                i + 1
+                            } else {
+                                i
+                            }
+                        });
                         restart |= started;
                     }
                 }
@@ -1308,12 +1324,13 @@ fn run(
                     reset_queue_edits = shuffled || unshuffled;
                     let replanned = shuffled || unshuffled || prefs.repeat != value.repeat;
                     if shuffled && let Some(i) = index {
-                        original = Some(queue.clone());
-                        queue[i + 1..].shuffle(&mut rand::rng());
+                        let mut order = ShuffleOrder::new(queue.len());
+                        order.shuffle(&mut queue, i + 1);
+                        original = Some(order);
                         queue_dirty = true;
                     }
                     if unshuffled && let Some(order) = original.take() {
-                        (queue, index) = unshuffle(std::mem::take(&mut queue), &order, index);
+                        (queue, index) = order.restore(std::mem::take(&mut queue), index);
                         queue_dirty = true;
                     }
                     prefs = value;
@@ -1376,9 +1393,15 @@ fn run(
                 let clock = clock.clone();
                 let errors = error_tx.clone();
                 let runtime = runtime.clone();
-                std::thread::Builder::new()
-                    .name("sonora-decoder".into())
-                    .spawn(move || decode_queue(request, tx, clock, errors, runtime))?;
+                match &platform {
+                    #[cfg(feature = "test-support")]
+                    PlaybackPlatform::Scripted(requests) => requests.send(request)?,
+                    _ => {
+                        std::thread::Builder::new()
+                            .name("sonora-decoder".into())
+                            .spawn(move || decode_queue(request, tx, clock, errors, runtime))?;
+                    }
+                }
                 started = true;
                 error = None;
             } else {
@@ -1500,6 +1523,7 @@ fn run(
         }
         clock.cancel_stale_downloads();
         if clock.finished.swap(false, Ordering::AcqRel) {
+            listen_seed = None;
             clock.playing.store(false, Ordering::Relaxed);
             clock.buffering.store(false, Ordering::Relaxed);
             started = false;
@@ -1574,6 +1598,7 @@ fn run(
                 SavedQueue {
                     listen: tracker.session(listen_seed),
                     ids: queue.iter().map(|t| t.id.clone()).collect(),
+                    shuffle_positions: original.as_ref().map(ShuffleOrder::saved_positions),
                     index,
                     position: if started {
                         position(&clock)
@@ -2022,6 +2047,20 @@ mod tests {
     }
 
     #[test]
+    fn unshuffle_without_a_valid_current_entry_keeps_no_current_entry() {
+        let original = tracks(2);
+        for index in [None, Some(2)] {
+            let (queue, current) =
+                ShuffleOrder::new(original.len()).restore(original.clone(), index);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(current, None);
+            let (queue, current) = ShuffleOrder::new(0).restore(Vec::new(), index);
+            assert!(queue.is_empty());
+            assert_eq!(current, None);
+        }
+    }
+
+    #[test]
     fn unshuffle_restores_original_order_and_keeps_later_edits() {
         let original = tracks(5);
         let ids = |queue: &[Arc<Track>]| queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
@@ -2035,7 +2074,7 @@ mod tests {
             id: "added".into(),
             ..Default::default()
         });
-        shuffled.push(added.clone());
+        shuffled.push(added);
         let updated = Arc::new(Track {
             id: "4".into(),
             title: "Updated".into(),
@@ -2043,10 +2082,10 @@ mod tests {
         });
         shuffled[1] = updated.clone();
         // Track 1 was removed while shuffled; the added track was appended.
-        let mut order = original;
-        order.remove(1);
-        order.push(added);
-        let (queue, index) = unshuffle(shuffled, &order, Some(1));
+        let mut order = ShuffleOrder::new(original.len());
+        order.reorder(&[2, 4, 0, 3]);
+        order.insert(4, 1, true);
+        let (queue, index) = order.restore(shuffled, Some(1));
         assert_eq!(ids(&queue), ["0", "2", "3", "4", "added"]);
         assert_eq!(index, Some(3));
         assert!(Arc::ptr_eq(&queue[3], &updated));
@@ -2162,6 +2201,19 @@ mod tests {
         };
         assert_eq!(replay_gain(Some(&hot), &GainMode::Track), 0.5);
         assert_eq!(replay_gain(None, &GainMode::Album), 1.);
+    }
+
+    #[test]
+    fn replay_gain_stays_bounded_for_absurd_tags_without_peak() {
+        let tags = |db| ReplayGain {
+            track_gain: Some(db),
+            ..Default::default()
+        };
+        let loud = replay_gain(Some(&tags(1000.)), &GainMode::Track);
+        let quiet = replay_gain(Some(&tags(-1000.)), &GainMode::Track);
+        assert!((loud - 1000.).abs() < 0.01, "+1000 dB gave {loud}");
+        assert!((quiet - 0.001).abs() < 1e-6, "-1000 dB gave {quiet}");
+        assert_eq!(0. * loud, 0., "silence must stay silent");
     }
 
     #[test]

@@ -1,4 +1,8 @@
 use rodio::{Decoder, Source};
+use sonora::{
+    model::{GainMode, ReplayGain},
+    playback::replay_gain,
+};
 use std::{fs::File, time::Duration};
 
 fn decode(path: &str) -> Vec<f32> {
@@ -53,5 +57,21 @@ fn flac_and_mp3_are_seekable() {
             .unwrap();
         decoder.try_seek(Duration::from_millis(50)).unwrap();
         assert!(decoder.next().is_some());
+    }
+}
+#[test]
+fn absurd_replay_gain_without_peak_keeps_decoded_samples_finite() {
+    let samples = decode("tests/fixtures/tone-0.flac");
+    for db in [1000., -1000.] {
+        let tags = ReplayGain {
+            track_gain: Some(db),
+            ..Default::default()
+        };
+        let gain = replay_gain(Some(&tags), &GainMode::Track);
+        assert!(gain.is_finite() && gain > 0., "{db} dB gave gain {gain}");
+        assert!(
+            samples.iter().all(|v| (v * gain).is_finite()),
+            "{db} dB produced non-finite samples"
+        );
     }
 }

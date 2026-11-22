@@ -1,0 +1,15 @@
+{
+  "id": "mix",
+  "name": "夜の散歩",
+  "comment": "Offline favorites",
+  "owner": "listener",
+  "readonly": true,
+  "validUntil": "2030-01-02T03:04:05Z",
+  "songCount": 2,
+  "duration": 360.5,
+  "coverArt": "cover-mix",
+  "entry": [
+    {"id": "song", "title": "Quiet", "albumId": "album", "artist": "青葉市子", "duration": 180.25, "track": 2, "year": 2024, "suffix": "flac"},
+    {"id": "song", "title": "Quiet", "albumId": "album", "artist": "青葉市子", "duration": 180.25, "track": 2, "year": 2024, "suffix": "flac"}
+  ]
+}

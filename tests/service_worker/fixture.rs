@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, RawQuery, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -22,6 +22,148 @@ use std::{
 };
 
 pub const WAIT: Duration = Duration::from_secs(5);
+
+pub struct Native {
+    pub renewal_gate: Option<flume::Receiver<()>>,
+    renewals: usize,
+    pub login_gate: Option<flume::Receiver<()>>,
+    pub rules: Option<Value>,
+    pub reject_token: bool,
+    pub refresh: Option<String>,
+    pub failure: Option<StatusCode>,
+    pub redirect: Option<String>,
+    token: String,
+    logins: usize,
+    requests: Vec<(Method, String, Value)>,
+}
+
+impl Default for Native {
+    fn default() -> Self {
+        Self {
+            renewal_gate: None,
+            renewals: 0,
+            login_gate: None,
+            rules: Some(json!({"all":[{"is":{"genre":"Jazz"}}],"sort":"random"})),
+            reject_token: false,
+            refresh: None,
+            failure: None,
+            redirect: None,
+            token: "native-initial".into(),
+            logins: 0,
+            requests: vec![],
+        }
+    }
+}
+
+async fn native(
+    State(state): State<ServerState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let renewal = uri.path() == "/api/keepalive/session";
+    if renewal {
+        let gate = {
+            let mut data = state.data.lock().unwrap();
+            data.library.native.renewals += 1;
+            data.library.native.renewal_gate.clone()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.recv_async().await;
+        }
+    }
+    if uri.path() == "/auth/login" {
+        let gate = state.data.lock().unwrap().library.native.login_gate.clone();
+        if let Some(gate) = gate {
+            let _ = gate.recv_async().await;
+        }
+    }
+    let mut data = state.data.lock().unwrap();
+    let body: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    let native = &mut data.library.native;
+    if uri.path() == "/auth/login" {
+        native.logins += 1;
+        if method != Method::POST
+            || body != json!({"username":"fixture","password":"native-password"})
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        native.reject_token = false;
+        return Json(json!({"token":native.token})).into_response();
+    }
+    if !renewal {
+        native
+            .requests
+            .push((method.clone(), uri.path().into(), body.clone()));
+    }
+    if native.reject_token
+        || headers
+            .get("x-nd-authorization")
+            .and_then(|v| v.to_str().ok())
+            != Some(format!("Bearer {}", native.token).as_str())
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(status) = native.failure {
+        return (status, "untrusted server text must not reach the user").into_response();
+    }
+    if let Some(location) = &native.redirect {
+        return (StatusCode::FOUND, [("location", location.as_str())]).into_response();
+    }
+    let refresh = native.refresh.take();
+    if let Some(token) = &refresh {
+        native.token = token.clone();
+    }
+    let id = uri.path().strip_prefix("/api/playlist/").unwrap_or("smart");
+    let mut response = match method {
+        Method::GET if renewal => Json(json!({"response":"ok","id":"keepalive"})).into_response(),
+        Method::GET => {
+            Json(json!({"id":id,"name":"Smart","ownerId":"fixture","rules":native.rules}))
+                .into_response()
+        }
+        Method::POST | Method::PUT => {
+            let valid = if uri.path() == "/api/playlist" {
+                method == Method::POST && body.get("public") == Some(&json!(false))
+            } else {
+                method == Method::PUT
+                    && body.get("public").is_none()
+                    && body.get("comment").is_none()
+            };
+            if !valid || !body["name"].is_string() || !body["rules"].is_object() {
+                data.unexpected.push("invalid native playlist body");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            data.library.native.rules = Some(body["rules"].clone());
+            let track = data.library.tracks[0].clone();
+            data.library.playlists = vec![Playlist {
+                id: id.into(),
+                name: body["name"].as_str().unwrap().into(),
+                owner: "fixture".into(),
+                readonly: true,
+                valid_until: Some("2999-01-01T00:00:00Z".into()),
+                song_count: 1,
+                entry: vec![Arc::new(track)].into(),
+                ..Playlist::default()
+            }];
+            Json(json!({"id":id})).into_response()
+        }
+        _ => {
+            data.unexpected.push("invalid native playlist method");
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        }
+    };
+    if let Some(token) = refresh {
+        response
+            .headers_mut()
+            .insert("x-nd-authorization", token.parse().unwrap());
+    }
+    response
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -52,16 +194,23 @@ impl Request {
 pub type ChartEntry = (&'static str, &'static str, u64);
 
 pub struct Library {
+    pub server_type: &'static str,
+    pub native: Native,
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
     pub fail_song_offset: Option<usize>,
+    pub sync_response: Option<(&'static str, Value)>,
+    pub playlists_response: Option<Value>,
+    pub playlist_response: Option<Value>,
+    pub scan_status_responses: VecDeque<Value>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
     pub offline: bool,
     pub hold_sync: bool,
     pub hold_scrobble: bool,
+    pub hold_playlist_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
@@ -82,16 +231,23 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         Self {
+            server_type: "Navidrome",
+            native: Native::default(),
             tracks: vec![song("song", "album"), song("other-song", "other-album")],
             albums: vec![album("album"), album("other-album")],
             playlists: vec![],
             fail_song_offset: None,
+            sync_response: None,
+            playlists_response: None,
+            playlist_response: None,
+            scan_status_responses: VecDeque::new(),
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
             offline: false,
             hold_sync: false,
             hold_scrobble: false,
+            hold_playlist_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
@@ -145,6 +301,7 @@ struct ServerState {
     metadata_gate: flume::Receiver<()>,
     sync_gate: flume::Receiver<()>,
     scrobble_gate: flume::Receiver<()>,
+    playlist_gate: flume::Receiver<()>,
 }
 
 impl ServerState {
@@ -241,17 +398,21 @@ async fn navidrome(
         song_ids,
     };
     state.record(request.clone());
-    let (offline, hold_sync, hold_scrobble, fail_artwork) = {
+    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_playlist) = {
         let data = state.data.lock().unwrap();
         (
             data.library.offline,
             data.library.hold_sync,
             data.library.hold_scrobble,
             data.library.fail_artwork,
+            data.library.hold_playlist_endpoint == Some(endpoint.as_str()),
         )
     };
     if offline {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if hold_playlist {
+        let _ = state.playlist_gate.recv_async().await;
     }
     if endpoint == "getScanStatus.view" && hold_sync {
         let _ = state.sync_gate.recv_async().await;
@@ -293,14 +454,18 @@ async fn navidrome(
     let mut data = state.data.lock().unwrap();
     let body = match endpoint.as_str() {
         "ping.view" if query.is_empty() => {
-            json!({"status":"ok","type":"Navidrome","serverVersion":"fixture"})
+            json!({"status":"ok","type":data.library.server_type,"serverVersion":"fixture"})
         }
         "getOpenSubsonicExtensions.view" if query.is_empty() => {
             json!({"status":"ok","openSubsonicExtensions":[]})
         }
-        "getScanStatus.view" if query.is_empty() => {
-            json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}})
-        }
+        "getScanStatus.view" if query.is_empty() => data
+            .library
+            .scan_status_responses
+            .pop_front()
+            .unwrap_or_else(
+                || json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}}),
+            ),
         "startScan.view" if query.is_empty() && data.library.scan_admin => {
             json!({"status":"ok","scanStatus":{"scanning":false}})
         }
@@ -308,10 +473,15 @@ async fn navidrome(
             json!({"status":"failed","error":{"code":50,"message":"Not an administrator"}})
         }
         "getPlaylists.view" if query.is_empty() => {
-            json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
+            data.library.playlists_response.clone().unwrap_or_else(
+                || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),
+            )
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
+        }
+        "getPlaylist.view" if let Some(response) = &data.library.playlist_response => {
+            response.clone()
         }
         "getPlaylist.view" => {
             let playlist = data
@@ -458,6 +628,10 @@ async fn navidrome(
             let offset = offset.unwrap();
             if kind == "song" && data.library.fail_song_offset == Some(offset) {
                 json!({"status":"failed","error":{"code":70,"message":"Fixture later page failed"}})
+            } else if let Some((field, response)) = &data.library.sync_response
+                && kind == *field
+            {
+                response.clone()
             } else {
                 let items = if kind == "song" {
                     serde_json::to_value(
@@ -740,6 +914,7 @@ pub struct Fixture {
     release_metadata: flume::Sender<()>,
     release_sync: flume::Sender<()>,
     release_scrobble: flume::Sender<()>,
+    release_playlist: flume::Sender<()>,
     finished: flume::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -770,6 +945,7 @@ impl Fixture {
         let (release_metadata, metadata_gate) = flume::bounded(1);
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
+        let (release_playlist, playlist_gate) = flume::unbounded();
         let state = ServerState {
             data: Arc::new(Mutex::new(StateData {
                 library,
@@ -781,8 +957,13 @@ impl Fixture {
             metadata_gate,
             sync_gate,
             scrobble_gate,
+            playlist_gate,
         };
         let app = Router::new()
+            .route("/auth/login", any(native))
+            .route("/api/keepalive/session", any(native))
+            .route("/api/playlist", any(native))
+            .route("/api/playlist/{id}", any(native))
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/lastfm/", any(lastfm))
@@ -818,6 +999,7 @@ impl Fixture {
             release_metadata,
             release_sync,
             release_scrobble,
+            release_playlist,
             finished,
             thread: Some(thread),
         }
@@ -831,6 +1013,25 @@ impl Fixture {
                 .join(format!("{}.sqlite", self.account.namespace())),
         )
         .unwrap()
+    }
+
+    pub fn native_requests(&self) -> Vec<(Method, String, Value)> {
+        self.state
+            .data
+            .lock()
+            .unwrap()
+            .library
+            .native
+            .requests
+            .clone()
+    }
+
+    pub fn native_login_count(&self) -> usize {
+        self.state.data.lock().unwrap().library.native.logins
+    }
+
+    pub fn native_renewal_count(&self) -> usize {
+        self.state.data.lock().unwrap().library.native.renewals
     }
 
     pub fn seed(&self) {
@@ -909,11 +1110,17 @@ impl Fixture {
         let _ = self.release_scrobble.send(());
     }
 
+    pub fn resume_playlist(&self) {
+        self.edit_library(|library| library.hold_playlist_endpoint = None);
+        let _ = self.release_playlist.send(());
+    }
+
     fn stop(&mut self) {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
             self.resume_scrobble();
+            self.resume_playlist();
             let _ = self.stop.try_send(());
             self.finished
                 .recv_timeout(WAIT)

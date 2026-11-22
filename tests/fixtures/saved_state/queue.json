@@ -1,0 +1,14 @@
+{
+  "ids": ["song", "other-song", "song"],
+  "index": 2,
+  "position": 23.5,
+  "listen": {
+    "id": 42,
+    "account": "saved-account",
+    "track_id": "song",
+    "started_ms": 1700000000000,
+    "played_seconds": 19.25,
+    "submitted": false,
+    "announced": true
+  }
+}

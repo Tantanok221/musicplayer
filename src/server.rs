@@ -15,6 +15,9 @@ use std::{
 };
 use url::Url;
 
+mod native;
+pub use native::NativeError;
+
 fn prepare_account(mut account: Account) -> Result<Account> {
     let mut url = Url::parse(account.url.trim())
         .context("Enter a complete server URL, including https://")?;
@@ -43,6 +46,8 @@ pub struct Server {
     // Never derive Debug: credentials and authenticated URLs must stay out of logs.
     credentials: ServerCredentials,
     http: reqwest::Client,
+    native_http: reqwest::Client,
+    pub is_navidrome: bool,
     pub extensions: HashSet<String>,
 }
 
@@ -67,6 +72,13 @@ impl Server {
                 .timeout(Duration::from_secs(60))
                 .build()?,
             extensions: HashSet::new(),
+            native_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            is_navidrome: false,
         })
     }
 
@@ -147,6 +159,9 @@ impl Server {
     }
     pub async fn connect(&mut self) -> Result<String> {
         let info = self.request("ping", &[]).await?;
+        self.is_navidrome = info["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("navidrome"));
         if let Ok(response) = self.request("getOpenSubsonicExtensions", &[]).await
             && let Some(items) = response["openSubsonicExtensions"].as_array()
         {
@@ -183,11 +198,14 @@ impl Server {
         };
         params.push((key, offset.to_string()));
         let response = self.request("search3", &params).await?;
-        Ok(response["searchResult3"][kind]
-            .as_array()
-            .cloned()
-            .map(Value::Array)
-            .unwrap_or_else(|| json!([])))
+        let Some(result) = response.get("searchResult3").and_then(Value::as_object) else {
+            bail!("Invalid search3 {kind} response: expected a searchResult3 object");
+        };
+        match result.get(kind) {
+            None | Some(Value::Null) => Ok(json!([])),
+            Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
+            _ => bail!("Invalid search3 {kind} list: expected an array"),
+        }
     }
     /// Fetches every page of `kind` and hands each to `handle` in order, keeping
     /// up to `ahead` requests in flight so the library syncs without waiting on
@@ -238,9 +256,9 @@ impl Server {
     }
     pub async fn scan_status(&self) -> Result<bool> {
         let response = self.request("getScanStatus", &[]).await?;
-        Ok(response["scanStatus"]["scanning"]
+        response["scanStatus"]["scanning"]
             .as_bool()
-            .unwrap_or(false))
+            .context("Invalid getScanStatus response: expected a boolean scanning state")
     }
     /// Asks the server to look for new files. Only administrators may.
     pub async fn start_scan(&self) -> Result<()> {
@@ -272,17 +290,46 @@ impl Server {
     }
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let response = self.request("getPlaylists", &[]).await?;
-        Ok(serde_json::from_value(
-            response["playlists"]["playlist"]
-                .as_array()
-                .cloned()
-                .map(Value::Array)
-                .unwrap_or_else(|| json!([])),
-        )?)
+        let Some(playlists) = response.get("playlists").and_then(Value::as_object) else {
+            bail!("Invalid getPlaylists response: expected a playlists object");
+        };
+        match playlists.get("playlist") {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => {
+                let mut ids = HashSet::new();
+                for item in items {
+                    let Some(id) = item["id"].as_str().filter(|id| !id.trim().is_empty()) else {
+                        bail!("Invalid getPlaylists playlist entry: missing ID");
+                    };
+                    if !ids.insert(id) {
+                        bail!("Invalid getPlaylists playlist entry: duplicate ID");
+                    }
+                }
+                serde_json::from_value(Value::Array(items.clone()))
+                    .context("Invalid getPlaylists playlist entry")
+            }
+            _ => bail!("Invalid getPlaylists playlist list: expected an array"),
+        }
     }
     pub async fn playlist(&self, id: &str) -> Result<Playlist> {
-        self.value("getPlaylist", &[("id", id.into())], "playlist")
-            .await
+        let response = self.request("getPlaylist", &[("id", id.into())]).await?;
+        let value = &response["playlist"];
+        if value["id"].as_str() != Some(id) || value["songCount"].as_u64().is_none() {
+            bail!("Invalid getPlaylist response: expected the requested playlist and song count");
+        }
+        let playlist: Playlist =
+            serde_json::from_value(value.clone()).context("Invalid getPlaylist playlist entry")?;
+        if playlist.entry.len() != playlist.song_count as usize {
+            bail!("Invalid getPlaylist response: entry count does not match song count");
+        }
+        if playlist
+            .entry
+            .iter()
+            .any(|track| track.id.trim().is_empty())
+        {
+            bail!("Invalid getPlaylist response: playlist track is missing an ID");
+        }
+        Ok(playlist)
     }
     pub async fn create_playlist(&self, name: &str, ids: &[String]) -> Result<()> {
         let mut params = vec![("name", name.into())];

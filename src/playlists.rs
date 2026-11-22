@@ -2,7 +2,37 @@ use crate::{
     model::{Playlist, Track, normalize},
     service::Mutation,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlaylistView {
+    #[default]
+    Tracks,
+    Albums,
+}
+
+/// An album's playlist occurrences, in their original order (including duplicates).
+#[derive(Clone)]
+pub struct PlaylistAlbum {
+    pub key: String,
+    pub track: Arc<Track>,
+    pub entries: Vec<usize>,
+}
+
+fn album_key(track: &Track) -> String {
+    if track.album_id.is_empty() {
+        // Some servers omit album IDs; do not combine unrelated artists' albums.
+        format!(
+            "metadata:{:?}",
+            (
+                normalize(track.album_artist_label()),
+                normalize(&track.album)
+            )
+        )
+    } else {
+        format!("id:{}", track.album_id)
+    }
+}
 
 pub fn is_smart(playlist: &Playlist, username: Option<&str>) -> bool {
     playlist.readonly
@@ -31,17 +61,23 @@ pub struct Playlists {
     summaries: Vec<Playlist>,
     current: Option<Playlist>,
     search: String,
+    view: PlaylistView,
+    expanded_album: Option<String>,
 }
 
 impl Playlists {
     pub fn open(&mut self, summary: Playlist) -> String {
         let id = summary.id.clone();
+        if self.current.as_ref().is_none_or(|current| current.id != id) {
+            self.expanded_album = None;
+        }
         self.current = Some(summary);
         id
     }
 
     pub fn close(&mut self) {
         self.current = None;
+        self.expanded_album = None;
     }
 
     pub fn summaries_loaded(&mut self, summaries: Vec<Playlist>) {
@@ -79,6 +115,42 @@ impl Playlists {
     }
     pub fn current(&self) -> Option<&Playlist> {
         self.current.as_ref()
+    }
+
+    pub fn view(&self) -> PlaylistView {
+        self.view
+    }
+
+    pub fn set_view(&mut self, view: PlaylistView) {
+        self.view = view;
+    }
+
+    pub fn expanded_album(&self) -> Option<&str> {
+        self.expanded_album.as_deref()
+    }
+
+    pub fn toggle_album(&mut self, key: String) {
+        self.expanded_album = (self.expanded_album.as_ref() != Some(&key)).then_some(key);
+    }
+
+    /// Group only the matching playlist entries, never the rest of a library album.
+    /// Album order is first occurrence, not the explorer's sort order.
+    pub fn visible_albums(&self) -> Vec<PlaylistAlbum> {
+        let mut albums: Vec<PlaylistAlbum> = Vec::new();
+        let mut positions = HashMap::new();
+        for (index, track) in self.visible_entries() {
+            let key = album_key(&track);
+            let position = *positions.entry(key.clone()).or_insert_with(|| {
+                albums.push(PlaylistAlbum {
+                    key,
+                    track,
+                    entries: Vec::new(),
+                });
+                albums.len() - 1
+            });
+            albums[position].entries.push(index);
+        }
+        albums
     }
     pub fn summaries(&self) -> &[Playlist] {
         &self.summaries
@@ -197,6 +269,66 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_groups_keep_first_occurrence_order_and_search_indices() {
+        let mut state = Playlists::default();
+        let make = |id: &str, album_id: &str, artist: &str| {
+            Arc::new(Track {
+                id: id.into(),
+                album_id: album_id.into(),
+                album: "Same title".into(),
+                album_artist: artist.into(),
+                title: id.into(),
+                ..Default::default()
+            })
+        };
+        state.open(Playlist {
+            entry: Arc::new(vec![
+                make("b", "release-b", "Artist"),
+                make("a", "release-a", "Artist"),
+                make("b", "release-b", "Artist"),
+                make("c", "", "First"),
+                make("d", "", "Second"),
+            ]),
+            ..playlist(&[])
+        });
+        let albums = state.visible_albums();
+        assert_eq!(albums.len(), 4);
+        assert_eq!(albums[0].entries, [0, 2]);
+        assert_eq!(albums[1].entries, [1]);
+        assert_ne!(albums[2].key, albums[3].key);
+        state.set_search("b".into());
+        assert_eq!(state.visible_albums().len(), 1);
+        assert_eq!(state.visible_albums()[0].entries, [0, 2]);
+        state.set_search("missing".into());
+        assert!(state.visible_albums().is_empty());
+    }
+
+    #[test]
+    fn album_expansion_toggles_and_clears_when_switching_playlists() {
+        let mut state = Playlists::default();
+        assert!(state.view() == PlaylistView::Tracks);
+        state.open(playlist(&["a"]));
+        state.set_view(PlaylistView::Albums);
+        state.toggle_album("album".into());
+        assert_eq!(state.expanded_album(), Some("album"));
+        state.set_view(PlaylistView::Tracks);
+        state.set_view(PlaylistView::Albums);
+        assert_eq!(state.expanded_album(), Some("album"));
+        state.toggle_album("album".into());
+        assert_eq!(state.expanded_album(), None);
+        state.toggle_album("album".into());
+        let mut other = playlist(&["b"]);
+        other.id = "other".into();
+        state.open(other);
+        assert_eq!(state.expanded_album(), None);
+        assert!(state.view() == PlaylistView::Albums);
+        state.detail_loaded(playlist(&["a"]));
+        assert_eq!(state.current().unwrap().entry[0].id, "b");
+        state.close();
+        assert!(state.visible_albums().is_empty());
+    }
 
     #[test]
     fn ownership_ignores_readonly_but_requires_empty_or_matching_owner() {
