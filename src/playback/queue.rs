@@ -133,14 +133,14 @@ impl QueueEdits {
         self.revision += 1;
         true
     }
-    pub fn update_track(&mut self, track: &Arc<Track>) {
+    pub fn retag(&mut self, old: &str, track: &Arc<Track>) {
         if let Some(undo) = self.undo.as_mut() {
             for queued in undo
                 .tracks
                 .iter_mut()
                 .chain(undo.original.iter_mut().flatten())
             {
-                if queued.id == track.id {
+                if queued.id == old {
                     *queued = track.clone();
                 }
             }
@@ -248,7 +248,7 @@ mod tests {
             title: "Updated".into(),
             ..Default::default()
         });
-        edits.update_track(&updated);
+        edits.retag(&updated.id, &updated);
         let mut current = Some(1);
         assert!(edits.undo(&mut queue, &mut original, &mut current));
         assert_eq!(current, Some(1));

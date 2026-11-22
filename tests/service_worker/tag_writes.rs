@@ -2,6 +2,7 @@
 use crate::fixture::{Fixture, Library, Request, event, synced};
 use sonora::{
     model::{MetadataPreferences, Preferences, Track},
+    playback::PlayerCommand,
     service::{Command, Event, Mutation},
     tags::{EditValue, TagEdit, TagField, TagReport, read},
 };
@@ -162,6 +163,53 @@ fn refuses_when_off_or_the_file_is_not_in_the_folder() {
     assert!(report(&worker).failures[0].1.contains("no tag edit"));
     assert_eq!(std::fs::read(folder.file()).unwrap(), original);
     assert_eq!(scans(&fixture), 0);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn the_queued_song_picks_up_the_rescanned_tags_and_new_id() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, true));
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    enable(&worker, &folder);
+    worker
+        .service()
+        .send(Command::Player(PlayerCommand::Restore(
+            fixture.catalog().by_ids(&["song".into()]).unwrap(),
+            0,
+            5.,
+            None,
+        )));
+    event(
+        &worker,
+        |e| matches!(e, Event::Playback(s) if s.track.as_ref().is_some_and(|t| t.id == "song")),
+    );
+    fixture.edit_library(|library| {
+        library.tracks[0] = Track {
+            id: "song-new".into(),
+            title: "New title".into(),
+            ..library.tracks[0].clone()
+        };
+    });
+    worker
+        .service()
+        .send(Command::WriteTags(retitle("New title")));
+    assert_eq!(report(&worker).written, 1);
+    event(
+        &worker,
+        |e| matches!(e, Event::TrackUpdated(t) if t.id == "song-new" && t.title == "New title"),
+    );
+    let Event::Playback(snapshot) = event(
+        &worker,
+        |e| matches!(e, Event::Playback(s) if s.track.as_ref().is_some_and(|t| t.id == "song-new")),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(snapshot.track.unwrap().title, "New title");
+    let queued: Vec<_> = snapshot.queue.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(queued, ["song-new"]);
     worker.shutdown(crate::fixture::WAIT).unwrap();
     fixture.finish();
 }

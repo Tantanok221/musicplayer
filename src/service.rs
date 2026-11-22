@@ -417,9 +417,14 @@ fn finish_tag_job(
 
 /// After a complete sync, finds each written file by path and, when the
 /// rescan gave it a new ID, carries its favorite and rating over.
-fn reconcile_tags(catalog: &Catalog) -> Result<Vec<Mutation>> {
+/// Confirms written edits Navidrome has rescanned. Returns annotations to
+/// carry over to new IDs, and each rescanned song with the ID it had before.
+type Reconciled = (Vec<Mutation>, Vec<(String, Arc<Track>)>);
+
+fn reconcile_tags(catalog: &Catalog) -> Result<Reconciled> {
     use crate::tags::EditState;
     let mut mutations = Vec::new();
+    let mut rescanned_tracks = Vec::new();
     for entry in catalog.unconfirmed_tag_edits()? {
         let Some(track) = catalog.track_by_path(&entry.path)? else {
             continue;
@@ -443,8 +448,9 @@ fn reconcile_tags(catalog: &Catalog) -> Result<Vec<Mutation>> {
             }
         }
         catalog.finish_tag_edit(entry.id, None, EditState::Confirmed)?;
+        rescanned_tracks.push((entry.track_id, track));
     }
-    Ok(mutations)
+    Ok((mutations, rescanned_tracks))
 }
 
 fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
@@ -1273,8 +1279,17 @@ fn run(
                         }
                         catalog.save_playlist_summaries(&playlists, can_delete)?;
                         if can_delete {
-                            for mutation in reconcile_tags(&catalog)? {
+                            let (mutations, rescanned) = reconcile_tags(&catalog)?;
+                            for mutation in mutations {
                                 tx.send(Command::Mutate(mutation))?;
+                            }
+                            for (old, track) in rescanned {
+                                player.send(if old == track.id {
+                                    PlayerCommand::UpdateTrack(track.clone())
+                                } else {
+                                    PlayerCommand::RetagTrack(old, track.clone())
+                                });
+                                events.send(Event::TrackUpdated(track))?;
                             }
                         }
                         syncing = false;
