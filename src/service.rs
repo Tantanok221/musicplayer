@@ -172,7 +172,7 @@ pub enum Command {
     /// Release ID: fetches its tracks for matching.
     LoadRelease(String),
     /// Fingerprints the song's file and asks AcoustID which recording it is.
-    IdentifyBySound(Track),
+    IdentifyBySound(Box<Track>),
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),

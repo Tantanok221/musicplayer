@@ -39,7 +39,7 @@ impl ReleaseQuery {
                 artist: artist.clone(),
                 tracks: 0,
                 title: song.title.clone(),
-                length_ms: (song.duration > 0.).then(|| (song.duration * 1000.) as u64),
+                length_ms: (song.duration > 0.).then_some((song.duration * 1000.) as u64),
                 ..Default::default()
             };
         }

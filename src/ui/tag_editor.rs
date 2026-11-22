@@ -209,7 +209,8 @@ impl MusicApp {
             return;
         };
         editor.lookup = Lookup::Identifying(track.id.clone());
-        self.service.send(Command::IdentifyBySound(track.clone()));
+        self.service
+            .send(Command::IdentifyBySound(Box::new(track.clone())));
         cx.notify();
     }
 

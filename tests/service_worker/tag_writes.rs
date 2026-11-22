@@ -410,12 +410,14 @@ fn identify_by_sound_fingerprints_the_file_and_asks_acoustid() {
             },
             ..Default::default()
         }));
-        worker.service().send(Command::IdentifyBySound(Track {
-            id: "song".into(),
-            path: PATH.into(),
-            duration: 2.,
-            ..Default::default()
-        }));
+        worker
+            .service()
+            .send(Command::IdentifyBySound(Box::new(Track {
+                id: "song".into(),
+                path: PATH.into(),
+                duration: 2.,
+                ..Default::default()
+            })));
         let Event::SoundIdentified(id, result) =
             event(&worker, |event| matches!(event, Event::SoundIdentified(..)))
         else {
