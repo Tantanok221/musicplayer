@@ -1,6 +1,6 @@
 //! Production paused actor, with no audio-device or OS media-control adapters.
 use sonora::{
-    model::{PlaybackSnapshot, Track},
+    model::{PlaybackSnapshot, Preferences, Track},
     playback::{
         Placement, PlayerCommand, QueueEdit,
         test_support::{OutputPlayer, PausedPlayer},
@@ -29,6 +29,52 @@ fn ids(snapshot: &PlaybackSnapshot) -> Vec<&str> {
         .iter()
         .map(|track| track.id.as_str())
         .collect()
+}
+
+#[test]
+fn unshuffle_after_track_update_keeps_later_duplicate_current() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    let initial = player
+        .command(
+            PlayerCommand::Restore(
+                tracks(&["same", "middle", "same", "next", "last"]),
+                2,
+                17.,
+                None,
+            ),
+            WAIT,
+        )
+        .unwrap();
+    player
+        .command(
+            PlayerCommand::Preferences(Preferences {
+                shuffle: true,
+                ..Default::default()
+            }),
+            WAIT,
+        )
+        .unwrap();
+    let updated = player
+        .command(
+            PlayerCommand::UpdateTrack(Arc::new(Track {
+                id: "same".into(),
+                title: "Fresh metadata".into(),
+                duration: 120.,
+                ..Default::default()
+            })),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(updated.index, Some(2));
+    let restored = player
+        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .unwrap();
+    assert_eq!(restored.index, Some(2));
+    assert_eq!(ids(&restored), ids(&initial));
+    assert_eq!(restored.position, 17.);
+    assert_eq!(restored.queue[0].title, "Fresh metadata");
+    assert_eq!(restored.queue[2].title, "Fresh metadata");
+    player.shutdown(WAIT).unwrap();
 }
 
 #[test]

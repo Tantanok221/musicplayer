@@ -638,26 +638,24 @@ fn unshuffle(
     original: &[Arc<Track>],
     index: Option<usize>,
 ) -> (Vec<Arc<Track>>, Option<usize>) {
-    let current = index.and_then(|i| queue.get(i)).cloned();
-    let mut pool: HashMap<&str, VecDeque<&Arc<Track>>> = HashMap::new();
-    for track in &queue {
-        pool.entry(&track.id).or_default().push_back(track);
+    let mut pool: HashMap<&str, VecDeque<(usize, &Arc<Track>)>> = HashMap::new();
+    for (i, track) in queue.iter().enumerate() {
+        pool.entry(&track.id).or_default().push_back((i, track));
     }
     let mut ordered = Vec::with_capacity(queue.len());
+    let mut current = None;
     for track in original.iter().chain(&queue) {
-        if let Some(entry) = pool
+        if let Some((i, entry)) = pool
             .get_mut(track.id.as_str())
             .and_then(VecDeque::pop_front)
         {
+            if Some(i) == index {
+                current = Some(ordered.len());
+            }
             ordered.push(entry.clone());
         }
     }
-    let index = current.and_then(|current| {
-        ordered
-            .iter()
-            .position(|track| Arc::ptr_eq(track, &current))
-    });
-    (ordered, index)
+    (ordered, current)
 }
 
 struct DecodeRequest {
@@ -2008,6 +2006,19 @@ mod tests {
         assert_eq!(insertion_point(&queue, None, Placement::Last), 5);
         let loose = vec![album("x", ""), album("y", "")];
         assert_eq!(insertion_point(&loose, Some(0), Placement::AfterAlbum), 1);
+    }
+
+    #[test]
+    fn unshuffle_without_a_valid_current_entry_keeps_no_current_entry() {
+        let original = tracks(2);
+        for index in [None, Some(2)] {
+            let (queue, current) = unshuffle(original.clone(), &original, index);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(current, None);
+            let (queue, current) = unshuffle(Vec::new(), &original, index);
+            assert!(queue.is_empty());
+            assert_eq!(current, None);
+        }
     }
 
     #[test]
