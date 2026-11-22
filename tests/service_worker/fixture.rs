@@ -57,6 +57,7 @@ pub struct Library {
     pub playlists: Vec<Playlist>,
     pub fail_song_offset: Option<usize>,
     pub sync_list: Option<(&'static str, Value)>,
+    pub playlists_response: Option<Value>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
@@ -86,6 +87,7 @@ impl Default for Library {
             playlists: vec![],
             fail_song_offset: None,
             sync_list: None,
+            playlists_response: None,
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
@@ -300,7 +302,7 @@ async fn navidrome(
             json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}})
         }
         "getPlaylists.view" if query.is_empty() => {
-            json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
+            json!({"status":"ok","playlists":data.library.playlists_response.clone().unwrap_or_else(|| json!({"playlist":data.library.playlists}))})
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
