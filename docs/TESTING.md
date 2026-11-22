@@ -40,6 +40,7 @@ worker suite to expose flaky timing.
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
+| Catalog schema upgrades (frozen v1 data and schema drift guard) | | `catalog` | `tests/catalog.rs` (`frozen_v1_`), `tests/fixtures/catalog-v1.sql` |
 | Sync, scrobbles, shutdown | | `service`, `catalog`, `listening` | `tests/service_worker/{sync,scrobbles,lifecycle}.rs` |
 
 `src/ui.rs` holds only the `MusicApp` struct, `new()`, actions and `Render`.
