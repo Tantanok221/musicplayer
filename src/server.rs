@@ -15,6 +15,9 @@ use std::{
 };
 use url::Url;
 
+mod native;
+pub use native::NativeError;
+
 fn prepare_account(mut account: Account) -> Result<Account> {
     let mut url = Url::parse(account.url.trim())
         .context("Enter a complete server URL, including https://")?;
@@ -43,6 +46,8 @@ pub struct Server {
     // Never derive Debug: credentials and authenticated URLs must stay out of logs.
     credentials: ServerCredentials,
     http: reqwest::Client,
+    native_http: reqwest::Client,
+    pub is_navidrome: bool,
     pub extensions: HashSet<String>,
 }
 
@@ -67,6 +72,13 @@ impl Server {
                 .timeout(Duration::from_secs(60))
                 .build()?,
             extensions: HashSet::new(),
+            native_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            is_navidrome: false,
         })
     }
 
@@ -147,6 +159,9 @@ impl Server {
     }
     pub async fn connect(&mut self) -> Result<String> {
         let info = self.request("ping", &[]).await?;
+        self.is_navidrome = info["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("navidrome"));
         if let Ok(response) = self.request("getOpenSubsonicExtensions", &[]).await
             && let Some(items) = response["openSubsonicExtensions"].as_array()
         {

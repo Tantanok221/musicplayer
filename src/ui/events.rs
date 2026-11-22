@@ -3,6 +3,9 @@ use super::*;
 impl MusicApp {
     pub(super) fn event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            Event::SmartRules(..)
+            | Event::SmartPlaylistSaved(_)
+            | Event::NativePasswordRequired => {}
             Event::Ready(account, prefs) => {
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
