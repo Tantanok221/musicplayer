@@ -23,6 +23,12 @@ fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
     tracks[2].album_id = "performer-fallback".into();
     tracks[2].album_artists.clear();
     tracks[2].album_artist.clear();
+    tracks[3].album_id = "joint-album".into();
+    tracks[3].album_artist = "Main feat. Other".into();
+    tracks[3].album_artists.push(NamedId {
+        id: "other".into(),
+        name: "Other".into(),
+    });
     let fixture = Fixture::new(Library {
         tracks,
         albums: vec![],
@@ -65,7 +71,25 @@ fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
             .artist_id,
         "guest"
     );
-    assert_eq!(catalog.artist_releases("Main", "main").unwrap().len(), 2);
+    let joint = catalog.album("joint-album").unwrap().unwrap();
+    assert!(
+        joint.artist_id.is_empty(),
+        "a joint label must not borrow a solo artist ID"
+    );
+    let joint_credit = joint
+        .artist_credits()
+        .into_iter()
+        .find(|credit| credit.name == "Main feat. Other")
+        .unwrap();
+    assert_eq!(
+        catalog
+            .artist_releases(&joint_credit.name, &joint_credit.id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(joint.artists.len(), 2);
+    assert_eq!(catalog.artist_releases("Main", "main").unwrap().len(), 3);
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }

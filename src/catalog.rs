@@ -341,16 +341,17 @@ impl Catalog {
                 ])?;
                 sorting::put_track(&tx, track)?;
                 if !track.album_id.is_empty() {
+                    let credits = track.album_artist_credits();
                     let album = Album {
                         id: track.album_id.clone(),
                         name: track.album.clone(),
                         artist: track.album_artist_label().into(),
-                        artist_id: track
-                            .album_artist_credits()
-                            .into_iter()
-                            .next()
-                            .map(|artist| artist.id)
-                            .unwrap_or_default(),
+                        artist_id: if credits.len() == 1 {
+                            credits[0].id.clone()
+                        } else {
+                            String::new()
+                        },
+                        artists: track.album_artists.clone(),
                         cover_art: track.cover_art.clone(),
                         year: track.year,
                         genre: genre.clone(),
