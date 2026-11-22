@@ -43,6 +43,7 @@ fn info_tab_key(tab: InfoTab) -> &'static str {
         InfoTab::Details => "details",
         InfoTab::Lyrics => "lyrics",
         InfoTab::Artwork => "artwork",
+        InfoTab::Properties => "properties",
     }
 }
 
@@ -707,11 +708,12 @@ impl MusicApp {
                         layout_choice(
                             app.clone(),
                             "Tab",
-                            "Details, lyrics, or artwork.",
+                            "Details, lyrics, artwork, or properties.",
                             [
                                 ("details", "Details"),
                                 ("lyrics", "Lyrics"),
                                 ("artwork", "Artwork"),
+                                ("properties", "Properties"),
                             ],
                             "details",
                             info_tab_key(layout.info_tab),
@@ -719,11 +721,12 @@ impl MusicApp {
                                 layout.info_tab = match key {
                                     "lyrics" => InfoTab::Lyrics,
                                     "artwork" => InfoTab::Artwork,
+                                    "properties" => InfoTab::Properties,
                                     _ => InfoTab::Details,
                                 };
                             },
                         )
-                        .keywords(["lyrics", "artwork", "details"]),
+                        .keywords(["lyrics", "artwork", "details", "properties", "tags"]),
                     ),
             )
             .group(
