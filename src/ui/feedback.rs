@@ -11,7 +11,7 @@ impl MusicApp {
                 }
             }
         }
-        for profile in self.artist_profiles.values_mut() {
+        for profile in self.account_cache.artist_profiles.values_mut() {
             if profile.popular.iter().any(|value| value.id == track.id) {
                 for value in &mut Arc::make_mut(profile).popular {
                     if value.id == track.id {
@@ -70,7 +70,8 @@ impl MusicApp {
             )
             .chain(self.artist_data.iter().flat_map(|data| &data.most_played))
             .chain(
-                self.artist_profiles
+                self.account_cache
+                    .artist_profiles
                     .values()
                     .flat_map(|profile| &profile.popular),
             )

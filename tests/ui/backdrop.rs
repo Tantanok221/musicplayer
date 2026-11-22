@@ -1,10 +1,95 @@
 use crate::common::ui::{Fixture, start};
 use gpui_kit::{AppContext, TestAppContext, test::TestWindowExt};
 use sonora::{
-    model::PlaybackSnapshot,
+    model::{PlaybackSnapshot, Preferences, Track},
+    platform::Account,
     service::{Command, Event},
 };
 use std::sync::Arc;
+
+#[gpui_kit::test]
+fn reconnect_keeps_cached_cover_and_backdrop_but_account_switch_drops_them(
+    cx: &mut TestAppContext,
+) {
+    let (dir, mut f, window, app) = start(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let path = dir.path().join("shared-cover.png");
+    image::RgbImage::from_pixel(32, 32, image::Rgb([80, 100, 160]))
+        .save(&path)
+        .unwrap();
+    let backdrop = Arc::new(sonora::backdrop::load_or_render(&path).unwrap());
+    f.backend
+        .emit(Event::Artwork("shared-cover".into(), path, false));
+    f.backend
+        .emit(Event::Backdrop("shared-cover".into(), backdrop));
+
+    let track = Arc::new(Track {
+        id: "shared-track".into(),
+        cover_art: "shared-cover".into(),
+        ..Default::default()
+    });
+    let play = |f: &Fixture| {
+        f.backend
+            .emit(Event::Lyrics(track.id.clone(), Err("No lyrics".into())));
+        f.backend.emit(Event::Playback(PlaybackSnapshot {
+            track: Some(track.clone()),
+            ..Default::default()
+        }));
+    };
+    let stop = |f: &mut Fixture, cx: &mut TestAppContext| {
+        f.backend.emit(Event::Playback(PlaybackSnapshot::default()));
+        f.settle(window, cx);
+    };
+    play(&f);
+    f.settle(window, cx);
+    f.click(window, ("workspace-tab", 4_u64), cx);
+
+    let backdrop_label = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            window
+                .find("now-playing-backdrop")
+                .label()
+                .unwrap()
+                .to_owned()
+        })
+        .unwrap()
+    };
+    assert_eq!(backdrop_label(cx), "Backdrop for shared-cover");
+
+    let mut account = Account {
+        url: "https://fixture.invalid".into(),
+        username: "fixture".into(),
+    };
+    stop(&mut f, cx);
+    f.backend
+        .emit(Event::Connected(account.clone(), "Connected".into()));
+    f.settle(window, cx);
+    play(&f);
+    f.settle(window, cx);
+    assert_eq!(backdrop_label(cx), "Backdrop for shared-cover");
+
+    account.username = "other-listener".into();
+    stop(&mut f, cx);
+    let prefs = Preferences {
+        tabs: cx.update(|cx| app.read(cx).tab_state().clone()),
+        ..f.catalog.state("preferences").unwrap()
+    };
+    f.expect(
+        "look up the reused cover ID for the new account",
+        |command, _| {
+            assert!(matches!(command, Command::Artwork(id, None) if id == "shared-cover"));
+            vec![Event::ArtworkFailed("shared-cover".into())]
+        },
+    );
+    f.backend.emit(Event::Ready(Some(account.clone()), prefs));
+    f.backend
+        .emit(Event::Connected(account, "Connected".into()));
+    f.settle(window, cx);
+    play(&f);
+    f.settle(window, cx);
+    assert_eq!(backdrop_label(cx), "Backdrop unavailable");
+    f.assert_script_finished();
+}
 
 #[gpui_kit::test]
 fn backdrop_waits_for_current_cover_ignores_late_previous_cover_and_handles_missing_art(
