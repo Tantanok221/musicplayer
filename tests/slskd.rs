@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use proptest::prelude::*;
 use serde_json::{Value, json};
 use sonora::slskd::{
     Completeness, Progress, RemoteFile, SearchResponse, Slskd, SlskdAuth, SlskdKey, Waiting,
@@ -15,6 +16,55 @@ use std::{
 };
 
 const KEY: &str = "0123456789abcdef-secret";
+
+#[path = "common/parser_values.rs"]
+mod parser_values;
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/slskd.proptest-regressions"))),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn prop_slskd_response_values_never_panic(value in parser_values::json_value(), name in ".{0,80}") {
+        let _ = serde_json::from_value::<SearchResponse>(value.clone());
+        let _ = serde_json::from_value::<RemoteFile>(value.clone());
+        let files = vec![name];
+        let result = progress(&value, &files);
+        prop_assert!(result.done <= result.total);
+        let _ = waiting(&value, &files);
+    }
+
+    #[test]
+    fn prop_slskd_rejects_invalid_numeric_fields(value in prop_oneof![Just(json!(-1)), Just(json!(u64::MAX)), ".{0,40}".prop_map(Value::String)]) {
+        let result = serde_json::from_value::<RemoteFile>(json!({"length": value}));
+        prop_assert!(result.is_err());
+    }
+
+    #[test]
+    fn prop_slskd_directory_rejects_scalar_responses(value in prop_oneof![
+        parser_values::json_value().prop_filter("not a folder or folder list", |v| !v.is_object() && !v.is_array()),
+        Just(json!([])),
+        Just(json!({"name": "Album", "files": []})),
+    ]) {
+        let invalid = !value.is_array() && !value.is_object();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let rejected = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(axum::serve(listener, Router::new().route(
+                "/api/v0/users/peer/directory", post(move || async move { Json(value) })
+            )).into_future());
+            let client = Slskd::new(&format!("http://{address}"), SlskdKey::new(KEY).unwrap()).unwrap();
+            let rejected = client.directory("peer", "Album").await.is_err();
+            task.abort();
+            rejected
+        });
+        prop_assert_eq!(rejected, invalid);
+    }
+}
 
 fn file(path: &str, size: u64) -> RemoteFile {
     RemoteFile {

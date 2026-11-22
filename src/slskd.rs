@@ -682,7 +682,7 @@ impl Slskd {
         let folders = match value {
             Value::Array(folders) => folders,
             folder @ Value::Object(_) => vec![folder],
-            _ => Vec::new(),
+            _ => bail!("slskd returned an invalid directory response"),
         };
         let mut files = Vec::new();
         for folder in folders {
