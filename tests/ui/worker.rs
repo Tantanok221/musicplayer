@@ -39,17 +39,7 @@ fn remove_after_server_reorder_removes_clicked_song(cx: &mut TestAppContext) {
         ..Default::default()
     });
     let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
-    let mut initialized = 0;
-    deliver_until(&worker, &tx, window, cx, |event, cx| {
-        initialized += usize::from(matches!(event, Event::Ready(..)));
-        cx.update_window(window, |_, window, _| {
-            initialized >= 2
-                && window
-                    .try_find("row-playlist-1")
-                    .is_some_and(|row| row.visible())
-        })
-        .unwrap()
-    });
+    wait_library(&worker, &tx, window, cx, "row-playlist-1");
     cx.run_until_parked();
     cx.update_window(window, |_, window, _| {
         assert_eq!(
@@ -82,13 +72,13 @@ fn remove_after_server_reorder_removes_clicked_song(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
-    deliver_until(
-        &worker,
-        &tx,
-        window,
-        cx,
-        |e, _| matches!(e, Event::Playlist(p) if p.entry.len() == 1),
-    );
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        assert!(
+            !matches!(event, Event::MutationFailed(..)),
+            "removing the clicked song must reach Navidrome"
+        );
+        matches!(event, Event::Playlist(p) if p.entry.len() == 1)
+    });
     cx.update_window(window, |_, window, _| {
         assert!(window.find("row-playlist-0").visible());
         assert_eq!(
