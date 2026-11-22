@@ -4,6 +4,28 @@ use crate::{
 };
 use std::sync::Arc;
 
+pub fn is_smart(playlist: &Playlist, username: Option<&str>) -> bool {
+    playlist.readonly
+        && (playlist.valid_until.is_some() || username.is_some_and(|user| playlist.owner == user))
+}
+
+pub fn is_owner(playlist: &Playlist, username: Option<&str>) -> bool {
+    playlist.owner.is_empty() || Some(playlist.owner.as_str()) == username
+}
+
+pub fn refresh_due(
+    playlist: &Playlist,
+    username: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    is_smart(playlist, username)
+        && playlist
+            .valid_until
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|until| until <= now)
+}
+
 #[derive(Clone, Default)]
 pub struct Playlists {
     summaries: Vec<Playlist>,
@@ -27,6 +49,9 @@ impl Playlists {
             if let Some(summary) = summaries.iter().find(|p| p.id == current.id) {
                 current.name.clone_from(&summary.name);
                 current.song_count = summary.song_count;
+                current.readonly = summary.readonly;
+                current.owner.clone_from(&summary.owner);
+                current.valid_until.clone_from(&summary.valid_until);
             } else {
                 self.current = None;
             }
@@ -89,7 +114,7 @@ impl Playlists {
     }
 
     pub fn can_edit(playlist: &Playlist, username: Option<&str>) -> bool {
-        playlist.owner.is_empty() || Some(playlist.owner.as_str()) == username
+        !playlist.readonly && is_owner(playlist, username)
     }
 
     pub fn append_queue(&self, ids: Vec<String>) -> Option<Mutation> {
@@ -137,7 +162,7 @@ impl PlaylistEntry {
 
     pub fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
         let current = current?;
-        self.matches(current)
+        (!current.readonly && self.matches(current))
             .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
     }
 
@@ -174,6 +199,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ownership_ignores_readonly_but_requires_empty_or_matching_owner() {
+        for readonly in [false, true] {
+            for owner in ["", "owner"] {
+                let playlist = Playlist {
+                    owner: owner.into(),
+                    readonly,
+                    ..Default::default()
+                };
+                for user in [None, Some("owner"), Some("other")] {
+                    assert_eq!(
+                        is_owner(&playlist, user),
+                        owner.is_empty() || user == Some(owner)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn smart_requires_readonly_and_expiry_or_signed_in_owner() {
+        for readonly in [false, true] {
+            for until in [None, Some("2999-01-01T00:00:00Z".to_string())] {
+                for user in [None, Some("owner"), Some("other")] {
+                    let value = Playlist {
+                        owner: "owner".into(),
+                        readonly,
+                        valid_until: until.clone(),
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        is_smart(&value, user),
+                        readonly && (until.is_some() || user == Some("owner"))
+                    );
+                }
+            }
+        }
+        assert!(!is_smart(
+            &Playlist {
+                readonly: true,
+                ..Default::default()
+            },
+            None
+        ));
+    }
+
+    #[test]
+    fn refresh_requires_smart_and_parseable_expired_timestamp() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut value = Playlist {
+            readonly: true,
+            owner: "owner".into(),
+            ..Default::default()
+        };
+        for until in [None, Some("invalid"), Some("2027-01-01T00:00:00Z")] {
+            value.valid_until = until.map(str::to_string);
+            assert!(!refresh_due(&value, Some("owner"), now));
+        }
+        value.valid_until = Some("2026-01-01T01:00:00+01:00".into());
+        assert!(refresh_due(&value, Some("owner"), now));
+        value.readonly = false;
+        assert!(!refresh_due(&value, Some("owner"), now));
+    }
+
+    #[test]
     fn open_close_and_stale_details() {
         let mut state = Playlists::default();
         assert!(state.current().is_none());
@@ -194,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn summaries_refresh_only_name_and_count_strip_entries_and_close_missing() {
+    fn summaries_refresh_metadata_strip_entries_and_close_missing() {
         let mut state = Playlists::default();
         let mut current = playlist(&["a"]);
         current.duration = 12.;
@@ -244,17 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn editable_preserves_owner_rules_even_for_readonly() {
+    fn editable_requires_writable_playlist_and_matching_owner() {
         let mut state = Playlists::default();
         assert!(!state.editable(None));
         let mut value = playlist(&[]);
         value.readonly = true;
         state.open(value.clone());
-        assert!(state.editable(None));
+        assert!(!state.editable(None));
         value.owner = "owner".into();
-        state.open(value);
+        state.open(value.clone());
         assert!(!state.editable(None));
         assert!(!state.editable(Some("other")));
+        assert!(!state.editable(Some("owner")));
+        value.readonly = false;
+        state.open(value);
         assert!(state.editable(Some("owner")));
     }
 
@@ -321,6 +415,8 @@ mod tests {
                 .is_none()
         );
         let mut other = original.clone();
+        other.readonly = true;
+        assert!(removal.mutation(Some(&other)).is_none());
         other.id = "other".into();
         assert!(removal.mutation(Some(&other)).is_none());
         assert!(

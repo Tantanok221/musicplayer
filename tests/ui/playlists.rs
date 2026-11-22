@@ -10,6 +10,106 @@ use sonora::{
 use std::{sync::Arc, time::Duration};
 
 #[gpui_kit::test]
+fn smart_playlist_owner_can_rename_but_not_edit_tracks(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    let mut smart = playlist("Automatic");
+    smart.readonly = true;
+    fixture.backend.emit(Event::Playlists(vec![smart.clone()]));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("smart-playlist-playlist-1").visible());
+    })
+    .unwrap();
+    fixture.expect("open smart playlist", move |command, catalog| {
+        assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+        smart.entry = catalog
+            .by_ids(&["track-1".into(), "track-2".into()])
+            .unwrap()
+            .into();
+        smart.song_count = 2;
+        vec![Event::Playlist(smart)]
+    });
+    fixture.click(window, "nav-playlist-playlist-1", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("smart-playlist-header").label(),
+            Some("Smart playlist · updates automatically")
+        );
+        assert!(window.find("playlist-options").visible());
+    })
+    .unwrap();
+    fixture.click(window, "playlist-options", cx);
+    cx.update_window(window, |_, window, _| {
+        let menu = window.within("popup-menu");
+        assert!(menu.find_by_label("Rename…").visible());
+        assert!(menu.find_by_label("Delete playlist…").visible());
+        assert!(menu.try_find_by_label("Append Queue").is_none());
+    })
+    .unwrap();
+    fixture.menu_item(window, "Rename…", cx);
+    edit_name(&mut fixture, window, "Automatic renamed", cx);
+    fixture.expect("rename owned smart playlist", |command, _| {
+        let expected = Mutation::RenamePlaylist("playlist-1".into(), "Automatic renamed".into());
+        assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+        vec![Event::MutationDone(expected)]
+    });
+    fixture.click(window, "save-playlist-editor", cx);
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn readonly_playlists_have_no_edit_actions_or_add_target(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    for owner in ["fixture", "another-owner"] {
+        let mut readonly = playlist("Automatic");
+        readonly.readonly = true;
+        readonly.owner = owner.into();
+        fixture
+            .backend
+            .emit(Event::Playlists(vec![readonly.clone()]));
+        fixture.settle(window, cx);
+        fixture.expect("open readonly playlist", move |command, catalog| {
+            assert!(matches!(command, Command::Playlist(id) if id == "playlist-1"));
+            readonly.entry = catalog
+                .by_ids(&["track-1".into(), "track-2".into()])
+                .unwrap()
+                .into();
+            readonly.song_count = 2;
+            vec![Event::Playlist(readonly)]
+        });
+        fixture.click(window, "nav-playlist-playlist-1", cx);
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(
+                window.try_find("playlist-options").is_some(),
+                owner == "fixture"
+            );
+            window.right_click("row-playlist-0", cx);
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        cx.update_window(window, |_, window, cx| {
+            let mut menu = window.within("popup-menu");
+            assert!(menu.try_find_by_label("Remove from Playlist").is_none());
+            let item = menu.find_by_label("Add to Playlist");
+            menu.hover(item.path().last().unwrap().clone(), cx);
+            menu.press("right", cx);
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+        cx.update_window(window, |_, window, cx| {
+            let mut submenu = window.within("submenu");
+            assert!(submenu.try_find_by_label("Automatic").is_none());
+            assert!(submenu.find_by_label("New Playlist…").visible());
+            submenu.press("escape", cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        fixture.settle(window, cx);
+    }
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
 fn double_click_replaces_queue_with_playlist_at_clicked_occurrence(cx: &mut TestAppContext) {
     double_click_playlist(cx, "fixture");
 }

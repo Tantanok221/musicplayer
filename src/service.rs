@@ -1037,12 +1037,28 @@ fn run(
                 }
                 Command::Synced(batch_generation, playlists, can_delete) => {
                     if generation == batch_generation && !failed_generations.contains(&generation) {
+                        let refresh = catalog
+                            .cached_playlist_summaries()?
+                            .into_iter()
+                            .filter(|cached| {
+                                playlists.iter().any(|playlist| playlist.id == cached.id)
+                                    && crate::playlists::refresh_due(
+                                        cached,
+                                        account.as_ref().map(|account| account.username.as_str()),
+                                        chrono::Utc::now(),
+                                    )
+                            })
+                            .map(|playlist| playlist.id)
+                            .collect::<Vec<_>>();
                         if can_delete {
                             catalog.finish_sync(generation)?;
                         }
                         catalog.save_playlist_summaries(&playlists, can_delete)?;
                         syncing = false;
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                        for id in refresh {
+                            tx.send(Command::Playlist(id))?;
+                        }
                         events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                         events.send(Event::Status(if can_delete {
                             format!(

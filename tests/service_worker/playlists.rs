@@ -5,6 +5,137 @@ use sonora::{
 };
 use std::sync::Arc;
 
+fn smart_playlist(until: &str) -> Playlist {
+    serde_json::from_value(serde_json::json!({
+        "id": "smart", "name": "Automatic", "owner": "fixture",
+        "readonly": true, "validUntil": until, "songCount": 1
+    }))
+    .unwrap()
+}
+
+#[test]
+fn sync_refreshes_only_expired_cached_smart_playlists() {
+    let mut library = Library::default();
+    let mut expired = smart_playlist("2000-01-01T00:00:00Z");
+    expired.entry = vec![Arc::new(library.tracks[1].clone())].into();
+    let mut fresh = smart_playlist("2999-01-01T00:00:00Z");
+    fresh.id = "fresh".into();
+    let mut uncached = expired.clone();
+    uncached.id = "uncached".into();
+    library.playlists = vec![expired.clone(), fresh.clone(), uncached];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    expired.entry = vec![Arc::new(crate::fixture::song("cached", "album"))].into();
+    fixture.catalog().save_playlist(&expired).unwrap();
+    fixture.catalog().save_playlist(&fresh).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    event(
+        &worker,
+        |event| matches!(event, Event::Playlist(p) if p.id == "smart" && p.entry[0].id == "other-song"),
+    );
+    assert_eq!(
+        serde_json::to_value(fixture.catalog().playlist("smart").unwrap().unwrap()).unwrap()["validUntil"],
+        "2000-01-01T00:00:00Z"
+    );
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|r| r.endpoint == "getPlaylist.view"
+                && r.params.get("id").is_some_and(|id| id != "smart"))
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn expired_smart_refresh_failure_keeps_cache_then_empty_result_replaces_it() {
+    let mut remote = smart_playlist("2000-01-01T00:00:00Z");
+    remote.song_count = 0;
+    let fixture = Fixture::new(Library {
+        playlists: vec![remote.clone()],
+        fail_playlist: true,
+        ..Library::default()
+    });
+    fixture.seed();
+    let mut cached = remote;
+    cached.song_count = 1;
+    cached.entry = vec![Arc::new(crate::fixture::song("cached", "album"))].into();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(error) if error.contains("Fixture playlist unavailable")),
+    );
+    assert_eq!(
+        fixture.catalog().playlist("smart").unwrap().unwrap().entry[0].id,
+        "cached"
+    );
+    fixture.edit_library(|library| library.fail_playlist = false);
+    worker.service().send(Command::Refresh);
+    synced(&worker);
+    event(
+        &worker,
+        |event| matches!(event, Event::Playlist(p) if p.id == "smart" && p.entry.is_empty()),
+    );
+    assert!(
+        fixture
+            .catalog()
+            .playlist("smart")
+            .unwrap()
+            .unwrap()
+            .entry
+            .is_empty()
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn opening_smart_playlist_replaces_cached_entries_and_failure_keeps_them() {
+    let mut library = Library::default();
+    let mut remote = smart_playlist("2999-01-01T00:00:00Z");
+    remote.entry = vec![Arc::new(library.tracks[1].clone())].into();
+    library.playlists = vec![remote.clone()];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    let mut cached = remote;
+    cached.entry = vec![Arc::new(crate::fixture::song("cached", "album"))].into();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    worker.service().send(Command::Playlist("smart".into()));
+    event(
+        &worker,
+        |event| matches!(event, Event::Playlist(p) if p.entry[0].id == "cached"),
+    );
+    event(
+        &worker,
+        |event| matches!(event, Event::Playlist(p) if p.entry[0].id == "other-song"),
+    );
+    fixture.edit_library(|library| library.offline = true);
+    worker.service().send(Command::Playlist("smart".into()));
+    event(
+        &worker,
+        |event| matches!(event, Event::Playlist(p) if p.entry[0].id == "other-song"),
+    );
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(error) if error.contains("Could not load playlist")),
+    );
+    assert_eq!(
+        fixture.catalog().playlist("smart").unwrap().unwrap().entry[0].id,
+        "other-song"
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
 #[test]
 fn reorder_checks_server_snapshot_and_persists_duplicate_song_ids_in_order() {
     let mut library = Library::default();

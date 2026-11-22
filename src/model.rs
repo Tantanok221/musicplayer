@@ -268,6 +268,7 @@ pub struct Playlist {
     pub comment: String,
     pub owner: String,
     pub readonly: bool,
+    pub valid_until: Option<String>,
     pub song_count: u32,
     pub duration: f64,
     pub cover_art: String,
