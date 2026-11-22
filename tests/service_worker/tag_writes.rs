@@ -351,3 +351,45 @@ fn one_song_finds_the_releases_its_recording_is_on() {
     assert_eq!(found[1].summary(), "1998 · JP · CD · 3 tracks");
     fixture.finish();
 }
+
+#[test]
+fn cover_art_is_fetched_embedded_and_undone() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    enable(&worker, &folder);
+    let cover = |release: &str| {
+        vec![TagEdit {
+            tracks: vec!["song".into()],
+            fields: BTreeMap::from([(
+                TagField::CoverArt,
+                EditValue::Set(format!("{}{release}", sonora::tags::COVER_PREFIX)),
+            )]),
+        }]
+    };
+    worker.service().send(Command::WriteTags(cover("no-art")));
+    let missing = report(&worker);
+    assert_eq!(missing.written, 0);
+    assert_eq!(
+        missing.failures,
+        vec![(
+            "Cover art".to_string(),
+            "Cover Art Archive has no front cover for this release".to_string()
+        )]
+    );
+    assert!(read(&folder.file()).unwrap()[&TagField::CoverArt].is_empty());
+    worker
+        .service()
+        .send(Command::WriteTags(cover("ok-computer")));
+    assert_eq!(report(&worker).written, 1);
+    assert_eq!(
+        read(&folder.file()).unwrap()[&TagField::CoverArt],
+        vec![sonora::tags::picture_value("image/png", b"\x89PNG cover")]
+    );
+    worker.service().send(Command::UndoTags);
+    assert!(report(&worker).undo);
+    assert!(read(&folder.file()).unwrap()[&TagField::CoverArt].is_empty());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}

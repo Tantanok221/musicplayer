@@ -317,6 +317,10 @@ pub fn proposed(release: &Release, track: &LookupTrack) -> BTreeMap<TagField, St
         (TagField::MusicBrainzReleaseGroup, release.group_id.clone()),
         (TagField::MusicBrainzArtist, ids(&track.artists)),
         (TagField::MusicBrainzAlbumArtist, ids(&release.artists)),
+        (
+            TagField::CoverArt,
+            format!("{}{}", crate::tags::COVER_PREFIX, release.id),
+        ),
     ]);
     if let Some(year) = release.date.get(..4).filter(|y| y.parse::<u32>().is_ok()) {
         values.insert(TagField::Year, year.to_string());
@@ -426,6 +430,7 @@ mod tests {
         assert_eq!(values[&TagField::Genre], "alternative rock");
         assert_eq!(values[&TagField::MusicBrainzTrack], "r2");
         assert_eq!(values[&TagField::MusicBrainzAlbumArtist], "a1");
+        assert_eq!(values[&TagField::CoverArt], "coverart:rel");
         assert!(!values.contains_key(&TagField::Comment));
     }
 

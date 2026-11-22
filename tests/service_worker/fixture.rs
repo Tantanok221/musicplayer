@@ -860,6 +860,14 @@ async fn lastfm(
         .into_response()
 }
 
+async fn cover_art(State(state): State<ServerState>, Path(path): Path<String>) -> Response {
+    state.record(Request::new("coverart", &[("path", &path)]));
+    if path == "release/ok-computer/front-500" {
+        return ([("content-type", "image/png")], b"\x89PNG cover".to_vec()).into_response();
+    }
+    (StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
 async fn metadata(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
@@ -1131,6 +1139,7 @@ impl Fixture {
             .route("/api/playlist/{id}", any(native))
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
+            .route("/coverart/{*path}", any(cover_art))
             .route("/lastfm/", any(lastfm))
             .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
@@ -1226,6 +1235,9 @@ impl Fixture {
     fn start_player(&self, paused: bool) -> Worker {
         let metadata =
             MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
+                .and_then(|metadata| {
+                    metadata.with_covers(&format!("{}coverart/", self.account.url))
+                })
                 .unwrap();
         let key = self.state.data.lock().unwrap().library.lastfm_key;
         let lastfm = LastFm::with_endpoints(

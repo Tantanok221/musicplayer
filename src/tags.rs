@@ -4,6 +4,7 @@ use crate::model::{Track, TrackId};
 use anyhow::{Context, Result, bail};
 use lofty::{
     config::WriteOptions,
+    picture::{MimeType, Picture, PictureType},
     prelude::*,
     tag::{ItemValue, Tag, TagItem},
 };
@@ -33,6 +34,59 @@ pub enum TagField {
     MusicBrainzReleaseGroup,
     MusicBrainzArtist,
     MusicBrainzAlbumArtist,
+    /// The embedded front cover, held as `mime;base64,data`.
+    CoverArt,
+}
+
+/// A cover art value still to be fetched from Cover Art Archive for the
+/// release ID that follows.
+pub const COVER_PREFIX: &str = "coverart:";
+
+/// A picture as a field value, so the journal can put it back.
+pub fn picture_value(mime: &str, data: &[u8]) -> String {
+    use base64::Engine;
+    format!(
+        "{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(data)
+    )
+}
+
+fn picture_data(value: &str) -> Result<Picture> {
+    use base64::Engine;
+    if value.starts_with(COVER_PREFIX) {
+        bail!("The cover art wasn't downloaded");
+    }
+    let (mime, data) = value.split_once(";base64,").context("Not a picture")?;
+    let data = base64::engine::general_purpose::STANDARD.decode(data)?;
+    Ok(Picture::unchecked(data)
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::from_str(mime))
+        .build())
+}
+
+/// Every release whose front cover an edit asks for.
+pub fn wanted_covers(edits: &[TagEdit]) -> std::collections::BTreeSet<String> {
+    edits
+        .iter()
+        .filter_map(|edit| match edit.fields.get(&TagField::CoverArt) {
+            Some(EditValue::Set(value)) => value.strip_prefix(COVER_PREFIX).map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Puts the downloaded covers in place of the release IDs.
+pub fn with_covers(mut edits: Vec<TagEdit>, covers: &BTreeMap<String, String>) -> Vec<TagEdit> {
+    for edit in &mut edits {
+        if let Some(EditValue::Set(value)) = edit.fields.get_mut(&TagField::CoverArt)
+            && let Some(cover) = value
+                .strip_prefix(COVER_PREFIX)
+                .and_then(|release| covers.get(release))
+        {
+            *value = cover.clone();
+        }
+    }
+    edits
 }
 
 impl TagField {
@@ -61,7 +115,10 @@ impl TagField {
 
     /// Every field Sonora reads, writes and puts back.
     pub fn every() -> impl Iterator<Item = TagField> {
-        Self::ALL.into_iter().chain(Self::IDS)
+        Self::ALL
+            .into_iter()
+            .chain(Self::IDS)
+            .chain([TagField::CoverArt])
     }
 
     pub fn label(self) -> &'static str {
@@ -82,6 +139,7 @@ impl TagField {
             TagField::MusicBrainzReleaseGroup => "MusicBrainz release group ID",
             TagField::MusicBrainzArtist => "MusicBrainz artist ID",
             TagField::MusicBrainzAlbumArtist => "MusicBrainz album artist ID",
+            TagField::CoverArt => "Cover art",
         }
     }
 
@@ -103,6 +161,7 @@ impl TagField {
             TagField::MusicBrainzReleaseGroup => "mb-release-group",
             TagField::MusicBrainzArtist => "mb-artist",
             TagField::MusicBrainzAlbumArtist => "mb-album-artist",
+            TagField::CoverArt => "cover-art",
         }
     }
 
@@ -152,6 +211,7 @@ impl TagField {
             TagField::MusicBrainzReleaseGroup => &[ItemKey::MusicBrainzReleaseGroupId],
             TagField::MusicBrainzArtist => &[ItemKey::MusicBrainzArtistId],
             TagField::MusicBrainzAlbumArtist => &[ItemKey::MusicBrainzReleaseArtistId],
+            TagField::CoverArt => &[],
         }
     }
 
@@ -384,7 +444,17 @@ impl EditorForm {
                     track: track.title.clone(),
                     field,
                     before: field.shown(track),
-                    after: value.values().unwrap_or_default().join("; "),
+                    after: if field == TagField::CoverArt {
+                        match value.values().unwrap_or_default().first() {
+                            Some(value) if value.starts_with(COVER_PREFIX) => {
+                                "Front cover from Cover Art Archive".into()
+                            }
+                            Some(_) => "Embedded picture".into(),
+                            None => String::new(),
+                        }
+                    } else {
+                        value.values().unwrap_or_default().join("; ")
+                    },
                 })
             })
             .collect()
@@ -470,6 +540,19 @@ pub fn read(path: &Path) -> Result<TagValues> {
     let tag = file.primary_tag().or_else(|| file.first_tag());
     Ok(TagField::every()
         .map(|field| {
+            if field == TagField::CoverArt {
+                let cover = tag.and_then(|tag| {
+                    tag.get_picture_type(PictureType::CoverFront)
+                        .or_else(|| tag.pictures().first())
+                });
+                let values = cover
+                    .map(|picture| {
+                        let mime = picture.mime_type().map_or("image/jpeg", MimeType::as_str);
+                        vec![picture_value(mime, picture.data())]
+                    })
+                    .unwrap_or_default();
+                return (field, values);
+            }
             let values = tag
                 .map(|tag| {
                     field
@@ -515,6 +598,15 @@ pub fn write(
             let Some(values) = value.values() else {
                 continue;
             };
+            if *field == TagField::CoverArt {
+                // MP4 cover atoms carry no picture type and read back as Other.
+                tag.remove_picture_type(PictureType::CoverFront);
+                tag.remove_picture_type(PictureType::Other);
+                for value in values {
+                    tag.push_picture(picture_data(&value)?);
+                }
+                continue;
+            }
             for key in field.keys() {
                 tag.remove_key(*key);
             }
@@ -846,6 +938,42 @@ mod tests {
             assert_eq!(undo[&TagField::Title], EditValue::Set("New title".into()));
             assert!(!path.with_file_name(format!(".sonora-tags.{name}")).exists());
         }
+    }
+
+    #[test]
+    fn writes_and_puts_back_the_front_cover() {
+        for name in ["tone-0.flac", "tone-0.mp3", "tone-aac.m4a"] {
+            let (_dir, path) = fixture(name);
+            let cover = picture_value("image/png", b"\x89PNG fixture");
+            let fields = BTreeMap::from([(TagField::CoverArt, EditValue::Set(cover.clone()))]);
+            let (before, after) = write(&path, &fields).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(after[&TagField::CoverArt], vec![cover], "{name}");
+            let undo = restore(&before, &BTreeMap::from([(TagField::CoverArt, vec![])]));
+            write(&path, &undo).unwrap();
+            assert_eq!(
+                read(&path).unwrap()[&TagField::CoverArt],
+                before[&TagField::CoverArt]
+            );
+            let unfetched = BTreeMap::from([(
+                TagField::CoverArt,
+                EditValue::Set(format!("{COVER_PREFIX}rel")),
+            )]);
+            assert!(write(&path, &unfetched).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn covers_replace_the_release_ids_they_were_fetched_for() {
+        let edit = |value: &str| TagEdit {
+            tracks: vec!["t".into()],
+            fields: BTreeMap::from([(TagField::CoverArt, EditValue::Set(value.into()))]),
+        };
+        let edits = vec![edit("coverart:a"), edit("image/png;base64,AA==")];
+        assert_eq!(wanted_covers(&edits), ["a".to_string()].into());
+        let covers = BTreeMap::from([("a".to_string(), "image/jpeg;base64,AQ==".to_string())]);
+        let resolved = with_covers(edits, &covers);
+        assert_eq!(resolved[0], edit("image/jpeg;base64,AQ=="));
+        assert_eq!(resolved[1], edit("image/png;base64,AA=="));
     }
 
     #[test]

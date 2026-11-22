@@ -266,7 +266,7 @@ impl MusicApp {
             Ok(release) => Lookup::Matched {
                 matches: autotag::match_tracks(&editor.form.tracks, &release),
                 release,
-                skipped: BTreeSet::new(),
+                skipped: BTreeSet::from([TagField::CoverArt]),
             },
             Err(error) => Lookup::Failed(error),
         };
@@ -352,7 +352,7 @@ impl MusicApp {
                     set(input, value, window, cx);
                 }
             }
-            for field in TagField::IDS {
+            for field in TagField::IDS.into_iter().chain([TagField::CoverArt]) {
                 if let Some(value) = values.get(&field) {
                     editor.extra[row].insert(field, value.clone());
                 }
@@ -507,7 +507,10 @@ impl MusicApp {
                 let groups = FILLED
                     .iter()
                     .map(|field| (*field, field.label(), field.slug()))
-                    .chain([(TagField::MusicBrainzTrack, "MusicBrainz IDs", "ids")]);
+                    .chain([
+                        (TagField::MusicBrainzTrack, "MusicBrainz IDs", "ids"),
+                        (TagField::CoverArt, "Cover art", "cover-art"),
+                    ]);
                 for (field, label, slug) in groups {
                     let app = cx.entity().downgrade();
                     boxes = boxes.child(

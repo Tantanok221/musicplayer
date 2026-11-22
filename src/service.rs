@@ -2320,8 +2320,39 @@ fn run(
                 }
                 Command::Player(command) => player.send(command),
                 Command::WriteTags(edits) => {
-                    let report = write_tags(&catalog, &edits)?;
-                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                    let covers = crate::tags::wanted_covers(&edits);
+                    if !covers.is_empty() {
+                        let (musicbrainz, tx, events) =
+                            (musicbrainz.clone(), tx.clone(), events.clone());
+                        runtime.spawn(async move {
+                            let mut fetched = std::collections::BTreeMap::new();
+                            for release in covers {
+                                match musicbrainz.front_cover(&release).await {
+                                    Ok(cover) => {
+                                        fetched.insert(release, cover);
+                                    }
+                                    Err(error) => {
+                                        let _ = events.send(Event::TagsWritten(
+                                            crate::tags::TagReport {
+                                                job: chrono::Utc::now().timestamp_micros(),
+                                                failures: vec![(
+                                                    "Cover art".into(),
+                                                    format!("{error:#}"),
+                                                )],
+                                                ..Default::default()
+                                            },
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            let edits = crate::tags::with_covers(edits, &fetched);
+                            let _ = tx.send(Command::WriteTags(edits));
+                        });
+                    } else {
+                        let report = write_tags(&catalog, &edits)?;
+                        finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                    }
                 }
                 Command::UndoTags => {
                     let report = undo_tags(&catalog)?;

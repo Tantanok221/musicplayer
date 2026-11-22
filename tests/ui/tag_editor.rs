@@ -397,6 +397,7 @@ fn find_on_musicbrainz_fills_matched_songs_for_review(cx: &mut TestAppContext) {
             set("rel")
         );
         assert!(!first.fields.contains_key(&TagField::Genre));
+        assert!(!first.fields.contains_key(&TagField::CoverArt));
         assert!(!first.fields.contains_key(&TagField::Album));
         assert_eq!(
             edits[1].fields.get(&TagField::MusicBrainzTrack).cloned(),
@@ -550,5 +551,41 @@ fn a_pasted_recording_link_offers_the_releases_it_is_on(cx: &mut TestAppContext)
         cx,
     );
     assert!(label(window, ("release-candidate", 0_usize), cx).is_some());
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn ticking_cover_art_asks_for_the_release_front_cover(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    fixture.expect("search", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    fixture.expect("load", |_, _| {
+        vec![Event::ReleaseLoaded("rel".into(), Ok(Arc::new(release())))]
+    });
+    fixture.click(window, ("release-candidate", 0_usize), cx);
+    fixture.click(window, "fill-cover-art", cx);
+    fixture.click(window, "fill-tags", cx);
+    fixture.click(window, "save-tags", cx);
+    let changes: Vec<String> = (0..40_usize)
+        .filter_map(|row| label(window, ("tag-change", row), cx))
+        .filter(|change| change.contains("Cover art"))
+        .collect();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert!(changes[0].ends_with("→ Front cover from Cover Art Archive"));
+    fixture.expect("write the cover with the tags", |command, _| {
+        let Command::WriteTags(edits) = command else {
+            panic!("expected a tag write");
+        };
+        assert!(edits.iter().all(|edit| edit.fields.get(&TagField::CoverArt)
+            == Some(&EditValue::Set("coverart:rel".into()))));
+        vec![]
+    });
+    fixture.click(window, "confirm-tags", cx);
     fixture.assert_script_finished();
 }

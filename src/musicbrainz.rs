@@ -23,6 +23,7 @@ const MAX_GROUP_PAGES: usize = 10;
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: Url,
+    covers: Url,
     /// MusicBrainz blocks clients that exceed one request per second.
     interval: Duration,
     last: Arc<Mutex<Option<Instant>>>,
@@ -45,9 +46,42 @@ impl MusicBrainz {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             base: Url::parse(base)?,
+            covers: Url::parse("https://coverartarchive.org/")?,
             interval,
             last: Arc::default(),
         })
+    }
+
+    /// Fetches front covers from `base` instead of Cover Art Archive.
+    pub fn with_covers(mut self, base: &str) -> Result<Self> {
+        self.covers = Url::parse(base)?;
+        Ok(self)
+    }
+
+    /// A release's front cover from Cover Art Archive, as a tag value.
+    pub async fn front_cover(&self, release: &str) -> Result<String> {
+        let url = self.covers.join(&format!("release/{release}/front-500"))?;
+        let response = self.http.get(url).send().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot reach Cover Art Archive")
+        })?;
+        match response.status().as_u16() {
+            404 => bail!("Cover Art Archive has no front cover for this release"),
+            status if !(200..300).contains(&status) => {
+                bail!("Cover Art Archive returned HTTP {status}")
+            }
+            _ => {}
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|mime| mime.starts_with("image/"))
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let data = response.bytes().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot download the cover")
+        })?;
+        Ok(crate::tags::picture_value(&mime, &data))
     }
 
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
