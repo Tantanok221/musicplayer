@@ -206,6 +206,65 @@ fn history_library() -> (Library, Vec<sonora::discover::SeasonSpan>) {
 }
 
 #[test]
+fn switching_lastfm_user_during_import_loads_the_new_history() {
+    let (mut library, spans) = history_library();
+    library.hold_lastfm = true;
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    listen_as(&worker, "listener");
+    assert!(matches!(
+        shelves(&worker, 1).history,
+        HistoryStatus::Loading { .. }
+    ));
+    fixture.wait_request(&crate::fixture::Request::new(
+        "lastfm/chart",
+        &[
+            ("from", &spans[0].from.to_string()),
+            ("to", &spans[0].to.to_string()),
+        ],
+    ));
+    fixture.edit_library(|library| {
+        library.lastfm_charts =
+            vec![(spans[0].from, vec![("Fixture Artist", "Release other", 20)])];
+    });
+    listen_as(&worker, "listener-new");
+    assert!(
+        matches!(
+            shelves(&worker, 2).history,
+            HistoryStatus::Loading { done: 0, total: 0 }
+        ),
+        "new user's history must be Loading while the old import is in flight"
+    );
+    let found = settled(&worker, 3);
+    assert_eq!(found.history, HistoryStatus::Ready);
+    assert_eq!(lane(&found), ["other"]);
+    fixture.resume_lastfm();
+    loop {
+        let Event::Discover(_, found) = event(&worker, |e| matches!(e, Event::Discover(3, _)))
+        else {
+            unreachable!()
+        };
+        assert_eq!(found.history, HistoryStatus::Ready);
+        assert_eq!(
+            lane(&found),
+            ["other"],
+            "old user's late charts must stay isolated"
+        );
+        let old: Option<sonora::discover::History> = fixture
+            .catalog()
+            .state("lastfm-history:v1:listener")
+            .unwrap();
+        if old.is_some_and(|h| h.seasons.len() == spans.len()) {
+            break;
+        }
+    }
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn memory_lane_reaches_back_through_lastfm_history_and_keeps_it() {
     let (library, spans) = history_library();
     let fixture = Fixture::new(library);

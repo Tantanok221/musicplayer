@@ -19,7 +19,7 @@ use crate::{
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -661,7 +661,6 @@ impl ArtworkClock {
 }
 
 struct LastFmFetch {
-    user: String,
     done: usize,
     total: usize,
 }
@@ -728,7 +727,8 @@ fn publish_discover(
     events: &Sender<Event>,
     lastfm: &crate::lastfm::LastFm,
     request: u64,
-    fetch: Option<&LastFmFetch>,
+    fetches: &HashMap<(String, String), LastFmFetch>,
+    account: Option<&Account>,
     failure: Option<&(String, String)>,
 ) -> Result<()> {
     use crate::discover::HistoryStatus;
@@ -742,6 +742,7 @@ fn publish_discover(
     } else {
         catalog.state(&lastfm_state(&user))?
     };
+    let fetch = account.and_then(|account| fetches.get(&(account.namespace(), user.clone())));
     let hidden: Option<crate::discover::Hidden> = catalog.state("discover-hidden")?;
     let mut shelves = crate::discover::rediscover(
         &catalog.rediscover_candidates()?,
@@ -753,7 +754,7 @@ fn publish_discover(
         HistoryStatus::Off
     } else if !lastfm.has_key() {
         HistoryStatus::Unavailable
-    } else if let Some(fetch) = fetch.filter(|fetch| fetch.user == user) {
+    } else if let Some(fetch) = fetch {
         HistoryStatus::Loading {
             done: fetch.done,
             total: fetch.total,
@@ -853,7 +854,7 @@ fn run(
     if let Ok(Some(key)) = paths.lastfm_key() {
         lastfm.set_key(key);
     }
-    let mut lastfm_fetch: Option<LastFmFetch> = None;
+    let mut lastfm_fetches = HashMap::new();
     let mut lastfm_failure: Option<(String, String)> = None;
     let mut release_requests: HashSet<String> = HashSet::new();
     let mut open_artist: Option<(u64, String, String)> = None;
@@ -1268,7 +1269,7 @@ fn run(
                     if let Some(namespace) = namespace
                         && !user.is_empty()
                         && lastfm.has_key()
-                        && lastfm_fetch.is_none()
+                        && !lastfm_fetches.contains_key(&(namespace.clone(), user.clone()))
                     {
                         let history = load_history(&catalog, &user)?;
                         if history.registered.is_none()
@@ -1276,11 +1277,10 @@ fn run(
                                 .is_empty()
                         {
                             lastfm_failure = None;
-                            lastfm_fetch = Some(LastFmFetch {
-                                user: user.clone(),
-                                done: 0,
-                                total: 0,
-                            });
+                            lastfm_fetches.insert(
+                                (namespace.clone(), user.clone()),
+                                LastFmFetch { done: 0, total: 0 },
+                            );
                             let tx = tx.clone();
                             let lastfm = lastfm.clone();
                             runtime.spawn(fetch_lastfm(lastfm, tx, namespace, user, history));
@@ -1291,7 +1291,8 @@ fn run(
                         &events,
                         &lastfm,
                         request,
-                        lastfm_fetch.as_ref(),
+                        &lastfm_fetches,
+                        account.as_ref(),
                         lastfm_failure.as_ref(),
                     )?;
                 }
@@ -1303,13 +1304,11 @@ fn run(
                     }
                 }
                 Command::LastFmSeason(namespace, user, season, chart, done, total) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                    if account.as_ref().map(Account::namespace).as_ref() == Some(&namespace) {
                         let mut history = load_history(&catalog, &user)?;
                         history.seasons.insert(season, chart);
                         catalog.set_state(&lastfm_state(&user), &Some(&history))?;
-                        if let Some(fetch) =
-                            lastfm_fetch.as_mut().filter(|fetch| fetch.user == user)
-                        {
+                        if let Some(fetch) = lastfm_fetches.get_mut(&(namespace, user)) {
                             fetch.done = done;
                             fetch.total = total;
                         }
@@ -1318,28 +1317,25 @@ fn run(
                             &events,
                             &lastfm,
                             discover_request,
-                            lastfm_fetch.as_ref(),
+                            &lastfm_fetches,
+                            account.as_ref(),
                             lastfm_failure.as_ref(),
                         )?;
                     }
                 }
                 Command::LastFmDone(namespace, user, result) => {
-                    if lastfm_fetch
-                        .as_ref()
-                        .is_some_and(|fetch| fetch.user == user)
-                    {
-                        lastfm_fetch = None;
-                    }
-                    if let Err(message) = result {
-                        lastfm_failure = Some((user, message));
-                    }
+                    lastfm_fetches.remove(&(namespace.clone(), user.clone()));
                     if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        if let Err(message) = result {
+                            lastfm_failure = Some((user, message));
+                        }
                         publish_discover(
                             &catalog,
                             &events,
                             &lastfm,
                             discover_request,
-                            lastfm_fetch.as_ref(),
+                            &lastfm_fetches,
+                            account.as_ref(),
                             lastfm_failure.as_ref(),
                         )?;
                     }
