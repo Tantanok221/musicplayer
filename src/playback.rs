@@ -1258,6 +1258,11 @@ fn run(
                 PlayerCommand::Toggle | PlayerCommand::Play => {
                     let play = matches!(command, PlayerCommand::Play)
                         || !clock.playing.load(Ordering::Relaxed);
+                    if play && index.is_none() && !queue.is_empty() {
+                        index = Some(0);
+                        base_position = 0.;
+                        listen_seed = None;
+                    }
                     clock.playing.store(play, Ordering::Relaxed);
                     // A stream stuck buffering reconnects when Play is pressed again.
                     let stalled =

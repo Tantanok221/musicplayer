@@ -268,6 +268,14 @@ impl ListeningPlayer {
         self.player.commands.send(command)?;
         Ok(())
     }
+
+    pub fn snapshot(&self, timeout: Duration) -> Result<PlaybackSnapshot> {
+        let (send, saved) = flume::bounded(1);
+        self.player.commands.send(PlayerCommand::SaveQueue(send))?;
+        saved.recv_timeout(timeout)?;
+        while self.player.events.try_recv().is_ok() {}
+        self.player.command(PlayerCommand::ClearError, timeout)
+    }
 }
 
 /// Production actor with the headless platform, for worker persistence scenarios.
