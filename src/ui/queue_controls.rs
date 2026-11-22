@@ -348,22 +348,27 @@ impl MusicApp {
             self.queue_edit(QueueEdit::Move { indices, before });
         }
     }
-    fn save_queue_playlist(&mut self, upcoming: bool, cx: &mut Context<Self>) {
+    pub(super) fn save_queue_playlist(
+        &mut self,
+        upcoming: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let start = if upcoming {
             next_index(&self.playback)
         } else {
             0
         };
-        self.playlist_editor_tracks = Some(
-            self.playback.queue[start..]
-                .iter()
-                .map(|t| t.id.clone())
-                .collect(),
+        let ids = self.playback.queue[start..]
+            .iter()
+            .map(|track| track.id.clone())
+            .collect();
+        self.new_playlist(
+            crate::playlists::CreationSource::Tracks(ids),
+            "",
+            window,
+            cx,
         );
-        self.show_playlist_editor = true;
-        self.playlist_editor_rename = false;
-        self.playlist_editor_album = None;
-        cx.notify();
     }
     pub(super) fn queue_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
@@ -384,16 +389,18 @@ impl MusicApp {
                     let all = weak.clone();
                     let upcoming = weak.clone();
                     menu.item(
-                        PopupMenuItem::new("Whole queue…").on_click(move |_, _, cx| {
-                            let _ = all.update(cx, |app, cx| app.save_queue_playlist(false, cx));
+                        PopupMenuItem::new("Whole queue…").on_click(move |_, window, cx| {
+                            let _ = all
+                                .update(cx, |app, cx| app.save_queue_playlist(false, window, cx));
                         }),
                     )
                     .item(
                         PopupMenuItem::new("Upcoming tracks…")
                             .disabled(no_upcoming)
-                            .on_click(move |_, _, cx| {
-                                let _ = upcoming
-                                    .update(cx, |app, cx| app.save_queue_playlist(true, cx));
+                            .on_click(move |_, window, cx| {
+                                let _ = upcoming.update(cx, |app, cx| {
+                                    app.save_queue_playlist(true, window, cx)
+                                });
                             }),
                     )
                 }),

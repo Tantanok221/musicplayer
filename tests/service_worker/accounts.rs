@@ -9,7 +9,7 @@ use sonora::{
 #[test]
 fn delayed_lyrics_reply_cannot_reach_the_new_account() {
     let a = Fixture::new(Library {
-        structured_lyrics: serde_json::json!([{"line": [{"value": "Account A lyrics"}]}]),
+        structured_lyrics: serde_json::json!([{"line":[{"value":"Account A lyrics"}]}]),
         ..Default::default()
     });
     let b = Fixture::new(Library::default());
