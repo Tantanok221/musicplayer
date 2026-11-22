@@ -319,8 +319,6 @@ pub struct LibraryQuery {
     pub genre: String,
     pub year: Option<i32>,
     pub record_label: String,
-    /// Narrows the library to tracks with a tag gap.
-    pub health: Option<crate::metadata::HealthIssue>,
     pub favorites: bool,
     /// The rules the Favorites page applies when `favorites` is set.
     pub favorite_filter: FavoritesFilter,

@@ -216,19 +216,6 @@ impl MusicApp {
                     })),
             );
         }
-        if let Some(issue) = self.query.health {
-            bar = bar.child(
-                Button::new("clear-health-filter")
-                    .ghost()
-                    .compact()
-                    .label(format!("Health: {} ×", issue.label()))
-                    .accessibility_label(format!("Clear {} filter", issue.label().to_lowercase()))
-                    .on_click(cx.listener(|app, _, _, cx| {
-                        app.query.health = None;
-                        app.request_query(cx);
-                    })),
-            );
-        }
         for (index, genre) in self.query.selection.genres.iter().enumerate() {
             let genre = genre.clone();
             bar = bar.child(
@@ -414,49 +401,6 @@ impl MusicApp {
                         filter.match_all,
                         Box::new(|filter| filter.match_all = true),
                     ))
-            })
-            .into_any_element()
-    }
-
-    /// Narrows the library to tracks with one tag gap at a time.
-    pub(super) fn health_filter_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.query.health;
-        let weak = cx.weak_entity();
-        Button::new("health-filter")
-            .ghost()
-            .small()
-            .icon(Glyph::TriangleAlert)
-            .label(current.map_or("Health", HealthIssue::label))
-            .text_color(if current.is_some() {
-                ink(cx).accent
-            } else {
-                ink(cx).muted
-            })
-            .tooltip("Find tracks with missing or inconsistent tags")
-            .dropdown_menu(move |mut menu, _, _| {
-                let set = |issue: Option<HealthIssue>| {
-                    let weak = weak.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        let _ = weak.update(cx, |app, cx| {
-                            app.query.health = issue;
-                            app.request_query(cx);
-                        });
-                    }
-                };
-                menu = menu.label("Show tracks with").item(
-                    PopupMenuItem::new("Any tags")
-                        .checked(current.is_none())
-                        .on_click(set(None)),
-                );
-                menu = menu.separator();
-                for issue in HealthIssue::ALL {
-                    menu = menu.item(
-                        PopupMenuItem::new(issue.label())
-                            .checked(current == Some(issue))
-                            .on_click(set(Some(issue))),
-                    );
-                }
-                menu
             })
             .into_any_element()
     }
@@ -892,8 +836,7 @@ impl MusicApp {
                 && (self.query.year.is_some()
                     || !self.query.selection.genres.is_empty()
                     || !self.query.record_label.is_empty()
-                    || !self.query.performer.is_empty()
-                    || self.query.health.is_some())
+                    || !self.query.performer.is_empty())
             {
                 center = center.child(self.active_filter_bar(cx));
             }

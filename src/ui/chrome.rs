@@ -50,9 +50,6 @@ impl MusicApp {
         if self.is_library() && self.query.favorites {
             left = left.child(self.favorites_filter_menu(cx));
         }
-        if self.is_library() {
-            left = left.child(self.health_filter_menu(cx));
-        }
         if self.workspace == Workspace::Queue
             && self.artist_name.is_none()
             && self.library_width >= 620.
@@ -139,7 +136,6 @@ impl MusicApp {
                                     app.query.performer.clear();
                                     app.query.year = None;
                                     app.query.record_label.clear();
-                                    app.query.health = None;
                                     app.request_query(cx);
                                 })),
                         )
