@@ -773,3 +773,40 @@ fn a_song_with_no_match_names_the_recording(cx: &mut TestAppContext) {
         "{error}"
     );
 }
+
+#[gpui_kit::test]
+fn one_song_can_take_the_release_cover(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    writes_tags(&mut fixture, true);
+    songs_view(&mut fixture, window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-1", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags…", cx);
+    fixture.expect("search", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    fixture.expect("load", |_, _| {
+        let mut release = release();
+        release.tracks[1].title = "Fixture song".into();
+        vec![Event::ReleaseLoaded("rel".into(), Ok(Arc::new(release)))]
+    });
+    fixture.click(window, ("release-candidate", 0_usize), cx);
+    fixture.click(window, "fill-cover-art", cx);
+    fixture.click(window, "fill-tags", cx);
+    fixture.click(window, "save-tags", cx);
+    assert!(present(window, "confirm-tags", cx));
+    let changes = changes(window, cx);
+    assert!(
+        changes.iter().any(|change| change
+            .ends_with("Cover art: (empty) → Front cover from Cover Art Archive")
+            || change.ends_with("→ Front cover from Cover Art Archive")),
+        "{changes:?}"
+    );
+}
