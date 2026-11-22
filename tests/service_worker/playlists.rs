@@ -10,6 +10,120 @@ use sonora::{
 use std::sync::Arc;
 
 #[test]
+fn removal_after_server_reorder_removes_selected_song() {
+    let mut library = Library::default();
+    library.playlists = vec![Playlist {
+        id: "playlist".into(),
+        name: "Roadtrip".into(),
+        song_count: 2,
+        entry: library
+            .tracks
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    }];
+    let cached = library.playlists[0].clone();
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    fixture.edit_library(|library| Arc::make_mut(&mut library.playlists[0].entry).reverse());
+    fixture.expect_mutation(
+        Request::new(
+            "updatePlaylist.view",
+            &[("playlistId", "playlist"), ("songIndexToRemove", "1")],
+        ),
+        true,
+    );
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::RemoveFromPlaylist {
+            id: "playlist".into(),
+            index: 0,
+            song: "song".into(),
+            occurrence: 0,
+        }));
+    let Event::Playlist(saved) = event(
+        &worker,
+        |e| matches!(e, Event::Playlist(p) if p.entry.len() == 1),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(
+        saved.entry[0].id, "other-song",
+        "wrong song removed after server reorder"
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn removal_of_song_missing_on_server_does_not_remove_another_entry() {
+    let mut library = Library::default();
+    let cached = Playlist {
+        id: "playlist".into(),
+        song_count: 2,
+        entry: library
+            .tracks
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    };
+    library.playlists = vec![cached.clone()];
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    fixture.edit_library(|library| {
+        Arc::make_mut(&mut library.playlists[0].entry).remove(0);
+        library.playlists[0].song_count = 1;
+    });
+    let mutation = Mutation::RemoveFromPlaylist {
+        id: "playlist".into(),
+        index: 0,
+        song: "song".into(),
+        occurrence: 0,
+    };
+    worker.service().send(Command::Mutate(mutation.clone()));
+    event(
+        &worker,
+        |e| matches!(e, Event::MutationFailed(failed, error) if failed == &mutation && error.contains("no longer")),
+    );
+    event(
+        &worker,
+        |e| matches!(e, Event::Playlist(p) if p.entry.len() == 1 && p.entry[0].id == "other-song"),
+    );
+    assert_eq!(
+        fixture
+            .catalog()
+            .playlist("playlist")
+            .unwrap()
+            .unwrap()
+            .entry[0]
+            .id,
+        "other-song"
+    );
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|request| request.endpoint == "updatePlaylist.view")
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn delayed_playlist_reply_after_account_switch_keeps_new_accounts_catalog() {
     delayed_playlist_reply_after_account_switch(false);
 }
@@ -53,10 +167,12 @@ fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
         );
         worker
             .service()
-            .send(Command::Mutate(Mutation::RemoveFromPlaylist(
-                "a-playlist".into(),
-                0,
-            )));
+            .send(Command::Mutate(Mutation::RemoveFromPlaylist {
+                id: "a-playlist".into(),
+                index: 0,
+                song: "a-song".into(),
+                occurrence: 0,
+            }));
         event(&worker, |event| matches!(event, Event::MutationDone(_)));
     } else {
         worker
@@ -403,7 +519,12 @@ fn removal_uses_entry_index_and_refreshes_persisted_playlist_only_on_success() {
         "updatePlaylist.view",
         &[("playlistId", "playlist"), ("songIndexToRemove", "2")],
     );
-    let mutation = Mutation::RemoveFromPlaylist("playlist".into(), 2);
+    let mutation = Mutation::RemoveFromPlaylist {
+        id: "playlist".into(),
+        index: 2,
+        song: "song".into(),
+        occurrence: 1,
+    };
     fixture.expect_mutation(request, false);
     worker.service().send(Command::Mutate(mutation.clone()));
     event(
@@ -431,10 +552,12 @@ fn removal_uses_entry_index_and_refreshes_persisted_playlist_only_on_success() {
         );
         worker
             .service()
-            .send(Command::Mutate(Mutation::RemoveFromPlaylist(
-                "playlist".into(),
+            .send(Command::Mutate(Mutation::RemoveFromPlaylist {
+                id: "playlist".into(),
                 index,
-            )));
+                song: if index == 1 { "other-song" } else { "song" }.into(),
+                occurrence: usize::from(index == 2),
+            }));
         event(
             &worker,
             |event| matches!(event, Event::Playlist(playlist) if playlist.entry.len() == index),

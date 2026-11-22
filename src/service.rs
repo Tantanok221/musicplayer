@@ -49,7 +49,12 @@ pub enum Mutation {
     DeletePlaylist(String),
     /// Playlist ID and the songs appended to it.
     AddToPlaylist(String, Vec<String>),
-    RemoveFromPlaylist(String, usize),
+    RemoveFromPlaylist {
+        id: String,
+        index: usize,
+        song: String,
+        occurrence: usize,
+    },
 }
 /// Where an album's songs go: a new playlist by name, or an existing one by ID.
 #[derive(Clone, Debug, PartialEq)]
@@ -2318,7 +2323,7 @@ fn run(
                         mutation,
                         Mutation::ReorderPlaylist { .. }
                             | Mutation::AddToPlaylist(..)
-                            | Mutation::RemoveFromPlaylist(..)
+                            | Mutation::RemoveFromPlaylist { .. }
                             | Mutation::DeletePlaylist(..)
                     )
                     .then(|| playlist_track_edits.clone());
@@ -2350,9 +2355,12 @@ fn run(
                             Mutation::AddToPlaylist(id, ids) => {
                                 server.add_to_playlist(id, ids).await
                             }
-                            Mutation::RemoveFromPlaylist(id, index) => {
-                                server.remove_from_playlist(id, *index).await
-                            }
+                            Mutation::RemoveFromPlaylist { id, index, song, occurrence } => async {
+                                let playlist = server.playlist(id).await?;
+                                let index = crate::playlists::removal_index(&playlist, *index, song, *occurrence)
+                                    .ok_or_else(|| anyhow::anyhow!("The selected song occurrence is no longer in the playlist. Reopen it before removing"))?;
+                                server.remove_from_playlist(id, index).await
+                            }.await,
                         };
                         match result {
                             Ok(()) => {
@@ -2452,7 +2460,7 @@ fn run(
                                     Mutation::ReorderPlaylist { id, .. }
                                     | Mutation::RenamePlaylist(id, _)
                                     | Mutation::AddToPlaylist(id, _) => Some(id),
-                                    Mutation::RemoveFromPlaylist(id, _) => Some(id),
+                                    Mutation::RemoveFromPlaylist { id, .. } => Some(id),
                                     _ => None,
                                 };
                                 runtime.spawn(async move {
@@ -2489,6 +2497,9 @@ fn run(
                 Command::MutationFailed(namespace, mutation, error) => {
                     if account.as_ref().map(Account::namespace).unwrap_or_default() != namespace {
                         return Ok(());
+                    }
+                    if let Mutation::RemoveFromPlaylist { id, .. } = &mutation {
+                        tx.send(Command::Playlist(id.clone()))?;
                     }
                     if let Mutation::Favorite(id, _) | Mutation::Rating(id, _) = &mutation
                         && let Some(track) = catalog.by_ids(std::slice::from_ref(id))?.first()

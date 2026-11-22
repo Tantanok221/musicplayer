@@ -12,6 +12,107 @@ use sonora::{
 };
 use std::time::Instant;
 
+#[gpui_kit::test]
+fn remove_after_server_reorder_removes_clicked_song(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    library.playlists = vec![sonora::model::Playlist {
+        id: "playlist".into(),
+        name: "Roadtrip".into(),
+        song_count: 2,
+        entry: library
+            .tracks
+            .iter()
+            .cloned()
+            .map(std::sync::Arc::new)
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    }];
+    let cached = library.playlists[0].clone();
+    let fixture = Fixture::new(library);
+    fixture.seed();
+    fixture.catalog().save_playlist(&cached).unwrap();
+    let mut prefs = Preferences::default();
+    prefs.tabs.active_mut().page = Some(sonora::browser::Page {
+        workspace: sonora::browser::Workspace::Playlists,
+        playlist: Some(("playlist".into(), "Roadtrip".into())),
+        ..Default::default()
+    });
+    let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
+    let mut initialized = 0;
+    deliver_until(&worker, &tx, window, cx, |event, cx| {
+        initialized += usize::from(matches!(event, Event::Ready(..)));
+        cx.update_window(window, |_, window, _| {
+            initialized >= 2
+                && window
+                    .try_find("row-playlist-1")
+                    .is_some_and(|row| row.visible())
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("row-playlist-0").label(),
+            Some("Song song · Fixture Artist · Release album")
+        );
+    })
+    .unwrap();
+    fixture.edit_library(|library| {
+        std::sync::Arc::make_mut(&mut library.playlists[0].entry).reverse()
+    });
+    fixture.expect_mutation(
+        Request::new(
+            "updatePlaylist.view",
+            &[("playlistId", "playlist"), ("songIndexToRemove", "1")],
+        ),
+        true,
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-playlist-0", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let mut menu = window.within("popup-menu");
+        let target = menu.find_by_label("Remove from Playlist");
+        let id = target.path().last().unwrap().clone();
+        menu.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Playlist(p) if p.entry.len() == 1),
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert_eq!(
+            window.find("row-playlist-0").label(),
+            Some("Song other-song · Fixture Artist · Release other-album"),
+            "wrong song removed by clicked Remove"
+        );
+        assert!(window.try_find("row-playlist-1").is_none());
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .catalog()
+            .playlist("playlist")
+            .unwrap()
+            .unwrap()
+            .entry[0]
+            .id,
+        "other-song"
+    );
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
 /// Stage real events in FIFO order through MusicApp's normal receiver. This
 /// lets the test inspect the optimistic frame before releasing HTTP results.
 /// No event is synthesized, filtered, reordered or handled directly by the view.

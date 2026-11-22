@@ -468,8 +468,10 @@ fn remove_playlist_entry_refreshes_only_after_success(cx: &mut TestAppContext) {
     })
     .unwrap();
     fixture.settle(window, cx);
-    fixture.expect("remove rejected", |command, _| {
-        let expected = Mutation::RemoveFromPlaylist("playlist-1".into(), 2);
+    let expected = sonora::playlists::PlaylistEntry::new(&loaded, 2)
+        .mutation(Some(&loaded))
+        .unwrap();
+    fixture.expect("remove rejected", move |command, _| {
         assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
         vec![Event::MutationFailed(
             expected,
@@ -490,8 +492,10 @@ fn remove_playlist_entry_refreshes_only_after_success(cx: &mut TestAppContext) {
         std::sync::Arc::make_mut(&mut updated.entry).remove(index);
         updated.song_count -= 1;
         let response = updated.clone();
+        let expected = sonora::playlists::PlaylistEntry::new(&loaded, index)
+            .mutation(Some(&loaded))
+            .unwrap();
         fixture.expect("remove selected entry", move |command, _| {
-            let expected = Mutation::RemoveFromPlaylist("playlist-1".into(), index);
             assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
             vec![
                 Event::Playlists(vec![response.clone()]),
