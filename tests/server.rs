@@ -27,8 +27,14 @@ async fn handler(
         "search3.view" => {
             assert_eq!(query["query"], "");
             assert_eq!(query["songCount"], "500");
-            assert_eq!(query["songOffset"], "500");
-            json!({"status":"ok","searchResult3":{"song":[{"id":"1","title":"夜の散歩","albumId":"a"}]}})
+            match query["songOffset"].as_str() {
+                "0" => json!({"status":"ok","searchResult3":{"song":null}}),
+                "1" => json!({"status":"ok","searchResult3":{}}),
+                "500" => {
+                    json!({"status":"ok","searchResult3":{"song":[{"id":"1","title":"夜の散歩","albumId":"a"}]}})
+                }
+                _ => panic!("unexpected song offset"),
+            }
         }
         "getScanStatus.view" => json!({"status":"ok","scanStatus":{"scanning":false}}),
         "star.view" => json!({"status":"ok"}),
@@ -80,6 +86,9 @@ async fn authentication_base_path_capabilities_and_pagination() {
         Server::with_credentials(server.account.clone(), server.credentials().clone()).unwrap();
     assert!(resumed.connect().await.unwrap().contains("navidrome"));
     assert!(server.extensions.contains("songLyrics"));
+    for offset in [0, 1] {
+        assert_eq!(server.page("song", offset).await.unwrap(), json!([]));
+    }
     assert_eq!(
         server.page("song", 500).await.unwrap()[0]["title"],
         "夜の散歩"
@@ -166,4 +175,52 @@ fn invalid_accounts_are_rejected_and_namespace_is_account_specific() {
         ..a.clone()
     };
     assert_ne!(a.namespace(), b.namespace());
+}
+
+#[tokio::test]
+async fn playlists_reject_malformed_lists_and_accept_empty_or_populated_lists() {
+    for (playlists, expected) in [
+        (json!({}), Some(0)),
+        (json!({"playlist":null}), Some(0)),
+        (json!({"playlist":[]}), Some(0)),
+        (
+            json!({"playlist":[{"id":"p1","name":"Favorites"}]}),
+            Some(1),
+        ),
+        (json!({"playlist":"oops"}), None),
+        (json!({"playlist":42}), None),
+        (json!({"playlist":false}), None),
+        (json!({"playlist":{"id":"single"}}), None),
+        (json!({"playlist":["oops"]}), None),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/rest/getPlaylists.view",
+                    get(move || async move {
+                        Json(json!({"subsonic-response":{"status":"ok","playlists":playlists}}))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let server = Server::new(
+            Account {
+                url: format!("http://{address}"),
+                username: "test".into(),
+            },
+            "secret".into(),
+        )
+        .unwrap();
+        let result = server.playlists().await;
+        match expected {
+            Some(count) => assert_eq!(result.unwrap().len(), count),
+            None => assert!(result.is_err()),
+        }
+        task.abort();
+    }
 }

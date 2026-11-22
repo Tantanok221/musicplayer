@@ -1,4 +1,5 @@
 use crate::fixture::{Fixture, Library, WAIT, album, event, song, view};
+use serde_json::json;
 use sonora::{
     model::{NamedId, Playlist},
     service::{Command, Event},
@@ -107,6 +108,130 @@ fn interrupted_sync_placeholder_albums_belong_to_album_artists() {
     assert_eq!(display_releases[0].id, "display-performer");
     worker.shutdown(WAIT).unwrap();
     fixture.finish();
+}
+
+#[test]
+fn malformed_playlist_lists_fail_sync_without_deleting_cached_playlists() {
+    for value in [
+        json!("oops"),
+        json!(42),
+        json!(false),
+        json!({"id":"single"}),
+    ] {
+        let fixture = Fixture::new(Library {
+            playlists_response: Some(json!({"playlist":value})),
+            ..Library::default()
+        });
+        fixture
+            .catalog()
+            .save_playlist_summaries(
+                &[Playlist {
+                    id: "cached-playlist".into(),
+                    name: "Offline playlist".into(),
+                    ..Default::default()
+                }],
+                true,
+            )
+            .unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        let outcome = event(&worker, |event| {
+            matches!(event, Event::Error(_))
+                || matches!(event, Event::Status(message) if message.starts_with("Up to date"))
+        });
+        assert!(
+            fixture
+                .catalog()
+                .playlist("cached-playlist")
+                .unwrap()
+                .is_some(),
+            "malformed playlist list must not delete cached playlists: {outcome:?}"
+        );
+        assert!(matches!(outcome, Event::Error(message)
+            if message.contains("getPlaylists") && message.contains("playlist")
+                && message.contains("Cached music is still available")));
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+    }
+}
+
+#[test]
+fn empty_playlist_lists_complete_sync_and_remove_cached_playlists() {
+    for response in [json!({}), json!({"playlist":[]}), json!({"playlist":null})] {
+        let fixture = Fixture::new(Library {
+            playlists_response: Some(response),
+            ..Library::default()
+        });
+        fixture
+            .catalog()
+            .save_playlist_summaries(
+                &[Playlist {
+                    id: "cached-playlist".into(),
+                    ..Default::default()
+                }],
+                true,
+            )
+            .unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        event(
+            &worker,
+            |event| matches!(event, Event::Status(message) if message.starts_with("Up to date")),
+        );
+        assert!(
+            fixture
+                .catalog()
+                .playlist("cached-playlist")
+                .unwrap()
+                .is_none()
+        );
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+    }
+}
+
+#[test]
+fn malformed_search3_lists_fail_sync_without_deleting_cached_music() {
+    for kind in ["song", "album"] {
+        for value in [
+            json!({"id":"single"}),
+            json!("invalid"),
+            json!(42),
+            json!(false),
+        ] {
+            let fixture = Fixture::new(Library {
+                tracks: vec![],
+                albums: vec![],
+                sync_list: Some((kind, value)),
+                ..Library::default()
+            });
+            {
+                let mut catalog = fixture.catalog();
+                catalog
+                    .put_tracks(&[song("cached", "cached-album")], 1)
+                    .unwrap();
+                catalog.put_albums(&[album("cached-album")], 1).unwrap();
+            }
+            let mut worker = fixture.start();
+            worker.wait_ready(WAIT).unwrap();
+            let outcome = event(&worker, |event| {
+                matches!(event, Event::Error(_))
+                    || matches!(event, Event::Status(message) if message.starts_with("Up to date"))
+            });
+            let catalog = fixture.catalog();
+            assert_eq!(
+                catalog.by_ids(&["cached".into()]).unwrap().len(),
+                1,
+                "malformed {kind} must not delete cached tracks"
+            );
+            assert!(catalog.album("cached-album").unwrap().is_some());
+            assert!(matches!(outcome, Event::Error(message)
+                if message.contains("search3") && message.contains(kind)
+                    && message.contains("Cached music is still available")));
+            worker.shutdown(WAIT).unwrap();
+            fixture.finish();
+        }
+    }
 }
 
 #[test]

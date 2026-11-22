@@ -56,6 +56,8 @@ pub struct Library {
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
     pub fail_song_offset: Option<usize>,
+    pub sync_list: Option<(&'static str, Value)>,
+    pub playlists_response: Option<Value>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
@@ -84,6 +86,8 @@ impl Default for Library {
             albums: vec![album("album"), album("other-album")],
             playlists: vec![],
             fail_song_offset: None,
+            sync_list: None,
+            playlists_response: None,
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
@@ -298,7 +302,7 @@ async fn navidrome(
             json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}})
         }
         "getPlaylists.view" if query.is_empty() => {
-            json!({"status":"ok","playlists":{"playlist":data.library.playlists}})
+            json!({"status":"ok","playlists":data.library.playlists_response.clone().unwrap_or_else(|| json!({"playlist":data.library.playlists}))})
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
@@ -448,6 +452,10 @@ async fn navidrome(
             let offset = offset.unwrap();
             if kind == "song" && data.library.fail_song_offset == Some(offset) {
                 json!({"status":"failed","error":{"code":70,"message":"Fixture later page failed"}})
+            } else if let Some((field, value)) = &data.library.sync_list
+                && kind == *field
+            {
+                json!({"status":"ok","searchResult3":{kind:value}})
             } else {
                 let items = if kind == "song" {
                     serde_json::to_value(

@@ -1,14 +1,57 @@
 //! Production paused actor, with no audio-device or OS media-control adapters.
 use sonora::{
-    model::{PlaybackSnapshot, Track},
+    model::{PlaybackSnapshot, Preferences, Track},
     playback::{
         Placement, PlayerCommand, QueueEdit,
-        test_support::{OutputPlayer, PausedPlayer},
+        test_support::{ListeningPlayer, OutputPlayer, PausedPlayer},
     },
 };
 use std::{sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(5);
+
+#[test]
+fn play_after_queue_end_starts_a_fresh_listen_and_scrobble_cycle() {
+    for replay in [PlayerCommand::Play, PlayerCommand::Toggle] {
+        let mut player = ListeningPlayer::start(WAIT).unwrap();
+        let first = player
+            .restart(PlayerCommand::Replace(tracks(&["last"]), 0), WAIT)
+            .unwrap();
+        let reports = player.progress(60., WAIT).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(!reports[0].submission);
+        assert!(reports[1].submission);
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+        let ended = player.finish(WAIT).unwrap();
+        assert!(!ended.playing);
+        assert_eq!(ended.index, Some(0));
+        assert_eq!(ended.position, 0.);
+        let second = player.restart(replay, WAIT).unwrap();
+        assert_ne!(first, second, "replay must not reuse the completed listen");
+        let reports = player.progress(60., WAIT).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(!reports[0].submission);
+        assert!(reports[1].submission);
+        assert!(reports.iter().all(|report| report.id == second));
+        assert!(player.progress(60., WAIT).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pause_and_retry_preserve_the_current_listen() {
+    let mut player = ListeningPlayer::start(WAIT).unwrap();
+    let first = player
+        .restart(PlayerCommand::Replace(tracks(&["current"]), 0), WAIT)
+        .unwrap();
+    assert_eq!(player.progress(30., WAIT).unwrap().len(), 1);
+    player.command(PlayerCommand::Pause).unwrap();
+    player.command(PlayerCommand::Play).unwrap();
+    assert_eq!(player.restart(PlayerCommand::Retry, WAIT).unwrap(), first);
+    let reports = player.progress(30., WAIT).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].submission);
+    assert_eq!(reports[0].id, first);
+}
 
 fn tracks(ids: &[&str]) -> Vec<Arc<Track>> {
     ids.iter()
@@ -29,6 +72,219 @@ fn ids(snapshot: &PlaybackSnapshot) -> Vec<&str> {
         .iter()
         .map(|track| track.id.as_str())
         .collect()
+}
+
+#[test]
+fn legacy_moves_preserve_the_current_duplicate_occurrence() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    for (current, from, to, expected, expected_ids) in [
+        (2, 1, 0, 2, ["B", "A", "A"]),
+        (2, 2, 1, 1, ["A", "A", "B"]),
+        (1, 2, 0, 2, ["A", "A", "B"]),
+        (1, 0, 2, 0, ["B", "A", "A"]),
+        (2, 1, 1, 2, ["A", "B", "A"]),
+        (2, 3, 0, 2, ["A", "B", "A"]),
+        (2, 0, 3, 2, ["A", "B", "A"]),
+    ] {
+        let initial = player
+            .command(
+                PlayerCommand::Restore(tracks(&["A", "B", "A"]), current, 17., None),
+                WAIT,
+            )
+            .unwrap();
+        let moved = player.command(PlayerCommand::Move(from, to), WAIT).unwrap();
+        assert_eq!(ids(&moved), expected_ids);
+        assert_eq!(
+            moved.index,
+            Some(expected),
+            "current {current}, move {from} to {to}"
+        );
+        assert!(Arc::ptr_eq(&moved.queue[expected], &initial.queue[current]));
+        assert_eq!(moved.position, 17.);
+        assert!(!moved.playing);
+    }
+    player
+        .command(PlayerCommand::Restore(vec![], 0, 0., None), WAIT)
+        .unwrap();
+    let empty = player.command(PlayerCommand::Move(0, 0), WAIT).unwrap();
+    assert!(empty.queue.is_empty());
+    assert_eq!(empty.index, None);
+    player.shutdown(WAIT).unwrap();
+}
+
+#[test]
+fn unshuffle_after_replace_keeps_selected_duplicate_and_its_next_track() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    player
+        .command(
+            PlayerCommand::Preferences(Preferences {
+                shuffle: true,
+                ..Default::default()
+            }),
+            WAIT,
+        )
+        .unwrap();
+    let shuffled = player
+        .command(
+            PlayerCommand::Replace(tracks(&["same", "middle", "same", "last"]), 2),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(shuffled.index, Some(0));
+    assert_eq!(shuffled.queue[0].id, "same");
+    let restored = player
+        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .unwrap();
+    assert_eq!(ids(&restored), ["same", "middle", "same", "last"]);
+    assert_eq!(restored.index, Some(2));
+    let next = player.command(PlayerCommand::Next, WAIT).unwrap();
+    assert_eq!(next.index, Some(3));
+    assert_eq!(next.queue[3].id, "last");
+    player.shutdown(WAIT).unwrap();
+}
+
+#[test]
+fn unshuffle_after_track_update_keeps_later_duplicate_current() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    let initial = player
+        .command(
+            PlayerCommand::Restore(
+                tracks(&["same", "middle", "same", "next", "last"]),
+                2,
+                17.,
+                None,
+            ),
+            WAIT,
+        )
+        .unwrap();
+    player
+        .command(
+            PlayerCommand::Preferences(Preferences {
+                shuffle: true,
+                ..Default::default()
+            }),
+            WAIT,
+        )
+        .unwrap();
+    let updated = player
+        .command(
+            PlayerCommand::UpdateTrack(Arc::new(Track {
+                id: "same".into(),
+                title: "Fresh metadata".into(),
+                duration: 120.,
+                ..Default::default()
+            })),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(updated.index, Some(2));
+    let restored = player
+        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .unwrap();
+    assert_eq!(restored.index, Some(2));
+    assert_eq!(ids(&restored), ids(&initial));
+    assert_eq!(restored.position, 17.);
+    assert_eq!(restored.queue[0].title, "Fresh metadata");
+    assert_eq!(restored.queue[2].title, "Fresh metadata");
+    player.shutdown(WAIT).unwrap();
+}
+
+#[test]
+fn shuffled_occurrences_survive_insert_remove_undo_and_metadata_refresh() {
+    let mut player = PausedPlayer::start(WAIT).unwrap();
+    player
+        .command(
+            PlayerCommand::Preferences(Preferences {
+                shuffle: true,
+                ..Default::default()
+            }),
+            WAIT,
+        )
+        .unwrap();
+    let mut queue = tracks(&["same", "middle", "same", "last"]);
+    Arc::make_mut(&mut queue[0]).title = "Earlier copy".into();
+    player
+        .command(PlayerCommand::Replace(queue, 2), WAIT)
+        .unwrap();
+    player
+        .command(
+            PlayerCommand::Insert(tracks(&["inserted"]), Placement::Next),
+            WAIT,
+        )
+        .unwrap();
+    let inserted = player
+        .command(
+            PlayerCommand::Insert(tracks(&["same"]), Placement::Last),
+            WAIT,
+        )
+        .unwrap();
+    let earlier = inserted
+        .queue
+        .iter()
+        .position(|track| track.title == "Earlier copy")
+        .unwrap();
+    let removed = player
+        .command(
+            PlayerCommand::EditQueue(inserted.queue_revision, QueueEdit::Remove(vec![earlier])),
+            WAIT,
+        )
+        .unwrap();
+    let stale = player
+        .command(
+            PlayerCommand::EditQueue(inserted.queue_revision, QueueEdit::ClearUpcoming),
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(stale.queue_ids, removed.queue_ids);
+    player
+        .command(
+            PlayerCommand::UpdateTrack(Arc::new(Track {
+                id: "same".into(),
+                title: "Updated".into(),
+                ..Default::default()
+            })),
+            WAIT,
+        )
+        .unwrap();
+    let undone = player.command(PlayerCommand::UndoQueue, WAIT).unwrap();
+    assert_eq!(undone.queue_ids, inserted.queue_ids);
+    assert!(
+        undone
+            .queue
+            .iter()
+            .filter(|track| track.id == "same")
+            .all(|track| track.title == "Updated")
+    );
+    let removed = player
+        .command(
+            PlayerCommand::EditQueue(undone.queue_revision, QueueEdit::Remove(vec![earlier])),
+            WAIT,
+        )
+        .unwrap();
+    player
+        .command(
+            PlayerCommand::EditQueue(
+                removed.queue_revision,
+                QueueEdit::Move {
+                    indices: vec![1],
+                    before: removed.queue.len(),
+                },
+            ),
+            WAIT,
+        )
+        .unwrap();
+    let restored = player
+        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .unwrap();
+    assert_eq!(
+        ids(&restored),
+        ["middle", "same", "inserted", "last", "same"]
+    );
+    assert_eq!(restored.index, Some(1));
+    let next = player.command(PlayerCommand::Next, WAIT).unwrap();
+    assert_eq!(next.index, Some(2));
+    assert_eq!(next.queue[2].id, "inserted");
+    player.shutdown(WAIT).unwrap();
 }
 
 #[test]

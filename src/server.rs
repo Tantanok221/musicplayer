@@ -183,11 +183,11 @@ impl Server {
         };
         params.push((key, offset.to_string()));
         let response = self.request("search3", &params).await?;
-        Ok(response["searchResult3"][kind]
-            .as_array()
-            .cloned()
-            .map(Value::Array)
-            .unwrap_or_else(|| json!([])))
+        match &response["searchResult3"][kind] {
+            Value::Null => Ok(json!([])),
+            Value::Array(items) => Ok(Value::Array(items.clone())),
+            _ => bail!("Invalid search3 {kind} list: expected an array"),
+        }
     }
     /// Fetches every page of `kind` and hands each to `handle` in order, keeping
     /// up to `ahead` requests in flight so the library syncs without waiting on
@@ -272,13 +272,11 @@ impl Server {
     }
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let response = self.request("getPlaylists", &[]).await?;
-        Ok(serde_json::from_value(
-            response["playlists"]["playlist"]
-                .as_array()
-                .cloned()
-                .map(Value::Array)
-                .unwrap_or_else(|| json!([])),
-        )?)
+        match &response["playlists"]["playlist"] {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(items) => Ok(serde_json::from_value(Value::Array(items.clone()))?),
+            _ => bail!("Invalid getPlaylists playlist list: expected an array"),
+        }
     }
     pub async fn playlist(&self, id: &str) -> Result<Playlist> {
         self.value("getPlaylist", &[("id", id.into())], "playlist")
