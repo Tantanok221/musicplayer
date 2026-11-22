@@ -321,6 +321,12 @@ pub struct History {
 }
 
 impl History {
+    pub fn remember_transition(&mut self, current: Option<Page>, target: Option<Page>) {
+        if current != target {
+            self.remember(current);
+        }
+    }
+
     pub fn remember(&mut self, current: Option<Page>) {
         if self.back.last() != Some(&current) {
             self.back.push(current);

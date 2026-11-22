@@ -72,6 +72,98 @@ fn assert_favorite(
 }
 
 #[gpui_kit::test]
+fn playlist_history_clicks_restore_the_selected_playlist(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.bind_keys(tab_bindings());
+    });
+    let playlists = ["A", "B"].map(|name| sonora::model::Playlist {
+        id: name.into(),
+        name: name.into(),
+        ..Default::default()
+    });
+    let fixture = Fixture::new(Library {
+        playlists: playlists.to_vec(),
+        ..Default::default()
+    });
+    fixture.seed();
+    let mut worker = fixture.start();
+    let (ui_events, received) = flume::unbounded();
+    let (window, app) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Default::default(),
+                    size(px(1440.), px(900.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| cx.new(|cx| MusicApp::new(worker.service().clone(), received, window, cx)),
+        )
+        .unwrap()
+    });
+    deliver_until(
+        &worker,
+        &ui_events,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Status(s) if s.starts_with("Up to date")),
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("library-disclosure", cx)
+    })
+    .unwrap();
+    for (target, name) in [
+        ("nav-playlist-A", "A"),
+        ("nav-playlist-B", "B"),
+        ("history-back", "A"),
+    ] {
+        cx.update_window(window, |_, window, cx| window.click(target, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| app.read(cx).tab_state().active().title()),
+            name
+        );
+        deliver_until(
+            &worker,
+            &ui_events,
+            window,
+            cx,
+            |e, _| matches!(e, Event::Playlist(p) if p.id == name),
+        );
+    }
+    cx.update_window(window, |_, window, cx| window.click("history-back", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| app.read(cx).tab_state().active().title()),
+        "Music Explorer"
+    );
+    for name in ["A", "B"] {
+        cx.update_window(window, |_, window, cx| window.click("history-forward", cx))
+            .unwrap();
+        deliver_until(
+            &worker,
+            &ui_events,
+            window,
+            cx,
+            |e, _| matches!(e, Event::Playlist(p) if p.id == name),
+        );
+        assert_eq!(
+            cx.update(|cx| app.read(cx).tab_state().active().title()),
+            name
+        );
+    }
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(app);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn create_smart_playlist_reaches_native_api_and_selects_saved_playlist(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);

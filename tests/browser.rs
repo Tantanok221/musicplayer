@@ -323,3 +323,30 @@ fn history_skips_repeated_pages_and_keeps_only_the_newest_fifty() {
     assert_eq!(seen.first().map(String::as_str), Some("59"));
     assert_eq!(seen.last().map(String::as_str), Some("10"));
 }
+
+#[test]
+fn playlist_transitions_preserve_identity_and_ignore_reopening_current_page() {
+    let explorer = Some(Page::of(Workspace::Explorer));
+    let playlist = |id: &str| {
+        Some(Page {
+            workspace: Workspace::Playlists,
+            playlist: Some((id.into(), id.into())),
+            ..Default::default()
+        })
+    };
+    let mut history = History::default();
+    history.remember_transition(explorer.clone(), playlist("A"));
+    history.remember_transition(playlist("A"), playlist("B"));
+    history.remember_transition(playlist("B"), playlist("B"));
+    assert_eq!(history.back(playlist("B")), Some(playlist("A")));
+    history.remember_transition(playlist("A"), playlist("A"));
+    assert!(history.can_go_forward());
+    assert_eq!(history.back(playlist("A")), Some(explorer.clone()));
+    assert_eq!(history.forward(explorer), Some(playlist("A")));
+    assert_eq!(history.forward(playlist("A")), Some(playlist("B")));
+    let mut empty = History::default();
+    empty.remember_transition(None, None);
+    assert!(!empty.can_go_back());
+    empty.remember_transition(None, playlist("A"));
+    assert_eq!(empty.back(playlist("A")), Some(None));
+}
