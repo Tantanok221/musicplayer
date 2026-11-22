@@ -270,6 +270,7 @@ impl Catalog {
             CREATE TABLE IF NOT EXISTS artist_profiles (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS listen_submissions (id TEXT PRIMARY KEY, track_id TEXT NOT NULL, started_ms INTEGER NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS tag_edits (id INTEGER PRIMARY KEY, job INTEGER NOT NULL, track_id TEXT NOT NULL, path TEXT NOT NULL, file TEXT NOT NULL, title TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, starred INTEGER NOT NULL, rating INTEGER, state TEXT NOT NULL, created INTEGER NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS track_search USING fts5(search, content='tracks', content_rowid='rowid', tokenize='trigram');
             CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
                 INSERT INTO track_search(rowid,search) VALUES (new.rowid,new.search); END;
@@ -1141,6 +1142,113 @@ impl Catalog {
             }
         }
         Ok(tracks)
+    }
+    /// Records a file about to be edited, before anything is written.
+    pub fn journal_tag_edit(
+        &self,
+        job: i64,
+        track: &Track,
+        file: &std::path::Path,
+        before: &crate::tags::TagValues,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO tag_edits(job,track_id,path,file,title,before,after,starred,rating,state,created) VALUES(?1,?2,?3,?4,?5,?6,'{}',?7,?8,'pending',?9)",
+            params![
+                job,
+                track.id,
+                track.path,
+                file.to_string_lossy(),
+                track.title,
+                serde_json::to_string(before)?,
+                track.starred.is_some(),
+                track.user_rating,
+                chrono::Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn finish_tag_edit(
+        &self,
+        id: i64,
+        after: Option<&crate::tags::TagValues>,
+        state: crate::tags::EditState,
+    ) -> Result<()> {
+        match after {
+            Some(after) => self.conn.execute(
+                "UPDATE tag_edits SET after=?1,state=?2 WHERE id=?3",
+                params![serde_json::to_string(after)?, state.as_str(), id],
+            )?,
+            None => self.conn.execute(
+                "UPDATE tag_edits SET state=?1 WHERE id=?2",
+                params![state.as_str(), id],
+            )?,
+        };
+        Ok(())
+    }
+    fn tag_edits_where(
+        &self,
+        filter: &str,
+        value: Value,
+    ) -> Result<Vec<crate::tags::JournalEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id,job,track_id,path,file,title,before,after,starred,rating,state FROM tag_edits WHERE {filter} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([value], |row| {
+            Ok((
+                crate::tags::JournalEntry {
+                    id: row.get(0)?,
+                    job: row.get(1)?,
+                    track_id: row.get(2)?,
+                    path: row.get(3)?,
+                    file: row.get(4)?,
+                    title: row.get(5)?,
+                    starred: row.get(8)?,
+                    rating: row.get(9)?,
+                    ..Default::default()
+                },
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut entry, before, after, state) = row?;
+            entry.before = serde_json::from_str(&before)?;
+            entry.after = serde_json::from_str(&after)?;
+            entry.state = crate::tags::EditState::parse(&state);
+            Ok(entry)
+        })
+        .collect()
+    }
+    pub fn tag_job(&self, job: i64) -> Result<Vec<crate::tags::JournalEntry>> {
+        self.tag_edits_where("job=?1", Value::Integer(job))
+    }
+    /// Edits written to files whose rescan has not been reconciled yet.
+    pub fn unconfirmed_tag_edits(&self) -> Result<Vec<crate::tags::JournalEntry>> {
+        self.tag_edits_where("state=?1", Value::Text("written".into()))
+    }
+    /// Edits a crash interrupted between journaling and writing.
+    pub fn interrupted_tag_edits(&self) -> Result<Vec<crate::tags::JournalEntry>> {
+        self.tag_edits_where("state=?1", Value::Text("pending".into()))
+    }
+    /// The newest job with files that can still be put back.
+    pub fn last_tag_job(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT max(job) FROM tag_edits WHERE state IN ('written','confirmed')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn track_by_path(&self, path: &str) -> Result<Option<Arc<Track>>> {
+        self.conn
+            .query_row(
+                "SELECT data FROM tracks WHERE json_extract(data,'$.path')=?1 LIMIT 1",
+                [path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|data| Ok(Arc::new(serde_json::from_str(&data)?)))
+            .transpose()
     }
     pub fn set_state<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         self.conn.execute(

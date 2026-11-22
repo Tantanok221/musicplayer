@@ -23,6 +23,9 @@ impl MusicApp {
                 self.volume.update(cx, |slider, cx| {
                     slider.set_value(self.preferences.volume, window, cx)
                 });
+                let folder = self.preferences.metadata.library_folder.clone();
+                self.metadata_folder
+                    .update(cx, |input, cx| input.set_value(folder, window, cx));
                 let slskd = self.preferences.downloads.url.clone();
                 self.slskd_url
                     .update(cx, |input, cx| input.set_value(slskd, window, cx));
@@ -225,6 +228,12 @@ impl MusicApp {
                 }
             }
             Event::SlskdStatus(status) => self.slskd_status = Some(status),
+            Event::TagsWritten(report) => self.tags_written(report),
+            Event::Album(id, tracks) if self.tag_editor_album.as_ref() == Some(&id) => {
+                self.tag_editor_album = None;
+                let tracks = tracks.iter().map(|track| (**track).clone()).collect();
+                self.open_tag_editor(tracks, window, cx);
+            }
             Event::Album(id, tracks) => {
                 if self.highlight_requested.as_ref() == Some(&id) {
                     self.highlight_album = Some((id, tracks));

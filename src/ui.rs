@@ -67,6 +67,7 @@ mod queue_controls;
 mod sections;
 use sections::{Part, style};
 mod tabs;
+mod tag_editor;
 use queue_controls::QueueViewState;
 pub use tabs::tab_bindings;
 mod sorting_controls;
@@ -502,6 +503,11 @@ pub struct MusicApp {
     /// Album whose songs a new playlist from the editor will hold.
     playlist_editor_album: Option<String>,
     pending_delete: Option<String>,
+    tag_editor: Option<tag_editor::TagEditor>,
+    /// Album whose songs the tag editor opens on when they arrive.
+    tag_editor_album: Option<String>,
+    tag_notice: Option<crate::tags::TagReport>,
+    metadata_folder: Entity<InputState>,
     status: String,
     connection: Connection,
     error: Option<String>,
@@ -550,6 +556,8 @@ impl MusicApp {
                 .masked(true)
         });
         let playlist_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
+        let metadata_folder =
+            cx.new(|cx| InputState::new(window, cx).placeholder("/Volumes/music"));
         let slskd_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://your-slskd-host:5030"));
         let lastfm_user = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
@@ -782,6 +790,10 @@ impl MusicApp {
             playlist_editor_tracks: None,
             playlist_editor_album: None,
             pending_delete: None,
+            tag_editor: None,
+            tag_editor_album: None,
+            tag_notice: None,
+            metadata_folder,
             status: "Opening library…".into(),
             connection: Connection::None,
             error: None,

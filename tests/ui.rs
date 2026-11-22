@@ -36,6 +36,8 @@ mod large_library;
 mod settings;
 #[path = "ui/song_feedback.rs"]
 mod song_feedback;
+#[path = "ui/tag_editor.rs"]
+mod tag_editor;
 #[allow(dead_code)]
 #[path = "service_worker/fixture.rs"]
 mod worker_fixture;

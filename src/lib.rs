@@ -20,6 +20,7 @@ pub mod server;
 pub mod service;
 pub mod slskd;
 pub mod sorting;
+pub mod tags;
 pub mod thumbnail;
 pub mod ui;
 pub mod visualizer;

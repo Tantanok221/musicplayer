@@ -944,6 +944,12 @@ impl MusicApp {
                         )),
                 );
         }
+        if let Some(notice) = self.tag_notice_banner(cx) {
+            center = center.child(notice);
+        }
+        if let Some(editor) = self.tag_editor_panel(cx) {
+            center = center.child(editor);
+        }
         if let Some(id) = self.pending_delete.clone() {
             center = center.child(
                 div()
