@@ -22,7 +22,7 @@ pub(super) enum TrackPosition {
     Queue(usize),
     Playlist {
         playback: TrackPlayback,
-        removal: Option<playlists::PlaylistRemoval>,
+        editable_entry: Option<playlists::PlaylistEntry>,
     },
 }
 
@@ -32,6 +32,22 @@ impl TrackPosition {
             Self::Queue(index) => TrackPlayback::Queue(*index),
             Self::Playlist { playback, .. } => playback.clone(),
         }
+    }
+}
+
+pub(super) struct TrackDragPreview(pub(super) String);
+
+impl Render for TrackDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(self.0.clone())
     }
 }
 
@@ -73,10 +89,18 @@ impl MusicApp {
         let feedback = self.track_feedback(track.clone(), key.clone(), cx);
         let now = track.clone();
         let playback = position.as_ref().map(TrackPosition::playback);
-        let menu = self.track_menu(track.clone(), position, cx);
         let row = div()
             .id(SharedString::from(format!("row-{key}")))
-            .test_support()
+            .cursor_default();
+        let row = match &position {
+            Some(TrackPosition::Playlist {
+                editable_entry: Some(entry),
+                ..
+            }) => self.playlist_reorder_row(row, entry, track.title.clone(), cx),
+            _ => row,
+        };
+        let menu = self.track_menu(track.clone(), position, cx);
+        row.test_support()
             .role(Role::Group)
             .aria_label(format!(
                 "{} · {} · {}",
@@ -92,7 +116,6 @@ impl MusicApp {
             .items_center()
             .gap_1()
             .text_size(px(11.))
-            .cursor_default()
             .when(selected, |s| s.bg(colors.selection))
             .when(!selected, |s| s.hover(|s| s.bg(colors.panel)))
             .when_some(popular, |row, popular| {
@@ -160,8 +183,8 @@ impl MusicApp {
                     }
                 }
             }))
-            .context_menu(menu);
-        row.into_any_element()
+            .context_menu(menu)
+            .into_any_element()
     }
 
     pub(super) fn playing_tracks(&mut self, cx: &mut Context<Self>) -> AnyElement {

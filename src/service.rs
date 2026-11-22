@@ -38,7 +38,11 @@ pub enum Mutation {
     AlbumFavorite(String, bool),
     AlbumRating(String, u8),
     CreatePlaylist(String, Vec<String>),
-    ReplacePlaylist(String, Vec<String>),
+    ReorderPlaylist {
+        id: String,
+        original: Vec<String>,
+        reordered: Vec<String>,
+    },
     RenamePlaylist(String, String),
     DeletePlaylist(String),
     /// Playlist ID and the songs appended to it.
@@ -746,6 +750,7 @@ fn run(
         ..
     } = service;
     let mut account = paths.account()?;
+    let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
     player.send(PlayerCommand::Preferences(prefs.clone()));
@@ -1905,7 +1910,20 @@ fn run(
                     };
                     let namespace = server.account.namespace();
                     let tx = tx.clone();
+                    let playlist_edit = matches!(
+                        mutation,
+                        Mutation::ReorderPlaylist { .. }
+                            | Mutation::AddToPlaylist(..)
+                            | Mutation::RemoveFromPlaylist(..)
+                            | Mutation::DeletePlaylist(..)
+                    )
+                    .then(|| playlist_track_edits.clone());
                     runtime.spawn(async move {
+                        // Don't let another local edit interleave a reorder's read and write.
+                        let _playlist_guard = match playlist_edit {
+                            Some(lock) => Some(lock.lock_owned().await),
+                            None => None,
+                        };
                         let result = match &mutation {
                             Mutation::Favorite(id, value) => server.star(id, *value).await,
                             Mutation::Rating(id, rating) => server.rating(id, *rating).await,
@@ -1916,9 +1934,11 @@ fn run(
                             Mutation::CreatePlaylist(name, ids) => {
                                 server.create_playlist(name, ids).await
                             }
-                            Mutation::ReplacePlaylist(id, ids) => {
-                                server.replace_playlist(id, ids).await
-                            }
+                            Mutation::ReorderPlaylist {
+                                id,
+                                original,
+                                reordered,
+                            } => server.reorder_playlist(id, original, reordered).await,
                             Mutation::RenamePlaylist(id, name) => {
                                 server.rename_playlist(id, name).await
                             }
@@ -2017,7 +2037,7 @@ fn run(
                             if let Some(server) = server.clone() {
                                 let tx = tx.clone();
                                 let changed_id = match mutation {
-                                    Mutation::ReplacePlaylist(id, _)
+                                    Mutation::ReorderPlaylist { id, .. }
                                     | Mutation::RenamePlaylist(id, _)
                                     | Mutation::AddToPlaylist(id, _) => Some(id),
                                     Mutation::RemoveFromPlaylist(id, _) => Some(id),

@@ -1,13 +1,13 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct PlaylistRemoval {
+pub(super) struct PlaylistEntry {
     id: String,
     index: usize,
     entries: Arc<Vec<Arc<Track>>>,
 }
 
-impl PlaylistRemoval {
+impl PlaylistEntry {
     fn new(playlist: &Playlist, index: usize) -> Self {
         Self {
             id: playlist.id.clone(),
@@ -18,18 +18,89 @@ impl PlaylistRemoval {
 
     pub(super) fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
         let current = current?;
-        (current.id == self.id
+        self.matches(current)
+            .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+    }
+
+    fn matches(&self, current: &Playlist) -> bool {
+        current.id == self.id
             && self.index < current.entry.len()
             && current
-                .entry
-                .iter()
-                .map(|track| &track.id)
-                .eq(self.entries.iter().map(|track| &track.id)))
-        .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+                .track_ids()
+                .eq(self.entries.iter().map(|track| track.id.as_str()))
+    }
+
+    fn move_to(&self, current: &Playlist, destination: usize) -> Option<Mutation> {
+        if destination == self.index
+            || !current.can_reorder()
+            || !self.matches(current)
+            || destination >= current.entry.len()
+        {
+            return None;
+        }
+        let original: Vec<_> = current.track_ids().map(str::to_owned).collect();
+        let mut reordered = original.clone();
+        let song = reordered.remove(self.index);
+        reordered.insert(destination, song);
+        (original != reordered).then(|| Mutation::ReorderPlaylist {
+            id: self.id.clone(),
+            original,
+            reordered,
+        })
     }
 }
 
+#[derive(Clone)]
+struct PlaylistDrag {
+    entry: PlaylistEntry,
+    title: String,
+}
+
 impl MusicApp {
+    pub(super) fn playlist_reorder_row(
+        &self,
+        row: Stateful<Div>,
+        entry: &PlaylistEntry,
+        title: String,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if !self.playlist.as_ref().is_some_and(Playlist::can_reorder) {
+            return row;
+        }
+        let colors = ink(cx);
+        let target_id = entry.id.clone();
+        let drop_id = target_id.clone();
+        let index = entry.index;
+        row.cursor_grab()
+            .on_drag(
+                PlaylistDrag {
+                    entry: entry.clone(),
+                    title,
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| tracks::TrackDragPreview(drag.title.clone()))
+                },
+            )
+            .drag_over::<PlaylistDrag>(move |style, drag, _, _| {
+                if drag.entry.id != target_id || drag.entry.index == index {
+                    style
+                } else if drag.entry.index < index {
+                    style.border_b_2().border_color(colors.accent)
+                } else {
+                    style.border_t_2().border_color(colors.accent)
+                }
+            })
+            .on_drop(cx.listener(move |app, drag: &PlaylistDrag, _, cx| {
+                if drag.entry.id == drop_id
+                    && let Some(current) = app.playlist.as_ref()
+                    && let Some(mutation) = drag.entry.move_to(current, index)
+                {
+                    app.mutate(mutation, cx);
+                }
+            }))
+    }
+
     pub(super) fn playlists_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         if let Some(playlist) = self.playlist.clone() {
@@ -176,8 +247,8 @@ impl MusicApp {
                                                 playlist.entry.clone(),
                                                 index,
                                             ),
-                                            removal: editable
-                                                .then(|| PlaylistRemoval::new(&playlist, index)),
+                                            editable_entry: editable
+                                                .then(|| PlaylistEntry::new(&playlist, index)),
                                         }),
                                         None,
                                         cx,
@@ -240,6 +311,7 @@ mod tests {
     fn playlist(ids: &[&str]) -> Playlist {
         Playlist {
             id: "playlist".into(),
+            song_count: ids.len() as u32,
             entry: Arc::new(
                 ids.iter()
                     .map(|id| {
@@ -257,7 +329,7 @@ mod tests {
     #[::core::prelude::v1::test]
     fn removal_keeps_duplicate_entry_indices_and_rejects_stale_or_empty_playlists() {
         let original = playlist(&["a", "b", "a"]);
-        let removal = PlaylistRemoval::new(&original, 2);
+        let removal = PlaylistEntry::new(&original, 2);
         assert_eq!(
             removal.mutation(Some(&original)),
             Some(Mutation::RemoveFromPlaylist("playlist".into(), 2))
@@ -273,9 +345,38 @@ mod tests {
         other.id = "other".into();
         assert!(removal.mutation(Some(&other)).is_none());
         assert!(
-            PlaylistRemoval::new(&original, 3)
+            PlaylistEntry::new(&original, 3)
                 .mutation(Some(&original))
                 .is_none()
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn reorder_uses_full_indices_and_rejects_changed_incomplete_or_unchanged_order() {
+        let original = playlist(&["a", "b", "a", "c"]);
+        let source = PlaylistEntry::new(&original, 2);
+        let expected = |ids: [&str; 4]| Mutation::ReorderPlaylist {
+            id: "playlist".into(),
+            original: ["a", "b", "a", "c"].map(String::from).into(),
+            reordered: ids.map(String::from).into(),
+        };
+        assert_eq!(
+            source.move_to(&original, 3),
+            Some(expected(["a", "b", "c", "a"]))
+        );
+        assert_eq!(
+            source.move_to(&original, 1),
+            Some(expected(["a", "a", "b", "c"]))
+        );
+        assert!(source.move_to(&original, 2).is_none());
+        assert!(source.move_to(&original, 4).is_none());
+        assert!(
+            source
+                .move_to(&playlist(&["a", "c", "a", "b"]), 3)
+                .is_none()
+        );
+        let mut incomplete = original;
+        incomplete.song_count += 1;
+        assert!(source.move_to(&incomplete, 3).is_none());
     }
 }

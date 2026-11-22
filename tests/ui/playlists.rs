@@ -291,6 +291,78 @@ fn remove_playlist_entry_refreshes_only_after_success(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn drag_playlist_occurrence_saves_order_and_keeps_it_on_failure(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    let original = ["track-1", "track-2", "track-1", "track-3"];
+    loaded.entry = fixture
+        .catalog
+        .by_ids(&original.map(String::from))
+        .unwrap()
+        .into();
+    loaded.song_count = original.len() as u32;
+    let drag = |from, to, cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.drag_to(from, to, cx))
+            .unwrap();
+    };
+    let mut read_only = loaded.clone();
+    read_only.readonly = true;
+    fixture.backend.emit(Event::Playlist(read_only));
+    fixture.settle(window, cx);
+    drag("row-playlist-2", "row-playlist-3", cx);
+    fixture.settle(window, cx);
+
+    fixture.backend.emit(Event::Playlist(loaded.clone()));
+    fixture.settle(window, cx);
+
+    // A drop on itself does not change the order or send a save.
+    drag("row-playlist-2", "row-playlist-2", cx);
+    fixture.settle(window, cx);
+
+    let reordered = ["track-1", "track-2", "track-3", "track-1"];
+    std::sync::Arc::make_mut(&mut loaded.entry).swap(2, 3);
+    for succeeds in [false, true] {
+        let updated = loaded.clone();
+        fixture.expect("save the dragged playlist occurrence", move |command, _| {
+            let expected = Mutation::ReorderPlaylist {
+                id: "playlist-1".into(),
+                original: original.map(String::from).into(),
+                reordered: reordered.map(String::from).into(),
+            };
+            assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+            if succeeds {
+                vec![Event::MutationDone(expected), Event::Playlist(updated)]
+            } else {
+                vec![Event::MutationFailed(expected, "Reorder rejected".into())]
+            }
+        });
+        drag("row-playlist-2", "row-playlist-3", cx);
+        fixture.settle(window, cx);
+        fixture.assert_script_finished();
+        cx.update_window(window, |_, window, _| {
+            let last = window.find("row-playlist-3");
+            assert!(last.visible());
+            assert!(last.label().unwrap().starts_with(if succeeds {
+                "Fixture song"
+            } else {
+                "Another song"
+            }));
+            if succeeds {
+                assert!(window.try_find("error-banner").is_none());
+            } else {
+                assert_eq!(
+                    window.find("error-banner").label(),
+                    Some("Reorder rejected")
+                );
+            }
+        })
+        .unwrap();
+    }
+    fixture.diagnose("playlist reorder confirmed", window, &app, cx);
+}
+
+#[gpui_kit::test]
 fn create_failure_keeps_the_name_and_retry_creates_one_playlist(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app) = start(cx);
     fixture.click(window, "new-playlist", cx);

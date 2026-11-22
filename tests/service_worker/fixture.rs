@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
@@ -27,6 +27,7 @@ pub const WAIT: Duration = Duration::from_secs(5);
 pub struct Request {
     pub endpoint: String,
     pub params: BTreeMap<String, String>,
+    song_ids: Vec<String>,
 }
 
 impl Request {
@@ -35,7 +36,13 @@ impl Request {
             endpoint: endpoint.into(),
             params: params
                 .iter()
+                .filter(|(key, _)| *key != "songId")
                 .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            song_ids: params
+                .iter()
+                .filter(|(key, _)| *key == "songId")
+                .map(|(_, value)| value.to_string())
                 .collect(),
         }
     }
@@ -159,8 +166,17 @@ async fn navidrome(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
     method: Method,
-    Query(mut query): Query<BTreeMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
+    let mut query = BTreeMap::new();
+    let mut song_ids = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(raw_query.as_deref().unwrap_or("").as_bytes()) {
+        if endpoint == "createPlaylist.view" && key == "songId" {
+            song_ids.push(value.into_owned());
+        } else if query.insert(key.into_owned(), value.into_owned()).is_some() {
+            return state.unexpected("repeated parameter");
+        }
+    }
     let authenticated = query.remove("u").as_deref() == Some("fixture")
         && query.remove("t").is_some_and(|token| token.len() == 32)
         && query.remove("s").is_some_and(|salt| !salt.is_empty())
@@ -177,6 +193,7 @@ async fn navidrome(
             | "getScanStatus.view"
             | "getPlaylists.view"
             | "getPlaylist.view"
+            | "createPlaylist.view"
             | "updatePlaylist.view"
             | "search3.view"
             | "star.view"
@@ -215,6 +232,7 @@ async fn navidrome(
     let request = Request {
         endpoint: endpoint.clone(),
         params: query.clone(),
+        song_ids,
     };
     state.record(request.clone());
     let (offline, hold_sync, hold_scrobble, fail_artwork) = {
@@ -288,6 +306,41 @@ async fn navidrome(
                 .find(|playlist| Some(&playlist.id) == query.get("id"));
             json!({"status":"ok","playlist":playlist})
         }
+        "createPlaylist.view" => match data.expected_mutations.pop_front() {
+            Some((expected, succeeds)) if request == expected => {
+                if succeeds {
+                    let entries: Vec<_> = request
+                        .song_ids
+                        .iter()
+                        .map(|id| {
+                            Arc::new(
+                                data.library
+                                    .tracks
+                                    .iter()
+                                    .find(|track| &track.id == id)
+                                    .unwrap()
+                                    .clone(),
+                            )
+                        })
+                        .collect();
+                    let playlist = data
+                        .library
+                        .playlists
+                        .iter_mut()
+                        .find(|playlist| Some(&playlist.id) == query.get("playlistId"))
+                        .unwrap();
+                    playlist.entry = entries.into();
+                    json!({"status":"ok","playlist":playlist})
+                } else {
+                    json!({"status":"failed","error":{"code":70,"message":"Fixture reorder rejected"}})
+                }
+            }
+            _ => {
+                data.unexpected
+                    .push("unexpected playlist replacement or song order");
+                json!({"status":"failed","error":{"code":70,"message":"Unexpected mutation"}})
+            }
+        },
         "updatePlaylist.view" => match data.expected_mutations.pop_front() {
             Some((expected, succeeds)) if request == expected => {
                 if succeeds {

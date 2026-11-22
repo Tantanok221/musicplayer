@@ -290,7 +290,17 @@ impl Server {
         self.request("createPlaylist", &params).await?;
         Ok(())
     }
-    pub async fn replace_playlist(&self, id: &str, ids: &[String]) -> Result<()> {
+    pub async fn reorder_playlist(
+        &self,
+        id: &str,
+        original: &[String],
+        ids: &[String],
+    ) -> Result<()> {
+        let playlist = self.playlist(id).await?;
+        if !playlist.can_reorder() || !playlist.track_ids().eq(original.iter().map(String::as_str))
+        {
+            bail!("The playlist changed or cannot be edited. Reopen it before reordering");
+        }
         let mut params = vec![("playlistId", id.into())];
         params.extend(ids.iter().cloned().map(|id| ("songId", id)));
         self.request("createPlaylist", &params).await?;
