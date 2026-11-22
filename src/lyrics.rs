@@ -71,6 +71,41 @@ impl Lyrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn prop_plain_lyrics_preserve_lines(text in ".{0,256}", position in any::<f64>()) {
+            let lyrics = Lyrics::plain(&text);
+            prop_assert_eq!(lyrics.line.iter().map(|line| line.value.as_str()).collect::<Vec<_>>(), text.lines().collect::<Vec<_>>());
+            prop_assert_eq!(lyrics.active_line(position), None);
+            prop_assert_eq!(lyrics.line_position(usize::MAX), None);
+            prop_assert!(!lyrics.line_is_active(usize::MAX, Some(usize::MAX)));
+            let _ = serde_json::from_str::<Lyrics>(&text);
+        }
+
+        #[test]
+        fn prop_structured_lyrics_round_trip(entries in proptest::collection::vec((any::<u64>(), ".{0,80}"), 0..24), offset in any::<i64>(), position in any::<f64>()) {
+            let lyrics = Lyrics {
+                synced: true,
+                offset,
+                line: entries.into_iter().map(|(start, value)| LyricLine { start: Some(start), value }).collect(),
+            };
+            let saved = serde_json::to_string(&lyrics).unwrap();
+            prop_assert_eq!(&serde_json::from_str::<Lyrics>(&saved).unwrap(), &lyrics);
+            let expected = if position.is_finite() {
+                lyrics.line.iter().enumerate()
+                    .filter(|(_, line)| line.start.unwrap() as f64 <= position.max(0.) * 1000. + offset as f64)
+                    .max_by_key(|(_, line)| line.start).map(|(index, _)| index)
+            } else { None };
+            prop_assert_eq!(lyrics.active_line(position), expected);
+            for index in 0..lyrics.line.len() {
+                prop_assert!(lyrics.line_position(index).unwrap().is_finite());
+            }
+        }
+    }
 
     fn timed() -> Lyrics {
         serde_json::from_value(serde_json::json!({
