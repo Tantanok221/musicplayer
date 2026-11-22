@@ -52,6 +52,7 @@ fn enable(worker: &sonora::service::test_support::Worker, folder: &Folder) {
         metadata: MetadataPreferences {
             write_tags: true,
             library_folder: folder.dir.path().to_string_lossy().into(),
+            ..Default::default()
         },
         ..Default::default()
     }));
@@ -238,6 +239,7 @@ fn finds_releases_and_loads_their_tracks_from_musicbrainz() {
         album: "OK Computer".into(),
         artist: "Radiohead".into(),
         tracks: 2,
+        ..Default::default()
     };
     worker.service().send(Command::FindReleases(query.clone()));
     let Event::ReleaseCandidates(asked, Ok(found)) = event(&worker, |event| {
@@ -320,6 +322,119 @@ fn writes_musicbrainz_ids_and_undo_takes_them_out() {
     worker.service().send(Command::UndoTags);
     assert!(report(&worker).undo);
     assert!(read(&folder.file()).unwrap()[&TagField::MusicBrainzRelease].is_empty());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn one_song_finds_the_releases_its_recording_is_on() {
+    let fixture = Fixture::new(Library::default());
+    let worker = fixture.start();
+    let query = ReleaseQuery {
+        artist: "Radiohead".into(),
+        title: "Airbag".into(),
+        length_ms: Some(284_000),
+        ..Default::default()
+    };
+    worker.service().send(Command::FindReleases(query));
+    let Event::ReleaseCandidates(_, Ok(found)) = event(&worker, |event| {
+        matches!(event, Event::ReleaseCandidates(..))
+    }) else {
+        panic!("the search failed");
+    };
+    let ids: Vec<_> = found
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    assert_eq!(ids, ["ok-computer", "airbag-ep"]);
+    assert_eq!(found[1].artist, "Radiohead");
+    assert_eq!(found[1].score, 90);
+    assert_eq!(found[1].summary(), "1998 · JP · CD · 3 tracks");
+    fixture.finish();
+}
+
+#[test]
+fn cover_art_is_fetched_embedded_and_undone() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    enable(&worker, &folder);
+    let cover = |release: &str| {
+        vec![TagEdit {
+            tracks: vec!["song".into()],
+            fields: BTreeMap::from([(
+                TagField::CoverArt,
+                EditValue::Set(format!("{}{release}", sonora::tags::COVER_PREFIX)),
+            )]),
+        }]
+    };
+    worker.service().send(Command::WriteTags(cover("no-art")));
+    let missing = report(&worker);
+    assert_eq!(missing.written, 0);
+    assert_eq!(
+        missing.failures,
+        vec![(
+            "Cover art".to_string(),
+            "Cover Art Archive has no front cover for this release".to_string()
+        )]
+    );
+    assert!(read(&folder.file()).unwrap()[&TagField::CoverArt].is_empty());
+    worker
+        .service()
+        .send(Command::WriteTags(cover("ok-computer")));
+    assert_eq!(report(&worker).written, 1);
+    assert_eq!(
+        read(&folder.file()).unwrap()[&TagField::CoverArt],
+        vec![sonora::tags::picture_value("image/png", b"\x89PNG cover")]
+    );
+    worker.service().send(Command::UndoTags);
+    assert!(report(&worker).undo);
+    assert!(read(&folder.file()).unwrap()[&TagField::CoverArt].is_empty());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn identify_by_sound_fingerprints_the_file_and_asks_acoustid() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    let identify = |key: &str| {
+        worker.service().send(Command::Preferences(Preferences {
+            metadata: MetadataPreferences {
+                write_tags: true,
+                library_folder: folder.dir.path().to_string_lossy().into(),
+                acoustid_key: key.into(),
+            },
+            ..Default::default()
+        }));
+        worker
+            .service()
+            .send(Command::IdentifyBySound(Box::new(Track {
+                id: "song".into(),
+                path: PATH.into(),
+                duration: 2.,
+                ..Default::default()
+            })));
+        let Event::SoundIdentified(id, result) =
+            event(&worker, |event| matches!(event, Event::SoundIdentified(..)))
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, "song");
+        result
+    };
+    assert_eq!(
+        identify(""),
+        Err("Add an AcoustID key in Settings first".to_string())
+    );
+    assert_eq!(
+        identify("wrong"),
+        Err("AcoustID: invalid API key".to_string())
+    );
+    assert_eq!(identify("fixture-key"), Ok("r1".to_string()));
     worker.shutdown(crate::fixture::WAIT).unwrap();
     fixture.finish();
 }

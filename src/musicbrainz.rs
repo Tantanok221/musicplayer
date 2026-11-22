@@ -23,6 +23,8 @@ const MAX_GROUP_PAGES: usize = 10;
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: Url,
+    covers: Url,
+    acoustid: Url,
     /// MusicBrainz blocks clients that exceed one request per second.
     interval: Duration,
     last: Arc<Mutex<Option<Instant>>>,
@@ -45,9 +47,86 @@ impl MusicBrainz {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             base: Url::parse(base)?,
+            covers: Url::parse("https://coverartarchive.org/")?,
+            acoustid: Url::parse("https://api.acoustid.org/v2/")?,
             interval,
             last: Arc::default(),
         })
+    }
+
+    /// Fetches front covers from `base` instead of Cover Art Archive.
+    pub fn with_covers(mut self, base: &str) -> Result<Self> {
+        self.covers = Url::parse(base)?;
+        Ok(self)
+    }
+
+    /// Looks fingerprints up at `base` instead of AcoustID.
+    pub fn with_acoustid(mut self, base: &str) -> Result<Self> {
+        self.acoustid = Url::parse(base)?;
+        Ok(self)
+    }
+
+    /// The MusicBrainz recording AcoustID matches a fingerprint to best.
+    pub async fn identify(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        duration: u32,
+    ) -> Result<Option<String>> {
+        let mut url = self.acoustid.join("lookup")?;
+        url.query_pairs_mut()
+            .append_pair("client", key)
+            .append_pair("meta", "recordings")
+            .append_pair("duration", &duration.to_string())
+            .append_pair("fingerprint", fingerprint)
+            .append_pair("format", "json");
+        let response = self.http.get(url).send().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot reach AcoustID")
+        })?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or_default();
+        if body["status"] != "ok" {
+            match body["error"]["message"].as_str() {
+                Some(message) => bail!("AcoustID: {message}"),
+                None => bail!("AcoustID returned HTTP {status}"),
+            }
+        }
+        let mut results: Vec<&Value> = body["results"].as_array().into_iter().flatten().collect();
+        results.sort_by(|a, b| {
+            let score = |v: &Value| v["score"].as_f64().unwrap_or_default();
+            score(b).total_cmp(&score(a))
+        });
+        Ok(results
+            .iter()
+            .filter_map(|result| result["recordings"][0]["id"].as_str())
+            .map(str::to_string)
+            .next())
+    }
+
+    /// A release's front cover from Cover Art Archive, as a tag value.
+    pub async fn front_cover(&self, release: &str) -> Result<String> {
+        let url = self.covers.join(&format!("release/{release}/front-500"))?;
+        let response = self.http.get(url).send().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot reach Cover Art Archive")
+        })?;
+        match response.status().as_u16() {
+            404 => bail!("Cover Art Archive has no front cover for this release"),
+            status if !(200..300).contains(&status) => {
+                bail!("Cover Art Archive returned HTTP {status}")
+            }
+            _ => {}
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|mime| mime.starts_with("image/"))
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let data = response.bytes().await.map_err(|error| {
+            anyhow::Error::new(error.without_url()).context("Cannot download the cover")
+        })?;
+        Ok(crate::tags::picture_value(&mime, &data))
     }
 
     async fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
@@ -320,6 +399,12 @@ impl MusicBrainz {
 impl MusicBrainz {
     /// Editions matching the album as it is tagged now, best match first.
     pub async fn search_releases(&self, query: &ReleaseQuery) -> Result<Vec<ReleaseCandidate>> {
+        if query.is_song() {
+            let found = self
+                .get("recording", &[("query", &query.lucene()), ("limit", "10")])
+                .await?;
+            return Ok(recording_candidates(&found));
+        }
         let found = self
             .get("release", &[("query", &query.lucene()), ("limit", "10")])
             .await?;
@@ -347,6 +432,27 @@ impl MusicBrainz {
         }
         Ok(parse_lookup(&release))
     }
+}
+
+/// Every release the found recordings appear on, best recording first, each
+/// scored by its recording.
+fn recording_candidates(found: &Value) -> Vec<ReleaseCandidate> {
+    let mut candidates: Vec<ReleaseCandidate> = vec![];
+    for recording in found["recordings"].as_array().into_iter().flatten() {
+        for release in recording["releases"].as_array().into_iter().flatten() {
+            let mut candidate = parse_candidate(release);
+            if candidates.iter().any(|known| known.id == candidate.id) {
+                continue;
+            }
+            if candidate.artist.is_empty() {
+                candidate.artist = credit(&recording["artist-credit"]);
+            }
+            candidate.score = recording["score"].as_u64().unwrap_or_default() as u32;
+            candidates.push(candidate);
+        }
+    }
+    candidates.truncate(10);
+    candidates
 }
 
 fn parse_candidate(release: &Value) -> ReleaseCandidate {

@@ -17,6 +17,8 @@ pub(super) struct TagEditor {
     review: Option<Vec<Change>>,
     lookup: Lookup,
     candidates: Vec<ReleaseCandidate>,
+    link: Entity<InputState>,
+    pattern: Entity<InputState>,
     saving: bool,
     failures: Vec<(String, String)>,
 }
@@ -26,11 +28,15 @@ enum Lookup {
     Searching(ReleaseQuery),
     Choosing,
     Loading(String),
+    /// Waiting for AcoustID to name the song's recording.
+    Identifying(String),
     Matched {
         release: Arc<Release>,
         matches: Vec<TrackMatch>,
         /// Field groups the user unticked; `MusicBrainzTrack` stands for the IDs.
         skipped: BTreeSet<TagField>,
+        /// How many genres to fill in, one of `autotag::GENRE_LIMITS`.
+        genres: usize,
     },
     Failed(String),
 }
@@ -120,6 +126,13 @@ impl MusicApp {
             review: None,
             lookup: Lookup::Idle,
             candidates: vec![],
+            link: text_input(
+                String::new(),
+                "MusicBrainz release or recording link",
+                window,
+                cx,
+            ),
+            pattern: text_input("%track% - %title%".into(), "%track% - %title%", window, cx),
             saving: false,
             failures: vec![],
         });
@@ -188,6 +201,66 @@ impl MusicApp {
         cx.notify();
     }
 
+    fn identify_by_sound(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let [track] = editor.form.tracks.as_slice() else {
+            return;
+        };
+        editor.lookup = Lookup::Identifying(track.id.clone());
+        self.service
+            .send(Command::IdentifyBySound(Box::new(track.clone())));
+        cx.notify();
+    }
+
+    pub(super) fn sound_identified(&mut self, id: String, result: Result<String, String>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        if !matches!(&editor.lookup, Lookup::Identifying(asked) if *asked == id) {
+            return;
+        }
+        match result {
+            Ok(recording) => {
+                let query = ReleaseQuery {
+                    recording,
+                    ..Default::default()
+                };
+                editor.lookup = Lookup::Searching(query.clone());
+                self.service.send(Command::FindReleases(query));
+            }
+            Err(error) => editor.lookup = Lookup::Failed(error),
+        }
+    }
+
+    fn open_link(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let pasted = editor.link.read(cx).value().to_string();
+        match autotag::parse_link(&pasted) {
+            Some(autotag::Link::Release(id)) => {
+                editor.candidates.clear();
+                editor.lookup = Lookup::Loading(id.clone());
+                self.service.send(Command::LoadRelease(id));
+            }
+            Some(autotag::Link::Recording(recording)) => {
+                let query = ReleaseQuery {
+                    recording,
+                    ..Default::default()
+                };
+                editor.lookup = Lookup::Searching(query.clone());
+                self.service.send(Command::FindReleases(query));
+            }
+            None => {
+                editor.lookup =
+                    Lookup::Failed("Paste a MusicBrainz release or recording link or ID".into())
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn releases_found(
         &mut self,
         query: ReleaseQuery,
@@ -200,10 +273,13 @@ impl MusicApp {
             return;
         }
         editor.lookup = match result {
-            Ok(found) if found.is_empty() => Lookup::Failed(format!(
-                "MusicBrainz found no release called {}.",
-                query.album
-            )),
+            Ok(found) if found.is_empty() => Lookup::Failed(if !query.recording.is_empty() {
+                "MusicBrainz found no release with that recording.".to_string()
+            } else if query.is_song() {
+                format!("MusicBrainz found no recording called {}.", query.title)
+            } else {
+                format!("MusicBrainz found no release called {}.", query.album)
+            }),
             Ok(found) => {
                 editor.candidates = found;
                 Lookup::Choosing
@@ -232,7 +308,8 @@ impl MusicApp {
             Ok(release) => Lookup::Matched {
                 matches: autotag::match_tracks(&editor.form.tracks, &release),
                 release,
-                skipped: BTreeSet::new(),
+                skipped: BTreeSet::from([TagField::CoverArt]),
+                genres: 3,
             },
             Err(error) => Lookup::Failed(error),
         };
@@ -260,6 +337,7 @@ impl MusicApp {
             release,
             matches,
             skipped,
+            genres,
         } = std::mem::replace(&mut editor.lookup, Lookup::Idle)
         else {
             return;
@@ -268,7 +346,7 @@ impl MusicApp {
             .iter()
             .map(|found| {
                 let (index, _) = (*found)?;
-                let mut values = autotag::proposed(&release, &release.tracks[index]);
+                let mut values = autotag::proposed(&release, &release.tracks[index], genres);
                 values.retain(|field, _| {
                     let group = if TagField::IDS.contains(field) {
                         TagField::MusicBrainzTrack
@@ -280,49 +358,38 @@ impl MusicApp {
                 Some(values)
             })
             .collect();
-        let set = |input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App| {
-            input.update(cx, |input, cx| {
-                input.set_value(value.to_string(), window, cx)
-            });
-        };
-        for (field, input) in &editor.inputs {
-            let values: Vec<Option<&String>> = proposals
-                .iter()
-                .map(|values| values.as_ref().and_then(|values| values.get(field)))
-                .collect();
-            let shared = values
-                .first()
-                .copied()
-                .flatten()
-                .filter(|first| values.iter().all(|value| value == &Some(*first)));
-            if let Some(value) = shared {
-                set(input, value, window, cx);
-                editor.cleared.remove(field);
-                for extra in &mut editor.extra {
-                    extra.remove(field);
-                }
-            } else {
-                for (row, value) in values.iter().enumerate() {
-                    if let Some(value) = value {
-                        editor.extra[row].insert(*field, (*value).clone());
-                    }
-                }
-            }
+        fill_form(editor, &proposals, window, cx);
+        cx.notify();
+    }
+
+    fn set_genres(&mut self, limit: usize, cx: &mut Context<Self>) {
+        if let Some(TagEditor {
+            lookup: Lookup::Matched { genres, .. },
+            ..
+        }) = self.tag_editor.as_mut()
+        {
+            *genres = limit;
         }
-        for (row, values) in proposals.iter().enumerate() {
-            let Some(values) = values else {
-                continue;
-            };
-            for (field, input) in &editor.cells[row] {
-                if let Some(value) = values.get(field) {
-                    set(input, value, window, cx);
-                }
-            }
-            for field in TagField::IDS {
-                if let Some(value) = values.get(&field) {
-                    editor.extra[row].insert(field, value.clone());
-                }
-            }
+        cx.notify();
+    }
+
+    /// Fills the form from each song's file name with the typed pattern.
+    fn fill_from_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.tag_editor.as_mut() else {
+            return;
+        };
+        let pattern = editor.pattern.read(cx).value().to_string();
+        let proposals: Vec<_> = editor
+            .form
+            .tracks
+            .iter()
+            .map(|track| Some(autotag::from_path(&pattern, &track.path)).filter(|v| !v.is_empty()))
+            .collect();
+        if proposals.iter().all(Option::is_none) {
+            editor.lookup = Lookup::Failed(format!("No file name fits {pattern}"));
+        } else {
+            editor.lookup = Lookup::Idle;
+            fill_form(editor, &proposals, window, cx);
         }
         cx.notify();
     }
@@ -362,8 +429,9 @@ impl MusicApp {
         Some(match &editor.lookup {
             Lookup::Idle => return None,
             Lookup::Searching(query) => {
-                status(format!("Searching MusicBrainz for {}…", query.album))
+                status(format!("Searching MusicBrainz for {}…", query.subject()))
             }
+            Lookup::Identifying(_) => status("Listening to the song for AcoustID…".into()),
             Lookup::Loading(id) => {
                 let title = editor
                     .candidates
@@ -436,6 +504,7 @@ impl MusicApp {
                 release,
                 matches,
                 skipped,
+                genres,
             } => {
                 let matched = matches.iter().filter(|found| found.is_some()).count();
                 let mut list = panel.child(
@@ -473,7 +542,10 @@ impl MusicApp {
                 let groups = FILLED
                     .iter()
                     .map(|field| (*field, field.label(), field.slug()))
-                    .chain([(TagField::MusicBrainzTrack, "MusicBrainz IDs", "ids")]);
+                    .chain([
+                        (TagField::MusicBrainzTrack, "MusicBrainz IDs", "ids"),
+                        (TagField::CoverArt, "Cover art", "cover-art"),
+                    ]);
                 for (field, label, slug) in groups {
                     let app = cx.entity().downgrade();
                     boxes = boxes.child(
@@ -485,7 +557,34 @@ impl MusicApp {
                             }),
                     );
                 }
+                let mut limits = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .child("Genres:");
+                for limit in autotag::GENRE_LIMITS {
+                    let text = match limit {
+                        1 => "Top 1".to_string(),
+                        usize::MAX => "All".to_string(),
+                        n => format!("Top {n}"),
+                    };
+                    let slug = if limit == usize::MAX {
+                        "all".to_string()
+                    } else {
+                        limit.to_string()
+                    };
+                    limits = limits.child(
+                        Button::new(SharedString::from(format!("genre-limit-{slug}")))
+                            .xsmall()
+                            .when(*genres == limit, |button| button.primary())
+                            .label(text)
+                            .on_click(cx.listener(move |app, _, _, cx| app.set_genres(limit, cx))),
+                    );
+                }
                 list.child(boxes)
+                    .child(limits)
                     .child(
                         div()
                             .flex()
@@ -726,7 +825,13 @@ impl MusicApp {
         };
         let entries = editor.entries(cx);
         let warns = editor.form.warns_ids(&editor.form.edits(&entries));
-        let searching = matches!(editor.lookup, Lookup::Searching(_) | Lookup::Loading(_));
+        let searching = matches!(
+            editor.lookup,
+            Lookup::Searching(_) | Lookup::Loading(_) | Lookup::Identifying(_)
+        );
+        let identifies = editor.review.is_none()
+            && editor.form.tracks.len() == 1
+            && !self.preferences.metadata.acoustid_key.trim().is_empty();
         let mut panel = div()
             .id("tag-editor")
             .test_support()
@@ -752,16 +857,71 @@ impl MusicApp {
                             .font_semibold()
                             .child(title),
                     )
-                    .when(editor.review.is_none(), |row| {
+                    .when(identifies, |row| {
                         row.child(
-                            Button::new("find-musicbrainz")
+                            Button::new("identify-sound")
                                 .small()
-                                .label("Find on MusicBrainz")
-                                .loading(searching)
-                                .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
+                                .label("Identify by Sound")
+                                .disabled(searching)
+                                .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
                         )
-                    }),
+                    })
+                    .when(
+                        editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks),
+                        |row| {
+                            row.child(
+                                Button::new("find-musicbrainz")
+                                    .small()
+                                    .label("Find on MusicBrainz")
+                                    .loading(searching)
+                                    .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
+                            )
+                        },
+                    ),
             );
+        if editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks) {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&editor.link).small().id("musicbrainz-link")),
+                    )
+                    .child(
+                        Button::new("open-musicbrainz-link")
+                            .small()
+                            .label("Load Link")
+                            .disabled(searching)
+                            .on_click(cx.listener(|app, _, _, cx| app.open_link(cx))),
+                    ),
+            );
+        }
+        if editor.review.is_none() {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&editor.pattern).small().id("filename-pattern")),
+                    )
+                    .child(
+                        Button::new("fill-from-names")
+                            .small()
+                            .label("Fill from File Names")
+                            .on_click(
+                                cx.listener(|app, _, window, cx| app.fill_from_names(window, cx)),
+                            ),
+                    ),
+            );
+        }
         if let Some(changes) = &editor.review {
             panel = panel.child(self.review_panel(changes, cx));
         } else {
@@ -884,5 +1044,60 @@ impl MusicApp {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// Puts proposed values into the form: shared fields when every song agrees,
+/// the table or hidden per-song values otherwise. Songs without a proposal
+/// keep theirs.
+fn fill_form(
+    editor: &mut TagEditor,
+    proposals: &[Option<BTreeMap<TagField, String>>],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let set = |input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App| {
+        input.update(cx, |input, cx| {
+            input.set_value(value.to_string(), window, cx)
+        });
+    };
+    for (field, input) in &editor.inputs {
+        let values: Vec<Option<&String>> = proposals
+            .iter()
+            .map(|values| values.as_ref().and_then(|values| values.get(field)))
+            .collect();
+        let shared = values
+            .first()
+            .copied()
+            .flatten()
+            .filter(|first| values.iter().all(|value| value == &Some(*first)));
+        if let Some(value) = shared {
+            set(input, value, window, cx);
+            editor.cleared.remove(field);
+            for extra in &mut editor.extra {
+                extra.remove(field);
+            }
+        } else {
+            for (row, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    editor.extra[row].insert(*field, (*value).clone());
+                }
+            }
+        }
+    }
+    for (row, values) in proposals.iter().enumerate() {
+        let Some(values) = values else {
+            continue;
+        };
+        for (field, input) in &editor.cells[row] {
+            if let Some(value) = values.get(field) {
+                set(input, value, window, cx);
+            }
+        }
+        for field in TagField::IDS.into_iter().chain([TagField::CoverArt]) {
+            if let Some(value) = values.get(&field) {
+                editor.extra[row].insert(field, value.clone());
+            }
+        }
     }
 }

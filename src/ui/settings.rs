@@ -594,16 +594,28 @@ impl MusicApp {
                         Some("The folder that matches Navidrome's music library, such as a mounted share."),
                         &["metadata", "tags", "folder", "library", "mount"],
                     ))
+                    .item(credential_field(
+                        "AcoustID key",
+                        self.acoustid_key.clone(),
+                        Some("Turns on Identify by Sound for songs with poor tags. Register a free application at acoustid.org."),
+                        &["metadata", "acoustid", "fingerprint", "identify", "key"],
+                    ))
                     .item(
                         SettingItem::render(move |_, _, _| {
                             let app = app.clone();
                             Button::new("save-music-folder")
                                 .small()
-                                .label("Save folder")
+                                .label("Save")
                                 .on_click(move |_, _, cx| {
                                     let _ = app.update(cx, |app, cx| {
                                         app.preferences.metadata.library_folder = app
                                             .metadata_folder
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        app.preferences.metadata.acoustid_key = app
+                                            .acoustid_key
                                             .read(cx)
                                             .value()
                                             .trim()

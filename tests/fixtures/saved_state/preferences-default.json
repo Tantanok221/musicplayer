@@ -62,7 +62,8 @@
   },
   "metadata": {
     "write_tags": false,
-    "library_folder": ""
+    "library_folder": "",
+    "acoustid_key": ""
   },
   "all_missing_releases": false,
   "favorites": {

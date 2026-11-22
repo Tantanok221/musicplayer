@@ -171,6 +171,8 @@ pub enum Command {
     FindReleases(crate::autotag::ReleaseQuery),
     /// Release ID: fetches its tracks for matching.
     LoadRelease(String),
+    /// Fingerprints the song's file and asks AcoustID which recording it is.
+    IdentifyBySound(Box<Track>),
     Preferences(Preferences),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
@@ -281,6 +283,8 @@ pub enum Event {
         Result<Vec<crate::autotag::ReleaseCandidate>, String>,
     ),
     ReleaseLoaded(String, Result<Arc<crate::autotag::Release>, String>),
+    /// The MusicBrainz recording AcoustID found for a song.
+    SoundIdentified(TrackId, Result<String, String>),
 }
 #[derive(Clone)]
 pub struct Service {
@@ -2323,8 +2327,39 @@ fn run(
                 }
                 Command::Player(command) => player.send(command),
                 Command::WriteTags(edits) => {
-                    let report = write_tags(&catalog, &edits)?;
-                    finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                    let covers = crate::tags::wanted_covers(&edits);
+                    if !covers.is_empty() {
+                        let (musicbrainz, tx, events) =
+                            (musicbrainz.clone(), tx.clone(), events.clone());
+                        runtime.spawn(async move {
+                            let mut fetched = std::collections::BTreeMap::new();
+                            for release in covers {
+                                match musicbrainz.front_cover(&release).await {
+                                    Ok(cover) => {
+                                        fetched.insert(release, cover);
+                                    }
+                                    Err(error) => {
+                                        let _ = events.send(Event::TagsWritten(
+                                            crate::tags::TagReport {
+                                                job: chrono::Utc::now().timestamp_micros(),
+                                                failures: vec![(
+                                                    "Cover art".into(),
+                                                    format!("{error:#}"),
+                                                )],
+                                                ..Default::default()
+                                            },
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            let edits = crate::tags::with_covers(edits, &fetched);
+                            let _ = tx.send(Command::WriteTags(edits));
+                        });
+                    } else {
+                        let report = write_tags(&catalog, &edits)?;
+                        finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                    }
                 }
                 Command::UndoTags => {
                     let report = undo_tags(&catalog)?;
@@ -2338,6 +2373,37 @@ fn run(
                             .await
                             .map_err(|error| format!("{error:#}"));
                         let _ = events.send(Event::ReleaseCandidates(query, result));
+                    });
+                }
+                Command::IdentifyBySound(track) => {
+                    let prefs: Preferences = catalog.state("preferences")?;
+                    let key = prefs.metadata.acoustid_key.trim().to_string();
+                    let file = crate::tags::resolve(
+                        std::path::Path::new(&prefs.metadata.library_folder),
+                        &track,
+                    );
+                    let (musicbrainz, events) = (musicbrainz.clone(), events.clone());
+                    runtime.spawn(async move {
+                        let result = async {
+                            if key.is_empty() {
+                                return Err("Add an AcoustID key in Settings first".to_string());
+                            }
+                            let file = file?;
+                            let print = tokio::task::spawn_blocking(move || {
+                                crate::fingerprint::fingerprint(&file)
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| format!("{error:#}"))?;
+                            let duration = track.duration.round().max(1.) as u32;
+                            musicbrainz
+                                .identify(&key, &print, duration)
+                                .await
+                                .map_err(|error| format!("{error:#}"))?
+                                .ok_or_else(|| "AcoustID doesn't know this recording".to_string())
+                        }
+                        .await;
+                        let _ = events.send(Event::SoundIdentified(track.id, result));
                     });
                 }
                 Command::LoadRelease(id) => {

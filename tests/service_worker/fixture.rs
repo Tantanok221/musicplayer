@@ -873,12 +873,63 @@ async fn lastfm(
         .into_response()
 }
 
+async fn acoustid(
+    State(state): State<ServerState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let fingerprinted = !query.get("fingerprint").is_none_or(String::is_empty);
+    state.record(Request::new(
+        "acoustid",
+        &[
+            ("duration", query.get("duration").map_or("", String::as_str)),
+            ("fingerprinted", if fingerprinted { "yes" } else { "no" }),
+        ],
+    ));
+    if query.get("client").map(String::as_str) != Some("fixture-key") {
+        return Json(json!({"status":"error","error":{"code":4,"message":"invalid API key"}}))
+            .into_response();
+    }
+    Json(json!({"status":"ok","results":[
+        {"id":"low","score":0.4,"recordings":[{"id":"r-low"}]},
+        {"id":"best","score":0.97,"recordings":[{"id":"r1"}]}
+    ]}))
+    .into_response()
+}
+
+async fn cover_art(State(state): State<ServerState>, Path(path): Path<String>) -> Response {
+    state.record(Request::new("coverart", &[("path", &path)]));
+    if path == "release/ok-computer/front-500" {
+        return ([("content-type", "image/png")], b"\x89PNG cover".to_vec()).into_response();
+    }
+    (StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
 async fn metadata(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
     method: Method,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    if method == Method::GET && endpoint == "recording" && query.contains_key("query") {
+        state.record(Request::new(
+            "metadata/recording-search",
+            &[("query", &query["query"]), ("limit", &query["limit"])],
+        ));
+        let credit =
+            json!([{"name":"Radiohead","joinphrase":"","artist":{"id":"a1","name":"Radiohead"}}]);
+        return Json(json!({"recordings":[
+            {"id":"r1", "score":100, "title":"Airbag", "artist-credit": credit, "releases":[
+                {"id":"ok-computer", "title":"OK Computer", "date":"1997-05-21", "country":"GB",
+                 "track-count":2, "artist-credit": credit, "media":[{"format":"CD","track-count":2}]}
+            ]},
+            {"id":"r9", "score":90, "title":"Airbag", "artist-credit": credit, "releases":[
+                {"id":"ok-computer", "title":"OK Computer"},
+                {"id":"airbag-ep", "title":"Airbag / How Am I Driving?", "date":"1998",
+                 "country":"JP", "track-count":3, "media":[{"format":"CD","track-count":3}]}
+            ]}
+        ]}))
+        .into_response();
+    }
     if method == Method::GET && endpoint == "release" && query.contains_key("query") {
         state.record(Request::new(
             "metadata/release-search",
@@ -1124,6 +1175,8 @@ impl Fixture {
             .route("/api/playlist/{id}", any(native))
             .route("/rest/{endpoint}", any(navidrome))
             .route("/metadata/{*endpoint}", any(metadata))
+            .route("/coverart/{*path}", any(cover_art))
+            .route("/acoustid/lookup", any(acoustid))
             .route("/lastfm/", any(lastfm))
             .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
@@ -1219,6 +1272,12 @@ impl Fixture {
     fn start_player(&self, paused: bool) -> Worker {
         let metadata =
             MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
+                .and_then(|metadata| {
+                    metadata.with_covers(&format!("{}coverart/", self.account.url))
+                })
+                .and_then(|metadata| {
+                    metadata.with_acoustid(&format!("{}acoustid/", self.account.url))
+                })
                 .unwrap();
         let key = self.state.data.lock().unwrap().library.lastfm_key;
         let lastfm = LastFm::with_endpoints(

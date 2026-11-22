@@ -10,6 +10,12 @@ pub struct ReleaseQuery {
     pub artist: String,
     /// The number of songs, or 0 to leave it out.
     pub tracks: usize,
+    /// For one song: its title, so the search looks for the recording and
+    /// offers the releases it appears on.
+    pub title: String,
+    pub length_ms: Option<u64>,
+    /// A pasted recording ID, searched for the releases it appears on.
+    pub recording: String,
 }
 
 impl ReleaseQuery {
@@ -22,6 +28,21 @@ impl ReleaseQuery {
                 .unwrap_or_default()
                 .to_string()
         };
+        if let [song] = tracks {
+            let artist = if song.artist.is_empty() {
+                &song.album_artist
+            } else {
+                &song.artist
+            };
+            return Self {
+                album: song.album.clone(),
+                artist: artist.clone(),
+                tracks: 0,
+                title: song.title.clone(),
+                length_ms: (song.duration > 0.).then_some((song.duration * 1000.) as u64),
+                ..Default::default()
+            };
+        }
         let mut artist = first(|track| &track.album_artist);
         if artist.is_empty() {
             artist = first(|track| &track.artist);
@@ -30,11 +51,52 @@ impl ReleaseQuery {
             album: first(|track| &track.album),
             artist,
             tracks: if tracks.len() > 1 { tracks.len() } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    /// Whether songs from more than one album are selected, which neither
+    /// an album nor a song search can fill in one go.
+    pub fn spans_albums(tracks: &[Track]) -> bool {
+        tracks.len() > 1
+            && tracks
+                .iter()
+                .any(|track| track.album_id != tracks[0].album_id)
+    }
+
+    pub fn is_song(&self) -> bool {
+        !self.title.is_empty() || !self.recording.is_empty()
+    }
+
+    /// What the search is for, as the editor names it while it runs.
+    pub fn subject(&self) -> &str {
+        if self.is_song() {
+            &self.title
+        } else {
+            &self.album
         }
     }
 
     /// The Lucene query MusicBrainz's release search takes.
     pub fn lucene(&self) -> String {
+        if !self.recording.is_empty() {
+            return format!("rid:{}", self.recording);
+        }
+        if self.is_song() {
+            let mut terms = vec![format!("recording:\"{}\"", escape(&self.title))];
+            if !self.artist.is_empty() {
+                terms.push(format!("artist:\"{}\"", escape(&self.artist)));
+            }
+            if let Some(length) = self.length_ms {
+                let slack = 3_000;
+                terms.push(format!(
+                    "dur:[{} TO {}]",
+                    length.saturating_sub(slack),
+                    length + slack
+                ));
+            }
+            return terms.join(" AND ");
+        }
         let mut terms = vec![format!("release:\"{}\"", escape(&self.album))];
         if !self.artist.is_empty() {
             terms.push(format!("artist:\"{}\"", escape(&self.artist)));
@@ -43,6 +105,131 @@ impl ReleaseQuery {
             terms.push(format!("tracks:{}", self.tracks));
         }
         terms.join(" AND ")
+    }
+}
+
+/// What a pasted MusicBrainz link or bare ID points at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+    Release(String),
+    Recording(String),
+}
+
+/// Reads a pasted release or recording URL, or a bare ID taken as a release.
+pub fn parse_link(text: &str) -> Option<Link> {
+    let text = text.trim().to_ascii_lowercase();
+    let is_id = |id: &str| {
+        id.len() == 36
+            && id.char_indices().all(|(at, c)| match at {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            })
+    };
+    if is_id(&text) {
+        return Some(Link::Release(text));
+    }
+    let path = text.split("musicbrainz.org/").nth(1)?;
+    let mut parts = path.split(['/', '?', '#']);
+    let kind = parts.next()?;
+    let id = parts.next().filter(|id| is_id(id))?.to_string();
+    match kind {
+        "release" => Some(Link::Release(id)),
+        "recording" => Some(Link::Recording(id)),
+        _ => None,
+    }
+}
+
+enum Piece {
+    Text(String),
+    Field(TagField),
+}
+
+fn placeholder(name: &str) -> Option<TagField> {
+    Some(match name {
+        "title" => TagField::Title,
+        "artist" => TagField::Artist,
+        "albumartist" => TagField::AlbumArtist,
+        "album" => TagField::Album,
+        "year" => TagField::Year,
+        "track" => TagField::Track,
+        "disc" => TagField::Disc,
+        "genre" => TagField::Genre,
+        "composer" => TagField::Composer,
+        _ => return None,
+    })
+}
+
+/// Reads tags from the end of a song's path with a pattern such as
+/// `%track% - %title%` or `%album%/%track% %title%`. Empty when it doesn't fit.
+pub fn from_path(pattern: &str, path: &str) -> BTreeMap<TagField, String> {
+    let mut pieces = vec![];
+    let mut literal = String::new();
+    for (at, part) in pattern.split('%').enumerate() {
+        match placeholder(part).filter(|_| at % 2 == 1) {
+            Some(field) => {
+                if !literal.is_empty() {
+                    pieces.push(Piece::Text(std::mem::take(&mut literal)));
+                }
+                pieces.push(Piece::Field(field));
+            }
+            None if at % 2 == 1 => literal.push_str(&format!("%{part}%")),
+            None => literal.push_str(part),
+        }
+    }
+    if !literal.is_empty() {
+        pieces.push(Piece::Text(literal));
+    }
+    let path = path.replace('\\', "/");
+    let parts: Vec<&str> = path.split('/').collect();
+    let depth = pattern.matches('/').count() + 1;
+    if parts.len() < depth || !pieces.iter().any(|piece| matches!(piece, Piece::Field(_))) {
+        return BTreeMap::new();
+    }
+    let mut text = parts[parts.len() - depth..].join("/");
+    if let Some((stem, extension)) = text.rsplit_once('.')
+        && !extension.contains('/')
+        && (1..=5).contains(&extension.len())
+    {
+        text = stem.to_string();
+    }
+    let mut found = vec![];
+    if capture(&pieces, &text, &mut found) {
+        found.into_iter().collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+fn capture(pieces: &[Piece], text: &str, found: &mut Vec<(TagField, String)>) -> bool {
+    match pieces.split_first() {
+        None => text.is_empty(),
+        Some((Piece::Text(literal), rest)) => text
+            .strip_prefix(literal.as_str())
+            .is_some_and(|text| capture(rest, text, found)),
+        Some((Piece::Field(field), rest)) => {
+            let numeric = matches!(field, TagField::Track | TagField::Disc | TagField::Year);
+            for end in (1..=text.len()).filter(|end| text.is_char_boundary(*end)) {
+                let value = text[..end].trim();
+                if value.is_empty() || value.contains('/') {
+                    continue;
+                }
+                if numeric && !value.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let value = if matches!(field, TagField::Track | TagField::Disc) {
+                    let number = value.trim_start_matches('0');
+                    if number.is_empty() { "0" } else { number }
+                } else {
+                    value
+                };
+                found.push((*field, value.to_string()));
+                if capture(rest, &text[end..], found) {
+                    return true;
+                }
+                found.pop();
+            }
+            false
+        }
     }
 }
 
@@ -210,7 +397,14 @@ fn ids(credits: &[(String, String)]) -> String {
 
 /// The tags a song matched to `track` would get. IDs come too, so a later
 /// rescan or lookup finds the same recording.
-pub fn proposed(release: &Release, track: &LookupTrack) -> BTreeMap<TagField, String> {
+/// How many of a release's genres, most voted first, a lookup fills in.
+pub const GENRE_LIMITS: [usize; 3] = [1, 3, usize::MAX];
+
+pub fn proposed(
+    release: &Release,
+    track: &LookupTrack,
+    genres: usize,
+) -> BTreeMap<TagField, String> {
     let mut values = BTreeMap::from([
         (TagField::Title, track.title.clone()),
         (TagField::Artist, names(&track.artists).join("; ")),
@@ -224,12 +418,22 @@ pub fn proposed(release: &Release, track: &LookupTrack) -> BTreeMap<TagField, St
         (TagField::MusicBrainzReleaseGroup, release.group_id.clone()),
         (TagField::MusicBrainzArtist, ids(&track.artists)),
         (TagField::MusicBrainzAlbumArtist, ids(&release.artists)),
+        (
+            TagField::CoverArt,
+            format!("{}{}", crate::tags::COVER_PREFIX, release.id),
+        ),
     ]);
     if let Some(year) = release.date.get(..4).filter(|y| y.parse::<u32>().is_ok()) {
         values.insert(TagField::Year, year.to_string());
     }
     if !release.genres.is_empty() {
-        values.insert(TagField::Genre, release.genres.join("; "));
+        let genres: Vec<&str> = release
+            .genres
+            .iter()
+            .take(genres)
+            .map(String::as_str)
+            .collect();
+        values.insert(TagField::Genre, genres.join("; "));
     }
     values.retain(|_, value| !value.is_empty());
     values
@@ -326,13 +530,20 @@ mod tests {
     #[test]
     fn proposals_fill_visible_tags_and_ids() {
         let release = release();
-        let values = proposed(&release, &release.tracks[1]);
+        let mut release = release;
+        release.genres.push("art rock".into());
+        assert_eq!(
+            proposed(&release, &release.tracks[1], usize::MAX)[&TagField::Genre],
+            "alternative rock; art rock"
+        );
+        let values = proposed(&release, &release.tracks[1], 1);
         assert_eq!(values[&TagField::Title], "Paranoid Android");
         assert_eq!(values[&TagField::Year], "1997");
         assert_eq!(values[&TagField::Track], "2");
         assert_eq!(values[&TagField::Genre], "alternative rock");
         assert_eq!(values[&TagField::MusicBrainzTrack], "r2");
         assert_eq!(values[&TagField::MusicBrainzAlbumArtist], "a1");
+        assert_eq!(values[&TagField::CoverArt], "coverart:rel");
         assert!(!values.contains_key(&TagField::Comment));
     }
 
@@ -351,5 +562,81 @@ mod tests {
             candidate.summary(),
             "1997-05-21 · GB · CD · Parlophone NODATA 02 · 12 tracks"
         );
+    }
+
+    #[test]
+    fn one_song_searches_its_recording_with_a_duration_window() {
+        let song = Track {
+            title: "Pyramid \"Song\"".into(),
+            artist: "Radiohead".into(),
+            album: "Amnesiac".into(),
+            album_id: "a".into(),
+            duration: 289.,
+            ..Default::default()
+        };
+        let query = ReleaseQuery::for_tracks(std::slice::from_ref(&song));
+        assert!(query.is_song());
+        assert_eq!(query.subject(), "Pyramid \"Song\"");
+        assert_eq!(
+            query.lucene(),
+            r#"recording:"Pyramid \"Song\"" AND artist:"Radiohead" AND dur:[286000 TO 292000]"#
+        );
+        let other = Track {
+            album_id: "b".into(),
+            ..song.clone()
+        };
+        assert!(!ReleaseQuery::spans_albums(&[song.clone(), song.clone()]));
+        assert!(ReleaseQuery::spans_albums(&[song, other]));
+    }
+
+    #[test]
+    fn pasted_links_and_ids_are_recognised() {
+        let id = "b84ee12a-09ef-421b-82de-0441a926375b";
+        assert_eq!(
+            parse_link(&format!(" https://musicbrainz.org/release/{id}/discids ")),
+            Some(Link::Release(id.into()))
+        );
+        assert_eq!(
+            parse_link(&format!("musicbrainz.org/recording/{id}")),
+            Some(Link::Recording(id.into()))
+        );
+        assert_eq!(parse_link(id), Some(Link::Release(id.into())));
+        assert_eq!(
+            parse_link(&id.to_uppercase()),
+            Some(Link::Release(id.into()))
+        );
+        assert_eq!(
+            parse_link(&format!("https://musicbrainz.org/artist/{id}")),
+            None
+        );
+        assert_eq!(parse_link("b84ee12a-09ef-421b"), None);
+        assert_eq!(parse_link(""), None);
+    }
+
+    #[test]
+    fn file_names_fill_tags_through_a_pattern() {
+        let path = "Radiohead/OK Computer/02 - Paranoid Android - Live.flac";
+        assert_eq!(
+            from_path("%track% - %title%", path),
+            BTreeMap::from([
+                (TagField::Track, "2".to_string()),
+                (TagField::Title, "Paranoid Android - Live".to_string()),
+            ])
+        );
+        assert_eq!(
+            from_path("%artist%/%album%/%track% - %title%", path)[&TagField::Album],
+            "OK Computer"
+        );
+        assert_eq!(
+            from_path("%disc%-%track% %title%", "x/1-07 Lucky.mp3"),
+            BTreeMap::from([
+                (TagField::Disc, "1".to_string()),
+                (TagField::Track, "7".to_string()),
+                (TagField::Title, "Lucky".to_string()),
+            ])
+        );
+        assert!(from_path("%track% - %title%", "Airbag.flac").is_empty());
+        assert!(from_path("no fields", path).is_empty());
+        assert!(from_path("%a%/%b%/%c%/%title%", path).is_empty());
     }
 }
