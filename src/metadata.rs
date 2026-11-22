@@ -1,57 +1,7 @@
-//! Read-only metadata inspection: the Properties view of a track and library
-//! health checks for gaps in the tags Navidrome reports.
+//! Read-only metadata inspection: the Properties view of a track.
 use crate::model::Track;
-use serde::{Deserialize, Serialize};
 
 const MISSING: &str = "—";
-
-/// A tag gap the library can be narrowed to, in the spirit of MusicBee's
-/// "missing" auto-playlists.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum HealthIssue {
-    MissingYear,
-    MissingGenre,
-    MissingTrackNumber,
-    MissingMusicBrainzId,
-    MixedAlbumArtist,
-}
-
-impl HealthIssue {
-    pub const ALL: [Self; 5] = [
-        Self::MissingYear,
-        Self::MissingGenre,
-        Self::MissingTrackNumber,
-        Self::MissingMusicBrainzId,
-        Self::MixedAlbumArtist,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::MissingYear => "Missing year",
-            Self::MissingGenre => "Missing genre",
-            Self::MissingTrackNumber => "Missing track number",
-            Self::MissingMusicBrainzId => "Missing MusicBrainz ID",
-            Self::MixedAlbumArtist => "Mixed album artist",
-        }
-    }
-
-    /// A condition on the `tracks` table that holds for affected tracks.
-    pub fn sql(self) -> &'static str {
-        match self {
-            Self::MissingYear => "coalesce(tracks.year,0)<=0",
-            Self::MissingGenre => "trim(tracks.genre)=''",
-            Self::MissingTrackNumber => "coalesce(tracks.track,0)<=0",
-            Self::MissingMusicBrainzId => {
-                "trim(coalesce(json_extract(tracks.data,'$.musicBrainzId'),''))=''"
-            }
-            Self::MixedAlbumArtist => {
-                // Navidrome gives each album artist its own album ID, so one
-                // release tagged inconsistently shows up as several albums.
-                "(lower(trim(tracks.album)),coalesce(tracks.year,0)) IN (SELECT lower(trim(album)),coalesce(year,0) FROM tracks WHERE trim(album)!='' GROUP BY 1,2 HAVING count(DISTINCT album_artist)>1)"
-            }
-        }
-    }
-}
 
 /// One row of the Properties view.
 #[derive(Clone, Debug, PartialEq, Eq)]
