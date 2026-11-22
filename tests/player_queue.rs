@@ -326,7 +326,9 @@ impl QueueModel {
             self.queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
         );
         assert_eq!(saved.index, self.current);
-        self.original = None;
+        if !account {
+            self.original = None;
+        }
         self.undo = None;
         // Restore selects slot zero when persistence has no selection.
         if self.current.is_none() && !self.queue.is_empty() {
@@ -334,13 +336,14 @@ impl QueueModel {
             self.preserved_selection = None;
         }
         if account {
-            PlayerCommand::RestoreAccount(
-                "test-account".into(),
-                self.queue.clone(),
-                saved.index.unwrap_or(0),
-                saved.position,
-                saved.listen,
-            )
+            PlayerCommand::RestoreAccount {
+                namespace: "test-account".into(),
+                tracks: self.queue.clone(),
+                index: saved.index.unwrap_or(0),
+                position: saved.position,
+                listen: saved.listen,
+                shuffle_positions: saved.shuffle_positions,
+            }
         } else {
             PlayerCommand::Restore(
                 self.queue.clone(),
