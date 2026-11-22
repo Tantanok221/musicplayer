@@ -715,12 +715,14 @@ impl Catalog {
             upstream.genre = query.genre.clone();
         }
         let (filter, values) = Self::filters(&upstream);
-        // Use the lowest-ID track for each set of album artist credit inputs.
+        // Keep one representative per credit set so guests on later tracks are seen:
+        // artist and artistId determine the fallback ID, and albumArtists holds structured credits.
         let mut statement = self.conn.prepare(&format!(
             "SELECT picked.data, groups.album_id
              FROM (
                  SELECT min(id) AS id, album_artist, album_id
                  FROM tracks{filter}
+                 AND tracks.album_artist!=''
                  GROUP BY album_artist, album_id, artist,
                           jsonb_extract(data,'$.artistId','$.albumArtists')
              ) groups
