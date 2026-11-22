@@ -17,6 +17,8 @@ mod fixture;
 mod lifecycle;
 #[path = "service_worker/metadata.rs"]
 mod metadata;
+#[path = "service_worker/playlists.rs"]
+mod playlists;
 #[path = "service_worker/preferences.rs"]
 mod preferences;
 #[path = "service_worker/queue.rs"]

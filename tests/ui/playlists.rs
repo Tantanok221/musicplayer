@@ -120,6 +120,82 @@ fn append_empty_queue_does_not_send_existing_playlist_songs(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn remove_playlist_entry_refreshes_only_after_success(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let tracks = fixture
+        .catalog
+        .by_ids(&["track-1".into(), "track-2".into()])
+        .unwrap();
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = std::sync::Arc::new(vec![
+        tracks[0].clone(),
+        tracks[1].clone(),
+        tracks[0].clone(),
+    ]);
+    loaded.song_count = 3;
+    fixture.backend.emit(Event::Playlist(loaded.clone()));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-playlist-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.expect("remove rejected", |command, _| {
+        let expected = Mutation::RemoveFromPlaylist("playlist-1".into(), 2);
+        assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+        vec![Event::MutationFailed(
+            expected,
+            "Fixture removal rejected".into(),
+        )]
+    });
+    fixture.menu_item(window, "Remove from Playlist", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-2").visible());
+        assert_eq!(
+            window.find("error-banner").label(),
+            Some("Fixture removal rejected")
+        );
+    })
+    .unwrap();
+    for index in (0..3).rev() {
+        let mut updated = loaded.clone();
+        std::sync::Arc::make_mut(&mut updated.entry).remove(index);
+        updated.song_count -= 1;
+        let response = updated.clone();
+        fixture.expect("remove selected entry", move |command, _| {
+            let expected = Mutation::RemoveFromPlaylist("playlist-1".into(), index);
+            assert!(matches!(command, Command::Mutate(ref mutation) if *mutation == expected));
+            vec![
+                Event::Playlists(vec![response.clone()]),
+                Event::Playlist(response),
+                Event::MutationDone(expected),
+            ]
+        });
+        if index == 2 {
+            fixture.click(window, "retry-error", cx);
+        } else {
+            cx.update_window(window, |_, window, cx| {
+                window.right_click(format!("row-playlist-{index}"), cx)
+            })
+            .unwrap();
+            fixture.settle(window, cx);
+            fixture.menu_item(window, "Remove from Playlist", cx);
+        }
+        cx.update_window(window, |_, window, _| {
+            assert!(window.try_find(format!("row-playlist-{index}")).is_none());
+            if index > 0 {
+                assert!(window.find("row-playlist-0").visible());
+            }
+        })
+        .unwrap();
+        loaded = updated;
+    }
+    fixture.assert_script_finished();
+    fixture.diagnose("playlist entry removed", window, &app, cx);
+}
+
+#[gpui_kit::test]
 fn create_failure_keeps_the_name_and_retry_creates_one_playlist(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, app) = start(cx);
     fixture.click(window, "new-playlist", cx);
