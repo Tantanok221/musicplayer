@@ -1,5 +1,8 @@
 use super::*;
 
+mod reorder;
+use reorder::{QueueDrag, next_index};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueRow {
     Earlier(usize),
@@ -8,12 +11,6 @@ enum QueueRow {
     Track(usize),
     Empty,
     End,
-}
-
-fn next_index(playback: &PlaybackSnapshot) -> usize {
-    playback
-        .index
-        .map_or(0, |i| (i + 1).min(playback.queue.len()))
 }
 
 fn queue_rows(playback: &PlaybackSnapshot, earlier: bool, search: &str) -> Vec<QueueRow> {
@@ -130,14 +127,6 @@ impl QueueViewState {
         }
         self.signature = Some(signature);
     }
-}
-
-#[derive(Clone)]
-struct QueueDrag {
-    revision: u64,
-    ids: Vec<u64>,
-    first_index: usize,
-    title: String,
 }
 
 impl MusicApp {
@@ -359,22 +348,27 @@ impl MusicApp {
             self.queue_edit(QueueEdit::Move { indices, before });
         }
     }
-    fn save_queue_playlist(&mut self, upcoming: bool, cx: &mut Context<Self>) {
+    pub(super) fn save_queue_playlist(
+        &mut self,
+        upcoming: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let start = if upcoming {
             next_index(&self.playback)
         } else {
             0
         };
-        self.playlist_editor_tracks = Some(
-            self.playback.queue[start..]
-                .iter()
-                .map(|t| t.id.clone())
-                .collect(),
+        let ids = self.playback.queue[start..]
+            .iter()
+            .map(|track| track.id.clone())
+            .collect();
+        self.new_playlist(
+            crate::playlists::CreationSource::Tracks(ids),
+            "",
+            window,
+            cx,
         );
-        self.show_playlist_editor = true;
-        self.playlist_editor_rename = false;
-        self.playlist_editor_album = None;
-        cx.notify();
     }
     pub(super) fn queue_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
@@ -395,16 +389,18 @@ impl MusicApp {
                     let all = weak.clone();
                     let upcoming = weak.clone();
                     menu.item(
-                        PopupMenuItem::new("Whole queue…").on_click(move |_, _, cx| {
-                            let _ = all.update(cx, |app, cx| app.save_queue_playlist(false, cx));
+                        PopupMenuItem::new("Whole queue…").on_click(move |_, window, cx| {
+                            let _ = all
+                                .update(cx, |app, cx| app.save_queue_playlist(false, window, cx));
                         }),
                     )
                     .item(
                         PopupMenuItem::new("Upcoming tracks…")
                             .disabled(no_upcoming)
-                            .on_click(move |_, _, cx| {
-                                let _ = upcoming
-                                    .update(cx, |app, cx| app.save_queue_playlist(true, cx));
+                            .on_click(move |_, window, cx| {
+                                let _ = upcoming.update(cx, |app, cx| {
+                                    app.save_queue_playlist(true, window, cx)
+                                });
                             }),
                     )
                 }),
@@ -667,16 +663,55 @@ impl MusicApp {
         }
     }
     fn drop_queue_tracks(&self, drag: &QueueDrag, before: usize) {
-        if drag.revision != self.playback.queue_revision {
-            return;
+        if let Some(edit) = drag.edit(&self.playback, before) {
+            self.queue_edit(edit);
         }
-        let indices = drag
-            .ids
-            .iter()
-            .filter_map(|id| self.playback.queue_ids.iter().position(|value| value == id))
-            .collect();
-        self.queue_edit(QueueEdit::Move { indices, before });
     }
+
+    pub(super) fn queue_reorder_row<E: StatefulInteractiveElement + Styled>(
+        &self,
+        row: E,
+        index: usize,
+        title: &str,
+        selection: Option<&[usize]>,
+        cx: &Context<Self>,
+    ) -> E {
+        if index < next_index(&self.playback) || self.playback.queue_ids.get(index).is_none() {
+            return row;
+        }
+        let drag = QueueDrag::new(&self.playback, selection.unwrap_or(&[index]), title);
+        let revision = self.playback.queue_revision;
+        let accent = ink(cx).accent;
+        let selection_owner = selection.map(|_| cx.weak_entity());
+
+        row.cursor_grab()
+            .on_drag(drag, move |drag, _, window, cx| {
+                cx.stop_propagation();
+                if let Some(owner) = &selection_owner {
+                    let _ = owner.update(cx, |app, cx| {
+                        app.queue_ui.selected = drag.ids().iter().copied().collect();
+                        app.queue_ui.focus.focus(window, cx);
+                        cx.notify();
+                    });
+                }
+                cx.new(|_| tracks::TrackDragPreview(drag.title().to_owned()))
+            })
+            .drag_over::<QueueDrag>(move |style, drag, _, _| {
+                match drag.row_destination(revision, index) {
+                    Some(before) if before > index => style.border_b_2().border_color(accent),
+                    Some(_) => style.border_t_2().border_color(accent),
+                    None => style,
+                }
+            })
+            .on_drop(cx.listener(move |app, drag: &QueueDrag, _, _| {
+                if index >= next_index(&app.playback)
+                    && let Some(before) = drag.row_destination(revision, index)
+                {
+                    app.drop_queue_tracks(drag, before);
+                }
+            }))
+    }
+
     fn queue_track_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let track = self.playback.queue[index].clone();
         let Some(id) = self.playback.queue_ids.get(index).copied() else {
@@ -691,20 +726,6 @@ impl MusicApp {
         if !indices.contains(&index) {
             indices = vec![index];
         }
-        let selected_ids = indices
-            .iter()
-            .filter_map(|i| self.playback.queue_ids.get(*i).copied())
-            .collect::<Vec<_>>();
-        let drag = QueueDrag {
-            revision: self.playback.queue_revision,
-            ids: selected_ids,
-            first_index: indices[0],
-            title: if indices.len() == 1 {
-                track.title.clone()
-            } else {
-                format!("{} tracks", indices.len())
-            },
-        };
         let remove = indices.clone();
         let move_next = indices;
         let weak = cx.weak_entity();
@@ -906,19 +927,8 @@ impl MusicApp {
                 )
         };
         if upcoming {
-            let revision = self.playback.queue_revision;
-            let drag_weak = cx.weak_entity();
-            row = row
-                .cursor_grab()
-                .on_drag(drag, move |drag, _, window, cx| {
-                    cx.stop_propagation();
-                    let _ = drag_weak.update(cx, |app, cx| {
-                        app.queue_ui.selected = drag.ids.iter().copied().collect();
-                        app.queue_ui.focus.focus(window, cx);
-                        cx.notify();
-                    });
-                    cx.new(|_| tracks::TrackDragPreview(drag.title.clone()))
-                })
+            row = self
+                .queue_reorder_row(row, index, &track.title, Some(&remove), cx)
                 .child(
                     short_button(
                         SharedString::from(format!("queue-remove-{id}")),
@@ -929,19 +939,7 @@ impl MusicApp {
                         cx.stop_propagation();
                         app.queue_edit(QueueEdit::Remove(remove.clone()));
                     })),
-                )
-                .drag_over::<QueueDrag>(move |s, drag, _, _| {
-                    if drag.first_index < index {
-                        s.border_b_2().border_color(colors.accent)
-                    } else {
-                        s.border_t_2().border_color(colors.accent)
-                    }
-                })
-                .on_drop(cx.listener(move |app, drag: &QueueDrag, _, _| {
-                    if drag.revision == revision {
-                        app.drop_queue_tracks(drag, index + usize::from(drag.first_index < index));
-                    }
-                }));
+                );
         }
         row.context_menu(context_menu).into_any_element()
     }

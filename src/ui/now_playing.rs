@@ -86,6 +86,25 @@ impl MusicApp {
         position
     }
 
+    /// Whether lyrics showing the playing track are out of date for its position.
+    pub(super) fn lyrics_need_redraw(&self) -> bool {
+        let Some(track) = &self.playback.track else {
+            return false;
+        };
+        let Some((_, shown)) = self
+            .lyrics_follow
+            .as_ref()
+            .filter(|(id, _)| id == &track.id)
+        else {
+            return false;
+        };
+        let Some(Ok(lyrics)) = self.lyrics.get(&track.id) else {
+            return false;
+        };
+        let armed = self.lyrics_wake.as_ref().map(|(index, _)| *index);
+        lyrics.needs_redraw(self.live_position(), *shown, armed)
+    }
+
     /// Redraws once the next timed line is due, so lyrics stay on the beat without a frame loop.
     pub(super) fn schedule_lyric_wake(
         &mut self,
@@ -96,14 +115,9 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) {
         let next = following
-            .then(|| {
-                (0..lyrics.line.len())
-                    .filter_map(|index| Some((index, lyrics.line_position(index)?)))
-                    .filter(|(_, start)| *start > now)
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-            })
+            .then(|| lyrics.next_line(now))
             .flatten()
-            .filter(|(_, start)| start - now < 0.4);
+            .filter(|(_, start)| start - now < crate::lyrics::WAKE_LEAD);
         let Some((index, start)) = next else {
             self.lyrics_wake = None;
             return;
@@ -120,7 +134,16 @@ impl MusicApp {
         let view = window.current_view();
         let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            this.update(cx, |_, cx| {
+            this.update(cx, |app, cx| {
+                // A fired wake must not block re-arming the same line when
+                // the redraw lands a moment before it starts.
+                if let Some((due, task)) = app.lyrics_wake.take() {
+                    if due == index {
+                        task.detach();
+                    } else {
+                        app.lyrics_wake = Some((due, task));
+                    }
+                }
                 let cx: &mut App = cx;
                 cx.notify(view);
             })

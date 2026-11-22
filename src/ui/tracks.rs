@@ -27,6 +27,13 @@ pub(super) enum TrackPosition {
 }
 
 impl TrackPosition {
+    pub(super) fn playlist(playlist: &Playlist, index: usize, editable: bool) -> Self {
+        Self::Playlist {
+            playback: TrackPlayback::Playlist(playlist.entry.clone(), index),
+            editable_entry: editable.then(|| crate::playlists::PlaylistEntry::new(playlist, index)),
+        }
+    }
+
     fn playback(&self) -> TrackPlayback {
         match self {
             Self::Queue(index) => TrackPlayback::Queue(*index),
@@ -223,13 +230,8 @@ impl MusicApp {
                     )
                     .child(
                         short_button("save-playing-tracks", Glyph::Save, "Save Queue as playlist")
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.show_playlist_editor = true;
-                                app.playlist_editor_rename = false;
-                                app.playlist_editor_album = None;
-                                app.playlist_editor_tracks =
-                                    Some(app.playback.queue.iter().map(|t| t.id.clone()).collect());
-                                cx.notify();
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.save_queue_playlist(false, window, cx);
                             })),
                     ),
             )
@@ -240,7 +242,10 @@ impl MusicApp {
                             .map(|index| {
                                 let track = app.playback.queue[index].clone();
                                 let active = app.playback.index == Some(index);
-                                let key = format!("queue-side-{index}");
+                                let key = match app.playback.queue_ids.get(index) {
+                                    Some(id) => format!("queue-side-{id}"),
+                                    None => format!("queue-side-index-{index}"),
+                                };
                                 let favorite = app.favorite_button(&track, &key, cx);
                                 let rating = if app.information_width < 300. {
                                     app.rating_menu(&track, &key, cx).into_any_element()
@@ -253,8 +258,9 @@ impl MusicApp {
                                 let service3 = service.clone();
                                 let menu_state = app.menu_state(cx);
                                 let menu_track = track.clone();
-                                div()
-                                    .id(("queued", index))
+                                let row = div()
+                                    .id(SharedString::from(key))
+                                    .test_support()
                                     .w_full()
                                     .min_w_0()
                                     .role(Role::Group)
@@ -323,12 +329,17 @@ impl MusicApp {
                                             .text_color(colors.muted)
                                             .child(duration_label(track.duration)),
                                     )
-                                    .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
-                                        app.select_track(select.clone(), cx);
-                                        if event.click_count() == 2 {
-                                            app.service.player.send(PlayerCommand::JumpTo(index));
-                                        }
-                                    }))
+                                    .on_click(cx.listener(
+                                        move |app, event: &ClickEvent, _, cx| {
+                                            app.select_track(select.clone(), cx);
+                                            if event.click_count() == 2 {
+                                                app.service
+                                                    .player
+                                                    .send(PlayerCommand::JumpTo(index));
+                                            }
+                                        },
+                                    ));
+                                app.queue_reorder_row(row, index, &track.title, None, cx)
                                     .context_menu(move |menu, window, cx| {
                                         let service = service.clone();
                                         let service2 = service2.clone();

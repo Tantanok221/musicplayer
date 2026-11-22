@@ -49,6 +49,7 @@ mod navigation;
 mod navigator;
 mod now_playing;
 mod player_bar;
+mod playlist_creation;
 mod playlists;
 mod settings;
 mod smart_playlists;
@@ -490,12 +491,9 @@ pub struct MusicApp {
     spectrum_tick: Option<Instant>,
     library_open: bool,
     playlists_open: bool,
-    show_playlist_editor: bool,
-    playlist_editor_rename: bool,
-    playlist_editor_tracks: Option<Vec<String>>,
-    /// Album whose songs a new playlist from the editor will hold.
-    playlist_editor_album: Option<String>,
-    pending_delete: Option<String>,
+    playlist_rename: Option<String>,
+    playlist_creation: Option<playlist_creation::CreationDialog>,
+    playlist_creation_focus: FocusHandle,
     tag_editor: Option<tag_editor::TagEditor>,
     /// Album whose songs the tag editor opens on when they arrive.
     tag_editor_album: Option<String>,
@@ -587,6 +585,7 @@ impl MusicApp {
             window.observe_window_visibility(move |_, _, cx| {
                 view.update(cx, |_, cx| cx.notify()).ok();
             }),
+            cx.subscribe_in(&playlist_name, window, Self::playlist_name_event),
             cx.subscribe_in(&search, window, |app, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = app.search.read(cx).value().to_string();
@@ -775,11 +774,9 @@ impl MusicApp {
             spectrum_tick: None,
             library_open: true,
             playlists_open: true,
-            show_playlist_editor: false,
-            playlist_editor_rename: false,
-            playlist_editor_tracks: None,
-            playlist_editor_album: None,
-            pending_delete: None,
+            playlist_rename: None,
+            playlist_creation: None,
+            playlist_creation_focus: cx.focus_handle(),
             tag_editor: None,
             tag_editor_album: None,
             tag_notice: None,
@@ -822,7 +819,7 @@ impl Render for MusicApp {
         if !self.settings {
             self.settings_page = 0;
         }
-        let body = if self.smart.editor.is_some() {
+        let body = if self.smart.editor.is_some() && self.playlist_creation.is_none() {
             self.smart_editor_view(cx)
         } else if self.workspace == Workspace::NowPlaying && !self.settings && !self.blank {
             self.now_playing_view(window, cx)
@@ -970,6 +967,7 @@ impl Render for MusicApp {
                 })
                 .into_any_element()
         };
+        let playlist_creation = self.playlist_creation_view(cx);
         let tabs = self.part(
             Part::Tabs,
             style()
@@ -1097,6 +1095,7 @@ impl Render for MusicApp {
                 app.switch_workspace(Workspace::Explorer, window, cx)
             }))
             .child(tabs)
+            .children(self.playlist_delete_confirmation(cx))
             .child(
                 div()
                     .flex_1()
@@ -1107,5 +1106,6 @@ impl Render for MusicApp {
             )
             .child(status)
             .child(player)
+            .children(playlist_creation)
     }
 }

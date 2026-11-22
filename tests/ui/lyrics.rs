@@ -132,3 +132,76 @@ fn timed_lyrics_seek_only_the_playing_track_and_keep_selected_source_distinct(
     fixture.assert_script_finished();
     fixture.diagnose("lyrics source and seek checked", window, &app, cx);
 }
+
+#[gpui_kit::test]
+fn now_playing_lyrics_follow_position_only_playback_updates(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let playing = fixture
+        .catalog
+        .by_ids(&["track-2".into()])
+        .unwrap()
+        .remove(0);
+    let snapshot = |position: f64| PlaybackSnapshot {
+        track: Some(playing.clone()),
+        queue: Arc::new(vec![playing.clone()]),
+        queue_ids: Arc::new(vec![1]),
+        queue_revision: 1,
+        index: Some(0),
+        playing: true,
+        duration: 120.,
+        position,
+        ..Default::default()
+    };
+    fixture.backend.emit(Event::Lyrics(
+        "track-2".into(),
+        Ok(Arc::new(timed("Playing"))),
+    ));
+    fixture.backend.emit(Event::Playback(snapshot(1.)));
+    fixture.settle(window, cx);
+    let album = playing.album_id.clone();
+    fixture.expect("now-playing album tracks", move |command, catalog| {
+        assert!(matches!(command, Command::Album(id) if *id == album));
+        vec![Event::Album(
+            album.clone(),
+            catalog.album_tracks(&album).unwrap(),
+        )]
+    });
+    fixture.click(window, ("workspace-tab", 4_u64), cx);
+    // A display-driven frame: unlike settle(), it does not refresh the whole
+    // window, so cached parts redraw only when something notified them.
+    let platform_frame = |cx: &mut TestAppContext| {
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    };
+    let current = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            (0..2)
+                .filter_map(|index| {
+                    window
+                        .find(format!("lyric-{index}"))
+                        .label()
+                        .map(str::to_owned)
+                })
+                .find(|label| label.starts_with("Current lyric: "))
+        })
+        .unwrap()
+    };
+    assert_eq!(current(cx).as_deref(), Some("Current lyric: Playing first"));
+
+    // Only the position moves, with no pointer input to force a redraw.
+    fixture.backend.emit(Event::Playback(snapshot(2.5)));
+    platform_frame(cx);
+    assert_eq!(
+        current(cx).as_deref(),
+        Some("Current lyric: Playing second")
+    );
+
+    // A seek back is also position-only and must move the highlight back.
+    fixture.backend.emit(Event::Playback(snapshot(1.)));
+    platform_frame(cx);
+    assert_eq!(current(cx).as_deref(), Some("Current lyric: Playing first"));
+    fixture.assert_script_finished();
+    fixture.diagnose("now playing lyrics followed position", window, &app, cx);
+}

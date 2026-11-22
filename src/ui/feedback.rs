@@ -80,8 +80,10 @@ impl MusicApp {
     }
 
     pub(super) fn find_album(&self, id: &str) -> Option<Arc<Album>> {
-        self.selected_album
-            .iter()
+        self.playlists
+            .album_details()
+            .into_iter()
+            .chain(&self.selected_album)
             .chain(&self.view.albums)
             .chain(self.artist_albums.iter().flatten())
             .chain(self.artist_data.iter().flat_map(|data| &data.albums))
@@ -90,6 +92,7 @@ impl MusicApp {
     }
 
     pub(super) fn apply_album_update(&mut self, album: Arc<Album>) {
+        self.playlists.update_album(album.clone());
         if self
             .selected_album
             .as_ref()
