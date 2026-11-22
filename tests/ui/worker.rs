@@ -12,6 +12,85 @@ use sonora::{
 };
 use std::time::Instant;
 
+#[gpui_kit::test]
+fn account_switch_shows_cached_playlists_before_sync(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
+    let playlist = |id: &str, name: &str| sonora::model::Playlist {
+        id: id.into(),
+        name: name.into(),
+        ..Default::default()
+    };
+    let a = Fixture::new(Library {
+        playlists: vec![playlist("a-playlist", "Account A playlist")],
+        ..Default::default()
+    });
+    let b = Fixture::new(Library {
+        hold_sync: true,
+        ..Default::default()
+    });
+    let mut catalog = sonora::catalog::Catalog::open(
+        &a.paths
+            .data
+            .join(format!("{}.sqlite", b.account.namespace())),
+    )
+    .unwrap();
+    catalog
+        .save_playlists(&[playlist("b-playlist", "Account B cached")])
+        .unwrap();
+    let (worker, tx, window, app) = mount_worker_with_player(&a, Preferences::default(), true, cx);
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Status(s) if s.starts_with("Up to date")),
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.find("nav-playlist-a-playlist").visible());
+        window.press(sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.within("settings-sidebar").click("0-0", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for (field, value) in [
+            ("Server address", b.account.url.as_str()),
+            ("Username", "fixture"),
+            ("Password", "synthetic-password"),
+        ] {
+            window.click(field, cx);
+            window.press(sonora::platform::shortcut("cmd-a", "ctrl-a"), cx);
+            window.input(value, cx);
+        }
+        window.click("connect-library", cx);
+    })
+    .unwrap();
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |e, _| matches!(e, Event::Connected(account, _) if account.namespace() == b.account.namespace()),
+    );
+    b.wait_request(&Request::new("getScanStatus.view", &[]));
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("nav-playlist-a-playlist").is_none(),
+            "previous account's playlist remains in sidebar"
+        );
+        assert!(window.find("nav-playlist-b-playlist").visible());
+    })
+    .unwrap();
+    b.resume_sync();
+    close_worker(worker, window, app, cx);
+    a.finish();
+    b.finish();
+}
+
 /// Stage real events in FIFO order through MusicApp's normal receiver. This
 /// lets the test inspect the optimistic frame before releasing HTTP results.
 /// No event is synthesized, filtered, reordered or handled directly by the view.

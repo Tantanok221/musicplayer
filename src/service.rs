@@ -1315,6 +1315,7 @@ fn run(
                         player.send(PlayerCommand::Preferences(prefs.clone()));
                         restore_queue(&catalog, &player, value.account.namespace())?;
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         slskd = None;
                         watched.clear();
                         open_artist = None;
