@@ -6,6 +6,86 @@ use sonora::{
 };
 
 #[test]
+fn malformed_playlist_lists_fail_sync_without_deleting_cached_playlists() {
+    for value in [
+        json!("oops"),
+        json!(42),
+        json!(false),
+        json!({"id":"single"}),
+    ] {
+        let fixture = Fixture::new(Library {
+            playlists_response: Some(json!({"playlist":value})),
+            ..Library::default()
+        });
+        fixture
+            .catalog()
+            .save_playlist_summaries(
+                &[Playlist {
+                    id: "cached-playlist".into(),
+                    name: "Offline playlist".into(),
+                    ..Default::default()
+                }],
+                true,
+            )
+            .unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        let outcome = event(&worker, |event| {
+            matches!(event, Event::Error(_))
+                || matches!(event, Event::Status(message) if message.starts_with("Up to date"))
+        });
+        assert!(
+            fixture
+                .catalog()
+                .playlist("cached-playlist")
+                .unwrap()
+                .is_some(),
+            "malformed playlist list must not delete cached playlists: {outcome:?}"
+        );
+        assert!(matches!(outcome, Event::Error(message)
+            if message.contains("getPlaylists") && message.contains("playlist")
+                && message.contains("Cached music is still available")));
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+    }
+}
+
+#[test]
+fn empty_playlist_lists_complete_sync_and_remove_cached_playlists() {
+    for response in [json!({}), json!({"playlist":[]}), json!({"playlist":null})] {
+        let fixture = Fixture::new(Library {
+            playlists_response: Some(response),
+            ..Library::default()
+        });
+        fixture
+            .catalog()
+            .save_playlist_summaries(
+                &[Playlist {
+                    id: "cached-playlist".into(),
+                    ..Default::default()
+                }],
+                true,
+            )
+            .unwrap();
+        let mut worker = fixture.start();
+        worker.wait_ready(WAIT).unwrap();
+        event(
+            &worker,
+            |event| matches!(event, Event::Status(message) if message.starts_with("Up to date")),
+        );
+        assert!(
+            fixture
+                .catalog()
+                .playlist("cached-playlist")
+                .unwrap()
+                .is_none()
+        );
+        worker.shutdown(WAIT).unwrap();
+        fixture.finish();
+    }
+}
+
+#[test]
 fn malformed_search3_lists_fail_sync_without_deleting_cached_music() {
     for kind in ["song", "album"] {
         for value in [

@@ -272,13 +272,11 @@ impl Server {
     }
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let response = self.request("getPlaylists", &[]).await?;
-        Ok(serde_json::from_value(
-            response["playlists"]["playlist"]
-                .as_array()
-                .cloned()
-                .map(Value::Array)
-                .unwrap_or_else(|| json!([])),
-        )?)
+        match &response["playlists"]["playlist"] {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(items) => Ok(serde_json::from_value(Value::Array(items.clone()))?),
+            _ => bail!("Invalid getPlaylists playlist list: expected an array"),
+        }
     }
     pub async fn playlist(&self, id: &str) -> Result<Playlist> {
         self.value("getPlaylist", &[("id", id.into())], "playlist")

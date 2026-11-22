@@ -176,3 +176,51 @@ fn invalid_accounts_are_rejected_and_namespace_is_account_specific() {
     };
     assert_ne!(a.namespace(), b.namespace());
 }
+
+#[tokio::test]
+async fn playlists_reject_malformed_lists_and_accept_empty_or_populated_lists() {
+    for (playlists, expected) in [
+        (json!({}), Some(0)),
+        (json!({"playlist":null}), Some(0)),
+        (json!({"playlist":[]}), Some(0)),
+        (
+            json!({"playlist":[{"id":"p1","name":"Favorites"}]}),
+            Some(1),
+        ),
+        (json!({"playlist":"oops"}), None),
+        (json!({"playlist":42}), None),
+        (json!({"playlist":false}), None),
+        (json!({"playlist":{"id":"single"}}), None),
+        (json!({"playlist":["oops"]}), None),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/rest/getPlaylists.view",
+                    get(move || async move {
+                        Json(json!({"subsonic-response":{"status":"ok","playlists":playlists}}))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let server = Server::new(
+            Account {
+                url: format!("http://{address}"),
+                username: "test".into(),
+            },
+            "secret".into(),
+        )
+        .unwrap();
+        let result = server.playlists().await;
+        match expected {
+            Some(count) => assert_eq!(result.unwrap().len(), count),
+            None => assert!(result.is_err()),
+        }
+        task.abort();
+    }
+}
