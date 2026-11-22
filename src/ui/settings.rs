@@ -1,4 +1,7 @@
 use super::*;
+use gpui_kit::component::switch::Switch;
+
+const PLAYLIST_SETTINGS_PAGE: usize = 6;
 
 fn gain_index(mode: &GainMode) -> usize {
     match mode {
@@ -258,9 +261,52 @@ impl MusicApp {
                     .page(self.appearance_settings(app.clone()))
                     // Keep the Layout page at LAYOUT_SETTINGS_PAGE.
                     .page(self.layout_settings(app.clone()))
-                    .page(self.metadata_settings(app)),
+                    .page(self.metadata_settings(app.clone()))
+                    .page(self.playlist_settings(app)),
             )
             .into_any_element()
+    }
+
+    fn playlist_settings(&self, app: WeakEntity<Self>) -> SettingPage {
+        let mut columns = SettingGroup::new().title("Track columns").description("Choose metadata for all playlist track views, including smart playlists. You can also right-click the track header. Title, playlist position, and favorite/rating controls always stay visible.");
+        for column in crate::playlists::PlaylistColumn::ALL {
+            let read = app.clone();
+            let write = app.clone();
+            let default = crate::playlists::PlaylistColumns::default().contains(column);
+            columns = columns.item(
+                SettingItem::new(
+                    column.label(),
+                    SettingField::render(move |_, _, cx| {
+                        let checked = read
+                            .read_with(cx, |app, _| {
+                                app.preferences.playlist_columns.contains(column)
+                            })
+                            .unwrap_or(default);
+                        let write = write.clone();
+                        Switch::new(SharedString::from(format!(
+                            "playlist-show-{}",
+                            column.key()
+                        )))
+                        .small()
+                        .accessibility_label(format!("Show {} in playlists", column.label()))
+                        .checked(checked)
+                        .on_click(move |checked, _, cx| {
+                            let _ = write.update(cx, |app, cx| {
+                                app.preferences.playlist_columns.set(column, *checked);
+                                app.settings_page = PLAYLIST_SETTINGS_PAGE;
+                                app.save_preferences();
+                                cx.notify();
+                            });
+                        })
+                    }),
+                )
+                .keywords(["playlist", "metadata", "columns", column.key()]),
+            );
+        }
+        SettingPage::new("Playlists")
+            .resettable(false)
+            .icon(Glyph::ListMusic)
+            .group(columns)
     }
 
     pub(super) fn library_settings(&self, app: WeakEntity<Self>) -> SettingPage {
