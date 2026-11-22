@@ -107,65 +107,97 @@ impl MusicApp {
                                 )),
                         )
                         .child(
-                            Button::new("playlist-options")
-                                .ghost()
-                                .compact()
-                                .icon(Glyph::Ellipsis)
-                                .tooltip("Playlist options")
-                                .dropdown_menu(move |menu, _, _| {
-                                    let weak = weak.clone();
-                                    let weak2 = weak.clone();
-                                    let weak3 = weak.clone();
-                                    let name = rename.clone();
-                                    let rename_id = rename_id.clone();
-                                    let delete_id = delete_id.clone();
-                                    let append = append.clone();
-                                    menu.item(PopupMenuItem::new("Rename…").on_click(
-                                        move |_, window, cx| {
-                                            let _ = weak.update(cx, |app, cx| {
-                                                if app
-                                                    .playlists
-                                                    .current()
-                                                    .is_some_and(|p| p.id == rename_id)
-                                                {
-                                                    app.show_playlist_editor = true;
-                                                    app.playlist_editor_rename = true;
-                                                    app.playlist_name.update(cx, |input, cx| {
-                                                        input.set_value(name.clone(), window, cx)
-                                                    });
-                                                    cx.notify();
-                                                }
-                                            });
-                                        },
-                                    ))
-                                    .item(PopupMenuItem::new("Append Queue").on_click(
-                                        move |_, _, cx| {
-                                            let _ = weak2.update(cx, |app, cx| {
-                                                let ids = app
-                                                    .playback
-                                                    .queue
-                                                    .iter()
-                                                    .map(|t| t.id.clone())
-                                                    .collect();
-                                                if let Some(mutation) = append.append_queue(ids) {
-                                                    app.mutate(mutation, cx);
-                                                }
-                                            });
-                                        },
-                                    ))
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new("Delete playlist…").on_click(
-                                            move |_, _, cx| {
-                                                let _ = weak3.update(cx, |app, cx| {
-                                                    app.pending_delete = Some(delete_id.clone());
-                                                    cx.notify();
+                            div().when(
+                                crate::playlists::is_smart(
+                                    &playlist,
+                                    self.account
+                                        .as_ref()
+                                        .map(|account| account.username.as_str()),
+                                ),
+                                |header| {
+                                    header.child(
+                                        div()
+                                            .id("smart-playlist-header")
+                                            .test_support()
+                                            .aria_label("Smart playlist · updates automatically")
+                                            .text_size(px(10.))
+                                            .text_color(colors.muted)
+                                            .child("Smart playlist · updates automatically"),
+                                    )
+                                },
+                            ),
+                        )
+                        .when(editable, |header| {
+                            header.child(
+                                Button::new("playlist-options")
+                                    .ghost()
+                                    .compact()
+                                    .icon(Glyph::Ellipsis)
+                                    .tooltip("Playlist options")
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let weak = weak.clone();
+                                        let weak2 = weak.clone();
+                                        let weak3 = weak.clone();
+                                        let name = rename.clone();
+                                        let rename_id = rename_id.clone();
+                                        let delete_id = delete_id.clone();
+                                        let append = append.clone();
+                                        menu.item(PopupMenuItem::new("Rename…").on_click(
+                                            move |_, window, cx| {
+                                                let _ = weak.update(cx, |app, cx| {
+                                                    if app
+                                                        .playlists
+                                                        .current()
+                                                        .is_some_and(|p| p.id == rename_id)
+                                                    {
+                                                        app.show_playlist_editor = true;
+                                                        app.playlist_editor_rename = true;
+                                                        app.playlist_name.update(
+                                                            cx,
+                                                            |input, cx| {
+                                                                input.set_value(
+                                                                    name.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        );
+                                                        cx.notify();
+                                                    }
                                                 });
                                             },
-                                        ),
-                                    )
-                                }),
-                        ),
+                                        ))
+                                        .item(PopupMenuItem::new("Append Queue").on_click(
+                                            move |_, _, cx| {
+                                                let _ = weak2.update(cx, |app, cx| {
+                                                    let ids = app
+                                                        .playback
+                                                        .queue
+                                                        .iter()
+                                                        .map(|t| t.id.clone())
+                                                        .collect();
+                                                    if let Some(mutation) = append.append_queue(ids)
+                                                    {
+                                                        app.mutate(mutation, cx);
+                                                    }
+                                                });
+                                            },
+                                        ))
+                                        .separator()
+                                        .item(
+                                            PopupMenuItem::new("Delete playlist…").on_click(
+                                                move |_, _, cx| {
+                                                    let _ = weak3.update(cx, |app, cx| {
+                                                        app.pending_delete =
+                                                            Some(delete_id.clone());
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            ),
+                                        )
+                                    }),
+                            )
+                        }),
                 )
                 .child(
                     uniform_list("playlist-tracks", count, move |range, _, cx| {

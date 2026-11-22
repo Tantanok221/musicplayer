@@ -212,6 +212,28 @@ impl MusicApp {
                             active,
                             cx,
                         )
+                        .when(
+                            crate::playlists::is_smart(
+                                &playlist,
+                                self.account
+                                    .as_ref()
+                                    .map(|account| account.username.as_str()),
+                            ),
+                            |row| {
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "smart-playlist-{}",
+                                            playlist.id
+                                        )))
+                                        .test_support()
+                                        .aria_label("Smart playlist")
+                                        .text_size(px(10.))
+                                        .text_color(ink(cx).muted)
+                                        .child("Smart"),
+                                )
+                            },
+                        )
                         .test_support()
                         .on_click(cx.listener(
                             move |app, _, window, cx| {

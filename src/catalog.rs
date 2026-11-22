@@ -1209,6 +1209,13 @@ impl Catalog {
             .map(|data| Ok(serde_json::from_str(&data)?))
             .transpose()
     }
+    pub fn cached_playlist_summaries(&self) -> Result<Vec<Playlist>> {
+        self.conn
+            .prepare("SELECT json_remove(data, '$.entry') FROM playlists WHERE json_type(data, '$.entry')='array'")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
     pub fn save_playlist(&self, playlist: &Playlist) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO playlists VALUES(?1,?2)",
