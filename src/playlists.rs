@@ -302,7 +302,7 @@ impl PlaylistEntry {
 mod tests {
     use super::*;
 
-    #[::core::prelude::v1::test]
+    #[test]
     fn removal_index_keeps_matching_slot_and_resolves_reordered_occurrences() {
         assert_eq!(
             removal_index(&playlist(&["a", "b", "a"]), 2, "a", 1),

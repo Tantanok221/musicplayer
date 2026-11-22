@@ -2355,12 +2355,30 @@ fn run(
                             Mutation::AddToPlaylist(id, ids) => {
                                 server.add_to_playlist(id, ids).await
                             }
-                            Mutation::RemoveFromPlaylist { id, index, song, occurrence } => async {
-                                let playlist = server.playlist(id).await?;
-                                let index = crate::playlists::removal_index(&playlist, *index, song, *occurrence)
-                                    .ok_or_else(|| anyhow::anyhow!("The selected song occurrence is no longer in the playlist. Reopen it before removing"))?;
-                                server.remove_from_playlist(id, index).await
-                            }.await,
+                            Mutation::RemoveFromPlaylist {
+                                id,
+                                index,
+                                song,
+                                occurrence,
+                            } => {
+                                async {
+                                    let playlist = server.playlist(id).await?;
+                                    let index = crate::playlists::removal_index(
+                                        &playlist,
+                                        *index,
+                                        song,
+                                        *occurrence,
+                                    )
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "The selected song occurrence is no longer in the playlist. \
+                                             Reopen it before removing"
+                                        )
+                                    })?;
+                                    server.remove_from_playlist(id, index).await
+                                }
+                                .await
+                            }
                         };
                         match result {
                             Ok(()) => {
