@@ -55,13 +55,15 @@ impl PausedPlayer {
         Ok(player)
     }
 
-    /// Only paused queue commands are accepted. No server, transport or decoder
-    /// can be started through this test endpoint. Every result is a real snapshot.
+    /// No server or decoder can be started through this test endpoint.
+    /// Transport commands exercise queue selection without opening audio.
     pub fn command(&self, command: PlayerCommand, timeout: Duration) -> Result<PlaybackSnapshot> {
         ensure!(
             matches!(
                 command,
                 PlayerCommand::Restore(..)
+                    | PlayerCommand::Replace(..)
+                    | PlayerCommand::Next
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::EditQueue(..)
                     | PlayerCommand::UndoQueue

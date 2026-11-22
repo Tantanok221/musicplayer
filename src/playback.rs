@@ -6,11 +6,10 @@ use crate::{
 };
 use anyhow::Result;
 use flume::{Receiver, Sender};
-use rand::seq::SliceRandom;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, Source};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -35,7 +34,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 mod output;
 mod queue;
 pub use queue::QueueEdit;
-use queue::QueueEdits;
+use queue::{QueueEdits, ShuffleOrder};
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -630,36 +629,6 @@ fn insertion_point(queue: &[Arc<Track>], index: Option<usize>, placement: Placem
     }
 }
 
-/// Restores the pre-shuffle order using the current entries, so tracks added
-/// or updated while shuffled are kept. Returns the queue and the new index of
-/// the current entry.
-fn unshuffle(
-    queue: Vec<Arc<Track>>,
-    original: &[Arc<Track>],
-    index: Option<usize>,
-) -> (Vec<Arc<Track>>, Option<usize>) {
-    let current = index.and_then(|i| queue.get(i)).cloned();
-    let mut pool: HashMap<&str, VecDeque<&Arc<Track>>> = HashMap::new();
-    for track in &queue {
-        pool.entry(&track.id).or_default().push_back(track);
-    }
-    let mut ordered = Vec::with_capacity(queue.len());
-    for track in original.iter().chain(&queue) {
-        if let Some(entry) = pool
-            .get_mut(track.id.as_str())
-            .and_then(VecDeque::pop_front)
-        {
-            ordered.push(entry.clone());
-        }
-    }
-    let index = current.and_then(|current| {
-        ordered
-            .iter()
-            .position(|track| Arc::ptr_eq(track, &current))
-    });
-    (ordered, index)
-}
-
 struct DecodeRequest {
     listen_id: u64,
     plan: Arc<Mutex<Plan>>,
@@ -958,7 +927,7 @@ fn run(
     let mut started = false;
     let mut plan = Plan::shared(Vec::new(), RepeatMode::Off);
     // The queue order before shuffling, kept in step with later edits.
-    let mut original: Option<Vec<Arc<Track>>> = None;
+    let mut original: Option<ShuffleOrder> = None;
     let mut plan_boundary = 0;
     let mut pending_output: Option<(Packet, Instant)> = None;
     // When the current stream started waiting for audio; cleared once samples flow.
@@ -1120,10 +1089,12 @@ fn run(
                     let at = at.min(tracks.len().saturating_sub(1));
                     original = None;
                     if prefs.shuffle && !tracks.is_empty() {
-                        original = Some(tracks.clone());
+                        let mut order = ShuffleOrder::new(tracks.len());
                         let current = tracks.remove(at);
-                        tracks.shuffle(&mut rand::rng());
                         tracks.insert(0, current);
+                        order.move_entry(at, 0);
+                        order.shuffle(&mut tracks, 1);
+                        original = Some(order);
                         index = Some(0);
                     } else {
                         index = (!tracks.is_empty()).then_some(at);
@@ -1159,15 +1130,7 @@ fn run(
                 PlayerCommand::Insert(tracks, placement) => {
                     let at = insertion_point(&queue, index, placement);
                     if let Some(original) = original.as_mut() {
-                        let after = match at.checked_sub(1).and_then(|anchor| queue.get(anchor)) {
-                            Some(anchor) if placement != Placement::Last => original
-                                .iter()
-                                .position(|t| t.id == anchor.id)
-                                .map_or(original.len(), |i| i + 1),
-                            None if placement != Placement::Last => 0,
-                            _ => original.len(),
-                        };
-                        original.splice(after..after, tracks.iter().cloned());
+                        original.insert(at, tracks.len(), placement == Placement::Last);
                     }
                     queue.splice(at..at, tracks);
                     if started && replan(&plan, &queue, prefs.repeat, index, plan_boundary) {
@@ -1182,11 +1145,9 @@ fn run(
                         } else {
                             base_position
                         };
-                        let removed = queue.remove(at);
-                        if let Some(original) = original.as_mut()
-                            && let Some(i) = original.iter().position(|t| t.id == removed.id)
-                        {
-                            original.remove(i);
+                        queue.remove(at);
+                        if let Some(original) = original.as_mut() {
+                            original.remove(at);
                         }
                         if let Some(i) = index {
                             if at < i {
@@ -1211,6 +1172,9 @@ fn run(
                         };
                         let track = queue.remove(from);
                         queue.insert(to, track);
+                        if let Some(original) = original.as_mut() {
+                            original.move_entry(from, to);
+                        }
                         index = current.and_then(|id| queue.iter().position(|t| t.id == id));
                         restart |= started;
                     }
@@ -1306,12 +1270,13 @@ fn run(
                     reset_queue_edits = shuffled || unshuffled;
                     let replanned = shuffled || unshuffled || prefs.repeat != value.repeat;
                     if shuffled && let Some(i) = index {
-                        original = Some(queue.clone());
-                        queue[i + 1..].shuffle(&mut rand::rng());
+                        let mut order = ShuffleOrder::new(queue.len());
+                        order.shuffle(&mut queue, i + 1);
+                        original = Some(order);
                         queue_dirty = true;
                     }
                     if unshuffled && let Some(order) = original.take() {
-                        (queue, index) = unshuffle(std::mem::take(&mut queue), &order, index);
+                        (queue, index) = order.restore(std::mem::take(&mut queue), index);
                         queue_dirty = true;
                     }
                     prefs = value;
@@ -2011,6 +1976,20 @@ mod tests {
     }
 
     #[test]
+    fn unshuffle_without_a_valid_current_entry_keeps_no_current_entry() {
+        let original = tracks(2);
+        for index in [None, Some(2)] {
+            let (queue, current) =
+                ShuffleOrder::new(original.len()).restore(original.clone(), index);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(current, None);
+            let (queue, current) = ShuffleOrder::new(0).restore(Vec::new(), index);
+            assert!(queue.is_empty());
+            assert_eq!(current, None);
+        }
+    }
+
+    #[test]
     fn unshuffle_restores_original_order_and_keeps_later_edits() {
         let original = tracks(5);
         let ids = |queue: &[Arc<Track>]| queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
@@ -2024,7 +2003,7 @@ mod tests {
             id: "added".into(),
             ..Default::default()
         });
-        shuffled.push(added.clone());
+        shuffled.push(added);
         let updated = Arc::new(Track {
             id: "4".into(),
             title: "Updated".into(),
@@ -2032,10 +2011,10 @@ mod tests {
         });
         shuffled[1] = updated.clone();
         // Track 1 was removed while shuffled; the added track was appended.
-        let mut order = original;
-        order.remove(1);
-        order.push(added);
-        let (queue, index) = unshuffle(shuffled, &order, Some(1));
+        let mut order = ShuffleOrder::new(original.len());
+        order.reorder(&[2, 4, 0, 3]);
+        order.insert(4, 1, true);
+        let (queue, index) = order.restore(shuffled, Some(1));
         assert_eq!(ids(&queue), ["0", "2", "3", "4", "added"]);
         assert_eq!(index, Some(3));
         assert!(Arc::ptr_eq(&queue[3], &updated));
