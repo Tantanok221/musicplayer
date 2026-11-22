@@ -230,6 +230,7 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{model::PlaybackSnapshot, service::test_support::ControlledService};
 
     fn stream() -> (flume::Sender<Event>, WorkerEvents) {
         let (send, received) = flume::unbounded();
@@ -275,6 +276,95 @@ mod tests {
         assert!(matches!(
             events.recv_timeout(Duration::ZERO),
             Err(flume::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    fn worker(events: Receiver<Event>) -> Worker {
+        let controlled = ControlledService::new();
+        Worker {
+            service: controlled.service(),
+            events: WorkerEvents {
+                received: events,
+                pending: Mutex::default(),
+            },
+            player_commands: controlled.player_commands().clone(),
+            finished: flume::unbounded().1,
+            thread: None,
+            player_threads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wait_ready_accepts_ready_first() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Event::Ready(None, Preferences::default())).unwrap();
+        assert!(worker(rx).wait_ready(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn wait_ready_preserves_startup_playback() {
+        let (tx, rx) = flume::unbounded();
+        for _ in 0..3 {
+            tx.send(Event::Playback(PlaybackSnapshot::default()))
+                .unwrap();
+        }
+        let prefs = Preferences {
+            volume: 0.42,
+            ..Default::default()
+        };
+        tx.send(Event::Ready(None, prefs)).unwrap();
+        tx.send(Event::Status("after ready".into())).unwrap();
+        let worker = worker(rx);
+        let (account, prefs) = worker.wait_ready(Duration::from_secs(1)).unwrap();
+        assert!(account.is_none());
+        assert_eq!(prefs.volume, 0.42);
+        for _ in 0..3 {
+            assert!(matches!(
+                worker.events().recv_timeout(Duration::ZERO),
+                Ok(Event::Playback(_))
+            ));
+        }
+        assert!(matches!(
+            worker.events().recv_timeout(Duration::ZERO),
+            Ok(Event::Status(_))
+        ));
+    }
+
+    #[test]
+    fn wait_ready_preserves_other_events() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Event::Status("not ready".into())).unwrap();
+        tx.send(Event::Ready(None, Preferences::default())).unwrap();
+        let worker = worker(rx);
+        assert!(worker.wait_ready(Duration::from_secs(1)).is_ok());
+        assert!(matches!(
+            worker.events().recv_timeout(Duration::ZERO),
+            Ok(Event::Status(_))
+        ));
+    }
+
+    #[test]
+    fn wait_ready_times_out_after_playback() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Event::Playback(PlaybackSnapshot::default()))
+            .unwrap();
+        let error = worker(rx).wait_ready(Duration::ZERO).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<flume::RecvTimeoutError>(),
+            Some(flume::RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn wait_ready_fails_on_disconnect_after_playback() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Event::Playback(PlaybackSnapshot::default()))
+            .unwrap();
+        drop(tx);
+        let error = worker(rx).wait_ready(Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<flume::RecvTimeoutError>(),
+            Some(flume::RecvTimeoutError::Disconnected)
         ));
     }
 }
