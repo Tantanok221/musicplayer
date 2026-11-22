@@ -10,7 +10,7 @@ use sonora::{
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[gpui_kit::test]
 fn remove_after_server_reorder_removes_clicked_song(cx: &mut TestAppContext) {
@@ -1081,6 +1081,74 @@ fn favorites_album_double_click_plays_only_the_favorite_songs(cx: &mut TestAppCo
         }
     };
     assert_eq!(played, ["hearted"]);
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
+fn latest_song_rating_is_visible_after_a_held_write(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        window.click("explorer-album-album", cx)
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |_, cx| {
+        cx.update_window(window, |_, window, _| {
+            window
+                .try_find("rating-group-album-0-2")
+                .is_some_and(|star| star.visible())
+        })
+        .unwrap()
+    });
+
+    let request = |rating| Request::new("setRating.view", &[("id", "song"), ("rating", rating)]);
+    let earlier = request("2");
+    let latest = request("5");
+    let release = fixture.hold_rating(earlier.clone(), true);
+    cx.update_window(window, |_, window, cx| {
+        window.click("rating-group-album-0-2", cx)
+    })
+    .unwrap();
+    fixture.wait_request(&earlier);
+    fixture.expect_mutation(latest.clone(), true);
+    cx.update_window(window, |_, window, cx| {
+        window.click("rating-group-album-0-5", cx)
+    })
+    .unwrap();
+
+    let assert_rating = |rating: u8, cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("song-feedback-group-album-0").label().unwrap(),
+                format!("Song song: not favorite, rating {rating} of 5")
+            );
+        })
+        .unwrap();
+    };
+    assert_rating(5, cx);
+    let deliver_save = |rating, cx: &mut TestAppContext| {
+        deliver_until(
+            &worker,
+            &tx,
+            window,
+            cx,
+            |event, _| matches!(event, Event::MutationDone(Mutation::Rating(id, value)) if id == "song" && *value == rating),
+        );
+    };
+    let overtook = fixture.request_arrives_within(&latest, Duration::from_secs(1));
+    if overtook {
+        deliver_save(5, cx);
+    }
+    release.send(()).unwrap();
+    deliver_save(2, cx);
+    if !overtook {
+        deliver_save(5, cx);
+    }
+
+    assert_rating(5, cx);
     close_worker(worker, window, app, cx);
     fixture.finish();
 }

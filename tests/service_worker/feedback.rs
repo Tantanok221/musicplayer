@@ -4,6 +4,142 @@ use sonora::{
     service::{Command, Event, Mutation},
     sorting::{Scope, SortSpec},
 };
+use std::time::Duration;
+
+#[test]
+fn latest_track_rating_wins_when_the_first_write_is_held() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let request = |id, rating| Request::new("setRating.view", &[("id", id), ("rating", rating)]);
+    let earlier = request("song", "2");
+    let latest = request("song", "5");
+    let release = fixture.hold_rating(earlier.clone(), true);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 2)));
+    fixture.wait_request(&earlier);
+
+    // A held write on this song must not block feedback on a different song.
+    fixture.expect_mutation(request("other-song", "4"), true);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("other-song".into(), 4)));
+    event(
+        &worker,
+        |event| matches!(event, Event::MutationDone(Mutation::Rating(id, 4)) if id == "other-song"),
+    );
+
+    fixture.expect_mutation(latest.clone(), true);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 5)));
+    let mut published = Vec::new();
+    let mut record_rating = || {
+        let Event::TrackUpdated(track) = event(
+            &worker,
+            |event| matches!(event, Event::TrackUpdated(track) if track.id == "song"),
+        ) else {
+            unreachable!()
+        };
+        published.push(track.user_rating.unwrap());
+    };
+    // If the requests race, let five stars finish before the server applies two.
+    let overtook = fixture.request_arrives_within(&latest, Duration::from_secs(1));
+    if overtook {
+        record_rating();
+    }
+    release.send(()).unwrap();
+    record_rating();
+    if !overtook {
+        record_rating();
+    }
+    let server = fixture.server_track_rating("song");
+    let catalog = fixture.catalog().by_ids(&["song".into()]).unwrap()[0].user_rating;
+    eprintln!("track ratings published={published:?}, server={server:?}, catalog={catalog:?}");
+    assert_eq!(
+        (published.last(), server, catalog),
+        (Some(&5), Some(5), Some(5))
+    );
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn rejected_track_rating_does_not_block_or_offer_retry_over_a_newer_rating() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let earlier = Request::new("setRating.view", &[("id", "song"), ("rating", "2")]);
+    let release = fixture.hold_rating(earlier.clone(), false);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 2)));
+    fixture.wait_request(&earlier);
+    fixture.expect_mutation(
+        Request::new("setRating.view", &[("id", "song"), ("rating", "5")]),
+        true,
+    );
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 5)));
+    let epoch = worker.service().query(LibraryQuery::default());
+    event(
+        &worker,
+        |event| matches!(event, Event::View(request, _) if *request == epoch),
+    );
+
+    release.send(()).unwrap();
+    let result = event(&worker, |event| {
+        matches!(event, Event::MutationDone(Mutation::Rating(id, 5))
+            | Event::MutationFailed(Mutation::Rating(id, 2), _) if id == "song")
+    });
+    assert!(
+        matches!(result, Event::MutationDone(Mutation::Rating(_, 5))),
+        "an already superseded rating must not become retryable"
+    );
+    assert_eq!(fixture.server_track_rating("song"), Some(5));
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn quitting_with_a_held_rating_keeps_the_latest_selection_for_reconnect() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let earlier = Request::new("setRating.view", &[("id", "song"), ("rating", "2")]);
+    let release = fixture.hold_rating(earlier.clone(), false);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 2)));
+    fixture.wait_request(&earlier);
+    let latest = Request::new("setRating.view", &[("id", "song"), ("rating", "5")]);
+    fixture.expect_mutation(latest.clone(), true);
+    worker
+        .service()
+        .send(Command::Mutate(Mutation::Rating("song".into(), 5)));
+    worker.shutdown(WAIT).unwrap();
+    assert!(!fixture.requests().contains(&latest));
+    drop(release);
+
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    fixture.wait_request(&latest);
+    event(
+        &worker,
+        |event| matches!(event, Event::MutationDone(Mutation::Rating(id, 5)) if id == "song"),
+    );
+    assert_eq!(fixture.server_track_rating("song"), Some(5));
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
 
 #[test]
 fn album_feedback_reaches_http_catalog_and_real_events_without_editing_tracks() {
