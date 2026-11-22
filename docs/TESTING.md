@@ -34,7 +34,7 @@ worker suite to expose flaky timing.
 | Missing releases, downloads | `downloads.rs` | `slskd` | `tests/ui/downloads.rs`, `tests/slskd.rs` |
 | Queue and playback controls | `queue_controls.rs`, `tracks.rs`, `player_bar.rs` | `playback`, `playback::queue` | `tests/ui/playback.rs`, `tests/player_queue.rs`, `tests/service_worker/queue.rs` |
 | Now Playing, lyrics, backdrop | `now_playing.rs`, `information.rs` | `lyrics`, `backdrop`, `visualizer` | `tests/ui/{lyrics,backdrop}.rs`, `tests/service_worker/artwork.rs` |
-| Playlists | `playlists.rs` | | `tests/ui/playlists.rs` |
+| Playlists | `playlists.rs` | `ui::playlists::PlaylistRemoval` | `tests/ui/playlists.rs`, `tests/service_worker/playlists.rs` |
 | Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs` |
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
