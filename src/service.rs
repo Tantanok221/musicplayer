@@ -2094,31 +2094,39 @@ fn run(
                         return Ok(());
                     }
                     let completed = mutation.clone();
+                    // Favorites match album feedback only in album views.
+                    let album_scope = current_query
+                        .ordering
+                        .as_ref()
+                        .is_some_and(|sort| sort.scope == SortScope::Albums);
+                    let rating_filtered =
+                        current_query.favorites && current_query.favorite_filter.min_rating > 0;
                     // Track edits are patched in place by the UI; a fresh view would
                     // reload every album panel, so send one only when the edit can
                     // change which rows appear or their order.
                     let reshapes_view = match &mutation {
                         Mutation::Favorite(..) => current_query.favorites,
-                        Mutation::Rating(..) => current_query
-                            .ordering
-                            .as_ref()
-                            .map_or(current_query.sort == Sort::Rating, |s| {
-                                s.scope == SortScope::Tracks && s.depends_on(SortField::Rating)
-                            }),
-                        Mutation::AlbumFavorite(..) => {
-                            current_query.favorites
-                                && current_query
-                                    .ordering
-                                    .as_ref()
-                                    .is_some_and(|sort| sort.scope == SortScope::Albums)
+                        Mutation::Rating(..) => {
+                            rating_filtered
+                                || current_query.ordering.as_ref().map_or(
+                                    current_query.sort == Sort::Rating,
+                                    |s| {
+                                        s.scope == SortScope::Tracks
+                                            && s.depends_on(SortField::Rating)
+                                    },
+                                )
                         }
-                        Mutation::AlbumRating(..) => current_query.ordering.as_ref().map_or(
-                            current_query.sort == Sort::Rating,
-                            |sort| {
-                                sort.scope == SortScope::Albums
-                                    && sort.depends_on(SortField::Rating)
-                            },
-                        ),
+                        Mutation::AlbumFavorite(..) => current_query.favorites && album_scope,
+                        Mutation::AlbumRating(..) => {
+                            (rating_filtered && album_scope)
+                                || current_query.ordering.as_ref().map_or(
+                                    current_query.sort == Sort::Rating,
+                                    |sort| {
+                                        sort.scope == SortScope::Albums
+                                            && sort.depends_on(SortField::Rating)
+                                    },
+                                )
+                        }
                         _ => true,
                     };
                     match mutation {
