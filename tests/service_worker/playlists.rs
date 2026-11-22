@@ -40,7 +40,7 @@ fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
     } else {
         "getPlaylist.view"
     };
-    a.edit_library(|library| library.hold_playlist_endpoint = Some(endpoint));
+    a.edit_library(|library| library.hold_endpoint = Some(endpoint));
     if post_mutation {
         a.expect_mutation(
             Request::new(
@@ -86,7 +86,7 @@ fn delayed_playlist_reply_after_account_switch(post_mutation: bool) {
     );
     synced(&worker);
     let before = serde_json::to_value(catalog.playlist_summaries().unwrap()).unwrap();
-    a.resume_playlist();
+    a.resume_held();
     if post_mutation {
         a.wait_request(&Request::new("getPlaylist.view", &[("id", "a-playlist")]));
     }
