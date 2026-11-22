@@ -10,6 +10,138 @@ use sonora::{
 use std::{sync::Arc, time::Duration};
 
 #[gpui_kit::test]
+fn album_view_groups_playlist_entries_and_preserves_playback_and_readonly(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, app) = start(cx);
+    open_playlist(&mut fixture, window, cx);
+    let mut loaded = playlist("Roadtrip");
+    loaded.entry = fixture
+        .catalog
+        .by_ids(&[
+            "track-2".into(),
+            "track-1".into(),
+            "track-2".into(),
+            "track-3".into(),
+        ])
+        .unwrap()
+        .into();
+    loaded.song_count = 4;
+    fixture.backend.emit(Event::Playlist(loaded.clone()));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert!(
+            window.try_find("playlist-view-albums").is_some(),
+            "playlist must offer an album view"
+        );
+    })
+    .unwrap();
+    fixture.click(window, "playlist-view-albums", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-album-0").visible());
+        assert!(window.find("playlist-album-1").visible());
+        assert!(window.find("playlist-album-2").visible());
+        assert!(
+            window.try_find("playlist-album-3").is_none(),
+            "duplicate entries share a card"
+        );
+        assert!(window.try_find("row-playlist-0").is_none());
+        assert!(window.try_find("sort-menu").is_none());
+    })
+    .unwrap();
+    fixture.click(window, "playlist-album-0", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-0").visible());
+        assert!(window.find("row-playlist-2").visible());
+        assert!(window.try_find("row-playlist-1").is_none());
+    })
+    .unwrap();
+    fixture.backend.player_commands().try_iter().for_each(drop);
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("row-playlist-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    let PlayerCommand::Replace(tracks, index) =
+        fixture.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("album rows must play their playlist occurrence")
+    };
+    assert_eq!(index, 2);
+    assert_eq!(
+        tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["track-2", "track-1", "track-2", "track-3"]
+    );
+    fixture.click(window, "playlist-view-tracks", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("row-playlist-1").visible())
+    })
+    .unwrap();
+    loaded.readonly = true;
+    fixture.backend.emit(Event::Playlist(loaded));
+    fixture.settle(window, cx);
+    fixture.click(window, "playlist-view-albums", cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-playlist-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        let mut menu = window.within("popup-menu");
+        assert!(menu.try_find_by_label("Remove from Playlist").is_none());
+        menu.press("escape", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.search(window, "no such song", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-album-0").is_none());
+        assert!(window.find("playlist-empty").visible());
+    })
+    .unwrap();
+    fixture.search(window, "", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("playlist-album-0").visible())
+    })
+    .unwrap();
+    fixture.backend.player_commands().try_iter().for_each(drop);
+    cx.update_window(window, |_, window, cx| {
+        window.double_click("playlist-album-0", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    let PlayerCommand::Replace(tracks, index) =
+        fixture.backend.player_commands().try_recv().unwrap()
+    else {
+        panic!("album double click must play only its playlist entries")
+    };
+    assert_eq!(index, 0);
+    assert_eq!(
+        tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["track-2", "track-2"]
+    );
+    fixture.backend.emit(Event::Playlist(playlist("Roadtrip")));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("playlist-album-0").is_none());
+        assert!(window.try_find("row-playlist-2").is_none());
+        assert!(window.find("playlist-empty").visible());
+    })
+    .unwrap();
+    fixture.click(window, "playlist-view-tracks", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("row-playlist-0").is_none())
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+    fixture.diagnose(
+        "playlist album view toggles and preserves occurrences",
+        window,
+        &app,
+        cx,
+    );
+}
+
+#[gpui_kit::test]
 fn smart_playlist_owner_can_rename_but_not_edit_tracks(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, _app) = start(cx);
     let mut smart = playlist("Automatic");

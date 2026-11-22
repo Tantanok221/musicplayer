@@ -5,7 +5,7 @@ use gpui_kit::{
     test::TestWindowExt,
 };
 use sonora::{
-    model::Preferences,
+    model::{FavoritesFilter, Preferences, SavedQueue},
     service::{Event, Mutation, test_support::Worker},
     ui::{MusicApp, tab_bindings},
 };
@@ -344,11 +344,37 @@ fn mount_worker(
     AnyWindowHandle,
     gpui_kit::Entity<MusicApp>,
 ) {
+    mount_worker_with(fixture, Preferences::default(), cx)
+}
+
+fn mount_worker_with(
+    fixture: &Fixture,
+    prefs: Preferences,
+    cx: &mut TestAppContext,
+) -> (
+    Worker,
+    flume::Sender<Event>,
+    AnyWindowHandle,
+    gpui_kit::Entity<MusicApp>,
+) {
+    mount_worker_with_player(fixture, prefs, false, cx)
+}
+
+fn mount_worker_with_player(
+    fixture: &Fixture,
+    mut prefs: Preferences,
+    paused: bool,
+    cx: &mut TestAppContext,
+) -> (
+    Worker,
+    flume::Sender<Event>,
+    AnyWindowHandle,
+    gpui_kit::Entity<MusicApp>,
+) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         cx.bind_keys(tab_bindings());
     });
-    let mut prefs = Preferences::default();
     prefs.tabs.active = 0;
     prefs.layout.show_spectrum = false;
     let path = fixture
@@ -363,7 +389,11 @@ fn mount_worker(
         .unwrap()
         .set_state("preferences", &prefs)
         .unwrap();
-    let worker = fixture.start();
+    let worker = if paused {
+        fixture.start_paused()
+    } else {
+        fixture.start()
+    };
     let (tx, rx) = flume::unbounded();
     let (window, app) = cx.update(|cx| {
         gpui_kit::open_window(
@@ -380,6 +410,54 @@ fn mount_worker(
         .unwrap()
     });
     (worker, tx, window, app)
+}
+
+#[gpui_kit::test]
+fn previous_after_restore_restarts_current_track(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    fixture
+        .catalog()
+        .set_state(
+            "queue",
+            &SavedQueue {
+                ids: vec!["song".into(), "other-song".into()],
+                index: Some(1),
+                position: 60.,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (worker, tx, window, app) =
+        mount_worker_with_player(&fixture, Preferences::default(), true, cx);
+    deliver_until(
+        &worker,
+        &tx,
+        window,
+        cx,
+        |event, _| matches!(event, Event::Playback(state) if state.index == Some(1) && state.position == 60. && !state.playing),
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(window.find("playback-elapsed").label(), Some("1:00"));
+        window.click("previous", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        if let Event::Playback(state) = event
+            && state.position == 0.
+        {
+            assert_eq!(state.index, Some(1));
+            assert_eq!(state.queue[1].id, "other-song");
+            return true;
+        }
+        false
+    });
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("playback-elapsed").label(), Some("0:00"));
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
 }
 
 fn wait_library(
@@ -661,6 +739,65 @@ fn favorites_album_double_click_plays_only_the_favorite_songs(cx: &mut TestAppCo
         }
     };
     assert_eq!(played, ["hearted"]);
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+/// Rating an album below the Favorites minimum rating drops it from the page
+/// even though the page is sorted by artist, not rating.
+#[gpui_kit::test]
+fn favorites_drop_an_album_rated_below_the_minimum_rating(cx: &mut TestAppContext) {
+    let mut library = Library::default();
+    library.albums[0].user_rating = Some(4);
+    let fixture = Fixture::new(library);
+    let prefs = Preferences {
+        favorites: FavoritesFilter {
+            hearted: false,
+            min_rating: 4,
+            match_all: false,
+        },
+        ..Default::default()
+    };
+    let (worker, tx, window, app) = mount_worker_with(&fixture, prefs, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        if window.try_find("nav-favorites").is_none() {
+            window.click("library-disclosure", cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| window.click("nav-favorites", cx))
+        .unwrap();
+    deliver_until(&worker, &tx, window, cx, |_, cx| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find("explorer-album-other-album").is_none()
+                && window
+                    .try_find("explorer-album-album")
+                    .is_some_and(|card| card.visible())
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("explorer-album-album", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    fixture.expect_mutation(
+        Request::new("setRating.view", &[("id", "album"), ("rating", "1")]),
+        true,
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("album-rating-album-1", cx)
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |_, cx| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find("explorer-album-album").is_none()
+        })
+        .unwrap()
+    });
     close_worker(worker, window, app, cx);
     fixture.finish();
 }

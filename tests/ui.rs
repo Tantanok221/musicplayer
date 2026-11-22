@@ -13,6 +13,8 @@ mod explorer;
 mod layout;
 #[path = "ui/lyrics.rs"]
 mod lyrics;
+#[path = "ui/metadata.rs"]
+mod metadata;
 #[path = "ui/playback.rs"]
 mod playback;
 #[path = "ui/playlists.rs"]

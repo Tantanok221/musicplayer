@@ -96,6 +96,7 @@ impl MusicApp {
             (InfoTab::Details, "Details"),
             (InfoTab::Lyrics, "Lyrics"),
             (InfoTab::Artwork, "Artwork"),
+            (InfoTab::Properties, "Properties"),
         ] {
             tabs = tabs.child(
                 div()
@@ -278,6 +279,9 @@ impl MusicApp {
                         .child(self.art(&track.cover_art, side, cx))
                         .child(div().pt_2().text_size(px(11.)).child(track.album.clone()));
                 }
+                InfoTab::Properties => {
+                    content = content.child(properties_view(&track, cx));
+                }
                 InfoTab::Lyrics => {
                     content = div()
                         .id("information-lyrics")
@@ -334,4 +338,47 @@ impl MusicApp {
         )
         .into_any_element()
     }
+}
+
+/// Read-only tag and file details, grouped like MusicBee's Properties tab.
+fn properties_view(track: &Track, cx: &App) -> AnyElement {
+    let colors = ink(cx);
+    let mut view = div()
+        .id("track-properties")
+        .test_support()
+        .role(Role::Group)
+        .aria_label(format!("Properties of {}", track.title))
+        .flex()
+        .flex_col()
+        .gap_3();
+    for section in crate::metadata::properties(track) {
+        let mut group = div().flex().flex_col().gap_1().child(
+            div()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.muted)
+                .child(section.title),
+        );
+        for row in section.rows {
+            group = group.child(
+                div()
+                    .id(SharedString::from(format!("property-{}", row.key)))
+                    .test_support()
+                    .aria_label(format!("{}: {}", row.label, row.value))
+                    .flex()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .child(
+                        div()
+                            .w(px(86.))
+                            .flex_shrink_0()
+                            .text_color(colors.muted)
+                            .child(row.label),
+                    )
+                    .child(div().min_w_0().flex_1().child(row.value)),
+            );
+        }
+        view = view.child(group);
+    }
+    view.into_any_element()
 }

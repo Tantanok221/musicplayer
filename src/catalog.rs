@@ -721,9 +721,20 @@ impl Catalog {
             upstream.genre = query.genre.clone();
         }
         let (filter, values) = Self::filters(&upstream);
-        // One track per album artist and album: the one with the smallest ID, read
-        // through the ID index instead of comparing whole JSON documents.
-        let mut statement = self.conn.prepare(&format!("SELECT picked.data,groups.album_id FROM (SELECT min(tracks.id) AS id,tracks.album_artist AS album_artist,tracks.album_id AS album_id FROM tracks{filter} AND tracks.album_artist!='' GROUP BY tracks.album_artist,tracks.album_id) groups JOIN tracks picked ON picked.id=groups.id ORDER BY groups.album_artist,groups.album_id"))?;
+        // Keep one representative per credit set so guests on later tracks are seen:
+        // artist and artistId determine the fallback ID, and albumArtists holds structured credits.
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT picked.data, groups.album_id
+             FROM (
+                 SELECT min(id) AS id, album_artist, album_id
+                 FROM tracks{filter}
+                 AND tracks.album_artist!=''
+                 GROUP BY album_artist, album_id, artist,
+                          jsonb_extract(data,'$.artistId','$.albumArtists')
+             ) groups
+             JOIN tracks picked ON picked.id=groups.id
+             ORDER BY groups.album_artist, groups.album_id, groups.id"
+        ))?;
         let rows = statement.query_map(params_from_iter(values), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;

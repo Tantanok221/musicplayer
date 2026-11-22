@@ -202,12 +202,15 @@ pub struct Library {
     pub fail_song_offset: Option<usize>,
     pub sync_response: Option<(&'static str, Value)>,
     pub playlists_response: Option<Value>,
+    pub playlist_response: Option<Value>,
+    pub scan_status_responses: VecDeque<Value>,
     pub fail_playlist: bool,
     pub scanning: bool,
     pub hold_metadata: bool,
     pub offline: bool,
     pub hold_sync: bool,
     pub hold_scrobble: bool,
+    pub hold_playlist_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
@@ -234,12 +237,15 @@ impl Default for Library {
             fail_song_offset: None,
             sync_response: None,
             playlists_response: None,
+            playlist_response: None,
+            scan_status_responses: VecDeque::new(),
             fail_playlist: false,
             scanning: false,
             hold_metadata: false,
             offline: false,
             hold_sync: false,
             hold_scrobble: false,
+            hold_playlist_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
@@ -292,6 +298,7 @@ struct ServerState {
     metadata_gate: flume::Receiver<()>,
     sync_gate: flume::Receiver<()>,
     scrobble_gate: flume::Receiver<()>,
+    playlist_gate: flume::Receiver<()>,
 }
 
 impl ServerState {
@@ -387,17 +394,21 @@ async fn navidrome(
         song_ids,
     };
     state.record(request.clone());
-    let (offline, hold_sync, hold_scrobble, fail_artwork) = {
+    let (offline, hold_sync, hold_scrobble, fail_artwork, hold_playlist) = {
         let data = state.data.lock().unwrap();
         (
             data.library.offline,
             data.library.hold_sync,
             data.library.hold_scrobble,
             data.library.fail_artwork,
+            data.library.hold_playlist_endpoint == Some(endpoint.as_str()),
         )
     };
     if offline {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if hold_playlist {
+        let _ = state.playlist_gate.recv_async().await;
     }
     if endpoint == "getScanStatus.view" && hold_sync {
         let _ = state.sync_gate.recv_async().await;
@@ -444,14 +455,23 @@ async fn navidrome(
         "getOpenSubsonicExtensions.view" if query.is_empty() => {
             json!({"status":"ok","openSubsonicExtensions":[]})
         }
-        "getScanStatus.view" if query.is_empty() => {
-            json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}})
-        }
+        "getScanStatus.view" if query.is_empty() => data
+            .library
+            .scan_status_responses
+            .pop_front()
+            .unwrap_or_else(
+                || json!({"status":"ok","scanStatus":{"scanning":data.library.scanning}}),
+            ),
         "getPlaylists.view" if query.is_empty() => {
-            json!({"status":"ok","playlists":data.library.playlists_response.clone().unwrap_or_else(|| json!({"playlist":data.library.playlists}))})
+            data.library.playlists_response.clone().unwrap_or_else(
+                || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),
+            )
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
+        }
+        "getPlaylist.view" if let Some(response) = &data.library.playlist_response => {
+            response.clone()
         }
         "getPlaylist.view" => {
             let playlist = data
@@ -884,6 +904,7 @@ pub struct Fixture {
     release_metadata: flume::Sender<()>,
     release_sync: flume::Sender<()>,
     release_scrobble: flume::Sender<()>,
+    release_playlist: flume::Sender<()>,
     finished: flume::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -914,6 +935,7 @@ impl Fixture {
         let (release_metadata, metadata_gate) = flume::bounded(1);
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
+        let (release_playlist, playlist_gate) = flume::unbounded();
         let state = ServerState {
             data: Arc::new(Mutex::new(StateData {
                 library,
@@ -925,6 +947,7 @@ impl Fixture {
             metadata_gate,
             sync_gate,
             scrobble_gate,
+            playlist_gate,
         };
         let app = Router::new()
             .route("/auth/login", any(native))
@@ -966,6 +989,7 @@ impl Fixture {
             release_metadata,
             release_sync,
             release_scrobble,
+            release_playlist,
             finished,
             thread: Some(thread),
         }
@@ -1076,11 +1100,17 @@ impl Fixture {
         let _ = self.release_scrobble.send(());
     }
 
+    pub fn resume_playlist(&self) {
+        self.edit_library(|library| library.hold_playlist_endpoint = None);
+        let _ = self.release_playlist.send(());
+    }
+
     fn stop(&mut self) {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
             self.resume_scrobble();
+            self.resume_playlist();
             let _ = self.stop.try_send(());
             self.finished
                 .recv_timeout(WAIT)

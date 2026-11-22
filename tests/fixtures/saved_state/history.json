@@ -1,0 +1,12 @@
+{
+  "user": "Listener",
+  "registered": 1500000000,
+  "seasons": {
+    "2024-1": {
+      "from": 1709251200,
+      "to": 1717200000,
+      "fetched_ms": 1717200000123,
+      "albums": [{"artist": "青葉市子", "name": "Quiet Hours", "plays": 17}]
+    }
+  }
+}

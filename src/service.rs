@@ -161,8 +161,8 @@ pub enum Command {
     Synced(i64, Vec<Playlist>, bool),
     Updated(String, Mutation),
     MutationFailed(String, Mutation, String),
-    PlaylistLoaded(Playlist),
-    PlaylistsLoaded(Vec<Playlist>),
+    PlaylistLoaded(String, Playlist),
+    PlaylistsLoaded(String, Vec<Playlist>),
     Error(String),
     SyncFailed(i64, String),
     /// Pings the server when a check is due; `true` checks right away.
@@ -343,6 +343,9 @@ fn forward_player_events(
 /// the current entry. A missing current entry starts its replacement at zero.
 fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) -> Result<()> {
     let queue: SavedQueue = catalog.state("queue")?;
+    let mut shuffle_positions = queue
+        .shuffle_positions
+        .filter(|positions| positions.len() == queue.ids.len());
     let current = queue.index.unwrap_or(0);
     let mut tracks = Vec::new();
     let mut index = None;
@@ -355,17 +358,24 @@ fn restore_queue(catalog: &Catalog, player: &PlayerHandle, namespace: String) ->
             if at >= current && index.is_none() {
                 index = Some(tracks.len());
             }
+            if let Some(positions) = &mut shuffle_positions {
+                positions[tracks.len()] = positions[at];
+            }
             tracks.push(track);
         }
     }
+    if let Some(positions) = &mut shuffle_positions {
+        positions.truncate(tracks.len());
+    }
     let index = index.unwrap_or(tracks.len().saturating_sub(1));
-    player.send(PlayerCommand::RestoreAccount(
+    player.send(PlayerCommand::RestoreAccount {
         namespace,
         tracks,
         index,
-        if same { queue.position } else { 0. },
-        if same { queue.listen } else { None },
-    ));
+        position: if same { queue.position } else { 0. },
+        listen: if same { queue.listen } else { None },
+        shuffle_positions,
+    });
     Ok(())
 }
 
@@ -1821,7 +1831,10 @@ fn run(
                         runtime.spawn(async move {
                             match server.playlist(&id).await {
                                 Ok(playlist) => {
-                                    let _ = tx.send(Command::PlaylistLoaded(playlist));
+                                    let _ = tx.send(Command::PlaylistLoaded(
+                                        server.account.namespace(),
+                                        playlist,
+                                    ));
                                 }
                                 Err(error) => {
                                     let _ = tx.send(Command::Error(format!(
@@ -1832,14 +1845,18 @@ fn run(
                         });
                     }
                 }
-                Command::PlaylistsLoaded(playlists) => {
-                    catalog.save_playlist_summaries(&playlists, true)?;
-                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                Command::PlaylistsLoaded(namespace, playlists) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        catalog.save_playlist_summaries(&playlists, true)?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                    }
                 }
-                Command::PlaylistLoaded(playlist) => {
-                    catalog.save_playlist(&playlist)?;
-                    events.send(Event::Playlist(playlist))?;
-                    events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                Command::PlaylistLoaded(namespace, playlist) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        catalog.save_playlist(&playlist)?;
+                        events.send(Event::Playlist(playlist))?;
+                        events.send(Event::Playlists(catalog.playlist_summaries()?))?;
+                    }
                 }
                 Command::Lyrics(track) => {
                     // Older cache entries contain flattened text with timing discarded.
@@ -2106,31 +2123,39 @@ fn run(
                         return Ok(());
                     }
                     let completed = mutation.clone();
+                    // Favorites match album feedback only in album views.
+                    let album_scope = current_query
+                        .ordering
+                        .as_ref()
+                        .is_some_and(|sort| sort.scope == SortScope::Albums);
+                    let rating_filtered =
+                        current_query.favorites && current_query.favorite_filter.min_rating > 0;
                     // Track edits are patched in place by the UI; a fresh view would
                     // reload every album panel, so send one only when the edit can
                     // change which rows appear or their order.
                     let reshapes_view = match &mutation {
                         Mutation::Favorite(..) => current_query.favorites,
-                        Mutation::Rating(..) => current_query
-                            .ordering
-                            .as_ref()
-                            .map_or(current_query.sort == Sort::Rating, |s| {
-                                s.scope == SortScope::Tracks && s.depends_on(SortField::Rating)
-                            }),
-                        Mutation::AlbumFavorite(..) => {
-                            current_query.favorites
-                                && current_query
-                                    .ordering
-                                    .as_ref()
-                                    .is_some_and(|sort| sort.scope == SortScope::Albums)
+                        Mutation::Rating(..) => {
+                            rating_filtered
+                                || current_query.ordering.as_ref().map_or(
+                                    current_query.sort == Sort::Rating,
+                                    |s| {
+                                        s.scope == SortScope::Tracks
+                                            && s.depends_on(SortField::Rating)
+                                    },
+                                )
                         }
-                        Mutation::AlbumRating(..) => current_query.ordering.as_ref().map_or(
-                            current_query.sort == Sort::Rating,
-                            |sort| {
-                                sort.scope == SortScope::Albums
-                                    && sort.depends_on(SortField::Rating)
-                            },
-                        ),
+                        Mutation::AlbumFavorite(..) => current_query.favorites && album_scope,
+                        Mutation::AlbumRating(..) => {
+                            (rating_filtered && album_scope)
+                                || current_query.ordering.as_ref().map_or(
+                                    current_query.sort == Sort::Rating,
+                                    |sort| {
+                                        sort.scope == SortScope::Albums
+                                            && sort.depends_on(SortField::Rating)
+                                    },
+                                )
+                        }
                         _ => true,
                     };
                     match mutation {
@@ -2181,10 +2206,16 @@ fn run(
                                 runtime.spawn(async move {
                                     let result = async {
                                         let playlists = server.playlists().await?;
-                                        let _ = tx.send(Command::PlaylistsLoaded(playlists));
+                                        let _ = tx.send(Command::PlaylistsLoaded(
+                                            server.account.namespace(),
+                                            playlists,
+                                        ));
                                         if let Some(id) = changed_id {
                                             let playlist = server.playlist(&id).await?;
-                                            let _ = tx.send(Command::PlaylistLoaded(playlist));
+                                            let _ = tx.send(Command::PlaylistLoaded(
+                                                server.account.namespace(),
+                                                playlist,
+                                            ));
                                         }
                                         Ok::<_, anyhow::Error>(())
                                     }
