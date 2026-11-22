@@ -67,6 +67,7 @@ impl PausedPlayer {
                     | PlayerCommand::Replace(..)
                     | PlayerCommand::Next
                     | PlayerCommand::Insert(..)
+                    | PlayerCommand::Move(..)
                     | PlayerCommand::EditQueue(..)
                     | PlayerCommand::UndoQueue
                     | PlayerCommand::UpdateTrack(..)

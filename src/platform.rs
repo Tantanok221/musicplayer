@@ -57,6 +57,28 @@ impl ServerCredentials {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NativeToken {
+    token: String,
+}
+
+impl NativeToken {
+    pub fn new(token: String) -> Result<Self> {
+        anyhow::ensure!(
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+            "Invalid Navidrome login token. Sign in again."
+        );
+        Ok(Self { token })
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        &self.token
+    }
+}
+
 /// The main window's last frame, kept outside any library so it survives
 /// rebuilds and account changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -116,6 +138,54 @@ impl Paths {
         self.data
             .join("credentials")
             .join(format!("{}.json", account.namespace()))
+    }
+
+    fn native_token_path(&self, account: &Account) -> PathBuf {
+        self.data
+            .join("credentials")
+            .join(format!("{}.native.json", account.namespace()))
+    }
+
+    pub fn native_token(&self, account: &Account) -> Result<Option<NativeToken>> {
+        let bytes = match std::fs::read(self.native_token_path(account)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => anyhow::bail!("Could not read the saved Navidrome login. Sign in again."),
+        };
+        let token: NativeToken = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid Navidrome login token. Sign in again."))?;
+        NativeToken::new(token.token).map(Some)
+    }
+
+    pub fn save_native_token(&self, account: &Account, token: &NativeToken) -> Result<()> {
+        let save = || -> Result<()> {
+            NativeToken::new(token.token.clone())?;
+            let directory = self.data.join("credentials");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&directory)?;
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(&directory)?;
+            atomic_write(
+                &self.native_token_path(account),
+                &serde_json::to_vec(token)?,
+            )
+        };
+        save().map_err(|_| anyhow::anyhow!("Could not save the Navidrome login locally"))
+    }
+
+    pub fn clear_native_token(&self, account: &Account) -> Result<()> {
+        match std::fs::remove_file(self.native_token_path(account)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => anyhow::bail!("Could not clear the saved Navidrome login"),
+        }
     }
 
     pub fn credentials(&self, account: &Account) -> Result<Option<ServerCredentials>> {

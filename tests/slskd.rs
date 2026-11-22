@@ -49,6 +49,28 @@ fn response(username: &str, free: bool, files: Vec<RemoteFile>) -> SearchRespons
 }
 
 #[test]
+fn parsed_search_candidates_saturate_untrusted_totals() {
+    for (size, length) in [(u64::MAX, 1), (1, u32::MAX), (u64::MAX, u32::MAX)] {
+        let responses: Vec<SearchResponse> = serde_json::from_value(json!([{
+            "username": "peer",
+            "files": [
+                {"filename": "Album\\01.flac", "size": size, "length": length},
+                {"filename": "Album\\02.flac", "size": size, "length": length},
+                {"filename": "Album\\cover.jpg", "size": 1, "length": u32::MAX}
+            ]
+        }]))
+        .unwrap();
+        let found = candidates(&responses, Some(2));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].size, size.saturating_add(size).saturating_add(1));
+        assert_eq!(found[0].seconds, length.saturating_add(length));
+        assert_eq!(found[0].tracks, 2);
+        assert_eq!(found[0].files.len(), 3);
+        assert_eq!(found[0].completeness, Completeness::Exact);
+    }
+}
+
+#[test]
 fn folders_are_grouped_described_and_ranked() {
     let responses = [
         response(

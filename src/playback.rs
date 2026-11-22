@@ -480,6 +480,10 @@ pub fn effective_gain_mode(mode: &GainMode, queue: &[Arc<Track>]) -> GainMode {
     }
 }
 
+/// Real tags sit far inside this range; clamping keeps a corrupt tag from
+/// overflowing the gain factor to infinity and turning samples into NaN.
+const MAX_REPLAY_GAIN_DB: f32 = 60.;
+
 pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
     let Some(gain) = gain else {
         return 1.;
@@ -495,7 +499,10 @@ pub fn replay_gain(gain: Option<&ReplayGain>, mode: &GainMode) -> f32 {
             }
         }
     };
-    let mut factor = 10f32.powf(db.filter(|v| v.is_finite()).unwrap_or(0.) / 20.);
+    let db = db
+        .filter(|v| v.is_finite())
+        .map_or(0., |v| v.clamp(-MAX_REPLAY_GAIN_DB, MAX_REPLAY_GAIN_DB));
+    let mut factor = 10f32.powf(db / 20.);
     if let Some(peak) = peak.filter(|p| p.is_finite() && *p > 0.) {
         factor = factor.min(1. / peak);
     }
@@ -1200,7 +1207,6 @@ fn run(
                 }
                 PlayerCommand::Move(from, to) => {
                     if from < queue.len() && to < queue.len() {
-                        let current = index.and_then(|i| queue.get(i)).map(|t| t.id.clone());
                         base_position = if started {
                             position(&clock)
                         } else {
@@ -1211,7 +1217,17 @@ fn run(
                         if let Some(original) = original.as_mut() {
                             original.move_entry(from, to);
                         }
-                        index = current.and_then(|id| queue.iter().position(|t| t.id == id));
+                        index = index.map(|i| {
+                            if i == from {
+                                to
+                            } else if from < i && i <= to {
+                                i - 1
+                            } else if to <= i && i < from {
+                                i + 1
+                            } else {
+                                i
+                            }
+                        });
                         restart |= started;
                     }
                 }
@@ -2174,6 +2190,19 @@ mod tests {
         };
         assert_eq!(replay_gain(Some(&hot), &GainMode::Track), 0.5);
         assert_eq!(replay_gain(None, &GainMode::Album), 1.);
+    }
+
+    #[test]
+    fn replay_gain_stays_bounded_for_absurd_tags_without_peak() {
+        let tags = |db| ReplayGain {
+            track_gain: Some(db),
+            ..Default::default()
+        };
+        let loud = replay_gain(Some(&tags(1000.)), &GainMode::Track);
+        let quiet = replay_gain(Some(&tags(-1000.)), &GainMode::Track);
+        assert!((loud - 1000.).abs() < 0.01, "+1000 dB gave {loud}");
+        assert!((quiet - 0.001).abs() < 1e-6, "-1000 dB gave {quiet}");
+        assert_eq!(0. * loud, 0., "silence must stay silent");
     }
 
     #[test]

@@ -341,11 +341,17 @@ impl Catalog {
                 ])?;
                 sorting::put_track(&tx, track)?;
                 if !track.album_id.is_empty() {
+                    let credits = track.album_artist_credits();
                     let album = Album {
                         id: track.album_id.clone(),
                         name: track.album.clone(),
                         artist: track.album_artist_label().into(),
-                        artist_id: track.artist_id.clone(),
+                        artist_id: if credits.len() == 1 {
+                            credits[0].id.clone()
+                        } else {
+                            String::new()
+                        },
+                        artists: track.album_artists.clone(),
                         cover_art: track.cover_art.clone(),
                         year: track.year,
                         genre: genre.clone(),
@@ -881,9 +887,9 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn album_tracks(&self, id: &str) -> Result<Vec<Arc<Track>>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT data FROM tracks WHERE album_id=? ORDER BY disc,track,title")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM tracks WHERE album_id=? ORDER BY coalesce(disc,1),track,title",
+        )?;
         stmt.query_map([id], |r| r.get::<_, String>(0))?
             .map(|r| Ok(Arc::new(serde_json::from_str(&r?)?)))
             .collect()
