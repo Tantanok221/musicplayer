@@ -456,7 +456,6 @@ async fn navidrome(
             | "scrobble.view"
             | "getSong.view"
             | "getCoverArt.view"
-            | "getLyricsBySongId.view"
             | "getLyrics.view"
     ) || query.keys().any(|key| {
         !matches!(
@@ -688,9 +687,6 @@ async fn navidrome(
         },
         "getArtist.view" if query == BTreeMap::from([("id".into(), "artist".into())]) => {
             json!({"status":"ok","artist":{"id":"artist","name":"Fixture Artist","musicBrainzId":data.library.artist_mbid}})
-        }
-        "getLyricsBySongId.view" if query == Request::new("", &[("id", "song")]).params => {
-            json!({"status":"ok","lyricsList":{"structuredLyrics":[{"line":[{"value":"Account A lyrics"}]}]}})
         }
         "getArtistInfo2.view"
             if query
