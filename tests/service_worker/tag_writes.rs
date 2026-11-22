@@ -197,17 +197,19 @@ fn the_queued_song_picks_up_the_rescanned_tags_and_new_id() {
         .service()
         .send(Command::WriteTags(retitle("New title")));
     assert_eq!(report(&worker).written, 1);
-    event(
-        &worker,
-        |e| matches!(e, Event::TrackUpdated(t) if t.id == "song-new" && t.title == "New title"),
-    );
-    let Event::Playback(snapshot) = event(
-        &worker,
-        |e| matches!(e, Event::Playback(s) if s.track.as_ref().is_some_and(|t| t.id == "song-new")),
-    ) else {
-        unreachable!()
-    };
-    assert_eq!(snapshot.track.unwrap().title, "New title");
+    // The player thread may publish the retagged snapshot before TrackUpdated.
+    let (mut updated, mut snapshot) = (false, None);
+    while !updated || snapshot.is_none() {
+        match event(&worker, |e| {
+            matches!(e, Event::TrackUpdated(t) if t.id == "song-new" && t.title == "New title")
+                || matches!(e, Event::Playback(s) if s.track.as_ref().is_some_and(|t| t.id == "song-new"))
+        }) {
+            Event::Playback(s) => snapshot = Some(s),
+            _ => updated = true,
+        }
+    }
+    let snapshot = snapshot.unwrap();
+    assert_eq!(snapshot.track.as_ref().unwrap().title, "New title");
     let queued: Vec<_> = snapshot.queue.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(queued, ["song-new"]);
     worker.shutdown(crate::fixture::WAIT).unwrap();
