@@ -10,6 +10,10 @@ pub struct ReleaseQuery {
     pub artist: String,
     /// The number of songs, or 0 to leave it out.
     pub tracks: usize,
+    /// For one song: its title, so the search looks for the recording and
+    /// offers the releases it appears on.
+    pub title: String,
+    pub length_ms: Option<u64>,
 }
 
 impl ReleaseQuery {
@@ -22,6 +26,20 @@ impl ReleaseQuery {
                 .unwrap_or_default()
                 .to_string()
         };
+        if let [song] = tracks {
+            let artist = if song.artist.is_empty() {
+                &song.album_artist
+            } else {
+                &song.artist
+            };
+            return Self {
+                album: song.album.clone(),
+                artist: artist.clone(),
+                tracks: 0,
+                title: song.title.clone(),
+                length_ms: (song.duration > 0.).then(|| (song.duration * 1000.) as u64),
+            };
+        }
         let mut artist = first(|track| &track.album_artist);
         if artist.is_empty() {
             artist = first(|track| &track.artist);
@@ -30,11 +48,49 @@ impl ReleaseQuery {
             album: first(|track| &track.album),
             artist,
             tracks: if tracks.len() > 1 { tracks.len() } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    /// Whether songs from more than one album are selected, which neither
+    /// an album nor a song search can fill in one go.
+    pub fn spans_albums(tracks: &[Track]) -> bool {
+        tracks.len() > 1
+            && tracks
+                .iter()
+                .any(|track| track.album_id != tracks[0].album_id)
+    }
+
+    pub fn is_song(&self) -> bool {
+        !self.title.is_empty()
+    }
+
+    /// What the search is for, as the editor names it while it runs.
+    pub fn subject(&self) -> &str {
+        if self.is_song() {
+            &self.title
+        } else {
+            &self.album
         }
     }
 
     /// The Lucene query MusicBrainz's release search takes.
     pub fn lucene(&self) -> String {
+        if self.is_song() {
+            let mut terms = vec![format!("recording:\"{}\"", escape(&self.title))];
+            if !self.artist.is_empty() {
+                terms.push(format!("artist:\"{}\"", escape(&self.artist)));
+            }
+            if let Some(length) = self.length_ms {
+                let slack = 3_000;
+                terms.push(format!(
+                    "dur:[{} TO {}]",
+                    length.saturating_sub(slack),
+                    length + slack
+                ));
+            }
+            return terms.join(" AND ");
+        }
         let mut terms = vec![format!("release:\"{}\"", escape(&self.album))];
         if !self.artist.is_empty() {
             terms.push(format!("artist:\"{}\"", escape(&self.artist)));
@@ -351,5 +407,30 @@ mod tests {
             candidate.summary(),
             "1997-05-21 · GB · CD · Parlophone NODATA 02 · 12 tracks"
         );
+    }
+
+    #[test]
+    fn one_song_searches_its_recording_with_a_duration_window() {
+        let song = Track {
+            title: "Pyramid \"Song\"".into(),
+            artist: "Radiohead".into(),
+            album: "Amnesiac".into(),
+            album_id: "a".into(),
+            duration: 289.,
+            ..Default::default()
+        };
+        let query = ReleaseQuery::for_tracks(std::slice::from_ref(&song));
+        assert!(query.is_song());
+        assert_eq!(query.subject(), "Pyramid \"Song\"");
+        assert_eq!(
+            query.lucene(),
+            r#"recording:"Pyramid \"Song\"" AND artist:"Radiohead" AND dur:[286000 TO 292000]"#
+        );
+        let other = Track {
+            album_id: "b".into(),
+            ..song.clone()
+        };
+        assert!(!ReleaseQuery::spans_albums(&[song.clone(), song.clone()]));
+        assert!(ReleaseQuery::spans_albums(&[song, other]));
     }
 }

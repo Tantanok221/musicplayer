@@ -362,7 +362,7 @@ impl MusicApp {
         Some(match &editor.lookup {
             Lookup::Idle => return None,
             Lookup::Searching(query) => {
-                status(format!("Searching MusicBrainz for {}…", query.album))
+                status(format!("Searching MusicBrainz for {}…", query.subject()))
             }
             Lookup::Loading(id) => {
                 let title = editor
@@ -752,15 +752,18 @@ impl MusicApp {
                             .font_semibold()
                             .child(title),
                     )
-                    .when(editor.review.is_none(), |row| {
-                        row.child(
-                            Button::new("find-musicbrainz")
-                                .small()
-                                .label("Find on MusicBrainz")
-                                .loading(searching)
-                                .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
-                        )
-                    }),
+                    .when(
+                        editor.review.is_none() && !ReleaseQuery::spans_albums(&editor.form.tracks),
+                        |row| {
+                            row.child(
+                                Button::new("find-musicbrainz")
+                                    .small()
+                                    .label("Find on MusicBrainz")
+                                    .loading(searching)
+                                    .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
+                            )
+                        },
+                    ),
             );
         if let Some(changes) = &editor.review {
             panel = panel.child(self.review_panel(changes, cx));

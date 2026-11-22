@@ -335,6 +335,7 @@ fn find_on_musicbrainz_fills_matched_songs_for_review(cx: &mut TestAppContext) {
                 album: "Fixture album".into(),
                 artist: "Fixture Artist".into(),
                 tracks: 2,
+                ..Default::default()
             }
         );
         vec![
@@ -426,4 +427,67 @@ fn a_failed_search_says_why_and_keeps_the_form(cx: &mut TestAppContext) {
         Some("MusicBrainz returned HTTP 503")
     );
     assert!(label(window, "tag-table", cx).is_some());
+}
+
+fn present(window: AnyWindowHandle, id: &'static str, cx: &mut TestAppContext) -> bool {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+fn songs_view(fixture: &mut Fixture, window: AnyWindowHandle, cx: &mut TestAppContext) {
+    writes_tags(fixture, true);
+    fixture.settle(window, cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    fixture.click(window, "main-view-menu", cx);
+    fixture.menu_item(window, "Tracks", cx);
+}
+
+#[gpui_kit::test]
+fn one_song_searches_musicbrainz_by_its_recording(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    songs_view(&mut fixture, window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-1", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags…", cx);
+    fixture.expect("search for the song's recording", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search");
+        };
+        assert!(query.is_song());
+        assert_eq!(query.length_ms, Some(120_000));
+        assert_eq!(query.tracks, 0);
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    assert_eq!(
+        label(window, ("release-candidate", 0_usize), cx).as_deref(),
+        Some("Fixture album — Fixture Artist · 1997-05-21 · GB · CD · 2 tracks · 100% match")
+    );
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn songs_from_several_albums_offer_no_musicbrainz_search(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    songs_view(&mut fixture, window, cx);
+    fixture.click(window, "row-flat-track-1", cx);
+    cx.update_window(window, |_, window, cx| {
+        window.click_with_modifiers("row-flat-track-2", Modifiers::command(), cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("row-flat-track-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.menu_item(window, "Edit Tags of 2 Songs…", cx);
+    assert!(present(window, "tag-editor", cx));
+    assert!(!present(window, "find-musicbrainz", cx));
 }

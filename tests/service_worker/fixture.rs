@@ -866,6 +866,26 @@ async fn metadata(
     method: Method,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    if method == Method::GET && endpoint == "recording" && query.contains_key("query") {
+        state.record(Request::new(
+            "metadata/recording-search",
+            &[("query", &query["query"]), ("limit", &query["limit"])],
+        ));
+        let credit =
+            json!([{"name":"Radiohead","joinphrase":"","artist":{"id":"a1","name":"Radiohead"}}]);
+        return Json(json!({"recordings":[
+            {"id":"r1", "score":100, "title":"Airbag", "artist-credit": credit, "releases":[
+                {"id":"ok-computer", "title":"OK Computer", "date":"1997-05-21", "country":"GB",
+                 "track-count":2, "artist-credit": credit, "media":[{"format":"CD","track-count":2}]}
+            ]},
+            {"id":"r9", "score":90, "title":"Airbag", "artist-credit": credit, "releases":[
+                {"id":"ok-computer", "title":"OK Computer"},
+                {"id":"airbag-ep", "title":"Airbag / How Am I Driving?", "date":"1998",
+                 "country":"JP", "track-count":3, "media":[{"format":"CD","track-count":3}]}
+            ]}
+        ]}))
+        .into_response();
+    }
     if method == Method::GET && endpoint == "release" && query.contains_key("query") {
         state.record(Request::new(
             "metadata/release-search",

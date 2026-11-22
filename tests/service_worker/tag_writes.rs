@@ -238,6 +238,7 @@ fn finds_releases_and_loads_their_tracks_from_musicbrainz() {
         album: "OK Computer".into(),
         artist: "Radiohead".into(),
         tracks: 2,
+        ..Default::default()
     };
     worker.service().send(Command::FindReleases(query.clone()));
     let Event::ReleaseCandidates(asked, Ok(found)) = event(&worker, |event| {
@@ -321,5 +322,32 @@ fn writes_musicbrainz_ids_and_undo_takes_them_out() {
     assert!(report(&worker).undo);
     assert!(read(&folder.file()).unwrap()[&TagField::MusicBrainzRelease].is_empty());
     worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn one_song_finds_the_releases_its_recording_is_on() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    let query = ReleaseQuery {
+        artist: "Radiohead".into(),
+        title: "Airbag".into(),
+        length_ms: Some(284_000),
+        ..Default::default()
+    };
+    worker.service().send(Command::FindReleases(query.clone()));
+    let Event::ReleaseCandidates(_, Ok(found)) = event(&worker, |event| {
+        matches!(event, Event::ReleaseCandidates(..))
+    }) else {
+        panic!("the search failed");
+    };
+    let ids: Vec<_> = found
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    assert_eq!(ids, ["ok-computer", "airbag-ep"]);
+    assert_eq!(found[1].artist, "Radiohead");
+    assert_eq!(found[1].score, 90);
+    assert_eq!(found[1].summary(), "1998 · JP · CD · 3 tracks");
     fixture.finish();
 }

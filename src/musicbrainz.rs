@@ -320,6 +320,12 @@ impl MusicBrainz {
 impl MusicBrainz {
     /// Editions matching the album as it is tagged now, best match first.
     pub async fn search_releases(&self, query: &ReleaseQuery) -> Result<Vec<ReleaseCandidate>> {
+        if query.is_song() {
+            let found = self
+                .get("recording", &[("query", &query.lucene()), ("limit", "10")])
+                .await?;
+            return Ok(recording_candidates(&found));
+        }
         let found = self
             .get("release", &[("query", &query.lucene()), ("limit", "10")])
             .await?;
@@ -347,6 +353,27 @@ impl MusicBrainz {
         }
         Ok(parse_lookup(&release))
     }
+}
+
+/// Every release the found recordings appear on, best recording first, each
+/// scored by its recording.
+fn recording_candidates(found: &Value) -> Vec<ReleaseCandidate> {
+    let mut candidates: Vec<ReleaseCandidate> = vec![];
+    for recording in found["recordings"].as_array().into_iter().flatten() {
+        for release in recording["releases"].as_array().into_iter().flatten() {
+            let mut candidate = parse_candidate(release);
+            if candidates.iter().any(|known| known.id == candidate.id) {
+                continue;
+            }
+            if candidate.artist.is_empty() {
+                candidate.artist = credit(&recording["artist-credit"]);
+            }
+            candidate.score = recording["score"].as_u64().unwrap_or_default() as u32;
+            candidates.push(candidate);
+        }
+    }
+    candidates.truncate(10);
+    candidates
 }
 
 fn parse_candidate(release: &Value) -> ReleaseCandidate {
