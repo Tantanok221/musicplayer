@@ -183,9 +183,12 @@ impl Server {
         };
         params.push((key, offset.to_string()));
         let response = self.request("search3", &params).await?;
-        match &response["searchResult3"][kind] {
-            Value::Null => Ok(json!([])),
-            Value::Array(items) => Ok(Value::Array(items.clone())),
+        let Some(result) = response.get("searchResult3").and_then(Value::as_object) else {
+            bail!("Invalid search3 {kind} response: expected a searchResult3 object");
+        };
+        match result.get(kind) {
+            None | Some(Value::Null) => Ok(json!([])),
+            Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
             _ => bail!("Invalid search3 {kind} list: expected an array"),
         }
     }
