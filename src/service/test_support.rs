@@ -7,7 +7,7 @@ use flume::{Receiver, Sender};
 use std::sync::{Arc, atomic::AtomicU64};
 
 mod worker;
-pub use worker::Worker;
+pub use worker::{Worker, WorkerEvents};
 
 pub struct ControlledService {
     service: Service,

@@ -10,18 +10,66 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use flume::Receiver;
 use std::{
-    sync::{Arc, atomic::AtomicU64},
+    collections::VecDeque,
+    sync::{Arc, Mutex, atomic::AtomicU64},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 pub struct Worker {
     service: Service,
-    events: Receiver<Event>,
+    events: WorkerEvents,
     player_commands: Receiver<PlayerCommand>,
     finished: Receiver<Result<(), String>>,
     thread: Option<JoinHandle<()>>,
     player_threads: Vec<JoinHandle<()>>,
+}
+
+/// Single-consumer event stream retaining events observed while awaiting readiness.
+pub struct WorkerEvents {
+    received: Receiver<Event>,
+    pending: Mutex<VecDeque<Event>>,
+}
+
+impl WorkerEvents {
+    pub fn recv_deadline(&self, deadline: Instant) -> Result<Event, flume::RecvTimeoutError> {
+        if let Some(event) = self.pending.lock().unwrap().pop_front() {
+            return Ok(event);
+        }
+        self.received.recv_deadline(deadline)
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Event, flume::RecvTimeoutError> {
+        self.recv_deadline(Instant::now() + timeout)
+    }
+
+    pub fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+        std::iter::from_fn(|| {
+            self.pending
+                .lock()
+                .unwrap()
+                .pop_front()
+                .or_else(|| self.received.try_recv().ok())
+        })
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.received.is_disconnected()
+    }
+
+    fn wait_ready(&self, timeout: Duration) -> Result<(Option<Account>, Preferences)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .received
+                .recv_deadline(deadline)
+                .context("worker readiness")?
+            {
+                Event::Ready(account, preferences) => return Ok((account, preferences)),
+                event => self.pending.lock().unwrap().push_back(event),
+            }
+        }
+    }
 }
 
 impl Worker {
@@ -56,6 +104,13 @@ impl Worker {
                 crate::playback::test_support::start_worker_player()?;
             service.player = player;
             player_threads.push(thread);
+            // Exercise the legal ordering where playback wins catalog startup.
+            match player_events.recv_timeout(Duration::from_secs(5))? {
+                crate::playback::PlayerEvent::Snapshot(snapshot) => {
+                    events.send(Event::Playback(snapshot))?;
+                }
+                _ => anyhow::bail!("paused player did not publish a snapshot first"),
+            }
             let command_tx = service.tx.clone();
             let event_tx = events.clone();
             player_threads.push(thread::spawn(move || {
@@ -90,7 +145,10 @@ impl Worker {
             })?;
         Ok(Self {
             service,
-            events: received_events,
+            events: WorkerEvents {
+                received: received_events,
+                pending: Mutex::default(),
+            },
             player_commands,
             finished: received_finish,
             thread: Some(thread),
@@ -102,7 +160,7 @@ impl Worker {
         &self.service
     }
 
-    pub fn events(&self) -> &Receiver<Event> {
+    pub fn events(&self) -> &WorkerEvents {
         &self.events
     }
 
@@ -111,14 +169,7 @@ impl Worker {
     }
 
     pub fn wait_ready(&self, timeout: Duration) -> Result<(Option<Account>, Preferences)> {
-        match self
-            .events
-            .recv_timeout(timeout)
-            .context("worker readiness")?
-        {
-            Event::Ready(account, preferences) => Ok((account, preferences)),
-            _ => anyhow::bail!("worker did not publish Ready first"),
-        }
+        self.events.wait_ready(timeout)
     }
 
     /// Acknowledge the real queue-save handshake with an empty controlled queue,
@@ -173,5 +224,57 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream() -> (flume::Sender<Event>, WorkerEvents) {
+        let (send, received) = flume::unbounded();
+        (
+            send,
+            WorkerEvents {
+                received,
+                pending: Mutex::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn readiness_preserves_all_events_in_order() {
+        let (send, events) = stream();
+        send.send(Event::Status("before".into())).unwrap();
+        send.send(Event::Error("startup error".into())).unwrap();
+        send.send(Event::Ready(None, Preferences::default()))
+            .unwrap();
+        send.send(Event::Status("after".into())).unwrap();
+        events.wait_ready(Duration::ZERO).unwrap();
+        assert!(
+            matches!(events.recv_timeout(Duration::ZERO).unwrap(), Event::Status(s) if s == "before")
+        );
+        assert!(
+            matches!(events.recv_timeout(Duration::ZERO).unwrap(), Event::Error(s) if s == "startup error")
+        );
+        assert!(
+            matches!(events.recv_timeout(Duration::ZERO).unwrap(), Event::Status(s) if s == "after")
+        );
+    }
+
+    #[test]
+    fn readiness_timeout_and_disconnect_keep_pending_events() {
+        let (send, events) = stream();
+        assert!(events.wait_ready(Duration::ZERO).is_err());
+        send.send(Event::Status("pending".into())).unwrap();
+        assert!(events.wait_ready(Duration::ZERO).is_err());
+        drop(send);
+        assert!(events.wait_ready(Duration::ZERO).is_err());
+        assert!(events.is_disconnected());
+        assert_eq!(events.try_iter().count(), 1);
+        assert!(matches!(
+            events.recv_timeout(Duration::ZERO),
+            Err(flume::RecvTimeoutError::Disconnected)
+        ));
     }
 }
