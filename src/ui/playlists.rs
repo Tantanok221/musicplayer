@@ -1,5 +1,5 @@
 use super::*;
-use crate::playlists::PlaylistEntry;
+use crate::playlists::{PlaylistEntry, PlaylistView};
 
 #[derive(Clone)]
 struct PlaylistDrag {
@@ -8,6 +8,149 @@ struct PlaylistDrag {
 }
 
 impl MusicApp {
+    fn playlist_track_row(
+        &mut self,
+        playlist: &Playlist,
+        index: usize,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.track_row(
+            playlist.entry[index].clone(),
+            index + 1,
+            format!("playlist-{index}"),
+            Some(tracks::TrackPosition::Playlist {
+                playback: tracks::TrackPlayback::Playlist(playlist.entry.clone(), index),
+                editable_entry: editable.then(|| PlaylistEntry::new(playlist, index)),
+            }),
+            None,
+            cx,
+        )
+    }
+
+    fn playlist_albums(
+        &mut self,
+        playlist: Playlist,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let albums = self.playlists.visible_albums();
+        if albums.is_empty() {
+            return div()
+                .id("playlist-empty")
+                .test_support()
+                .aria_label("No tracks match this playlist view")
+                .p_4()
+                .text_size(px(11.))
+                .text_color(ink(cx).muted)
+                .child(if playlist.entry.is_empty() {
+                    "This playlist is empty."
+                } else {
+                    "No tracks match your search."
+                })
+                .into_any_element();
+        }
+        let (columns, side) = cover_layout(self.library_width);
+        let rows = albums.len().div_ceil(columns);
+        if self.playlist_album_list.item_count() != rows {
+            self.playlist_album_list.reset(rows);
+        }
+        // Expanding a card, a refresh, and resizing can all change row heights.
+        self.playlist_album_list.remeasure();
+        let entity = cx.entity();
+        list(self.playlist_album_list.clone(), move |row, _, cx| {
+            entity.update(cx, |app, cx| {
+                let mut cards = div().w_full().min_w_0().flex().gap_4().px_3().pt_3();
+                let range = row * columns..((row + 1) * columns).min(albums.len());
+                for index in range.clone() {
+                    let album = &albums[index];
+                    let selected = app.playlists.expanded_album() == Some(album.key.as_str());
+                    let key = album.key.clone();
+                    let play: Vec<_> = album
+                        .entries
+                        .iter()
+                        .map(|&i| playlist.entry[i].clone())
+                        .collect();
+                    let art = app.art(&album.track.cover_art, side, cx);
+                    cards = cards.child(
+                        div()
+                            .id(SharedString::from(format!("playlist-album-{index}")))
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label(format!(
+                                "{} by {} · {} playlist tracks",
+                                album.track.album,
+                                album.track.album_artist_label(),
+                                album.entries.len()
+                            ))
+                            .aria_selected(selected)
+                            .w(px(side))
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .pb_2()
+                            .border_b_2()
+                            .border_color(if selected {
+                                ink(cx).accent
+                            } else {
+                                ink(cx).background
+                            })
+                            .child(art)
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(if album.track.album.is_empty() {
+                                        "Unknown album".to_string()
+                                    } else {
+                                        album.track.album.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(ink(cx).muted)
+                                    .truncate()
+                                    .child(album.track.album_artist_label().to_string()),
+                            )
+                            .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
+                                if event.click_count() == 2 {
+                                    app.service
+                                        .player
+                                        .send(PlayerCommand::Replace(play.clone(), 0));
+                                } else {
+                                    app.playlists.toggle_album(key.clone());
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                let mut item = div().w_full().min_w_0().flex().flex_col().child(cards);
+                if let Some(album) = albums[range]
+                    .iter()
+                    .find(|album| app.playlists.expanded_album() == Some(album.key.as_str()))
+                {
+                    let mut panel = div()
+                        .w_full()
+                        .min_w_0()
+                        .mt_2()
+                        .px_2()
+                        .py_2()
+                        .border_y_1()
+                        .border_color(ink(cx).line);
+                    for &index in &album.entries {
+                        panel = panel.child(app.playlist_track_row(&playlist, index, editable, cx));
+                    }
+                    item = item.child(panel);
+                }
+                item.into_any_element()
+            })
+        })
+        .size_full()
+        .into_any_element()
+    }
+
     pub(super) fn playlist_reorder_row(
         &self,
         row: Stateful<Div>,
@@ -56,9 +199,6 @@ impl MusicApp {
         let colors = ink(cx);
         if let Some(playlist) = self.playlists.current().cloned() {
             let tracks = playlist.entry.clone();
-            let values = self.playlists.visible_entries();
-            let count = values.len();
-            let entity = cx.entity();
             let play = tracks;
             let weak = cx.weak_entity();
             let rename = playlist.name.clone();
@@ -77,6 +217,26 @@ impl MusicApp {
                     &playlist,
                     self.account.as_ref().map(|a| a.username.as_str()),
                 );
+            let body = if self.playlists.view() == PlaylistView::Albums {
+                self.playlist_albums(playlist.clone(), editable, cx)
+            } else {
+                let values = self.playlists.visible_entries();
+                let entity = cx.entity();
+                let playlist = playlist.clone();
+                uniform_list("playlist-tracks", values.len(), move |range, _, cx| {
+                    entity.update(cx, |app, cx| {
+                        range
+                            .map(|row| {
+                                app.playlist_track_row(&playlist, values[row].0, editable, cx)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .flex_1()
+                .size_full()
+                .px_2()
+                .into_any_element()
+            };
             return div()
                 .size_full()
                 .min_h_0()
@@ -135,6 +295,23 @@ impl MusicApp {
                                     )
                                 },
                             ),
+                        )
+                        .children(
+                            [
+                                ("playlist-view-tracks", "Tracks", PlaylistView::Tracks),
+                                ("playlist-view-albums", "Albums", PlaylistView::Albums),
+                            ]
+                            .map(|(id, label, view)| {
+                                Button::new(id)
+                                    .ghost()
+                                    .small()
+                                    .label(label)
+                                    .selected(self.playlists.view() == view)
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.playlists.set_view(view);
+                                        cx.notify();
+                                    }))
+                            }),
                         )
                         .when(owned, |header| {
                             header.child(
@@ -221,35 +398,7 @@ impl MusicApp {
                             )
                         }),
                 )
-                .child(
-                    uniform_list("playlist-tracks", count, move |range, _, cx| {
-                        entity.update(cx, |app, cx| {
-                            range
-                                .map(|row| {
-                                    let (index, track) = values[row].clone();
-                                    app.track_row(
-                                        track,
-                                        index + 1,
-                                        format!("playlist-{index}"),
-                                        Some(tracks::TrackPosition::Playlist {
-                                            playback: tracks::TrackPlayback::Playlist(
-                                                playlist.entry.clone(),
-                                                index,
-                                            ),
-                                            editable_entry: editable
-                                                .then(|| PlaylistEntry::new(&playlist, index)),
-                                        }),
-                                        None,
-                                        cx,
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .flex_1()
-                    .size_full()
-                    .px_2(),
-                )
+                .child(body)
                 .into_any_element();
         }
         let mut items = div().flex().flex_col().p_2().gap_1();
