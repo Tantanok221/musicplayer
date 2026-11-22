@@ -22,6 +22,14 @@ impl PausedPlayer {
     }
 
     fn spawn(output: HeadlessOutput, clock: Arc<Clock>, timeout: Duration) -> Result<Self> {
+        Self::spawn_platform(PlaybackPlatform::Headless(output), clock, timeout)
+    }
+
+    fn spawn_platform(
+        platform: PlaybackPlatform,
+        clock: Arc<Clock>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let (commands, received) = flume::unbounded();
         let (events, received_events) = flume::unbounded();
         let (finished, received_finish) = flume::bounded(1);
@@ -32,13 +40,7 @@ impl PausedPlayer {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let result = run(
-                        received,
-                        events,
-                        runtime.handle().clone(),
-                        clock,
-                        PlaybackPlatform::Headless(output),
-                    );
+                    let result = run(received, events, runtime.handle().clone(), clock, platform);
                     drop(runtime);
                     result
                 })();
@@ -55,13 +57,15 @@ impl PausedPlayer {
         Ok(player)
     }
 
-    /// Only paused queue commands are accepted. No server, transport or decoder
-    /// can be started through this test endpoint. Every result is a real snapshot.
+    /// No server or decoder can be started through this test endpoint.
+    /// Transport commands exercise queue selection without opening audio.
     pub fn command(&self, command: PlayerCommand, timeout: Duration) -> Result<PlaybackSnapshot> {
         ensure!(
             matches!(
                 command,
                 PlayerCommand::Restore(..)
+                    | PlayerCommand::Replace(..)
+                    | PlayerCommand::Next
                     | PlayerCommand::Insert(..)
                     | PlayerCommand::Move(..)
                     | PlayerCommand::EditQueue(..)
@@ -169,6 +173,95 @@ impl OutputPlayer {
 impl Drop for PausedPlayer {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::from_secs(5));
+    }
+}
+
+/// Production actor and listen tracker with scripted decoder progress, without
+/// network or audio devices. Requests retain the actor's real listen identity.
+pub struct ListeningPlayer {
+    player: PausedPlayer,
+    clock: Arc<Clock>,
+    requests: Receiver<super::DecodeRequest>,
+    request: Option<super::DecodeRequest>,
+}
+
+impl ListeningPlayer {
+    pub fn start(timeout: Duration) -> Result<Self> {
+        let (send, requests) = flume::unbounded();
+        let clock = Arc::new(Clock::default());
+        let player =
+            PausedPlayer::spawn_platform(PlaybackPlatform::Scripted(send), clock.clone(), timeout)?;
+        player
+            .commands
+            .send(PlayerCommand::Server(crate::server::Server::new(
+                crate::platform::Account {
+                    url: "http://127.0.0.1:1".into(),
+                    username: "fixture".into(),
+                },
+                "fixture".into(),
+            )?))?;
+        Ok(Self {
+            player,
+            clock,
+            requests,
+            request: None,
+        })
+    }
+
+    pub fn restart(&mut self, command: PlayerCommand, timeout: Duration) -> Result<u64> {
+        self.player.commands.send(command)?;
+        let request = self.requests.recv_timeout(timeout)?;
+        let id = request.listen_id;
+        self.request = Some(request);
+        Ok(id)
+    }
+
+    pub fn progress(
+        &self,
+        seconds: f64,
+        timeout: Duration,
+    ) -> Result<Vec<crate::listening::ListenReport>> {
+        let request = self.request.as_ref().context("decoder request")?;
+        let track = request.plan.lock().unwrap().queue[request.index].clone();
+        self.clock.listen_tx.send(crate::listening::AudioProgress {
+            listen: Arc::new(crate::listening::AudibleListen {
+                id: request.listen_id,
+                account: request.server.account.namespace(),
+                track,
+            }),
+            seconds,
+            started_ms: 1700000000000 + request.epoch as i64,
+            epoch: request.epoch,
+        })?;
+        let (send, saved) = flume::bounded(1);
+        self.player.commands.send(PlayerCommand::SaveQueue(send))?;
+        saved.recv_timeout(timeout)?;
+        let mut reports = Vec::new();
+        while let Ok(event) = self.player.events.try_recv() {
+            if let PlayerEvent::Scrobble(report) = event {
+                reports.push(report);
+            }
+        }
+        Ok(reports)
+    }
+
+    pub fn finish(&self, timeout: Duration) -> Result<PlaybackSnapshot> {
+        self.clock.finished.store(true, Ordering::Release);
+        self.player.commands.send(PlayerCommand::ClearError)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let PlayerEvent::Snapshot(snapshot) = self.player.events.recv_deadline(deadline)?
+                && !snapshot.playing
+                && snapshot.position == 0.
+            {
+                return Ok(snapshot);
+            }
+        }
+    }
+
+    pub fn command(&self, command: PlayerCommand) -> Result<()> {
+        self.player.commands.send(command)?;
+        Ok(())
     }
 }
 
