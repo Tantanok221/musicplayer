@@ -1,7 +1,7 @@
 use crate::fixture::{Fixture, Library, WAIT, event, synced};
 use sonora::{
     listening::ListenSession,
-    model::{PlaybackSnapshot, SavedQueue},
+    model::{PlaybackSnapshot, Preferences, SavedQueue},
     playback::PlayerCommand,
     service::{Command, Event, test_support::Worker},
 };
@@ -14,6 +14,97 @@ fn snapshot(worker: &Worker, ids: &[&str]) -> PlaybackSnapshot {
         unreachable!()
     };
     snapshot
+}
+
+#[test]
+fn disabling_shuffle_after_restart_restores_order_and_current_duplicate() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let original = ["other-song", "song", "song"];
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    worker.service().send(Command::Preferences(Preferences {
+        shuffle: true,
+        ..Preferences::default()
+    }));
+    worker
+        .service()
+        .send(Command::Player(PlayerCommand::Replace(
+            fixture
+                .catalog()
+                .by_ids(&original.map(str::to_owned))
+                .unwrap(),
+            2,
+        )));
+    worker.shutdown(WAIT).unwrap();
+
+    let shuffled: SavedQueue = fixture.catalog().state("queue").unwrap();
+    assert_eq!(shuffled.index, Some(0));
+    assert_eq!(shuffled.ids[0], "song");
+    let mut restarted = fixture.start_paused();
+    synced(&restarted);
+    restarted
+        .service()
+        .send(Command::Player(PlayerCommand::ClearError));
+    let ids: Vec<_> = shuffled.ids.iter().map(String::as_str).collect();
+    let restored = snapshot(&restarted, &ids);
+    assert_eq!(restored.index, Some(0));
+    restarted
+        .service()
+        .send(Command::Preferences(Preferences::default()));
+    restarted.shutdown(WAIT).unwrap();
+
+    let saved: SavedQueue = fixture.catalog().state("queue").unwrap();
+    assert_eq!(
+        (
+            saved.ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            saved.index
+        ),
+        (original.to_vec(), Some(2)),
+        "shuffle-off must recover the order and the later copy"
+    );
+    fixture.finish();
+}
+
+#[test]
+fn legacy_shuffled_queue_loads_without_an_original_order() {
+    let fixture = Fixture::new(Library::default());
+    fixture.seed();
+    let ids = ["other-song", "song"];
+    let catalog = fixture.catalog();
+    catalog
+        .set_state(
+            "queue",
+            &serde_json::json!({"ids": ids, "index": 1, "position": 23.}),
+        )
+        .unwrap();
+    catalog
+        .set_state(
+            "preferences",
+            &Preferences {
+                shuffle: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+    drop(catalog);
+
+    let mut worker = fixture.start_paused();
+    synced(&worker);
+    worker
+        .service()
+        .send(Command::Player(PlayerCommand::ClearError));
+    let restored = snapshot(&worker, &ids);
+    assert_eq!(restored.index, Some(1));
+    assert_eq!(restored.position, 23.);
+    worker
+        .service()
+        .send(Command::Preferences(Preferences::default()));
+    worker.shutdown(WAIT).unwrap();
+    let saved: SavedQueue = fixture.catalog().state("queue").unwrap();
+    assert_eq!(saved.ids, ids);
+    assert_eq!(saved.index, Some(1));
+    fixture.finish();
 }
 
 #[test]
@@ -73,11 +164,21 @@ fn restart_preserves_duplicate_order_index_position_and_listen() {
 fn restart_skips_missing_tracks_without_moving_the_current_occurrence() {
     let fixture = Fixture::new(Library::default());
     fixture.seed();
-    fixture
-        .catalog()
+    let catalog = fixture.catalog();
+    catalog
+        .set_state(
+            "preferences",
+            &Preferences {
+                shuffle: true,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+    catalog
         .set_state(
             "queue",
             &SavedQueue {
+                shuffle_positions: Some(vec![1, 3, 2, 0]),
                 ids: vec![
                     "song".into(),
                     "missing".into(),
@@ -98,6 +199,7 @@ fn restart_skips_missing_tracks_without_moving_the_current_occurrence() {
             },
         )
         .unwrap();
+    drop(catalog);
     let mut worker = fixture.start_paused();
     synced(&worker);
     worker
@@ -110,6 +212,12 @@ fn restart_skips_missing_tracks_without_moving_the_current_occurrence() {
         "missing predecessors must not change the current track"
     );
     assert_eq!(restored.position, 23.);
+    worker
+        .service()
+        .send(Command::Preferences(Preferences::default()));
+    let unshuffled = snapshot(&worker, &["other-song", "song", "song"]);
+    assert_eq!(unshuffled.index, Some(2));
+    assert_eq!(unshuffled.position, 23.);
     worker.shutdown(WAIT).unwrap();
     let saved: SavedQueue = fixture.catalog().state("queue").unwrap();
     assert_eq!(saved.listen.unwrap().id, 43);
@@ -129,6 +237,7 @@ fn missing_current_track_resets_position_and_listen_and_empty_queue_is_safe() {
             .set_state(
                 "queue",
                 &SavedQueue {
+                    shuffle_positions: None,
                     ids: ids.iter().map(|s| (*s).into()).collect(),
                     index: Some(1),
                     position: 23.,
