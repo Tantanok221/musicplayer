@@ -126,6 +126,7 @@ pub enum Command {
     SoulseekSearch(String, String),
     Download(Box<DownloadRequest>),
     DownloadUpdate(String, DownloadJob),
+    DownloadRejected(String, String, String),
     DismissDownload(String),
     ResumeDownloads,
     ScrobbleFinished(String, u64, Result<Option<Arc<Track>>, String>),
@@ -1592,7 +1593,6 @@ fn run(
                         return Ok(());
                     }
                     let tx = tx.clone();
-                    let events = events.clone();
                     let runtime_handle = runtime.clone();
                     runtime.spawn(async move {
                         // Search hits only cover files that matched the text; take the whole folder.
@@ -1625,8 +1625,8 @@ fn run(
                                 watch_download(&runtime_handle, client, tx, namespace, job);
                             }
                             Err(error) => {
-                                let _ = tx.send(Command::DismissDownload(job.release.clone()));
-                                let _ = events.send(Event::DownloadNotStarted(
+                                let _ = tx.send(Command::DownloadRejected(
+                                    namespace,
                                     job.release,
                                     format!(
                                         "{} did not accept the request: {error:#}",
@@ -1672,6 +1672,16 @@ fn run(
                                 let _ = tx.send(Command::Refresh);
                             });
                         }
+                    }
+                }
+                Command::DownloadRejected(namespace, release, message) => {
+                    if account.as_ref().map(Account::namespace) == Some(namespace) {
+                        watched.remove(&release);
+                        let mut jobs: Vec<DownloadJob> = catalog.state(DOWNLOADS)?;
+                        jobs.retain(|job| job.release != release);
+                        catalog.set_state(DOWNLOADS, &jobs)?;
+                        events.send(Event::Downloads(Arc::new(jobs)))?;
+                        events.send(Event::DownloadNotStarted(release, message))?;
                     }
                 }
                 Command::DismissDownload(release) => {
