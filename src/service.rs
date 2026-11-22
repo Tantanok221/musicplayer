@@ -51,6 +51,9 @@ pub enum Mutation {
     AddToPlaylist(String, Vec<String>),
     RemoveFromPlaylist(String, usize),
 }
+pub(crate) const EMPTY_ALBUM_PLAYLIST_ERROR: &str =
+    "This album has no songs in the library yet. Refresh and try again.";
+
 /// Where an album's songs go: a new playlist by name, or an existing one by ID.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaylistTarget {
@@ -2236,10 +2239,7 @@ fn run(
                         .map(|track| track.id.clone())
                         .collect::<Vec<_>>();
                     if ids.is_empty() {
-                        events.send(Event::Error(
-                            "This album has no songs in the library yet. Refresh and try again."
-                                .into(),
-                        ))?;
+                        events.send(Event::Error(EMPTY_ALBUM_PLAYLIST_ERROR.into()))?;
                     } else {
                         tx.send(Command::Mutate(match target {
                             PlaylistTarget::New(name) => Mutation::CreatePlaylist(name, ids),

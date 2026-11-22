@@ -227,21 +227,18 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = match &item {
-            PlaylistItem::Track(_) => String::new(),
-            PlaylistItem::Album(album) => album.name.clone(),
+        use crate::playlists::CreationSource;
+
+        let (source, name) = match item {
+            PlaylistItem::Track(track) => (
+                CreationSource::Tracks(vec![track.id.clone()]),
+                String::new(),
+            ),
+            PlaylistItem::Album(album) => {
+                (CreationSource::Album(album.id.clone()), album.name.clone())
+            }
         };
-        (self.playlist_editor_tracks, self.playlist_editor_album) = match item {
-            PlaylistItem::Track(track) => (Some(vec![track.id.clone()]), None),
-            PlaylistItem::Album(album) => (None, Some(album.id.clone())),
-        };
-        self.show_playlist_editor = true;
-        self.playlist_editor_rename = false;
-        self.playlist_name.update(cx, |input, cx| {
-            input.set_value(name, window, cx);
-            input.focus(window, cx);
-        });
-        cx.notify();
+        self.new_playlist(source, &name, window, cx);
     }
 
     fn add_to_playlist(&mut self, item: PlaylistItem, playlist: String, cx: &mut Context<Self>) {
