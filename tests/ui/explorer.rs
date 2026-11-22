@@ -14,6 +14,88 @@ use sonora::{
 };
 use std::{sync::Arc, time::Duration};
 
+fn start_first_tab_cover(
+    cx: &mut TestAppContext,
+) -> (
+    tempfile::TempDir,
+    Fixture,
+    AnyWindowHandle,
+    Entity<MusicApp>,
+) {
+    let (dir, mut fixture, old_window, old_app) = start(cx);
+    cx.update_window(old_window, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(old_app);
+    let mut album = (*fixture.catalog.album("album-1").unwrap().unwrap()).clone();
+    album.cover_art = "first-cover".into();
+    fixture.catalog.put_albums(&[album], 1).unwrap();
+    let mut prefs: Preferences = fixture.catalog.state("preferences").unwrap();
+    prefs.tabs.active = 0;
+    fixture.catalog.set_state("preferences", &prefs).unwrap();
+    fixture.expect("disk-only artwork lookup", |command, _| {
+        assert!(
+            matches!(command, sonora::service::Command::Artwork(id, None) if id == "first-cover")
+        );
+        vec![]
+    });
+    let (window, app) = fixture.mount(cx);
+    fixture.settle(window, cx);
+    fixture.assert_script_finished();
+    (dir, fixture, window, app)
+}
+
+fn late_art_wake(cx: &mut TestAppContext) {
+    // No input, playback, service event or animation advances the idle page.
+    // Deliver the timer one frame late, as on a real event loop.
+    cx.executor()
+        .dispatcher()
+        .as_test()
+        .unwrap()
+        .scheduler()
+        .clock()
+        .advance(Duration::from_millis(130));
+}
+
+#[gpui_kit::test]
+fn first_tab_cover_downloads_after_its_own_settle_timer(cx: &mut TestAppContext) {
+    let (dir, mut fixture, window, app) = start_first_tab_cover(cx);
+    let path = dir.path().join("cover.png");
+    image::RgbImage::from_pixel(32, 32, image::Rgb([70, 130, 180]))
+        .save(&path)
+        .unwrap();
+    fixture.expect("visible artwork after idle wake", move |command, _| {
+        assert!(matches!(command, sonora::service::Command::Artwork(id, Some(sonora::artwork::Priority::Visible)) if id == "first-cover"));
+        vec![Event::Artwork("first-cover".into(), path, false)]
+    });
+    late_art_wake(cx);
+    fixture.settle(window, cx);
+    fixture.assert_script_finished();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(app.read(cx).tab_state().active, 0);
+        assert!(window.find("cover-image-first-cover").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn failed_first_tab_cover_stays_placeholder_without_repeated_requests(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start_first_tab_cover(cx);
+    fixture.expect("failed visible artwork", |command, _| {
+        assert!(matches!(command, sonora::service::Command::Artwork(id, Some(sonora::artwork::Priority::Visible)) if id == "first-cover"));
+        vec![Event::ArtworkFailed("first-cover".into())]
+    });
+    late_art_wake(cx);
+    fixture.settle(window, cx);
+    fixture.assert_script_finished();
+    cx.executor().advance_clock(Duration::from_secs(2));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("explorer-album-album-1").visible());
+        assert!(window.try_find("cover-image-first-cover").is_none());
+    })
+    .unwrap();
+}
+
 fn start_explorer(
     cx: &mut TestAppContext,
 ) -> (

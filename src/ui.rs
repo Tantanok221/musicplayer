@@ -428,7 +428,7 @@ pub struct MusicApp {
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
     art_requested: HashMap<String, Instant>,
     /// First and last time each missing cover was on screen, to skip downloads for fly-bys.
-    art_seen: HashMap<String, (Instant, Instant)>,
+    art_seen: HashMap<String, library::ArtSettle>,
     /// A missing cover is waiting to settle, so render again shortly to request it.
     art_wake: bool,
     /// When each neighboring cover was last queued for download ahead of scrolling.

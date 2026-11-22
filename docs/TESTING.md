@@ -27,7 +27,7 @@ worker suite to expose flaky timing.
 | Feature | UI code (`src/ui/`) | Pure logic | Tests |
 | --- | --- | --- | --- |
 | Tabs, Back/Forward | `tabs.rs`, `navigation.rs` | `browser::{Tabs, History}` | `tests/ui/tabs.rs`, `tests/browser.rs` |
-| Music Explorer, navigator, sorting | `library.rs`, `navigator.rs`, `sorting_controls.rs` | `catalog`, `sorting`, `browser` | `tests/ui/{explorer,large_library}.rs`, `tests/{sorting,catalog,navigator}.rs` |
+| Music Explorer, navigator, sorting, cover settling | `library.rs`, `navigator.rs`, `sorting_controls.rs` | `catalog`, `sorting`, `browser`, `ui::library::ArtSettle` | `tests/ui/{explorer,large_library}.rs`, `tests/{sorting,catalog,navigator}.rs`, `ui::library` unit tests |
 | Album and song favorites/ratings | `feedback.rs`, `album_feedback.rs` | `feedback::{Feedback, optimistic_*}` | `tests/ui/{album_feedback,song_feedback,worker}.rs`, `tests/service_worker/feedback.rs`, `feedback` unit tests |
 | Artist pages, albums | `artist_page.rs`, `albums.rs` | `artists`, `discography` | `tests/ui/artists.rs`, `tests/service_worker/{artists,metadata}.rs` |
 | Discover (Memory lane, Last.fm history) | `discover.rs`, `settings.rs` | `discover` (`rediscover`, `stale_seasons`, `Visit`), `lastfm`, `Catalog::rediscover_candidates` | `tests/ui/discover.rs`, `tests/ui/settings.rs`, `tests/service_worker/discover.rs`, `tests/discover.rs` |
