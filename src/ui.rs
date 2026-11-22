@@ -493,7 +493,6 @@ pub struct MusicApp {
     playlist_rename: Option<String>,
     playlist_creation: Option<playlist_creation::CreationDialog>,
     playlist_creation_focus: FocusHandle,
-    pending_delete: Option<String>,
     tag_editor: Option<tag_editor::TagEditor>,
     /// Album whose songs the tag editor opens on when they arrive.
     tag_editor_album: Option<String>,
@@ -776,7 +775,6 @@ impl MusicApp {
             playlist_rename: None,
             playlist_creation: None,
             playlist_creation_focus: cx.focus_handle(),
-            pending_delete: None,
             tag_editor: None,
             tag_editor_album: None,
             tag_notice: None,
@@ -1095,6 +1093,7 @@ impl Render for MusicApp {
                 app.switch_workspace(Workspace::Explorer, window, cx)
             }))
             .child(tabs)
+            .children(self.playlist_delete_confirmation(cx))
             .child(
                 div()
                     .flex_1()

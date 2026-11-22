@@ -172,6 +172,7 @@ pub struct Playlists {
     search: String,
     view: PlaylistView,
     expanded_album: Option<ExpandedAlbum>,
+    pending_delete: Option<String>,
 }
 
 #[derive(Clone)]
@@ -218,6 +219,13 @@ impl Playlists {
                 playlist
             })
             .collect();
+        if self
+            .pending_delete
+            .as_deref()
+            .is_some_and(|id| self.by_id(id).is_none())
+        {
+            self.cancel_delete();
+        }
     }
 
     pub fn detail_loaded(&mut self, playlist: Playlist) {
@@ -290,6 +298,40 @@ impl Playlists {
     pub fn summaries(&self) -> &[Playlist] {
         &self.summaries
     }
+    pub(crate) fn by_id(&self, id: &str) -> Option<&Playlist> {
+        self.current
+            .as_ref()
+            .filter(|playlist| playlist.id == id)
+            .or_else(|| self.summaries.iter().find(|playlist| playlist.id == id))
+    }
+
+    pub(crate) fn request_delete(&mut self, id: &str, username: Option<&str>) -> bool {
+        if self
+            .by_id(id)
+            .is_some_and(|playlist| is_owner(playlist, username))
+        {
+            self.pending_delete = Some(id.to_owned());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn pending_deletion(&self, username: Option<&str>) -> Option<&Playlist> {
+        self.by_id(self.pending_delete.as_deref()?)
+            .filter(|playlist| is_owner(playlist, username))
+    }
+
+    pub(crate) fn confirm_delete(&mut self, username: Option<&str>) -> Option<Mutation> {
+        let id = self.pending_delete.take()?;
+        self.by_id(&id)
+            .filter(|playlist| is_owner(playlist, username))?;
+        Some(Mutation::DeletePlaylist(id))
+    }
+
+    pub(crate) fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
     pub fn name_of(&self, id: &str) -> Option<&str> {
         self.summaries
             .iter()
@@ -348,6 +390,28 @@ pub struct PlaylistEntry {
     entries: Arc<Vec<Arc<Track>>>,
 }
 
+pub fn removal_index(
+    playlist: &Playlist,
+    index: usize,
+    song: &str,
+    occurrence: usize,
+) -> Option<usize> {
+    if playlist
+        .entry
+        .get(index)
+        .is_some_and(|entry| entry.id == song)
+    {
+        return Some(index);
+    }
+    playlist
+        .entry
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.id == song)
+        .nth(occurrence)
+        .map(|(index, _)| index)
+}
+
 impl PlaylistEntry {
     pub fn drop_target(&self, target: &Self) -> Option<std::cmp::Ordering> {
         (self.id == target.id && self.index != target.index).then(|| self.index.cmp(&target.index))
@@ -369,8 +433,18 @@ impl PlaylistEntry {
 
     pub fn mutation(&self, current: Option<&Playlist>) -> Option<Mutation> {
         let current = current?;
-        (!current.readonly && self.matches(current))
-            .then(|| Mutation::RemoveFromPlaylist(self.id.clone(), self.index))
+        (!current.readonly && self.matches(current)).then(|| {
+            let song = &self.entries[self.index].id;
+            Mutation::RemoveFromPlaylist {
+                id: self.id.clone(),
+                index: self.index,
+                song: song.clone(),
+                occurrence: self.entries[..self.index]
+                    .iter()
+                    .filter(|entry| entry.id == *song)
+                    .count(),
+            }
+        })
     }
 
     fn matches(&self, current: &Playlist) -> bool {
@@ -404,6 +478,22 @@ impl PlaylistEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_index_keeps_matching_slot_and_resolves_reordered_occurrences() {
+        assert_eq!(
+            removal_index(&playlist(&["a", "b", "a"]), 2, "a", 1),
+            Some(2)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 0, "a", 0), Some(1));
+        assert_eq!(
+            removal_index(&playlist(&["a", "a", "b"]), 2, "a", 1),
+            Some(1)
+        );
+        assert_eq!(removal_index(&playlist(&["b", "a"]), 2, "a", 1), None);
+        assert_eq!(removal_index(&playlist(&["b"]), 0, "a", 0), None);
+        assert_eq!(removal_index(&playlist(&[]), 0, "a", 0), None);
+    }
 
     #[test]
     fn manual_creation_rejects_empty_duplicate_and_mismatched_submissions() {
@@ -698,6 +788,41 @@ mod tests {
         assert_eq!(entries[2].title, "New");
     }
 
+    #[::core::prelude::v1::test]
+    fn deletion_requires_current_ownership_and_an_existing_playlist() {
+        let mut state = Playlists::default();
+        let mut owned = playlist(&[]);
+        owned.owner = "listener".into();
+        owned.readonly = true;
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(!state.request_delete("playlist", Some("another-user")));
+        assert!(state.request_delete("playlist", Some("listener")));
+        assert_eq!(
+            state.pending_deletion(Some("listener")).unwrap().id,
+            "playlist"
+        );
+
+        owned.owner = "another-user".into();
+        state.summaries_loaded(vec![owned.clone()]);
+        assert!(state.pending_deletion(Some("listener")).is_none());
+        assert!(state.confirm_delete(Some("listener")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.summaries_loaded(vec![]);
+        state.summaries_loaded(vec![owned]);
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+
+        assert!(state.request_delete("playlist", Some("another-user")));
+        state.cancel_delete();
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+        assert!(state.request_delete("playlist", Some("another-user")));
+        assert_eq!(
+            state.confirm_delete(Some("another-user")),
+            Some(Mutation::DeletePlaylist("playlist".into()))
+        );
+        assert!(state.confirm_delete(Some("another-user")).is_none());
+    }
+
     fn playlist(ids: &[&str]) -> Playlist {
         Playlist {
             id: "playlist".into(),
@@ -722,7 +847,12 @@ mod tests {
         let removal = PlaylistEntry::new(&original, 2);
         assert_eq!(
             removal.mutation(Some(&original)),
-            Some(Mutation::RemoveFromPlaylist("playlist".into(), 2))
+            Some(Mutation::RemoveFromPlaylist {
+                id: "playlist".into(),
+                index: 2,
+                song: "a".into(),
+                occurrence: 1
+            })
         );
         assert!(removal.mutation(None).is_none());
         assert!(removal.mutation(Some(&playlist(&[]))).is_none());

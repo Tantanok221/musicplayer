@@ -896,34 +896,6 @@ impl MusicApp {
         if let Some(editor) = self.tag_editor_panel(cx) {
             center = center.child(editor);
         }
-        if let Some(id) = self.pending_delete.clone() {
-            center = center.child(
-                div()
-                    .p_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child("Delete this playlist from Navidrome?")
-                    .child(
-                        Button::new("confirm-delete")
-                            .small()
-                            .label("Delete")
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                app.pending_delete = None;
-                                app.mutate(Mutation::DeletePlaylist(id.clone()), cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("cancel-delete")
-                            .small()
-                            .label("Cancel")
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                app.pending_delete = None;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
         if let Some(editor) = self.playlist_rename_view(cx) {
             center = center.child(editor);
         }

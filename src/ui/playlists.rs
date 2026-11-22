@@ -8,6 +8,130 @@ struct PlaylistDrag {
 }
 
 impl MusicApp {
+    pub(super) fn playlist_menu(
+        &self,
+        playlist: &Playlist,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let app = cx.weak_entity();
+        let id = playlist.id.clone();
+        let namespace = self.account.as_ref().map(Account::namespace);
+        let delete = self.playlist_delete_action(id.clone(), cx);
+        move |menu, _, cx| {
+            let Some(view) = app.upgrade() else {
+                return menu;
+            };
+            let view = view.read(cx);
+            let Some(playlist) = view.playlists.by_id(&id) else {
+                return menu;
+            };
+            let owned = crate::playlists::is_owner(
+                playlist,
+                view.account
+                    .as_ref()
+                    .map(|account| account.username.as_str()),
+            );
+            let (app, id, namespace) = (app.clone(), id.clone(), namespace.clone());
+            context_menu::queue_options(
+                menu.min_w(px(220.)),
+                &view.queue_places(),
+                move |placement, cx| {
+                    let _ = app.update(cx, |app, _| {
+                        if app.account.as_ref().map(Account::namespace) == namespace
+                            && app.playlists.by_id(&id).is_some()
+                        {
+                            app.service
+                                .send(Command::EnqueuePlaylist(id.clone(), placement));
+                        }
+                    });
+                },
+            )
+            .when(owned, |menu| {
+                menu.separator()
+                    .item(PopupMenuItem::new("Delete playlist…").on_click(delete.clone()))
+            })
+        }
+    }
+
+    fn playlist_delete_action(
+        &self,
+        id: String,
+        cx: &Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + Clone + 'static {
+        let app = cx.weak_entity();
+        let namespace = self.account.as_ref().map(Account::namespace);
+        move |_, _, cx| {
+            let _ = app.update(cx, |app, cx| {
+                if app.account.as_ref().map(Account::namespace) == namespace
+                    && app.playlists.request_delete(
+                        &id,
+                        app.account
+                            .as_ref()
+                            .map(|account| account.username.as_str()),
+                    )
+                {
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    pub(super) fn playlist_delete_confirmation(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let playlist = self.playlists.pending_deletion(
+            self.account
+                .as_ref()
+                .map(|account| account.username.as_str()),
+        )?;
+        let prompt = format!("Delete “{}” from Navidrome?", playlist.name);
+        Some(
+            div()
+                .p_2()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .bg(ink(cx).panel)
+                .child(
+                    div()
+                        .id("playlist-delete-prompt")
+                        .min_w_0()
+                        .test_support()
+                        .aria_label(prompt.clone())
+                        .child(prompt),
+                )
+                .child(
+                    Button::new("confirm-delete")
+                        .small()
+                        .danger()
+                        .label("Delete")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            let user = app
+                                .account
+                                .as_ref()
+                                .map(|account| account.username.as_str());
+                            if let Some(mutation) = app.playlists.confirm_delete(user) {
+                                app.mutate(mutation, cx);
+                            } else {
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("cancel-delete")
+                        .small()
+                        .label("Cancel")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.playlists.cancel_delete();
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn playlist_track_row(
         &mut self,
         playlist: &Playlist,
@@ -234,7 +358,7 @@ impl MusicApp {
             let weak = cx.weak_entity();
             let rename = playlist.name.clone();
             let rename_id = playlist.id.clone();
-            let delete_id = playlist.id.clone();
+            let delete = self.playlist_delete_action(playlist.id.clone(), cx);
             let append = self.playlists.clone();
             let editable = self
                 .playlists
@@ -289,10 +413,13 @@ impl MusicApp {
                                 .small()
                                 .icon(Glyph::Play)
                                 .label("Play")
+                                .disabled(play.is_empty())
                                 .on_click(cx.listener(move |app, _, _, _| {
-                                    app.service
-                                        .player
-                                        .send(PlayerCommand::Replace(play.as_ref().clone(), 0))
+                                    if !play.is_empty() {
+                                        app.service
+                                            .player
+                                            .send(PlayerCommand::Replace(play.as_ref().clone(), 0));
+                                    }
                                 })),
                         )
                         .child(
@@ -354,11 +481,9 @@ impl MusicApp {
                                     .dropdown_menu(move |menu, _, _| {
                                         let weak = weak.clone();
                                         let weak2 = weak.clone();
-                                        let weak3 = weak.clone();
                                         let weak_rules = weak.clone();
                                         let name = rename.clone();
                                         let rename_id = rename_id.clone();
-                                        let delete_id = delete_id.clone();
                                         let append = append.clone();
                                         menu.item(PopupMenuItem::new("Rename…").on_click(
                                             move |_, window, cx| {
@@ -415,15 +540,8 @@ impl MusicApp {
                                         })
                                         .separator()
                                         .item(
-                                            PopupMenuItem::new("Delete playlist…").on_click(
-                                                move |_, _, cx| {
-                                                    let _ = weak3.update(cx, |app, cx| {
-                                                        app.pending_delete =
-                                                            Some(delete_id.clone());
-                                                        cx.notify();
-                                                    });
-                                                },
-                                            ),
+                                            PopupMenuItem::new("Delete playlist…")
+                                                .on_click(delete.clone()),
                                         )
                                     }),
                             )
@@ -435,9 +553,13 @@ impl MusicApp {
         let mut items = div().flex().flex_col().p_2().gap_1();
         for playlist in self.playlists.summaries().to_vec() {
             let name = playlist.name.clone();
+            let menu = self.playlist_menu(&playlist, cx);
             items = items.child(
                 div()
                     .id(SharedString::from(format!("playlist-list-{}", playlist.id)))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(name.clone())
                     .h(px(35.))
                     .px_2()
                     .flex()
@@ -461,7 +583,8 @@ impl MusicApp {
                         let id = app.playlists.open(playlist.clone());
                         app.service.send(Command::Playlist(id));
                         cx.notify();
-                    })),
+                    }))
+                    .context_menu(menu),
             );
         }
         div()
