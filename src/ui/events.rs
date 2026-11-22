@@ -307,6 +307,12 @@ impl MusicApp {
                 self.queue_ui.retain_selection(&self.playback.queue_ids);
                 if position_only {
                     self.notify_part(Part::Player, cx);
+                    // Timed lyrics draw in their own part, so redraw it when
+                    // the line moves or the next one needs a wake armed.
+                    if self.lyrics_need_redraw() {
+                        self.notify_part(Part::NowLyrics, cx);
+                        self.notify_part(Part::InfoBody, cx);
+                    }
                     if self.workspace == Workspace::Queue && !self.blank {
                         // The playing queue row shows elapsed time.
                         self.notify_part(Part::Center, cx);
