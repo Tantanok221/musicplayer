@@ -584,3 +584,152 @@ fn a_busy_musicbrainz_is_retried_and_then_explained() {
     worker.shutdown(crate::fixture::WAIT).unwrap();
     fixture.finish();
 }
+
+/// Where a FLAC file's audio starts, after its metadata blocks.
+fn audio_start(bytes: &[u8]) -> usize {
+    assert_eq!(&bytes[..4], b"fLaC");
+    let mut at = 4;
+    loop {
+        let last = bytes[at] & 0x80 != 0;
+        let len = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+        at += 4 + len;
+        if last {
+            return at;
+        }
+    }
+}
+
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+#[test]
+fn a_small_edit_rewrites_only_the_tag_area_in_place() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    enable(&worker, &folder);
+    let original = std::fs::read(folder.file()).unwrap();
+    let file = inode(&folder.file());
+    worker
+        .service()
+        .send(Command::WriteTags(vec![retitle("In place")]));
+    let written = report(&worker);
+    assert_eq!((written.written, written.failures.len()), (1, 0));
+    assert_eq!(folder.title(), vec!["In place"]);
+    // Only the tag area changed: same file, same size, same audio.
+    let edited = std::fs::read(folder.file()).unwrap();
+    assert_eq!(
+        inode(&folder.file()),
+        file,
+        "the file was replaced, not edited"
+    );
+    assert_eq!(edited.len(), original.len());
+    let audio = audio_start(&original);
+    assert_eq!(audio_start(&edited), audio);
+    assert!(edited[audio..] == original[audio..], "the audio changed");
+    assert!(!sonora::tags::staged_path(&folder.file()).exists());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn an_edit_too_big_for_the_tag_area_replaces_the_file_safely() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let mut worker = fixture.start();
+    synced(&worker);
+    enable(&worker, &folder);
+    let original = std::fs::read(folder.file()).unwrap();
+    let file = inode(&folder.file());
+    // Far more than the fixture's 8 KiB of padding.
+    let comment = "long ".repeat(4_000);
+    worker.service().send(Command::WriteTags(vec![TagEdit {
+        tracks: vec!["song".into()],
+        fields: BTreeMap::from([(TagField::Comment, EditValue::Set(comment.clone()))]),
+    }]));
+    let written = report(&worker);
+    assert_eq!((written.written, written.failures.len()), (1, 0));
+    assert_eq!(
+        read(&folder.file()).unwrap()[&TagField::Comment],
+        vec![comment]
+    );
+    assert_ne!(
+        inode(&folder.file()),
+        file,
+        "a grown tag area replaces the file"
+    );
+    let edited = std::fs::read(folder.file()).unwrap();
+    assert!(edited[audio_start(&edited)..] == original[audio_start(&original)..]);
+    assert!(!sonora::tags::staged_path(&folder.file()).exists());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn an_interrupted_in_place_write_is_put_back_at_startup() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    fixture.seed();
+    let original = std::fs::read(folder.file()).unwrap();
+    let audio = audio_start(&original);
+    // Sonora stopped halfway through rewriting the tag area.
+    let mut torn = original.clone();
+    torn[audio - 64..audio].fill(0xAB);
+    std::fs::write(folder.file(), &torn).unwrap();
+    let catalog = fixture.catalog();
+    let track = catalog.by_ids(&["song".into()]).unwrap().remove(0);
+    let id = catalog
+        .journal_tag_edit(1, &track, &folder.file(), &BTreeMap::new())
+        .unwrap();
+    catalog
+        .keep_tag_head(
+            id,
+            &sonora::tags::HeadBackup {
+                length: original.len() as u64,
+                head: original[..audio].to_vec(),
+            },
+        )
+        .unwrap();
+    drop(catalog);
+
+    let mut worker = fixture.start();
+    let Event::Error(message) = event(&worker, |event| matches!(event, Event::Error(_))) else {
+        unreachable!()
+    };
+    assert!(message.contains("stopped while writing tags"), "{message}");
+    assert!(
+        std::fs::read(folder.file()).unwrap() == original,
+        "the tag area must be put back"
+    );
+    assert!(fixture.catalog().tag_head(id).unwrap().is_none());
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn an_edit_confirmed_while_another_is_writing_waits_its_turn() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let (mut worker, gate) = fixture.start_tag_gated();
+    synced(&worker);
+    enable(&worker, &folder);
+    worker
+        .service()
+        .send(Command::WriteTags(vec![retitle("First")]));
+    event(&worker, |event| matches!(event, Event::TagProgress(_)));
+    worker
+        .service()
+        .send(Command::WriteTags(vec![retitle("Second")]));
+    gate.send(()).unwrap();
+    let first = report(&worker);
+    assert_eq!((first.written, first.failures), (1, vec![]));
+    gate.send(()).unwrap();
+    let second = report(&worker);
+    assert_eq!((second.written, second.failures), (1, vec![]));
+    assert_eq!(folder.title(), vec!["Second"]);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}

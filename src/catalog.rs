@@ -270,6 +270,7 @@ impl Catalog {
             CREATE TABLE IF NOT EXISTS artist_profiles (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS listen_submissions (id TEXT PRIMARY KEY, track_id TEXT NOT NULL, started_ms INTEGER NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS tag_edit_heads (edit INTEGER PRIMARY KEY, length INTEGER NOT NULL, head BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS tag_edits (id INTEGER PRIMARY KEY, job INTEGER NOT NULL, track_id TEXT NOT NULL, path TEXT NOT NULL, file TEXT NOT NULL, title TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, starred INTEGER NOT NULL, rating INTEGER, state TEXT NOT NULL, created INTEGER NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS track_search USING fts5(search, content='tracks', content_rowid='rowid', tokenize='trigram');
             CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
@@ -1180,12 +1181,39 @@ impl Catalog {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+    /// Keeps the original start of a file a write is about to change in
+    /// place, so it can be put back if the write is cut off.
+    pub fn keep_tag_head(&self, id: i64, backup: &crate::tags::HeadBackup) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tag_edit_heads(edit,length,head) VALUES(?1,?2,?3)",
+            params![id, backup.length as i64, backup.head],
+        )?;
+        Ok(())
+    }
+    pub fn tag_head(&self, id: i64) -> Result<Option<crate::tags::HeadBackup>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT length,head FROM tag_edit_heads WHERE edit=?1",
+                [id],
+                |row| {
+                    Ok(crate::tags::HeadBackup {
+                        length: row.get::<_, i64>(0)? as u64,
+                        head: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
     pub fn finish_tag_edit(
         &self,
         id: i64,
         after: Option<&crate::tags::TagValues>,
         state: crate::tags::EditState,
     ) -> Result<()> {
+        // A finished edit no longer needs the start of its file.
+        self.conn
+            .execute("DELETE FROM tag_edit_heads WHERE edit=?1", [id])?;
         match after {
             Some(after) => self.conn.execute(
                 "UPDATE tag_edits SET after=?1,state=?2 WHERE id=?3",

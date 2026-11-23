@@ -886,11 +886,12 @@ fn progress(done: usize, current: &str) -> Event {
         done,
         total: 2,
         current: current.into(),
+        undo: false,
     })
 }
 
 #[gpui_kit::test]
-fn the_editor_floats_over_the_library_and_shows_each_file_as_it_is_written(
+fn the_editor_floats_over_the_library_and_gets_out_of_the_way_while_writing(
     cx: &mut TestAppContext,
 ) {
     let (_dir, mut fixture, window, _app) = start(cx);
@@ -918,6 +919,8 @@ fn the_editor_floats_over_the_library_and_shows_each_file_as_it_is_written(
     fixture.settle(window, cx);
     fixture.click(window, "save-tags", cx);
     fixture.click(window, "confirm-tags", cx);
+    // Confirming closes the dialog; the write goes on in a bar below.
+    assert!(!present(window, "tag-editor", cx));
     assert_eq!(
         label(window, "tag-progress", cx).as_deref(),
         Some("Writing 1 of 2 · First")
@@ -928,9 +931,10 @@ fn the_editor_floats_over_the_library_and_shows_each_file_as_it_is_written(
         label(window, "tag-progress", cx).as_deref(),
         Some("Writing 2 of 2 · Second")
     );
-    // Escape does not close the editor while files are being written.
-    fixture.press(window, "escape", cx);
+    // The library stays usable: another album's editor opens meanwhile.
+    open_album_editor(&mut fixture, window, cx);
     assert!(present(window, "tag-editor", cx));
+    fixture.click(window, "cancel-tags", cx);
 
     fixture.backend.emit(Event::TagsWritten(TagReport {
         job: 1,
@@ -938,6 +942,7 @@ fn the_editor_floats_over_the_library_and_shows_each_file_as_it_is_written(
         ..Default::default()
     }));
     fixture.settle(window, cx);
+    assert!(!present(window, "tag-progress", cx));
     assert!(!present(window, "tag-editor", cx));
     assert_eq!(
         label(window, "tag-notice", cx).as_deref(),

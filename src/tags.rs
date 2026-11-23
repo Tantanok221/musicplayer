@@ -575,7 +575,209 @@ pub fn read(path: &Path) -> Result<TagValues> {
 /// Writes the changed fields into a copy beside the file, syncs it and
 /// renames it over the original, so a failure leaves the file untouched.
 /// Returns the values before and after.
+/// The original start of a file a write changes in place: its length and
+/// tag area, to put back if the write is cut off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadBackup {
+    pub length: u64,
+    pub head: Vec<u8>,
+}
+
+/// Writes `fields` into the file, returning its tags before and after.
+///
+/// When the new tags fit in the file's tag area, only that area is rewritten
+/// in place: on a network share that is a few kilobytes instead of the whole
+/// file twice. `keep` gets the original area first, so a write that is cut off
+/// can be put back with `restore_head`. Otherwise the file is replaced by a
+/// finished copy, as `write` does.
+pub fn write_keeping(
+    path: &Path,
+    fields: &BTreeMap<TagField, EditValue>,
+    keep: &mut dyn FnMut(&HeadBackup) -> Result<()>,
+) -> Result<(TagValues, TagValues)> {
+    match write_in_place(path, fields, keep)? {
+        Some(done) => Ok(done),
+        None => write_copy(path, fields),
+    }
+}
+
+/// `write_keeping` without storing the original tag area anywhere.
 pub fn write(
+    path: &Path,
+    fields: &BTreeMap<TagField, EditValue>,
+) -> Result<(TagValues, TagValues)> {
+    write_keeping(path, fields, &mut |_| Ok(()))
+}
+
+/// Puts back the start of a file an in-place write was cut off in. Refuses a
+/// file whose size changed since, as it is no longer the one backed up.
+pub fn restore_head(path: &Path, backup: &HeadBackup) -> Result<()> {
+    use std::io::{Seek, Write};
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let length = file.metadata()?.len();
+    if length != backup.length {
+        bail!(
+            "{} changed size since it was backed up ({length} bytes, was {})",
+            path.display(),
+            backup.length
+        );
+    }
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(&backup.head)?;
+    flush(&file)?;
+    Ok(())
+}
+
+/// Audio read along with a tag area, so the tag library can parse the stream.
+const AUDIO_SAMPLE: u64 = 64 * 1024;
+const FLAC_PADDING: u8 = 1;
+
+/// Rewrites a FLAC file's metadata blocks where they are, when the new ones
+/// fit. Returns `None` when the file has to be replaced instead.
+fn write_in_place(
+    path: &Path,
+    fields: &BTreeMap<TagField, EditValue>,
+    keep: &mut dyn FnMut(&HeadBackup) -> Result<()>,
+) -> Result<Option<(TagValues, TagValues)>> {
+    use std::io::{Read, Seek, Write};
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
+    let length = file.metadata()?.len();
+    let mut magic = [0; 4];
+    if file.read_exact(&mut magic).is_err() || &magic != b"fLaC" {
+        return Ok(None);
+    }
+    // The tag area is at most a few megabytes; read it and a little audio.
+    let mut head = magic.to_vec();
+    let audio = loop {
+        let mut header = [0; 4];
+        file.read_exact(&mut header)?;
+        let size = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        head.extend_from_slice(&header);
+        let start = head.len();
+        head.resize(start + size, 0);
+        file.read_exact(&mut head[start..])?;
+        if header[0] & 0x80 != 0 {
+            break head.len();
+        }
+    };
+    let mut sample = head;
+    let take = AUDIO_SAMPLE.min(length.saturating_sub(audio as u64));
+    (&mut file).take(take).read_to_end(&mut sample)?;
+    drop(file);
+
+    let name = path
+        .file_name()
+        .context("Not a file")?
+        .to_string_lossy()
+        .into_owned();
+    let local_dir = tempfile::Builder::new().prefix("sonora-tags").tempdir()?;
+    let local = local_dir.path().join(&name);
+    std::fs::write(&local, &sample)?;
+    let before = read(&local)?;
+    set_tags(&local, &name, fields)?;
+    let edited = std::fs::read(&local)?;
+    let Some((blocks, edited_audio)) = flac_blocks(&edited) else {
+        return Ok(None);
+    };
+    if edited[edited_audio..] != sample[audio..] {
+        return Ok(None);
+    }
+    let Some(new_head) = pack_flac_head(&edited, &blocks, audio) else {
+        return Ok(None);
+    };
+    // Check the packed area reads back as the edit before touching the file.
+    let mut packed = new_head.clone();
+    packed.extend_from_slice(&sample[audio..]);
+    std::fs::write(&local, &packed)?;
+    let after = read(&local)?;
+    if after != read_edited(&edited, local_dir.path(), &name)? {
+        return Ok(None);
+    }
+    if new_head == sample[..audio] {
+        return Ok(Some((before, after)));
+    }
+    keep(&HeadBackup {
+        length,
+        head: sample[..audio].to_vec(),
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Couldn't open {} for writing", path.display()))?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(&new_head)
+        .with_context(|| format!("Couldn't write tags to {name}"))?;
+    flush(&file).with_context(|| format!("Couldn't save {name} to disk"))?;
+    Ok(Some((before, after)))
+}
+
+/// The tags lofty wrote into `edited`, read from a file of their own.
+fn read_edited(edited: &[u8], dir: &Path, name: &str) -> Result<TagValues> {
+    let check = dir.join(format!("edited.{name}"));
+    std::fs::write(&check, edited)?;
+    read(&check)
+}
+
+/// A FLAC metadata block: its type and where its content is.
+type FlacBlock = (u8, std::ops::Range<usize>);
+
+/// A FLAC file's metadata blocks, as type and content range, and the offset
+/// its audio starts at.
+fn flac_blocks(bytes: &[u8]) -> Option<(Vec<FlacBlock>, usize)> {
+    if bytes.get(..4)? != b"fLaC" {
+        return None;
+    }
+    let mut at = 4;
+    let mut blocks = vec![];
+    loop {
+        let header = bytes.get(at..at + 4)?;
+        let size = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        let content = at + 4..at + 4 + size;
+        if content.end > bytes.len() {
+            return None;
+        }
+        blocks.push((header[0] & 0x7f, content.clone()));
+        at = content.end;
+        if header[0] & 0x80 != 0 {
+            return Some((blocks, at));
+        }
+    }
+}
+
+/// Lays the non-padding `blocks` of `bytes` out in exactly `size` bytes,
+/// filling what is left with one padding block, or `None` if they don't fit.
+fn pack_flac_head(bytes: &[u8], blocks: &[FlacBlock], size: usize) -> Option<Vec<u8>> {
+    let kept: Vec<_> = blocks
+        .iter()
+        .filter(|(kind, _)| *kind != FLAC_PADDING)
+        .collect();
+    let used = 4 + kept
+        .iter()
+        .map(|(_, content)| 4 + content.len())
+        .sum::<usize>();
+    let spare = size.checked_sub(used)?;
+    // A padding block needs its 4-byte header.
+    if spare != 0 && spare < 4 || spare.saturating_sub(4) > 0xFF_FFFF {
+        return None;
+    }
+    let mut head = b"fLaC".to_vec();
+    for (index, (kind, content)) in kept.iter().enumerate() {
+        let last = spare == 0 && index + 1 == kept.len();
+        head.push(kind | if last { 0x80 } else { 0 });
+        head.extend_from_slice(&(content.len() as u32).to_be_bytes()[1..]);
+        head.extend_from_slice(&bytes[content.clone()]);
+    }
+    if spare != 0 {
+        head.push(FLAC_PADDING | 0x80);
+        head.extend_from_slice(&((spare - 4) as u32).to_be_bytes()[1..]);
+        head.resize(size, 0);
+    }
+    Some(head)
+}
+
+/// Replaces the file with an edited copy, renamed over it once complete.
+fn write_copy(
     path: &Path,
     fields: &BTreeMap<TagField, EditValue>,
 ) -> Result<(TagValues, TagValues)> {
@@ -784,17 +986,88 @@ pub struct TagProgress {
     pub done: usize,
     pub total: usize,
     pub current: String,
+    /// Whether the job puts back an earlier edit.
+    pub undo: bool,
 }
 
 impl TagProgress {
     /// "Writing 3 of 16 · Title", counting the file being written.
     pub fn label(&self) -> String {
+        let verb = if self.undo { "Putting back" } else { "Writing" };
         let at = (self.done + 1).min(self.total.max(1));
         if self.current.is_empty() {
-            format!("Writing {at} of {}", self.total)
+            format!("{verb} {at} of {}", self.total)
         } else {
-            format!("Writing {at} of {} · {}", self.total, self.current)
+            format!("{verb} {at} of {} · {}", self.total, self.current)
         }
+    }
+}
+
+/// Tag jobs handed to the service, which runs them one at a time in order:
+/// the edits (with whatever the view needs to reopen them if they fail), how
+/// many undos are queued, and how far the running job has got.
+#[derive(Debug)]
+pub struct TagJobs<T> {
+    writes: std::collections::VecDeque<T>,
+    undos: usize,
+    progress: Option<TagProgress>,
+}
+
+impl<T> Default for TagJobs<T> {
+    fn default() -> Self {
+        Self {
+            writes: Default::default(),
+            undos: 0,
+            progress: None,
+        }
+    }
+}
+
+impl<T> TagJobs<T> {
+    pub fn write(&mut self, edit: T) {
+        self.writes.push_back(edit);
+    }
+
+    pub fn undo(&mut self) {
+        self.undos += 1;
+    }
+
+    pub fn progress(&mut self, progress: TagProgress) {
+        if self.busy() {
+            self.progress = Some(progress);
+        }
+    }
+
+    /// Takes the job `report` is for; a write's edit comes back.
+    pub fn finished(&mut self, report: &TagReport) -> Option<T> {
+        self.progress = None;
+        if report.undo {
+            self.undos = self.undos.saturating_sub(1);
+            None
+        } else {
+            self.writes.pop_front()
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        !self.writes.is_empty() || self.undos > 0
+    }
+
+    /// What the progress bar says while any job is queued or running.
+    pub fn status(&self) -> Option<String> {
+        if !self.busy() {
+            return None;
+        }
+        let waiting = self.writes.len() + self.undos;
+        let mut text = match &self.progress {
+            Some(progress) => progress.label(),
+            None if self.writes.is_empty() => "Putting back tags…".to_string(),
+            None => "Writing tags…".to_string(),
+        };
+        if waiting > 1 {
+            text.push_str(&format!(" · {} more waiting", waiting - 1));
+        }
+        Some(text)
     }
 }
 
@@ -813,11 +1086,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_flac_tags_are_packed_into_the_old_area_or_refused() {
+        // fLaC, a 2-byte block, a 3-byte padding block (last).
+        let file = [
+            b'f', b'L', b'a', b'C', 4, 0, 0, 2, b'a', b'b', 0x81, 0, 0, 3, 0, 0, 0,
+        ];
+        let (blocks, audio) = flac_blocks(&file).unwrap();
+        assert_eq!(audio, file.len());
+        assert_eq!(blocks, vec![(4, 8..10), (1, 14..17)]);
+        // Same area: the padding is laid out again.
+        assert_eq!(pack_flac_head(&file, &blocks, 17).unwrap(), file);
+        // Exactly full: the tag block becomes the last one.
+        assert_eq!(
+            pack_flac_head(&file, &blocks, 10).unwrap(),
+            [b'f', b'L', b'a', b'C', 0x84, 0, 0, 2, b'a', b'b']
+        );
+        // Too small, or a gap a padding header can't fill.
+        assert!(pack_flac_head(&file, &blocks, 9).is_none());
+        assert!(pack_flac_head(&file, &blocks, 12).is_none());
+        assert!(flac_blocks(b"ID3...").is_none());
+    }
+
+    #[test]
+    fn a_cut_off_in_place_write_is_put_back_unless_the_file_changed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("01 Song.flac");
+        std::fs::write(&file, b"fLaC-torn-audio").unwrap();
+        let backup = HeadBackup {
+            length: 15,
+            head: b"fLaC-good".to_vec(),
+        };
+        restore_head(&file, &backup).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"fLaC-good-audio");
+        std::fs::write(&file, b"replaced since").unwrap();
+        assert!(restore_head(&file, &backup).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"replaced since");
+    }
+
+    #[test]
+    fn queued_jobs_report_in_order_and_give_back_failed_edits() {
+        let mut jobs = TagJobs::default();
+        assert_eq!(jobs.status(), None);
+        jobs.write("album");
+        jobs.write("song");
+        assert_eq!(
+            jobs.status().as_deref(),
+            Some("Writing tags… · 1 more waiting")
+        );
+        jobs.progress(TagProgress {
+            done: 2,
+            total: 16,
+            current: "花鳥風月".into(),
+            undo: false,
+        });
+        assert_eq!(
+            jobs.status().as_deref(),
+            Some("Writing 3 of 16 · 花鳥風月 · 1 more waiting")
+        );
+        let written = TagReport::default();
+        assert_eq!(jobs.finished(&written), Some("album"));
+        assert_eq!(jobs.status().as_deref(), Some("Writing tags…"));
+        jobs.undo();
+        assert_eq!(jobs.finished(&written), Some("song"));
+        assert_eq!(jobs.status().as_deref(), Some("Putting back tags…"));
+        jobs.progress(TagProgress {
+            done: 0,
+            total: 1,
+            current: "Song".into(),
+            undo: true,
+        });
+        assert_eq!(jobs.status().as_deref(), Some("Putting back 1 of 1 · Song"));
+        let undone = TagReport {
+            undo: true,
+            ..Default::default()
+        };
+        assert_eq!(jobs.finished(&undone), None);
+        assert!(!jobs.busy());
+        // Progress for nothing the view queued is ignored.
+        jobs.progress(TagProgress::default());
+        assert_eq!(jobs.status(), None);
+    }
+
+    #[test]
     fn progress_counts_the_file_being_written() {
         let progress = |done, current: &str| TagProgress {
             done,
             total: 16,
             current: current.into(),
+            undo: false,
         };
         assert_eq!(
             progress(0, "ベテルギウス").label(),

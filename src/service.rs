@@ -355,6 +355,7 @@ fn write_tags(
             done,
             total,
             current: track.title.clone(),
+            undo: false,
         });
         let file = match unconfirmed
             .iter()
@@ -381,7 +382,8 @@ fn write_tags(
             }
         };
         let id = catalog.journal_tag_edit(report.job, &track, &file, &before)?;
-        match tags::write(&file, fields) {
+        let mut keep = |backup: &tags::HeadBackup| catalog.keep_tag_head(id, backup);
+        match tags::write_keeping(&file, fields, &mut keep) {
             Ok((_, after)) => {
                 catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
                 report.written += 1;
@@ -425,6 +427,7 @@ fn undo_tags(
             done,
             total,
             current: entry.title.clone(),
+            undo: true,
         });
         let changed: tags::TagValues = entry
             .after
@@ -454,7 +457,8 @@ fn undo_tags(
             }
         };
         let id = catalog.journal_tag_edit(report.job, &track, &file, &current)?;
-        match tags::write(&file, &tags::restore(&entry.before, &changed)) {
+        let mut keep = |backup: &tags::HeadBackup| catalog.keep_tag_head(id, backup);
+        match tags::write_keeping(&file, &tags::restore(&entry.before, &changed), &mut keep) {
             Ok((_, after)) => {
                 catalog.finish_tag_edit(id, Some(&after), EditState::Written)?;
                 catalog.finish_tag_edit(entry.id, None, EditState::Undone)?;
@@ -1170,11 +1174,17 @@ fn run(
     let interrupted = catalog.interrupted_tag_edits()?;
     if !interrupted.is_empty() {
         for entry in &interrupted {
-            crate::tags::discard_staged(std::path::Path::new(&entry.file));
+            let file = std::path::Path::new(&entry.file);
+            // An in-place write puts back the tag area it kept; a replacing
+            // write only ever renames a finished copy, so its leftover goes.
+            if let Some(backup) = catalog.tag_head(entry.id)? {
+                let _ = crate::tags::restore_head(file, &backup);
+            }
+            crate::tags::discard_staged(file);
             catalog.finish_tag_edit(entry.id, None, crate::tags::EditState::Failed)?;
         }
         events.send(Event::Error(format!(
-            "Sonora stopped while writing tags to {} file(s), starting with {}. Files are only replaced once fully written, so they kept their old tags or have the new ones. Check them before editing again.",
+            "Sonora stopped while writing tags to {} file(s), starting with {}. Their old tags were put back where Sonora could; check them before editing again.",
             interrupted.len(),
             interrupted[0].file
         )))?;
@@ -1219,8 +1229,9 @@ fn run(
     let mut native_editor = native::Editor::default();
     let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
-    // One tag job at a time, on its own thread.
+    // One tag job at a time, on its own thread; later ones wait their turn.
     let mut tag_job_running = false;
+    let mut tag_jobs: std::collections::VecDeque<TagJob> = Default::default();
     let mut generation = 0i64;
     let mut current_query = LibraryQuery::default();
     let mut current_request = 0;
@@ -1308,6 +1319,11 @@ fn run(
                     });
                 }
             }
+        }
+        if !tag_job_running && let Some(job) = tag_jobs.pop_front() {
+            tag_job_running = true;
+            let path = catalog_path(&paths, account.as_ref());
+            start_tag_job(job, path, &hooks, &tx, &events)?;
         }
         // Completed requests wake this actor; only artwork backoff needs a timer.
         let retry = server
@@ -2462,29 +2478,11 @@ fn run(
                             let edits = crate::tags::with_covers(edits, &fetched);
                             let _ = tx.send(Command::WriteTags(edits));
                         });
-                    } else if tag_job_running {
-                        events.send(Event::TagsWritten(failed_tag_job(
-                            false,
-                            "Sonora is still writing the previous tag edit.".into(),
-                        )))?;
                     } else {
-                        tag_job_running = true;
-                        let path = catalog_path(&paths, account.as_ref());
-                        start_tag_job(TagJob::Write(edits), path, &hooks, &tx, &events)?;
+                        tag_jobs.push_back(TagJob::Write(edits));
                     }
                 }
-                Command::UndoTags => {
-                    if tag_job_running {
-                        events.send(Event::TagsWritten(failed_tag_job(
-                            true,
-                            "Sonora is still writing the previous tag edit.".into(),
-                        )))?;
-                    } else {
-                        tag_job_running = true;
-                        let path = catalog_path(&paths, account.as_ref());
-                        start_tag_job(TagJob::Undo, path, &hooks, &tx, &events)?;
-                    }
-                }
+                Command::UndoTags => tag_jobs.push_back(TagJob::Undo),
                 Command::TagJobDone(report) => {
                     tag_job_running = false;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;

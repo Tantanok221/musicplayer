@@ -499,6 +499,8 @@ pub struct MusicApp {
     /// Album whose songs the tag editor opens on when they arrive.
     tag_editor_album: Option<String>,
     tag_notice: Option<crate::tags::TagReport>,
+    /// Tag edits handed to the service, oldest first, and the running one's progress.
+    tag_jobs: crate::tags::TagJobs<tag_editor::TagEditor>,
     metadata_folder: Entity<InputState>,
     acoustid_key: Entity<InputState>,
     status: String,
@@ -788,6 +790,7 @@ impl MusicApp {
             tag_editor: None,
             tag_editor_album: None,
             tag_notice: None,
+            tag_jobs: Default::default(),
             metadata_folder,
             acoustid_key,
             status: "Opening library…".into(),

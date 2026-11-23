@@ -22,9 +22,6 @@ pub(super) struct TagEditor {
     candidates: Vec<ReleaseCandidate>,
     link: Entity<InputState>,
     pattern: Entity<InputState>,
-    saving: bool,
-    /// The file being written, while `saving`.
-    progress: Option<TagProgress>,
     failures: Vec<(String, String)>,
     /// Holds the dialog's keyboard focus, so Escape reaches it.
     focus: FocusHandle,
@@ -157,8 +154,6 @@ impl MusicApp {
                 cx,
             ),
             pattern: text_input("%track% - %title%".into(), "%track% - %title%", window, cx),
-            saving: false,
-            progress: None,
             failures: vec![],
             focus: cx.focus_handle(),
             previous_focus: window.focused(cx),
@@ -178,13 +173,13 @@ impl MusicApp {
     }
 
     /// Shows what would change; a retry after failures writes straight away.
-    fn save_tags(&mut self, cx: &mut Context<Self>) {
+    fn save_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.tag_editor.as_mut() else {
             return;
         };
         let entries = editor.entries(cx);
         if !editor.failures.is_empty() {
-            self.write_tags(cx);
+            self.write_tags(window, cx);
             return;
         }
         let changes = editor.form.changes(&entries);
@@ -196,17 +191,23 @@ impl MusicApp {
         cx.notify();
     }
 
-    fn write_tags(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.tag_editor.as_mut() else {
+    /// Hands the edit to the service and closes the dialog: the write goes on
+    /// in the progress bar while the library stays usable. A failed write
+    /// reopens its editor.
+    fn write_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut editor) = self.tag_editor.take() else {
             return;
         };
         let edits = editor.form.edits(&editor.entries(cx));
         editor.review = None;
-        if edits.is_empty() {
-            self.tag_editor = None;
-        } else {
-            editor.saving = true;
-            editor.failures.clear();
+        editor.failures.clear();
+        editor
+            .previous_focus
+            .clone()
+            .unwrap_or_else(|| self.focus.clone())
+            .focus(window, cx);
+        if !edits.is_empty() {
+            self.tag_jobs.write(editor);
             self.service.send(Command::WriteTags(edits));
         }
         cx.notify();
@@ -450,19 +451,30 @@ impl MusicApp {
         cx.notify();
     }
 
-    pub(super) fn tags_written(&mut self, report: TagReport) {
-        if let Some(editor) = self.tag_editor.as_mut().filter(|_| !report.undo) {
-            editor.saving = false;
-            editor.progress = None;
-            if report.failures.is_empty() {
-                self.tag_editor = None;
-            } else {
+    pub(super) fn tags_written(
+        &mut self,
+        report: TagReport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.tag_jobs.finished(&report) {
+            // Reopen a failed edit for a retry, unless another is open.
+            Some(mut editor) if !report.failures.is_empty() && self.tag_editor.is_none() => {
                 editor.failures = report.failures.clone();
+                editor.previous_focus = window.focused(cx);
+                self.tag_editor = Some(editor);
+                cx.defer_in(window, |app, window, cx| {
+                    if let Some(editor) = &app.tag_editor {
+                        editor.focus.clone().focus(window, cx);
+                    }
+                });
             }
-        } else if report.written == 0
-            && let Some((_, reason)) = report.failures.first()
-        {
-            self.error = Some(reason.clone());
+            _ if report.written == 0 => {
+                if let Some((_, reason)) = report.failures.first() {
+                    self.error = Some(reason.clone());
+                }
+            }
+            _ => {}
         }
         if report.written > 0 {
             self.tag_notice = Some(report);
@@ -895,7 +907,7 @@ impl MusicApp {
                             .small()
                             .primary()
                             .label(files)
-                            .on_click(cx.listener(|app, _, _, cx| app.write_tags(cx))),
+                            .on_click(cx.listener(|app, _, window, cx| app.write_tags(window, cx))),
                     )
                     .child(
                         Button::new("back-tags")
@@ -912,11 +924,8 @@ impl MusicApp {
             .into_any_element()
     }
 
-    /// Closes the editor unless files are being written, and gives focus back.
+    /// Closes the editor and gives focus back.
     fn close_tag_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tag_editor.as_ref().is_some_and(|editor| editor.saving) {
-            return;
-        }
         if let Some(editor) = self.tag_editor.take() {
             editor
                 .previous_focus
@@ -927,9 +936,7 @@ impl MusicApp {
     }
 
     pub(super) fn tag_progress(&mut self, progress: TagProgress) {
-        if let Some(editor) = self.tag_editor.as_mut().filter(|editor| editor.saving) {
-            editor.progress = Some(progress);
-        }
+        self.tag_jobs.progress(progress);
     }
 
     /// The editor as a dialog over the window, so the library keeps its place.
@@ -948,7 +955,6 @@ impl MusicApp {
             editor.lookup,
             Lookup::Searching(_) | Lookup::Loading(_) | Lookup::Identifying(_)
         );
-        let saving = editor.saving;
         let spans = ReleaseQuery::spans_albums(&editor.form.tracks);
         let identifies = editor.review.is_none()
             && editor.form.tracks.len() == 1
@@ -976,7 +982,7 @@ impl MusicApp {
                     Button::new("identify-sound")
                         .small()
                         .label("Identify by Sound")
-                        .disabled(searching || saving)
+                        .disabled(searching)
                         .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
                 )
             })
@@ -990,7 +996,6 @@ impl MusicApp {
                             "Find on MusicBrainz"
                         })
                         .loading(searching)
-                        .disabled(saving)
                         .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
                 )
             });
@@ -1021,7 +1026,7 @@ impl MusicApp {
                         Button::new("open-musicbrainz-link")
                             .small()
                             .label("Load Link")
-                            .disabled(searching || saving)
+                            .disabled(searching)
                             .on_click(cx.listener(|app, _, _, cx| app.open_link(cx))),
                     ),
             );
@@ -1042,7 +1047,6 @@ impl MusicApp {
                         Button::new("fill-from-names")
                             .small()
                             .label("Fill from File Names")
-                            .disabled(saving)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.fill_from_names(window, cx)),
                             ),
@@ -1100,12 +1104,6 @@ impl MusicApp {
                     .child(summary),
             );
         }
-        let status = saving.then(|| {
-            editor
-                .progress
-                .as_ref()
-                .map_or_else(|| "Writing…".to_string(), TagProgress::label)
-        });
         let retry = !editor.failures.is_empty();
         let footer = div()
             .flex_shrink_0()
@@ -1116,24 +1114,7 @@ impl MusicApp {
             .py_3()
             .border_t_1()
             .border_color(colors.line)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(colors.muted)
-                    .when_some(status, |row, status| {
-                        row.child(
-                            div()
-                                .id("tag-progress")
-                                .test_support()
-                                .role(Role::Status)
-                                .aria_label(status.clone())
-                                .child(status),
-                        )
-                    }),
-            )
+            .child(div().flex_1())
             .when(editor.review.is_none(), |footer| {
                 footer
                     .child(
@@ -1141,7 +1122,6 @@ impl MusicApp {
                             .small()
                             .ghost()
                             .label("Cancel")
-                            .disabled(saving)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.close_tag_editor(window, cx)),
                             ),
@@ -1150,9 +1130,8 @@ impl MusicApp {
                         Button::new("save-tags")
                             .small()
                             .primary()
-                            .loading(saving)
                             .label(if retry { "Retry" } else { "Review Changes" })
-                            .on_click(cx.listener(|app, _, _, cx| app.save_tags(cx))),
+                            .on_click(cx.listener(|app, _, window, cx| app.save_tags(window, cx))),
                     )
             });
         let card = div()
@@ -1195,6 +1174,27 @@ impl MusicApp {
     }
 
     pub(super) fn tag_notice_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // While edits are written the strip shows how far they have got.
+        if let Some(status) = self.tag_jobs.status() {
+            return Some(
+                div()
+                    .id("tag-progress")
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label(status.clone())
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .bg(cx.theme().secondary)
+                    .child(div().flex_1().min_w_0().truncate().child(status))
+                    .into_any_element(),
+            );
+        }
         let report = self.tag_notice.as_ref()?;
         let files = if report.written == 1 { "file" } else { "files" };
         let mut text = if report.undo {
@@ -1227,6 +1227,7 @@ impl MusicApp {
                         .label("Undo")
                         .on_click(cx.listener(|app, _, _, cx| {
                             app.tag_notice = None;
+                            app.tag_jobs.undo();
                             app.service.send(Command::UndoTags);
                             cx.notify();
                         })),
