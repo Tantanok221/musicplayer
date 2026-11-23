@@ -474,24 +474,80 @@ fn one_song_searches_musicbrainz_by_its_recording(cx: &mut TestAppContext) {
     fixture.assert_script_finished();
 }
 
+fn from_album(id: &str, title: &str, album_id: &str, album: &str) -> Arc<Track> {
+    let mut track = (*song(id, title)).clone();
+    track.album_id = album_id.into();
+    track.album = album.into();
+    Arc::new(track)
+}
+
 #[gpui_kit::test]
-fn songs_from_several_albums_offer_no_musicbrainz_search(cx: &mut TestAppContext) {
+fn songs_from_several_albums_are_looked_up_one_album_at_a_time(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, _app) = start(cx);
-    songs_view(&mut fixture, window, cx);
-    fixture.click(window, "row-flat-track-1", cx);
-    cx.update_window(window, |_, window, cx| {
-        window.click_with_modifiers("row-flat-track-2", Modifiers::command(), cx)
-    })
-    .unwrap();
+    let other = from_album("three", "Third", "album-2", "Other album");
+    open_editor_on(
+        &mut fixture,
+        window,
+        vec![song("one", "First"), song("two", "Second"), other.clone()],
+        cx,
+    );
+    assert_eq!(
+        label(window, "find-musicbrainz", cx).as_deref(),
+        Some("Find Each Album")
+    );
+    assert!(!present(window, "musicbrainz-link", cx));
+    fixture.expect("search the first album alone", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a release search");
+        };
+        assert_eq!(query.album, "Fixture album");
+        assert_eq!(query.tracks, 2);
+        vec![Event::ReleaseCandidates(query, Ok(vec![candidate()]))]
+    });
+    fixture.click(window, "find-musicbrainz", cx);
+    assert_eq!(
+        label(window, "lookup-album", cx).as_deref(),
+        Some("Album 1 of 2: Fixture album")
+    );
+    fixture.expect("load the first album's edition", |_, _| {
+        vec![Event::ReleaseLoaded("rel".into(), Ok(Arc::new(release())))]
+    });
+    fixture.click(window, ("release-candidate", 0_usize), cx);
+    assert!(label(window, ("track-match", 1_usize), cx).is_some());
+    assert!(label(window, ("track-match", 2_usize), cx).is_none());
+    fixture.expect("then search the next album", |command, _| {
+        let Command::FindReleases(query) = command else {
+            panic!("expected a search for the next album");
+        };
+        assert_eq!(query.album, "Other album");
+        vec![]
+    });
+    fixture.click(window, "fill-tags", cx);
+    assert_eq!(
+        label(window, "lookup-album", cx).as_deref(),
+        Some("Album 2 of 2: Other album")
+    );
+    fixture.click(window, "skip-album", cx);
+    assert!(!present(window, "lookup-album", cx));
+    fixture.backend.emit(Event::ReleaseCandidates(
+        ReleaseQuery::for_tracks(&[(*other).clone()]),
+        Ok(vec![candidate()]),
+    ));
     fixture.settle(window, cx);
-    cx.update_window(window, |_, window, cx| {
-        window.right_click("row-flat-track-2", cx)
-    })
-    .unwrap();
-    fixture.settle(window, cx);
-    fixture.menu_item(window, "Edit Tags of 2 Songs…", cx);
-    assert!(present(window, "tag-editor", cx));
-    assert!(!present(window, "find-musicbrainz", cx));
+    assert!(!present(window, "release-candidate", cx));
+    fixture.click(window, "save-tags", cx);
+    let changes = changes(window, cx);
+    assert!(
+        changes
+            .iter()
+            .any(|change| change == "First · Title: First → First Song"),
+        "{changes:?}"
+    );
+    assert!(
+        !changes.iter().any(|change| change.starts_with("Third")),
+        "{changes:?}"
+    );
+    fixture.assert_script_finished();
 }
 
 fn paste_link(fixture: &mut Fixture, window: AnyWindowHandle, link: &str, cx: &mut TestAppContext) {
