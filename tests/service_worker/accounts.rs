@@ -357,7 +357,7 @@ fn account_switch_saves_each_queue_and_preferences_and_refuses_during_sync() {
         .send(Command::Connect(b.account.clone(), "".into()));
     event(
         &worker,
-        |e| matches!(e, Event::Error(s) if s.contains("Wait for the current refresh")),
+        |e| matches!(e, Event::SignInFailed(s) if s.contains("Wait for the current refresh")),
     );
     assert_eq!(
         a.paths.account().unwrap().unwrap().namespace(),

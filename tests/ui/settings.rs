@@ -317,22 +317,31 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
     fill(window, "Server address", "https://fixture.invalid/", cx);
     fill(window, "Username", "音楽 listener", cx);
     fill(window, "Password", "synthetic-nav-password", cx);
-    for attempt in 0..2 {
-        f.expect("sign-in intent without logging credentials", |command, _| {
-            assert!(matches!(command, Command::Connect(account, password) if account.url == "https://fixture.invalid/" && account.username == "音楽 listener" && password == "synthetic-nav-password"));
+    for attempt in 0..3 {
+        let (button, password) = match attempt {
+            0 => ("connect-library", "synthetic-nav-password"),
+            1 => ("retry-error", "synthetic-nav-password"),
+            _ => {
+                fill(window, "Password", "synthetic-replacement", cx);
+                ("retry-error", "synthetic-replacement")
+            }
+        };
+        f.expect("sign-in intent without logging credentials", move |command, _| {
+            assert!(matches!(command, Command::Connect(account, submitted) if account.url == "https://fixture.invalid/" && account.username == "音楽 listener" && submitted == password), "Connect and sign-in Retry must send the current form values");
             vec![]
         });
-        f.click(window, "connect-library", cx);
+        f.click(window, button, cx);
         cx.update_window(window, |_, window, _| {
-            assert_eq!(window.find("connect-library").disabled(), Some(true))
+            assert_eq!(window.find("connect-library").disabled(), Some(true));
+            assert!(window.try_find("error-banner").is_none());
         })
         .unwrap();
         // A disabled button must reject repeated actual pointer input.
         f.click(window, "connect-library", cx);
         f.assert_script_finished();
-        if attempt == 0 {
+        if attempt < 2 {
             f.backend
-                .emit(Event::Error("Fixture sign-in rejected".into()));
+                .emit(Event::SignInFailed("Fixture sign-in rejected".into()));
             f.settle(window, cx);
             cx.update_window(window, |_, window, _| {
                 assert!(window.find("error-banner").visible());
@@ -376,6 +385,16 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
         assert_eq!(window.find("Password").value().unwrap_or_default(), "");
     })
     .unwrap();
+
+    f.backend
+        .emit(Event::Error("Fixture refresh failed".into()));
+    f.settle(window, cx);
+    f.expect("ordinary errors still refresh", |command, _| {
+        assert!(matches!(command, Command::Refresh));
+        vec![]
+    });
+    f.click(window, "retry-error", cx);
+    f.assert_script_finished();
 }
 
 #[gpui_kit::test]

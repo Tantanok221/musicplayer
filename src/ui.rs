@@ -52,6 +52,7 @@ mod player_bar;
 mod playlist_creation;
 mod playlists;
 mod settings;
+mod sign_in;
 mod smart_playlists;
 mod tracks;
 mod window;
@@ -401,6 +402,7 @@ pub struct MusicApp {
     preferences: Preferences,
     volume_before_mute: Option<f32>,
     account: Option<Account>,
+    sign_in: sign_in::SignIn,
     settings: bool,
     settings_save: crate::settings_save::SaveFeedback,
     /// The settings page to reopen when the settings view is rebuilt, as it
@@ -499,6 +501,8 @@ pub struct MusicApp {
     tag_editor: Option<tag_editor::TagEditor>,
     /// Album whose songs the tag editor opens on when they arrive.
     tag_editor_album: Option<String>,
+    album_deletion: Option<context_menu::AlbumDeletion>,
+    album_deletion_focus: FocusHandle,
     tag_notice: Option<crate::tags::TagReport>,
     /// Tag edits handed to the service, oldest first, and the running one's progress.
     tag_jobs: crate::tags::TagJobs<tag_editor::TagEditor>,
@@ -717,6 +721,7 @@ impl MusicApp {
             preferences: Preferences::default(),
             volume_before_mute: None,
             account: None,
+            sign_in: Default::default(),
             settings: false,
             settings_save: Default::default(),
             settings_page: 0,
@@ -793,6 +798,8 @@ impl MusicApp {
             playlist_creation_focus: cx.focus_handle(),
             tag_editor: None,
             tag_editor_album: None,
+            album_deletion: None,
+            album_deletion_focus: cx.focus_handle(),
             tag_notice: None,
             tag_jobs: Default::default(),
             metadata_folder,
@@ -986,6 +993,7 @@ impl Render for MusicApp {
         };
         let playlist_creation = self.playlist_creation_view(cx);
         let tag_editor = self.tag_editor_dialog(cx);
+        let album_deletion = self.album_delete_dialog(cx);
         let tabs = self.part(
             Part::Tabs,
             style()
@@ -1131,5 +1139,6 @@ impl Render for MusicApp {
             .child(player)
             .children(playlist_creation)
             .children(tag_editor)
+            .children(album_deletion)
     }
 }

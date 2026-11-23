@@ -168,6 +168,9 @@ pub enum Command {
     Mutate(Mutation),
     /// Writes the edit into the files under the mapped music folder.
     WriteTags(Vec<crate::tags::TagEdit>),
+    DeleteAlbum(String),
+    AlbumDeletionLoaded(u64, String, String, Result<Vec<Track>, String>),
+    AlbumDeletionRescanned(u64),
     /// Puts back the tags the last edit changed.
     UndoTags,
     /// A tag job's thread finished with this report.
@@ -184,7 +187,12 @@ pub enum Command {
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
-    Connected(Server, String, Option<flume::Receiver<()>>),
+    Connected {
+        server: Server,
+        label: String,
+        session: Option<flume::Receiver<()>>,
+        manual: bool,
+    },
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
@@ -251,6 +259,7 @@ pub enum Event {
     NativePasswordRequired,
     Ready(Option<Account>, Preferences),
     SignInRequired(String),
+    SignInFailed(String),
     Connected(Account, String),
     View(u64, LibraryView),
     Page(u64, u64, usize, Vec<Arc<Track>>),
@@ -534,6 +543,48 @@ fn failed_tag_job(undo: bool, reason: String) -> crate::tags::TagReport {
     }
 }
 
+fn album_files(root: &std::path::Path, tracks: &[Track]) -> Result<Vec<PathBuf>> {
+    let mut files = HashSet::new();
+    for track in tracks {
+        if track.size.is_none() {
+            anyhow::bail!("Navidrome didn't report a file size for {}.", track.title);
+        }
+        let path = crate::tags::resolve(root, track).map_err(anyhow::Error::msg)?;
+        if path.canonicalize()? != path {
+            anyhow::bail!("Cannot delete {} through a symbolic link.", track.title);
+        }
+        if !files.insert(path) {
+            anyhow::bail!("Multiple songs resolve to the same file. No files were deleted.");
+        }
+    }
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_unstable();
+    Ok(files)
+}
+
+fn delete_album_files(root: &std::path::Path, files: &[PathBuf]) -> (usize, Vec<String>) {
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    let mut parents = HashSet::new();
+    for file in files {
+        match std::fs::remove_file(file) {
+            Ok(()) => {
+                removed += 1;
+                if let Some(parent) = file.parent().filter(|parent| *parent != root) {
+                    parents.insert(parent);
+                }
+            }
+            Err(error) => errors.push(format!("Couldn't delete {}: {error}", file.display())),
+        }
+    }
+    let mut parents = parents.into_iter().collect::<Vec<_>>();
+    parents.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for parent in parents {
+        let _ = std::fs::remove_dir(parent);
+    }
+    (removed, errors)
+}
+
 /// Reports a tag job and asks Navidrome to rescan. Only administrators can
 /// start a scan; for others Navidrome's file watcher picks the change up.
 fn finish_tag_job(
@@ -553,15 +604,34 @@ fn finish_tag_job(
         ))?;
         return Ok(());
     };
+    rescan_after_file_change(
+        server,
+        "Tags saved",
+        "Navidrome shows them after its next scan",
+        runtime,
+        tx,
+        events,
+        Command::Refresh,
+    );
+    Ok(())
+}
+
+fn rescan_after_file_change(
+    server: Server,
+    status: &'static str,
+    waiting: &'static str,
+    runtime: &tokio::runtime::Handle,
+    tx: &Sender<Command>,
+    events: &Sender<Event>,
+    refresh: Command,
+) {
     let (tx, events) = (tx.clone(), events.clone());
     runtime.spawn(async move {
         if server.start_scan().await.is_err() {
-            let _ = events.send(Event::Status(
-                "Tags saved · Navidrome shows them after its next scan".into(),
-            ));
+            let _ = events.send(Event::Status(format!("{status} · {waiting}")));
             return;
         }
-        let _ = events.send(Event::Status("Tags saved · Navidrome is rescanning".into()));
+        let _ = events.send(Event::Status(format!("{status} · Navidrome is rescanning")));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         for _ in 0..600 {
             if matches!(server.scan_status().await, Ok(false)) {
@@ -569,9 +639,8 @@ fn finish_tag_job(
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let _ = tx.send(Command::Refresh);
+        let _ = tx.send(refresh);
     });
-    Ok(())
 }
 
 /// After a complete sync, finds each written file by path and, when the
@@ -1030,7 +1099,12 @@ fn reconnect(
         }
         .await;
         let _ = tx.send(match result {
-            Ok((server, label)) => Command::Connected(server, label, None),
+            Ok((server, label)) => Command::Connected {
+                server,
+                label,
+                session: None,
+                manual: false,
+            },
             Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
         });
     });
@@ -1363,6 +1437,7 @@ fn run(
             let _ = ack.send(());
             break;
         }
+        let manual_sign_in = matches!(&command, Command::Connected { manual: true, .. });
         let result: Result<()> = (|| {
             match command {
                 Command::CancelSmartPlaylist => native_editor.reset(),
@@ -1456,6 +1531,7 @@ fn run(
                 }
                 Command::Connect(account, password) => {
                     let command_tx = tx.clone();
+                    let events = events.clone();
                     let paths = paths.clone();
                     runtime.spawn(async move {
                         let result = async {
@@ -1470,16 +1546,27 @@ fn run(
                         match result {
                             Ok((server, label)) => {
                                 let session = native::sign_in_session(&server, &paths, password);
-                                let _ = command_tx.send(Command::Connected(server, label, session));
+                                let _ = command_tx.send(Command::Connected {
+                                    server,
+                                    label,
+                                    session,
+                                    manual: true,
+                                });
                             }
                             Err(error) => {
-                                let _ = command_tx
-                                    .send(Command::Error(format!("Could not connect: {error:#}")));
+                                let _ = events.send(Event::SignInFailed(format!(
+                                    "Could not connect: {error:#}"
+                                )));
                             }
                         }
                     });
                 }
-                Command::Connected(value, label, session) => {
+                Command::Connected {
+                    server: value,
+                    label,
+                    session,
+                    ..
+                } => {
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
@@ -2471,6 +2558,91 @@ fn run(
                     }
                 }
                 Command::UndoTags => tag_jobs.push_back(TagJob::Undo),
+                Command::DeleteAlbum(id) => {
+                    let prefs: Preferences = catalog.state("preferences")?;
+                    if !prefs.metadata.tag_writes_enabled() {
+                        anyhow::bail!("Turn on Write tags to files in Settings → Metadata first.");
+                    }
+                    let Some(server) = server.clone() else {
+                        anyhow::bail!("Connect to Navidrome before deleting an album.");
+                    };
+                    let (tx, epoch, folder) =
+                        (tx.clone(), account_epoch, prefs.metadata.library_folder);
+                    runtime.spawn(async move {
+                        let result = server
+                            .album(&id)
+                            .await
+                            .map_err(|_| "Couldn't load the album from Navidrome.".into())
+                            .and_then(|(album, tracks)| {
+                                if album.id == id
+                                    && !tracks.is_empty()
+                                    && album.song_count as usize == tracks.len()
+                                    && tracks.iter().all(|track| track.album_id == id)
+                                {
+                                    Ok(tracks)
+                                } else {
+                                    Err("Navidrome didn't return the complete album. No files were deleted.".into())
+                                }
+                            });
+                        let _ = tx.send(Command::AlbumDeletionLoaded(epoch, id, folder, result));
+                    });
+                }
+                Command::AlbumDeletionLoaded(epoch, id, folder, result) => {
+                    if epoch != account_epoch {
+                        return Ok(());
+                    }
+                    let prefs: Preferences = catalog.state("preferences")?;
+                    if !prefs.metadata.tag_writes_enabled()
+                        || prefs.metadata.library_folder != folder
+                    {
+                        anyhow::bail!("Metadata settings changed. No files were deleted.");
+                    }
+                    if syncing || tag_job_running {
+                        anyhow::bail!(
+                            "Wait for the current refresh or tag edit to finish before deleting an album."
+                        );
+                    }
+                    let tracks = result.map_err(anyhow::Error::msg)?;
+                    let root = std::path::Path::new(&folder).canonicalize().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Choose an available music folder in Settings → Metadata first."
+                        )
+                    })?;
+                    let files = album_files(&root, &tracks)?;
+                    let (removed, errors) = delete_album_files(&root, &files);
+                    if removed > 0
+                        && let Some(server) = server.clone()
+                    {
+                        rescan_after_file_change(
+                            server,
+                            if errors.is_empty() {
+                                "Album deleted"
+                            } else {
+                                "Album partially deleted"
+                            },
+                            "refresh after Navidrome's next scan",
+                            &runtime,
+                            &tx,
+                            &events,
+                            Command::AlbumDeletionRescanned(epoch),
+                        );
+                    }
+                    if !errors.is_empty() {
+                        anyhow::bail!(
+                            "Deleted {removed} of {} files. {}",
+                            files.len(),
+                            errors.join(" ")
+                        );
+                    }
+                    generation += 1;
+                    catalog.remove_deleted_album(&id)?;
+                    events.send(Event::View(current_request, catalog.view(&current_query)?))?;
+                }
+                Command::AlbumDeletionRescanned(epoch) => {
+                    if epoch == account_epoch {
+                        tx.send(Command::Refresh)?;
+                    }
+                }
                 Command::TagJobDone(report) => {
                     tag_job_running = false;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
@@ -2932,7 +3104,11 @@ fn run(
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = events.send(Event::Error(format!("{error:#}")));
+            let _ = events.send(if manual_sign_in {
+                Event::SignInFailed(format!("{error:#}"))
+            } else {
+                Event::Error(format!("{error:#}"))
+            });
         }
     }
     Ok(())

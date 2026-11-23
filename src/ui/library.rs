@@ -850,6 +850,14 @@ impl MusicApp {
         }
     }
 
+    pub(super) fn banner_error(&self) -> Option<String> {
+        self.sign_in
+            .error()
+            .map(str::to_owned)
+            .or_else(|| self.error.clone())
+            .or_else(|| self.playback.error.clone())
+    }
+
     pub(super) fn center_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         if self.blank && !self.settings {
@@ -867,7 +875,7 @@ impl MusicApp {
                 center = center.child(self.active_filter_bar(cx));
             }
         }
-        if let Some(error) = self.error.clone().or_else(|| self.playback.error.clone()) {
+        if let Some(error) = self.banner_error() {
             center =
                 center.child(
                     div()
@@ -891,6 +899,10 @@ impl MusicApp {
                         .child(div().flex_1().min_w_0().child(error))
                         .child(Button::new("retry-error").small().label("Retry").on_click(
                             cx.listener(|app, _, _, cx| {
+                                if app.sign_in.error().is_some() {
+                                    app.connect_library(cx);
+                                    return;
+                                }
                                 if let Some(mutation) = app.feedback.retryable().cloned() {
                                     app.mutate(mutation, cx);
                                 } else if app.playback.error.is_some() {
@@ -904,6 +916,7 @@ impl MusicApp {
                         ))
                         .child(short_button("dismiss-error", Glyph::X, "Dismiss").on_click(
                             cx.listener(|app, _, _, cx| {
+                                app.sign_in.dismiss_error();
                                 app.error = None;
                                 app.playback.error = None;
                                 app.feedback.dismiss();

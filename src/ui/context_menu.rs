@@ -3,6 +3,18 @@
 //! queue → playlists → navigation → feedback → copy.
 use super::*;
 use crate::service::PlaylistTarget;
+use gpui_kit::base::Dialog;
+
+pub(super) struct AlbumDeletion {
+    album: Arc<Album>,
+    namespace: Option<String>,
+}
+
+impl AlbumDeletion {
+    fn allowed(&self, namespace: Option<String>, write_tags: bool) -> bool {
+        write_tags && self.namespace.is_some() && self.namespace == namespace
+    }
+}
 
 /// Play Next, Play After This Album, and Add to End of Queue, each with a
 /// second line naming what the music will follow.
@@ -347,6 +359,7 @@ impl MusicApp {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let state = self.menu_state(cx);
         let album = Arc::new(album.clone());
+        let namespace = self.account.as_ref().map(Account::namespace);
         move |menu, window, cx| {
             let app = state.app.clone();
             let id = album.id.clone();
@@ -381,10 +394,32 @@ impl MusicApp {
             let menu = artist_items(menu.separator(), &state, album.artist_credits(), window, cx);
             let menu = if writes_tags(&state, cx) {
                 let (app, id) = (state.app.clone(), album.id.clone());
+                let delete_app = app.clone();
+                let delete_album = album.clone();
+                let namespace = namespace.clone();
                 menu.separator()
                     .item(
                         menu_row(Glyph::Music, "Edit Album Tags…").on_click(move |_, _, cx| {
                             let _ = app.update(cx, |app, _| app.open_album_tag_editor(id.clone()));
+                        }),
+                    )
+                    .item(
+                        menu_row(Glyph::Trash, "Delete Album…").on_click(move |_, window, cx| {
+                            let _ = delete_app.update(cx, |app, cx| {
+                                let deletion = AlbumDeletion {
+                                    album: delete_album.clone(),
+                                    namespace: namespace.clone(),
+                                };
+                                if app.album_deletion_allowed(&deletion) {
+                                    app.album_deletion = Some(deletion);
+                                    cx.defer_in(window, |app, window, cx| {
+                                        if app.album_deletion.is_some() {
+                                            app.album_deletion_focus.focus(window, cx);
+                                        }
+                                    });
+                                    cx.notify();
+                                }
+                            });
                         }),
                     )
             } else {
@@ -427,6 +462,91 @@ impl MusicApp {
                 ),
             )
         }
+    }
+
+    fn album_deletion_allowed(&self, deletion: &AlbumDeletion) -> bool {
+        deletion.allowed(
+            self.account.as_ref().map(Account::namespace),
+            self.preferences.metadata.tag_writes_enabled(),
+        )
+    }
+
+    fn close_album_deletion(&mut self, confirm: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(deletion) = self.album_deletion.take()
+            && confirm
+            && self.album_deletion_allowed(&deletion)
+        {
+            self.service
+                .send(Command::DeleteAlbum(deletion.album.id.clone()));
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn album_delete_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let deletion = self.album_deletion.as_ref()?;
+        if !self.album_deletion_allowed(deletion) {
+            return None;
+        }
+        let prompt = format!("Permanently delete “{}”?", deletion.album.name);
+        let colors = ink(cx);
+        let card = div()
+            .id("album-delete-prompt")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label(prompt.clone())
+            .occlude()
+            .w_full()
+            .max_w(px(460.))
+            .bg(colors.background)
+            .border_1()
+            .border_color(colors.line)
+            .rounded_xl()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(prompt))
+            .child("This removes the album’s songs from your mapped music folder. This cannot be undone.")
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel-album-delete")
+                            .label("Cancel")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.close_album_deletion(false, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-album-delete")
+                            .danger()
+                            .label("Delete Album")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.close_album_deletion(true, window, cx);
+                            })),
+                    ),
+            );
+        let app = cx.weak_entity();
+        Some(
+            Dialog::new(cx)
+                .focus_handle(self.album_deletion_focus.clone())
+                .p_5()
+                .close_on_backdrop_press(false)
+                .backdrop(div().absolute().inset_0().occlude().bg(cx.theme().overlay))
+                .popup(card)
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, window, cx| {
+                    let _ = app.update(cx, |app, cx| {
+                        app.close_album_deletion(false, window, cx);
+                    });
+                    false
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -624,4 +744,21 @@ fn copy_row(menu: PopupMenu, state: &Rc<MenuState>, text: String) -> PopupMenu {
             },
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Album, AlbumDeletion, Arc};
+
+    #[test]
+    fn pending_album_deletion_requires_opt_in_and_the_original_account() {
+        let deletion = AlbumDeletion {
+            album: Arc::new(Album::default()),
+            namespace: Some("original".into()),
+        };
+        assert!(deletion.allowed(Some("original".into()), true));
+        assert!(!deletion.allowed(Some("original".into()), false));
+        assert!(!deletion.allowed(Some("other".into()), true));
+        assert!(!deletion.allowed(None, true));
+    }
 }

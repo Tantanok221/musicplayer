@@ -509,6 +509,22 @@ impl MusicApp {
             .group(columns)
     }
 
+    pub(super) fn connect_library(&mut self, cx: &mut Context<Self>) {
+        if !self.sign_in.begin() {
+            return;
+        }
+        self.status = "Connecting…".into();
+        self.error = None;
+        self.service.send(Command::Connect(
+            Account {
+                url: self.server_url.read(cx).value().to_string(),
+                username: self.username.read(cx).value().to_string(),
+            },
+            self.password.read(cx).value().to_string(),
+        ));
+        cx.notify();
+    }
+
     pub(super) fn library_settings(&self, app: WeakEntity<Self>) -> SettingPage {
         let lastfm_app = app.clone();
         let signed_in = self
@@ -516,7 +532,7 @@ impl MusicApp {
             .as_ref()
             .map(|account| format!("Signed in as {} · {}", account.username, account.url));
         let server = self.account.as_ref().map(|account| account.url.clone());
-        let connecting = self.status == "Connecting…";
+        let connecting = self.sign_in.is_connecting();
         SettingPage::new("Library")
             .icon(Icon::new(Glyph::Library))
             .resettable(false)
@@ -550,18 +566,7 @@ impl MusicApp {
                                 .label("Connect")
                                 .disabled(connecting)
                                 .on_click(move |_, _, cx| {
-                                    let _ = app.update(cx, |app, cx| {
-                                        app.status = "Connecting…".into();
-                                        app.error = None;
-                                        app.service.send(Command::Connect(
-                                            Account {
-                                                url: app.server_url.read(cx).value().to_string(),
-                                                username: app.username.read(cx).value().to_string(),
-                                            },
-                                            app.password.read(cx).value().to_string(),
-                                        ));
-                                        cx.notify();
-                                    });
+                                    let _ = app.update(cx, |app, cx| app.connect_library(cx));
                                 })
                         })
                         .keywords(["connect", "sign in", "library"]),
