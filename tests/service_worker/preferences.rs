@@ -2,7 +2,7 @@ use crate::fixture::{Fixture, Library, WAIT, synced};
 use sonora::{
     model::{GainMode, Preferences, RepeatMode},
     playback::PlayerCommand,
-    service::Command,
+    service::{Command, SettingsCredentials},
 };
 use std::time::Instant;
 
@@ -60,6 +60,58 @@ fn preferences_save_through_the_worker_and_restore_after_clean_restart() {
     assert_eq!(serde_json::to_value(restored).unwrap(), expected);
     synced(&restarted);
     restarted.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn settings_save_acknowledges_failure_and_worker_allows_retry() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    let (_, initial) = worker.wait_ready(WAIT).unwrap();
+    synced(&worker);
+    let db = rusqlite::Connection::open(
+        fixture
+            .paths
+            .data
+            .join(format!("{}.sqlite", fixture.account.namespace())),
+    )
+    .unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_preferences BEFORE INSERT ON state
+         WHEN NEW.key = 'preferences' BEGIN SELECT RAISE(FAIL, 'test write failed'); END;",
+    )
+    .unwrap();
+    let preferences = Preferences {
+        dark: Some(true),
+        ..initial
+    };
+    let save = || {
+        worker
+            .service()
+            .save_settings(preferences.clone(), SettingsCredentials::Unchanged)
+            .recv_timeout(WAIT)
+            .unwrap()
+    };
+    assert!(!save());
+    assert_ne!(
+        fixture
+            .catalog()
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .dark,
+        preferences.dark
+    );
+    db.execute_batch("DROP TRIGGER reject_preferences").unwrap();
+    assert!(save());
+    assert_eq!(
+        fixture
+            .catalog()
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .dark,
+        preferences.dark
+    );
+    worker.shutdown(WAIT).unwrap();
     fixture.finish();
 }
 

@@ -1,4 +1,6 @@
 use super::*;
+use crate::{service::SettingsCredentials, settings_save::SaveOutcome};
+use gpui_kit::base::{Toast, ToastTransitionStatus};
 use gpui_kit::component::switch::Switch;
 
 const PLAYLIST_SETTINGS_PAGE: usize = 6;
@@ -97,7 +99,7 @@ fn layout_switch(
                 let _ = app.update(cx, |app, cx| {
                     set(&mut app.preferences.layout, value);
                     app.settings_page = LAYOUT_SETTINGS_PAGE;
-                    app.save_preferences();
+                    app.save_settings(cx);
                     cx.notify();
                 });
             },
@@ -138,7 +140,7 @@ fn layout_choice<const N: usize>(
                     let _ = app.update(cx, |app, cx| {
                         apply(&mut app.preferences.layout, key);
                         app.settings_page = LAYOUT_SETTINGS_PAGE;
-                        app.save_preferences();
+                        app.save_settings(cx);
                         cx.notify();
                     });
                 })
@@ -150,7 +152,7 @@ fn layout_choice<const N: usize>(
                 let _ = app.update(cx, |app, cx| {
                     apply(&mut app.preferences.layout, default_key);
                     app.settings_page = LAYOUT_SETTINGS_PAGE;
-                    app.save_preferences();
+                    app.save_settings(cx);
                     cx.notify();
                 });
             },
@@ -206,9 +208,13 @@ impl MusicApp {
     pub(super) fn restore_layout(&mut self, cx: &mut Context<Self>) {
         self.preferences.layout = LayoutPreferences::default();
         self.layout_generation += 1;
-        self.save_preferences();
         self.album_list.reset(self.album_row_count());
         cx.notify();
+    }
+
+    fn restore_settings_layout(&mut self, cx: &mut Context<Self>) {
+        self.restore_layout(cx);
+        self.save_settings(cx);
     }
 
     /// Saves the window frame after it has been still for a moment, so a drag
@@ -239,6 +245,65 @@ impl MusicApp {
     pub(super) fn save_preferences(&self) {
         self.service
             .send(Command::Preferences(self.preferences.clone()));
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.save_settings_with(SettingsCredentials::Unchanged, cx);
+    }
+
+    fn save_settings_with(&mut self, credentials: SettingsCredentials, cx: &mut Context<Self>) {
+        let request = self.settings_save.begin();
+        let result = self
+            .service
+            .save_settings(self.preferences.clone(), credentials);
+        cx.spawn(async move |this, cx| {
+            let outcome = if result.recv_async().await == Ok(true) {
+                SaveOutcome::Saved
+            } else {
+                SaveOutcome::Failed
+            };
+            let show = this.update(cx, |app, cx| {
+                let show = app.settings_save.complete(request, outcome);
+                if show {
+                    cx.notify();
+                }
+                show
+            });
+            if !matches!(show, Ok(true)) {
+                return;
+            }
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.settings_save.expire(request) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn settings_save_toast(&self, cx: &App) -> Option<impl IntoElement> {
+        let colors = ink(cx);
+        let (id, label) = match self.settings_save.outcome()? {
+            SaveOutcome::Saved => ("settings-saved", "Settings saved"),
+            SaveOutcome::Failed => ("settings-save-failed", "Could not save settings"),
+        };
+        Some(
+            Toast::new("settings-save-toast")
+                .transition_status(ToastTransitionStatus::Present)
+                .absolute()
+                .bottom(px(16.))
+                .right(px(16.))
+                .rounded_md()
+                .border_1()
+                .border_color(colors.line)
+                .bg(colors.panel)
+                .text_color(colors.text)
+                .shadow_md()
+                .px_3()
+                .py_2()
+                .child(div().id(id).test_support().aria_label(label).child(label)),
+        )
     }
 
     pub(super) fn connection_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -294,7 +359,7 @@ impl MusicApp {
                             let _ = write.update(cx, |app, cx| {
                                 app.preferences.playlist_columns.set(column, *checked);
                                 app.settings_page = PLAYLIST_SETTINGS_PAGE;
-                                app.save_preferences();
+                                app.save_settings(cx);
                                 cx.notify();
                             });
                         })
@@ -416,10 +481,11 @@ impl MusicApp {
                                         input.set_value(user.clone(), window, cx)
                                     });
                                     app.preferences.lastfm_user = user;
-                                    app.save_preferences();
                                     let key = app.lastfm_key.read(cx).value().trim().to_string();
-                                    if !key.is_empty() {
-                                        app.service.send(Command::LastFmKey(key));
+                                    if key.is_empty() {
+                                        app.save_settings(cx);
+                                    } else {
+                                        app.save_settings_with(SettingsCredentials::LastFm(key), cx);
                                         app.lastfm_key.update(cx, |input, cx| {
                                             input.set_value("", window, cx)
                                         });
@@ -465,7 +531,7 @@ impl MusicApp {
                                     move |value, cx: &mut App| {
                                         let _ = app.update(cx, |app, cx| {
                                             app.preferences.downloads.enabled = value;
-                                            app.save_preferences();
+                                            app.save_settings(cx);
                                             cx.notify();
                                         });
                                     }
@@ -512,7 +578,6 @@ impl MusicApp {
                                         app.preferences.downloads.url =
                                             app.slskd_url.read(cx).value().trim().to_string();
                                         app.preferences.downloads.enabled = true;
-                                        app.save_preferences();
                                         let fields = [
                                             app.slskd_key.clone(),
                                             app.slskd_username.clone(),
@@ -521,8 +586,10 @@ impl MusicApp {
                                         let [key, username, password] = fields
                                             .each_ref()
                                             .map(|field| field.read(cx).value().to_string());
-                                        app.service
-                                            .send(Command::SlskdAuth(key, username, password));
+                                        app.save_settings_with(
+                                            SettingsCredentials::Slskd(key, username, password),
+                                            cx,
+                                        );
                                         for field in fields {
                                             field.update(cx, |input, cx| {
                                                 input.set_value("", window, cx)
@@ -576,7 +643,7 @@ impl MusicApp {
                                                 .value()
                                                 .trim()
                                                 .to_string();
-                                            app.save_preferences();
+                                            app.save_settings(cx);
                                             cx.notify();
                                         });
                                     }
@@ -620,7 +687,7 @@ impl MusicApp {
                                             .value()
                                             .trim()
                                             .to_string();
-                                        app.save_preferences();
+                                        app.save_settings(cx);
                                         cx.notify();
                                     });
                                 })
@@ -653,7 +720,7 @@ impl MusicApp {
                                         let mode = gain_from_index(*index);
                                         let _ = app.update(cx, |app, cx| {
                                             app.preferences.gain = mode;
-                                            app.save_preferences();
+                                            app.save_settings(cx);
                                             cx.notify();
                                         });
                                     })
@@ -672,7 +739,7 @@ impl MusicApp {
                             move |_, cx| {
                                 let _ = app.update(cx, |app, cx| {
                                     app.preferences.gain = GainMode::Smart;
-                                    app.save_preferences();
+                                    app.save_settings(cx);
                                     cx.notify();
                                 });
                             },
@@ -721,7 +788,7 @@ impl MusicApp {
                                         let _ = app.update(cx, |app, cx| {
                                             app.preferences.dark = dark;
                                             app.apply_theme(window, cx);
-                                            app.save_preferences();
+                                            app.save_settings(cx);
                                             cx.notify();
                                         });
                                     })
@@ -739,7 +806,7 @@ impl MusicApp {
                                 let _ = app.update(cx, |app, cx| {
                                     app.preferences.dark = None;
                                     app.apply_theme(window, cx);
-                                    app.save_preferences();
+                                    app.save_settings(cx);
                                     cx.notify();
                                 });
                             },
@@ -877,7 +944,7 @@ impl MusicApp {
                                 .small()
                                 .label("Restore initial panel layout")
                                 .on_click(move |_, _, cx| {
-                                    let _ = app.update(cx, |app, cx| app.restore_layout(cx));
+                                    let _ = app.update(cx, |app, cx| app.restore_settings_layout(cx));
                                 })
                         }
                     })
@@ -893,7 +960,7 @@ impl MusicApp {
                             }
                         },
                         move |_, cx| {
-                            let _ = app.update(cx, |app, cx| app.restore_layout(cx));
+                            let _ = app.update(cx, |app, cx| app.restore_settings_layout(cx));
                         },
                     ),
                 ),

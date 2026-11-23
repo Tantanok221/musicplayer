@@ -402,6 +402,7 @@ pub struct MusicApp {
     volume_before_mute: Option<f32>,
     account: Option<Account>,
     settings: bool,
+    settings_save: crate::settings_save::SaveFeedback,
     /// The settings page to reopen when the settings view is rebuilt, as it
     /// is when the navigator is docked or undocked.
     settings_page: usize,
@@ -715,6 +716,7 @@ impl MusicApp {
             volume_before_mute: None,
             account: None,
             settings: false,
+            settings_save: Default::default(),
             settings_page: 0,
             tracks: vec![],
             track_total: 0,
@@ -1094,7 +1096,10 @@ impl Render for MusicApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|app, _: &ToggleBrowser, _, cx| app.toggle_browser(cx)))
-            .on_action(cx.listener(|app, _: &RestoreLayout, _, cx| app.restore_layout(cx)))
+            .on_action(cx.listener(|app, _: &RestoreLayout, _, cx| {
+                app.restore_layout(cx);
+                app.save_preferences();
+            }))
             .on_action(cx.listener(|app, _: &QueueWorkspace, window, cx| {
                 app.switch_workspace(Workspace::Queue, window, cx)
             }))
@@ -1114,8 +1119,10 @@ impl Render for MusicApp {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
+                    .relative()
                     .overflow_hidden()
-                    .child(body),
+                    .child(body)
+                    .children(self.settings_save_toast(cx)),
             )
             .child(status)
             .child(player)

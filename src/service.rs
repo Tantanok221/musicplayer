@@ -33,6 +33,13 @@ const SIGN_IN_NOTICE: &str =
 
 pub mod native;
 
+#[derive(Clone)]
+pub enum SettingsCredentials {
+    Unchanged,
+    Slskd(String, String, String),
+    LastFm(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
     Favorite(String, bool),
@@ -126,10 +133,6 @@ pub enum Command {
     ReleaseDetailsLoaded(String, Result<ReleaseDetails, String>),
     /// Artist name, artist ID, release group: stop offering this release.
     HideRelease(String, String, String),
-    /// API key, username, password as typed; all empty keeps what is saved.
-    SlskdAuth(String, String, String),
-    /// A Last.fm API key as typed; empty keeps what is saved.
-    LastFmKey(String),
     SlskdTest,
     /// Release group and search text.
     SoulseekSearch(String, String),
@@ -176,6 +179,7 @@ pub enum Command {
     /// Fingerprints the song's file and asks AcoustID which recording it is.
     IdentifyBySound(Box<Track>),
     Preferences(Preferences),
+    SaveSettings(Preferences, SettingsCredentials, Sender<bool>),
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
@@ -650,6 +654,16 @@ impl Service {
     }
     pub fn send(&self, command: Command) {
         let _ = self.tx.send(command);
+    }
+
+    pub fn save_settings(
+        &self,
+        prefs: Preferences,
+        credentials: SettingsCredentials,
+    ) -> Receiver<bool> {
+        let (reply, result) = flume::bounded(1);
+        self.send(Command::SaveSettings(prefs, credentials, reply));
+        result
     }
     pub fn query(&self, query: LibraryQuery) -> u64 {
         let epoch = self.query_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1896,33 +1910,6 @@ fn run(
                     }
                     publish_discography(&catalog, &events, &name, &id, false)?;
                 }
-                Command::SlskdAuth(key, username, password) => {
-                    slskd = None;
-                    let saved = SlskdAuth::from_fields(&key, &username, &password)
-                        .and_then(|auth| auth.map_or(Ok(()), |auth| paths.save_slskd_auth(&auth)));
-                    if let Err(error) = saved {
-                        events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
-                    }
-                }
-                Command::LastFmKey(key) => {
-                    let key = key.trim().to_string();
-                    if !key.is_empty() {
-                        match paths.save_lastfm_key(&key) {
-                            Ok(()) => {
-                                lastfm.set_key(key);
-                                lastfm_failure = None;
-                            }
-                            Err(error) => {
-                                let user = catalog
-                                    .state::<Preferences>("preferences")?
-                                    .lastfm_user
-                                    .trim()
-                                    .to_string();
-                                lastfm_failure = Some((user, format!("{error:#}")));
-                            }
-                        }
-                    }
-                }
                 Command::SlskdTest => match slskd_client(&mut slskd, &catalog, &paths) {
                     Ok(client) => {
                         let events = events.clone();
@@ -2541,6 +2528,44 @@ fn run(
                 }
                 Command::Preferences(prefs) => {
                     persist_preferences(&catalog, &player, prefs)?;
+                }
+                Command::SaveSettings(prefs, credentials, reply) => {
+                    let lastfm_user = prefs.lastfm_user.trim().to_string();
+                    let saved = persist_preferences(&catalog, &player, prefs).is_ok()
+                        && match credentials {
+                            SettingsCredentials::Unchanged => true,
+                            SettingsCredentials::Slskd(key, username, password) => {
+                                slskd = None;
+                                let saved = SlskdAuth::from_fields(&key, &username, &password)
+                                    .and_then(|auth| {
+                                        auth.map_or(Ok(()), |auth| paths.save_slskd_auth(&auth))
+                                    });
+                                if let Err(error) = &saved {
+                                    events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
+                                }
+                                saved.is_ok()
+                            }
+                            SettingsCredentials::LastFm(key) => {
+                                let key = key.trim().to_string();
+                                if key.is_empty() {
+                                    true
+                                } else {
+                                    match paths.save_lastfm_key(&key) {
+                                        Ok(()) => {
+                                            lastfm.set_key(key);
+                                            lastfm_failure = None;
+                                            true
+                                        }
+                                        Err(error) => {
+                                            lastfm_failure =
+                                                Some((lastfm_user, format!("{error:#}")));
+                                            false
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                    let _ = reply.send(saved);
                 }
                 Command::Persist(namespace, queue) => {
                     if namespace == account.as_ref().map(Account::namespace).unwrap_or_default() {

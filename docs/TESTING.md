@@ -41,6 +41,7 @@ worker suite to expose flaky timing.
 | Native smart playlist editor, sign-in and background session renewal | `smart_playlists.rs`, `navigator.rs`, `playlists.rs` | `smart_editor`, `smart_rules`, `server::native`, `service::native`, `platform::NativeToken` | `tests/ui/{smart_playlists,worker}.rs`, `tests/service_worker/smart_playlists.rs`, `smart_editor`, `smart_rules` and `service::native` unit tests, `tests/platform.rs` |
 | Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform`, `ui::account_cache` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs`, `ui::account_cache` unit tests |
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
+| Settings save confirmation and errors | `settings.rs` | `settings_save::SaveFeedback` | `tests/ui/settings.rs`, `tests/service_worker/{discover,preferences}.rs`, `settings_save` unit tests |
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
