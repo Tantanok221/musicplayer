@@ -90,6 +90,46 @@ fn edit_menu_is_hidden_until_tag_writing_is_turned_on(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn album_deletion_is_opt_in_and_requires_confirmation(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    album_menu(&mut fixture, window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window
+                .within("popup-menu")
+                .try_find_by_label("Delete Album…")
+                .is_none()
+        );
+    })
+    .unwrap();
+    fixture.press(window, "escape", cx);
+    writes_tags(&mut fixture, true);
+    fixture.settle(window, cx);
+
+    for response in ["escape", "cancel-album-delete", "confirm-album-delete"] {
+        album_menu(&mut fixture, window, cx);
+        fixture.menu_item(window, "Delete Album…", cx);
+        assert!(
+            label(window, "album-delete-prompt", cx)
+                .is_some_and(|prompt| prompt.contains("Fixture album"))
+        );
+        if response == "confirm-album-delete" {
+            fixture.expect("confirmed album deletion", |command, _| {
+                assert!(matches!(command, Command::DeleteAlbum(id) if id == "album-1"));
+                vec![]
+            });
+        }
+        if response == "escape" {
+            fixture.press(window, response, cx);
+        } else {
+            fixture.click(window, response, cx);
+        }
+        assert!(label(window, "album-delete-prompt", cx).is_none());
+        fixture.assert_script_finished();
+    }
+}
+
+#[gpui_kit::test]
 fn album_edit_sends_only_the_changed_field_then_retries_and_undoes(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, _app) = start(cx);
     writes_tags(&mut fixture, true);
