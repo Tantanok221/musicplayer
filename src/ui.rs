@@ -52,6 +52,7 @@ mod player_bar;
 mod playlist_creation;
 mod playlists;
 mod settings;
+mod sign_in;
 mod smart_playlists;
 mod tracks;
 mod window;
@@ -401,6 +402,7 @@ pub struct MusicApp {
     preferences: Preferences,
     volume_before_mute: Option<f32>,
     account: Option<Account>,
+    sign_in: sign_in::SignIn,
     settings: bool,
     settings_save: crate::settings_save::SaveFeedback,
     /// The settings page to reopen when the settings view is rebuilt, as it
@@ -717,6 +719,7 @@ impl MusicApp {
             preferences: Preferences::default(),
             volume_before_mute: None,
             account: None,
+            sign_in: Default::default(),
             settings: false,
             settings_save: Default::default(),
             settings_page: 0,

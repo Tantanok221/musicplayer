@@ -1143,7 +1143,7 @@ fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut 
     cx.update_window(window, |_, window, cx| window.click("connect-library", cx))
         .unwrap();
     deliver_until(&worker, &tx, window, cx, |e, _| {
-        matches!(e, Event::Error(_))
+        matches!(e, Event::SignInFailed(_))
     });
     cx.update_window(window, |_, window, cx| {
         assert_ne!(window.find("connect-library").disabled(), Some(true));
@@ -1160,7 +1160,7 @@ fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut 
             window.click(field, cx);
             window.input(value, cx);
         }
-        window.click("connect-library", cx);
+        window.click("retry-error", cx);
     })
     .unwrap();
     wait_library(&worker, &tx, window, cx, "explorer-album-album");
