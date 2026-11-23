@@ -289,7 +289,7 @@ pub enum Event {
     ResumeQueue(Option<String>),
     SharedPreferences(crate::sync::SharedPreferences),
     LanStatus(crate::sync::lan::LanStatus),
-    LanOffer(crate::sync::lan::LanCode),
+    LanOffer(crate::sync::lan::LanOfferState),
     Status(String),
     Connection(Connection),
     Error(String),

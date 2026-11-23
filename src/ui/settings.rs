@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync::lan::LanOfferState;
 use gpui_kit::component::switch::Switch;
 
 const PLAYLIST_SETTINGS_PAGE: usize = 6;
@@ -754,7 +755,17 @@ impl MusicApp {
         let discovery_app = pair_app.clone();
         let controls = self.service.clone();
         let port = self.lan_status.port;
-        let code = self.lan_offer.clone();
+        let offer_notice = match &self.lan_offer {
+            LanOfferState::Idle => None,
+            LanOfferState::Available(code) => Some((
+                "lan-pairing-code",
+                format!("{} · use within 2 minutes", code.0),
+            )),
+            LanOfferState::UsedOrExpired => Some((
+                "lan-pairing-code-unavailable",
+                "Code used or expired — generate a new code".to_owned(),
+            )),
+        };
         let peers = self.lan_status.peers.clone();
         let discovered = self.lan_status.discovered.clone();
         SettingGroup::new()
@@ -854,11 +865,10 @@ impl MusicApp {
                     .when(port != 0, |el| {
                         el.child(format!("Listening on port {port}"))
                     })
-                    .when_some(code.clone(), |el, code| {
-                        let text = format!("{} · use within 2 minutes", code.0);
+                    .when_some(offer_notice.clone(), |el, (id, text)| {
                         el.child(
                             div()
-                                .id("lan-pairing-code")
+                                .id(id)
                                 .test_support()
                                 .role(Role::Label)
                                 .aria_label(text.clone())

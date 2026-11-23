@@ -21,7 +21,7 @@ impl MusicApp {
                     self.artist_albums = None;
                     self.resume_queue = None;
                     self.lan_status = Default::default();
-                    self.lan_offer = None;
+                    self.lan_offer = Default::default();
                 }
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
@@ -357,14 +357,11 @@ impl MusicApp {
             }
             Event::SharedPreferences(shared) => self.apply_shared_preferences(&shared, window, cx),
             Event::LanStatus(status) => {
-                if status.peers != self.lan_status.peers || status.port != self.lan_status.port {
-                    self.lan_offer = None;
-                }
                 self.lan_status = status;
                 self.notify_part(Part::Center, cx);
             }
-            Event::LanOffer(code) => {
-                self.lan_offer = Some(code);
+            Event::LanOffer(offer) => {
+                self.lan_offer = offer;
                 self.notify_part(Part::Center, cx);
             }
             Event::Status(status) => self.status = status,

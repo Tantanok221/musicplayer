@@ -33,15 +33,77 @@ use tokio_tungstenite::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(7);
+const OFFER_TTL: Duration = Duration::from_secs(120);
 const SERVICE_TYPE: &str = "_sonora._tcp.local.";
 const PROTOCOL_VERSION: &str = "1";
 
 #[derive(Clone)]
 pub struct LanCode(pub String);
 
+#[derive(Clone, Debug, Default)]
+pub enum LanOfferState {
+    #[default]
+    Idle,
+    Available(LanCode),
+    UsedOrExpired,
+}
+
 impl std::fmt::Debug for LanCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LanCode([REDACTED])")
+    }
+}
+
+pub(crate) enum PairingOffer {
+    Idle,
+    Available(LanCode, Instant),
+    UsedOrExpired,
+}
+
+impl PairingOffer {
+    pub(crate) fn state(&self) -> LanOfferState {
+        match self {
+            Self::Idle => LanOfferState::Idle,
+            Self::Available(code, _) => LanOfferState::Available(code.clone()),
+            Self::UsedOrExpired => LanOfferState::UsedOrExpired,
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Available(_, expires) => Some(*expires),
+            _ => None,
+        }
+    }
+}
+
+async fn expire_offers(offers: &watch::Sender<PairingOffer>) {
+    let mut changes = offers.subscribe();
+    loop {
+        let deadline = changes.borrow_and_update().deadline();
+        let elapsed = async {
+            match deadline {
+                Some(deadline) => time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = elapsed => {
+                offers.send_if_modified(|offer| {
+                    if offer.deadline().is_some_and(|deadline| deadline <= Instant::now()) {
+                        *offer = PairingOffer::UsedOrExpired;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -80,7 +142,7 @@ struct Network {
     discovery: Mutex<HashMap<String, Vec<LanPeer>>>,
     change: watch::Sender<()>,
     hosting: watch::Sender<Option<LocalCoordinator>>,
-    offer: Mutex<Option<(String, Instant)>>,
+    offer: watch::Sender<PairingOffer>,
 }
 
 pub struct LanNode {
@@ -196,14 +258,17 @@ impl LanNode {
             discovery: Mutex::default(),
             change: watch::channel(()).0,
             hosting: watch::channel(None).0,
-            offer: Mutex::default(),
+            offer: watch::Sender::new(PairingOffer::Idle),
         });
         let accepted = network.clone();
         let task = tokio::spawn(async move {
             let limit = Arc::new(Semaphore::new(24));
             let mut sessions = tokio::task::JoinSet::new();
+            let expiry = expire_offers(&accepted.offer);
+            tokio::pin!(expiry);
             loop {
                 tokio::select! {
+                    _ = &mut expiry => break,
                     _ = sessions.join_next(), if !sessions.is_empty() => {}
                     Ok((stream, address)) = listener.accept() => {
                         if let Ok(permit) = limit.clone().try_acquire_owned() {
@@ -233,10 +298,15 @@ impl LanNode {
 
     pub fn offer_code(&self) -> String {
         let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
-        if let Ok(mut offer) = self.network.offer.lock() {
-            *offer = Some((code.clone(), Instant::now() + Duration::from_secs(120)));
-        }
+        self.network.offer.send_replace(PairingOffer::Available(
+            LanCode(code.clone()),
+            Instant::now() + OFFER_TTL,
+        ));
         code
+    }
+
+    pub(crate) fn offers(&self) -> watch::Receiver<PairingOffer> {
+        self.network.offer.subscribe()
     }
 
     pub async fn pair(&self, address: SocketAddr, code: &str) -> Result<()> {
@@ -492,6 +562,21 @@ fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()
 }
 
 impl Network {
+    fn take_offer(&self) -> Option<LanCode> {
+        let mut available = None;
+        self.offer.send_if_modified(|offer| {
+            let PairingOffer::Available(code, expires) = offer else {
+                return false;
+            };
+            if Instant::now() < *expires {
+                available = Some(code.clone());
+            }
+            *offer = PairingOffer::UsedOrExpired;
+            true
+        });
+        available
+    }
+
     fn remember(&self, ip: IpAddr, key: PublicKey, peer: Announcement) -> Result<()> {
         let device = peer.device;
         ensure!(
@@ -607,19 +692,13 @@ impl Network {
         )
         .await?;
         if pairing {
-            let (code, _) = self
-                .offer
-                .lock()
-                .ok()
-                .and_then(|mut offer| offer.take())
-                .filter(|(_, expires)| Instant::now() < *expires)
-                .context("No active pairing code")?;
+            let code = self.take_offer().context("No active pairing code")?;
             let (mut link, key) = Link::establish(
                 socket,
                 false,
                 &self.group,
                 &self.identity,
-                Trust::Pair(&code),
+                Trust::Pair(&code.0),
             )
             .await?;
             self.remember(ip, key, serde_json::from_slice(&link.recv().await?)?)?;
@@ -784,4 +863,31 @@ async fn dial(address: SocketAddr, path: &str) -> Result<Socket> {
     )
     .await?;
     Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unused_offer_expires_and_notifies_subscribers() {
+        let (offer, mut updates) = watch::channel(PairingOffer::Available(
+            LanCode("123456".into()),
+            Instant::now() + Duration::from_millis(10),
+        ));
+        time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = expire_offers(&offer) => panic!("offer expiry watcher stopped"),
+                result = updates.wait_for(|offer| matches!(offer, PairingOffer::UsedOrExpired)) => {
+                    assert!(result.is_ok());
+                }
+            }
+        })
+        .await
+        .expect("unused code should expire");
+        assert!(matches!(
+            updates.borrow().state(),
+            LanOfferState::UsedOrExpired
+        ));
+    }
 }

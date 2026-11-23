@@ -35,7 +35,7 @@ fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut Test
 
 #[gpui_kit::test]
 fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut TestAppContext) {
-    use sonora::sync::lan::{LanCode, LanPeer, LanStatus};
+    use sonora::sync::lan::{LanCode, LanOfferState, LanPeer, LanStatus};
 
     let (_dir, mut f, window, _) = start(cx);
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
@@ -52,7 +52,9 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
     f.settle(window, cx);
     f.expect("generate LAN pairing code", |command, _| {
         assert!(matches!(command, Command::LanShowCode));
-        vec![Event::LanOffer(LanCode("123456".into()))]
+        vec![Event::LanOffer(LanOfferState::Available(LanCode(
+            "123456".into(),
+        )))]
     });
     f.click(window, "lan-show-code", cx);
     f.assert_script_finished();
@@ -60,6 +62,37 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
         let code = window.find("lan-pairing-code");
         assert!(code.visible());
         assert_eq!(code.label(), Some("123456 · use within 2 minutes"));
+    })
+    .unwrap();
+    f.backend
+        .emit(Event::LanOffer(LanOfferState::UsedOrExpired));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("lan-pairing-code").is_none(),
+            "a used or expired code must not stay visible"
+        );
+        let notice = window.find("lan-pairing-code-unavailable");
+        assert!(notice.visible());
+        assert_eq!(
+            notice.label(),
+            Some("Code used or expired — generate a new code")
+        );
+    })
+    .unwrap();
+    f.expect("replace used LAN pairing code", |command, _| {
+        assert!(matches!(command, Command::LanShowCode));
+        vec![Event::LanOffer(LanOfferState::Available(LanCode(
+            "654321".into(),
+        )))]
+    });
+    f.click(window, "lan-show-code", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("lan-pairing-code").label(),
+            Some("654321 · use within 2 minutes")
+        );
+        assert!(window.try_find("lan-pairing-code-unavailable").is_none());
     })
     .unwrap();
     f.expect("revoke LAN device", |command, _| {

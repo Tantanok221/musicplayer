@@ -6,7 +6,7 @@ use crate::{
     playback::{PlayerCommand, PlayerHandle},
     sync::{
         DeviceStatus, RelayEvent, SharedPreferences,
-        lan::{LanCode, LanNode, user_hash},
+        lan::{LanNode, user_hash},
         position_at,
         relay::{self, RelayTransport, SyncTask},
         settings::SettingsState,
@@ -183,6 +183,7 @@ impl DeviceSync {
         self.task = Some(self.runtime.spawn(async move {
             let Ok(node) = LanNode::start(device, identity, group, port, Some(pins)).await else {
                 let _ = events.send(Event::LanStatus(Default::default()));
+                let _ = events.send(Event::LanOffer(Default::default()));
                 let _ = events.send(Event::Error("Could not start local device sync".into()));
                 Box::pin(task.run(None)).await;
                 return;
@@ -194,7 +195,7 @@ impl DeviceSync {
                     tokio::select! {
                         action = requests.recv_async() => match action {
                             Ok(LanAction::ShowCode) => {
-                                let _ = events.send(Event::LanOffer(LanCode(node.offer_code())));
+                                node.offer_code();
                             }
                             Ok(LanAction::Pair(address, code)) => {
                                 if node.pair(address, &code).await.is_err() {
@@ -214,9 +215,19 @@ impl DeviceSync {
                     }
                 }
             };
+            let offers = async {
+                let mut offers = node.offers();
+                loop {
+                    let state = offers.borrow_and_update().state();
+                    if events.send(Event::LanOffer(state)).is_err() || offers.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
             tokio::select! {
                 _ = Box::pin(task.run(Some(&node))) => {}
                 _ = control => {}
+                _ = offers => {}
             }
         }));
         Ok(())

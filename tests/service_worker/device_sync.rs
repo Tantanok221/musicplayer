@@ -8,6 +8,7 @@ use sonora::{
     model::{PlaybackSnapshot, Preferences, SavedQueue},
     playback::PlayerCommand,
     service::{Command, Event},
+    sync::lan::LanOfferState,
 };
 use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState, ServerMessage};
 use tokio::net::TcpListener;
@@ -353,7 +354,9 @@ async fn lan_authority_moves_to_the_higher_id_after_transfer() {
         );
     }
     old.service().send(Command::LanShowCode);
-    let Event::LanOffer(code) = event(&old, |event| matches!(event, Event::LanOffer(_))) else {
+    let Event::LanOffer(LanOfferState::Available(code)) = event(&old, |event| {
+        matches!(event, Event::LanOffer(LanOfferState::Available(_)))
+    }) else {
         unreachable!();
     };
     new.service().send(Command::LanPair(
@@ -408,6 +411,67 @@ async fn lan_authority_moves_to_the_higher_id_after_transfer() {
     relay.abort();
     source.finish();
     target.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_pairing_offer_is_invalidated_after_wrong_code_and_after_success() {
+    use sonora::sync::lan::{LanNode, user_hash};
+
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    let (account, _) = worker.wait_ready(WAIT).unwrap();
+    let Event::LanStatus(status) = event(
+        &worker,
+        |event| matches!(event, Event::LanStatus(status) if status.port != 0),
+    ) else {
+        unreachable!();
+    };
+    let address = ([127, 0, 0, 1], status.port).into();
+    let peer = LanNode::listen(
+        Device {
+            id: "pairing-peer".into(),
+            name: "Pairing peer".into(),
+            os: "linux".into(),
+            online: true,
+            last_seen: 0,
+        },
+        [8; 32],
+        user_hash(&account.unwrap()),
+        0,
+    )
+    .await
+    .unwrap();
+    let offer = || {
+        worker.service().send(Command::LanShowCode);
+        let Event::LanOffer(LanOfferState::Available(code)) = event(&worker, |event| {
+            matches!(event, Event::LanOffer(LanOfferState::Available(_)))
+        }) else {
+            unreachable!();
+        };
+        code
+    };
+    let code = offer();
+    let wrong = if code.0 == "000000" {
+        "000001"
+    } else {
+        "000000"
+    };
+    assert!(peer.pair(address, wrong).await.is_err());
+    assert!(
+        peer.pair(address, &code.0).await.is_err(),
+        "only one attempt per offer"
+    );
+    event(&worker, |event| {
+        matches!(event, Event::LanOffer(LanOfferState::UsedOrExpired))
+    });
+
+    let replacement = offer();
+    peer.pair(address, &replacement.0).await.unwrap();
+    event(&worker, |event| {
+        matches!(event, Event::LanOffer(LanOfferState::UsedOrExpired))
+    });
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
 }
 
 #[tokio::test]
