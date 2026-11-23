@@ -5,8 +5,10 @@ use crate::{
     platform::{Account, Paths},
     playback::{PlayerCommand, PlayerHandle},
     sync::{
-        DeviceStatus, RelayEvent, SharedPreferences, position_at,
-        relay::{self, RelayTask},
+        DeviceStatus, RelayEvent, SharedPreferences,
+        lan::{LanCode, LanNode, user_hash},
+        position_at,
+        relay::{self, RelayTransport, SyncTask},
         settings::SettingsState,
         wall_ms,
     },
@@ -14,7 +16,7 @@ use crate::{
 use anyhow::Result;
 use flume::Sender;
 use sonora_sync_protocol::{
-    ClientMessage, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
+    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
     VersionedSettings, valid_settings,
 };
 use std::time::Duration;
@@ -27,9 +29,10 @@ use tokio::{
 pub(super) struct DeviceSync {
     pub status: DeviceStatus,
     generation: u64,
-    configuration: Option<(String, String, blake3::Hash)>,
+    configuration: Option<(String, String, blake3::Hash, u16)>,
     task: Option<JoinHandle<()>>,
     out: Option<mpsc::Sender<ClientMessage>>,
+    lan: Option<Sender<LanAction>>,
     runtime: Handle,
     tx: Sender<Command>,
     playback: watch::Receiver<PlaybackSnapshot>,
@@ -41,6 +44,12 @@ struct PreparedTransfer {
     id: String,
     backup: SavedQueue,
     was_playing: bool,
+}
+
+pub(super) enum LanAction {
+    ShowCode,
+    Pair(std::net::SocketAddr, String),
+    Revoke(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +71,7 @@ impl DeviceSync {
             configuration: None,
             task: None,
             out: None,
+            lan: None,
             runtime,
             tx,
             playback,
@@ -74,10 +84,10 @@ impl DeviceSync {
         &mut self,
         paths: &Paths,
         account: Option<&Account>,
-        url: &str,
+        prefs: &Preferences,
         events: &Sender<Event>,
     ) {
-        if let Err(error) = self.configure_inner(paths, account, url, events) {
+        if let Err(error) = self.configure_inner(paths, account, prefs, events) {
             self.stop();
             let _ = events.send(Event::DeviceSync(self.status.clone()));
             let _ = events.send(Event::Error(error.to_string()));
@@ -88,10 +98,12 @@ impl DeviceSync {
         &mut self,
         paths: &Paths,
         account: Option<&Account>,
-        url: &str,
+        prefs: &Preferences,
         events: &Sender<Event>,
     ) -> Result<()> {
-        let Some((account, endpoint)) = account.zip(relay::endpoint(url)?) else {
+        let endpoint = relay::endpoint(&prefs.sync_server_url)?;
+        let port = prefs.lan_port.unwrap_or(0);
+        let Some(account) = account else {
             if self.configuration.is_some() {
                 self.stop();
                 events.send(Event::DeviceSync(self.status.clone()))?;
@@ -109,12 +121,16 @@ impl DeviceSync {
         let namespace = account.namespace();
         let key = (
             namespace.clone(),
-            endpoint.as_str().to_owned(),
+            endpoint
+                .as_ref()
+                .map_or_else(String::new, |endpoint| endpoint.as_str().to_owned()),
             digest.finalize(),
+            port,
         );
         if self.configuration.as_ref() == Some(&key) {
             return Ok(());
         }
+        let previous_enabled = self.status.enabled;
         self.stop();
         let device_id = paths.sync_device_id()?;
         let os = std::env::consts::OS;
@@ -126,31 +142,90 @@ impl DeviceSync {
         };
         let device_name = format!("{system_label} · {}", &device_id[..6]);
         self.configuration = Some(key);
-        self.status.enabled = true;
+        self.status.enabled = endpoint.is_some();
         self.status.local_device_id.clone_from(&device_id);
-        events.send(Event::DeviceSync(self.status.clone()))?;
-        self.task = Some(
-            self.runtime.spawn(
-                RelayTask {
-                    endpoint,
-                    hello: Hello {
-                        username: account.username.clone(),
-                        subsonic_token: credentials.token,
-                        subsonic_salt: credentials.salt,
-                        device_id,
-                        device_name,
-                        os: os.into(),
-                        client_version: env!("CARGO_PKG_VERSION").into(),
-                    },
-                    namespace,
-                    service: self.tx.clone(),
-                    generation: self.generation,
-                    playback: self.playback.clone(),
+        if self.status.enabled || previous_enabled {
+            events.send(Event::DeviceSync(self.status.clone()))?;
+        }
+        let relay = endpoint.map(|endpoint| RelayTransport {
+            endpoint,
+            hello: Hello {
+                username: account.username.clone(),
+                subsonic_token: credentials.token,
+                subsonic_salt: credentials.salt,
+                device_id: device_id.clone(),
+                device_name: device_name.clone(),
+                os: os.into(),
+                client_version: env!("CARGO_PKG_VERSION").into(),
+            },
+        });
+        let device = Device {
+            id: device_id.clone(),
+            name: device_name,
+            os: os.into(),
+            online: true,
+            last_seen: 0,
+        };
+        let identity = paths.sync_signing_key()?;
+        let group = user_hash(account);
+        let pins = paths.data.join(format!("sync-pins-{namespace}.json"));
+        let task = SyncTask {
+            relay,
+            device_id,
+            namespace,
+            service: self.tx.clone(),
+            generation: self.generation,
+            playback: self.playback.clone(),
+        };
+        let (actions, requests) = flume::bounded::<LanAction>(8);
+        self.lan = Some(actions);
+        let events = events.clone();
+        self.task = Some(self.runtime.spawn(async move {
+            let Ok(node) = LanNode::start(device, identity, group, port, Some(pins)).await else {
+                let _ = events.send(Event::LanStatus(Default::default()));
+                let _ = events.send(Event::Error("Could not start local device sync".into()));
+                Box::pin(task.run(None)).await;
+                return;
+            };
+            let control = async {
+                let mut changes = node.changes();
+                let _ = events.send(Event::LanStatus(node.status()));
+                loop {
+                    tokio::select! {
+                        action = requests.recv_async() => match action {
+                            Ok(LanAction::ShowCode) => {
+                                let _ = events.send(Event::LanOffer(LanCode(node.offer_code())));
+                            }
+                            Ok(LanAction::Pair(address, code)) => {
+                                if node.pair(address, &code).await.is_err() {
+                                    let _ = events.send(Event::Error("Could not pair LAN device".into()));
+                                }
+                            }
+                            Ok(LanAction::Revoke(id)) => {
+                                if node.revoke(&id).is_err() {
+                                    let _ = events.send(Event::Error("Could not revoke LAN device".into()));
+                                }
+                            }
+                            Err(_) => break,
+                        },
+                        changed = changes.changed() => {
+                            if changed.is_err() || events.send(Event::LanStatus(node.status())).is_err() { break; }
+                        }
+                    }
                 }
-                .run(),
-            ),
-        );
+            };
+            tokio::select! {
+                _ = Box::pin(task.run(Some(&node))) => {}
+                _ = control => {}
+            }
+        }));
         Ok(())
+    }
+
+    pub fn lan(&self, action: LanAction) -> bool {
+        self.lan
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(action).is_ok())
     }
 
     pub fn receive(
@@ -179,6 +254,7 @@ impl DeviceSync {
             } => {
                 self.out = Some(out);
                 self.status.connected = true;
+                self.status.enabled = true;
                 self.status.devices = devices;
                 self.status.active_device_id = active_device_id;
                 self.status.playback = None;
@@ -322,7 +398,13 @@ impl DeviceSync {
             return Ok(());
         }
         let mut state: SettingsState = catalog.state("sync:settings")?;
-        if frame != SettingsFrame::Welcome && version < state.remote.version {
+        if version < state.remote.version {
+            if frame == SettingsFrame::Welcome {
+                self.outbound(ClientMessage::Reconcile {
+                    playback: None,
+                    settings: Some(state.remote.clone()),
+                });
+            }
             return Ok(());
         }
         if frame == SettingsFrame::Conflict
@@ -380,6 +462,14 @@ impl DeviceSync {
 
     pub fn can_save_queue(&self) -> bool {
         !self.preparing_transfer() && self.status.remote_id().is_none()
+    }
+
+    pub fn can_offer_queue_resume(&self) -> bool {
+        self.can_save_queue()
+            && self
+                .configuration
+                .as_ref()
+                .is_none_or(|(_, relay, _, _)| relay.is_empty())
     }
 
     fn prepare_transfer(
@@ -624,6 +714,7 @@ impl DeviceSync {
         self.generation = self.generation.wrapping_add(1);
         self.configuration = None;
         self.out = None;
+        self.lan = None;
         self.transfer = None;
         self.settings_flight = None;
         self.status = DeviceStatus::default();

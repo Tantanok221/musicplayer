@@ -20,6 +20,8 @@ impl MusicApp {
                     self.artist_name = None;
                     self.artist_albums = None;
                     self.resume_queue = None;
+                    self.lan_status = Default::default();
+                    self.lan_offer = None;
                 }
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
@@ -31,6 +33,12 @@ impl MusicApp {
                 let sync_server_url = self.preferences.sync_server_url.clone();
                 self.sync_server_url
                     .update(cx, |input, cx| input.set_value(sync_server_url, window, cx));
+                let port = self
+                    .preferences
+                    .lan_port
+                    .map_or_else(String::new, |port| port.to_string());
+                self.lan_port
+                    .update(cx, |input, cx| input.set_value(port, window, cx));
                 self.preferences.tabs = std::mem::take(&mut self.preferences.tabs).normalized();
                 self.prefs_loaded = true;
                 self.histories.clear();
@@ -348,6 +356,17 @@ impl MusicApp {
                 return;
             }
             Event::SharedPreferences(shared) => self.apply_shared_preferences(&shared, window, cx),
+            Event::LanStatus(status) => {
+                if status.peers != self.lan_status.peers || status.port != self.lan_status.port {
+                    self.lan_offer = None;
+                }
+                self.lan_status = status;
+                self.notify_part(Part::Center, cx);
+            }
+            Event::LanOffer(code) => {
+                self.lan_offer = Some(code);
+                self.notify_part(Part::Center, cx);
+            }
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {

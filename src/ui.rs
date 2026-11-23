@@ -375,6 +375,11 @@ pub struct MusicApp {
     workspace_scroll: ScrollHandle,
     server_url: Entity<InputState>,
     sync_server_url: Entity<InputState>,
+    lan_port: Entity<InputState>,
+    lan_address: Entity<InputState>,
+    lan_code: Entity<InputState>,
+    lan_status: crate::sync::lan::LanStatus,
+    lan_offer: Option<crate::sync::lan::LanCode>,
     username: Entity<InputState>,
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
@@ -547,6 +552,9 @@ impl MusicApp {
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search music"));
         let sync_server_url = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
+        let lan_port = cx.new(|cx| InputState::new(window, cx).placeholder("Automatic"));
+        let lan_address = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20:8088"));
+        let lan_code = cx.new(|cx| InputState::new(window, cx).placeholder("Six-digit code"));
         let server_url = cx
             .new(|cx| InputState::new(window, cx).placeholder("http://your-navidrome-server:4533"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
@@ -695,6 +703,11 @@ impl MusicApp {
             workspace_scroll: ScrollHandle::new(),
             server_url,
             sync_server_url,
+            lan_port,
+            lan_address,
+            lan_code,
+            lan_status: Default::default(),
+            lan_offer: None,
             username,
             password,
             playlist_name,

@@ -1,7 +1,7 @@
 use crate::store::{Store, StoreError};
 use sonora_sync_protocol::{
-    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
-    VersionedSettings, valid_settings,
+    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ReconciledPlayback,
+    ServerMessage, TRANSFER_TIMEOUT, VersionedSettings, valid_settings,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,7 +16,7 @@ use tokio::{
 pub(crate) const PRESENCE_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(thiserror::Error, Debug)]
-pub(crate) enum SessionError {
+pub enum SessionError {
     #[error("Relay database error")]
     Store(#[from] StoreError),
     #[error("Relay session unavailable")]
@@ -217,7 +217,7 @@ impl SessionHub {
                     .await
                     .is_err()
                 {
-                    tracing::warn!("Could not expire playback transfer");
+                    tracing::warn!("Could not expire device sync session");
                 }
             });
         }
@@ -456,6 +456,20 @@ impl Hub {
                 }
             }
             ClientMessage::Ping => ServerMessage::Pong,
+            ClientMessage::Reconcile { playback, settings } => {
+                if playback.as_ref().is_some_and(|candidate| {
+                    !candidate.state.valid()
+                        || candidate.device_id.is_empty()
+                        || candidate.device_id.len() > 128
+                }) || settings
+                    .as_ref()
+                    .is_some_and(|candidate| !valid_settings(&candidate.settings))
+                {
+                    error("invalid_snapshot", "Invalid playback or settings snapshot")
+                } else {
+                    return Ok(reconcile(&self.store, user, account, playback, settings)?);
+                }
+            }
             ClientMessage::Hello(_) => error("unexpected_hello", "Already authenticated"),
             ClientMessage::SettingsPut {
                 settings,
@@ -481,6 +495,72 @@ impl Hub {
         }
         Ok(None)
     }
+}
+
+fn reconcile(
+    store: &Store,
+    user: &str,
+    account: &mut AccountSession,
+    playback: Option<ReconciledPlayback>,
+    settings: Option<VersionedSettings>,
+) -> Result<Option<Instant>, StoreError> {
+    let mut deadline = None;
+    if let Some(ReconciledPlayback {
+        device_id,
+        mut state,
+    }) = playback
+        && state.seq > account.state.as_ref().map_or(0, |previous| previous.seq)
+    {
+        let now = wall_ms();
+        if state.playing && state.captured_at_ms > 0 {
+            state.position_ms = state
+                .position_ms
+                .saturating_add(now.saturating_sub(state.captured_at_ms).max(0) as u64);
+        }
+        state.captured_at_ms = now;
+        store.save_playback(user, &state)?;
+        account.fail_transfer("Playback changed on another device");
+        if account.active.as_ref() != Some(&device_id) {
+            if let Some(previous) = account.active.as_ref().and_then(|id| account.peers.get(id)) {
+                previous.send(ServerMessage::Command {
+                    cmd: PlaybackCommand::Pause,
+                    from_device_id: device_id.clone(),
+                });
+            }
+            account.active = Some(device_id.clone());
+            account.broadcast(
+                "",
+                ServerMessage::ActiveDeviceChanged {
+                    device_id: account.active.clone(),
+                },
+            );
+        }
+        deadline =
+            (!account.peers.contains_key(&device_id)).then(|| Instant::now() + PRESENCE_GRACE);
+        account.active_deadline = deadline;
+        account.state = Some(state.clone());
+        account.broadcast(
+            "",
+            ServerMessage::State {
+                state,
+                from_device_id: device_id,
+            },
+        );
+    }
+    if let Some(settings) = settings
+        && settings.version > account.settings.version
+    {
+        store.save_settings(user, &settings)?;
+        account.broadcast(
+            "",
+            ServerMessage::Settings {
+                settings: settings.settings.clone().into(),
+                version: settings.version,
+            },
+        );
+        account.settings = settings;
+    }
+    Ok(deadline)
 }
 
 #[derive(Debug)]

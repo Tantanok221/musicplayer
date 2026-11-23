@@ -369,6 +369,8 @@ pub struct Preferences {
     pub lastfm_user: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub sync_server_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lan_port: Option<u16>,
 }
 /// What counts as a favorite on the Favorites page.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -443,6 +445,7 @@ impl Default for Preferences {
             tabs: crate::browser::Tabs::default(),
             lastfm_user: String::new(),
             sync_server_url: String::new(),
+            lan_port: None,
         }
     }
 }

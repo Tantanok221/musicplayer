@@ -186,6 +186,9 @@ pub enum Command {
     RemoteQueueFound(String, i64, crate::server::RemotePlayQueue),
     ResumeServerQueue,
     DeviceSync(u64, crate::sync::RelayEvent),
+    LanPair(std::net::SocketAddr, String),
+    LanShowCode,
+    LanRevoke(String),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
     Connected(Server, String, Option<flume::Receiver<()>>),
@@ -285,6 +288,8 @@ pub enum Event {
     LocalVolume(f32),
     ResumeQueue(Option<String>),
     SharedPreferences(crate::sync::SharedPreferences),
+    LanStatus(crate::sync::lan::LanStatus),
+    LanOffer(crate::sync::lan::LanCode),
     Status(String),
     Connection(Connection),
     Error(String),
@@ -1192,7 +1197,7 @@ fn run(
         account.as_ref().map(Account::namespace).unwrap_or_default(),
     )?;
     events.send(Event::Ready(account.clone(), prefs.clone()))?;
-    devices.configure(&paths, account.as_ref(), &prefs.sync_server_url, &events);
+    devices.configure(&paths, account.as_ref(), &prefs, &events);
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     let interrupted = catalog.interrupted_tag_edits()?;
     if !interrupted.is_empty() {
@@ -1529,7 +1534,7 @@ fn run(
                     native_editor.session(session);
                     account = Some(value.account.clone());
                     let prefs: Preferences = catalog.state("preferences")?;
-                    devices.configure(&paths, account.as_ref(), &prefs.sync_server_url, &events);
+                    devices.configure(&paths, account.as_ref(), &prefs, &events);
                     checking = false;
                     queue_sync.connected(
                         &value,
@@ -2499,6 +2504,21 @@ fn run(
                 Command::DeviceSync(generation, event) => {
                     devices.receive(generation, event, &catalog, &player, &events)?;
                 }
+                Command::LanPair(address, code) => {
+                    if !devices.lan(device_sync::LanAction::Pair(address, code)) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
+                Command::LanShowCode => {
+                    if !devices.lan(device_sync::LanAction::ShowCode) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
+                Command::LanRevoke(id) => {
+                    if !devices.lan(device_sync::LanAction::Revoke(id)) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
                 Command::TransferTo(id, start_playing) => {
                     if !devices.transfer_to(id, start_playing) {
                         events.send(Event::Error("Device is not available for transfer".into()))?;
@@ -2511,12 +2531,12 @@ fn run(
                     devices.transfer_expired(generation, &id, &catalog, &player)?;
                 }
                 Command::RemoteQueueFound(namespace, local, queue) => {
-                    if !devices.status.enabled {
+                    if devices.can_offer_queue_resume() {
                         queue_sync.offer(queue, &namespace, local, &catalog, &events)?;
                     }
                 }
                 Command::ResumeServerQueue => {
-                    if !devices.status.enabled {
+                    if devices.can_offer_queue_resume() {
                         queue_sync.resume(&catalog, &player, &events)?;
                     }
                 }
@@ -2612,14 +2632,15 @@ fn run(
                     });
                 }
                 Command::Preferences(prefs) => {
-                    let sync_server_url = prefs.sync_server_url.clone();
                     let previous: Preferences = catalog.state("preferences")?;
-                    if previous.sync_server_url != sync_server_url {
+                    if previous.sync_server_url != prefs.sync_server_url
+                        || previous.lan_port != prefs.lan_port
+                    {
                         devices.rollback_transfer(&catalog, &player)?;
                         queue_sync.dismiss(&events)?;
                     }
                     persist_preferences(&catalog, &player, prefs.clone())?;
-                    devices.configure(&paths, account.as_ref(), &sync_server_url, &events);
+                    devices.configure(&paths, account.as_ref(), &prefs, &events);
                     devices.share_preferences(&previous, &prefs, &catalog)?;
                 }
                 Command::Persist(namespace, queue) => {

@@ -10,6 +10,12 @@ pub struct VersionedSettings {
     pub version: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReconciledPlayback {
+    pub device_id: String,
+    pub state: PlaybackState,
+}
+
 pub fn valid_settings(settings: &serde_json::Map<String, serde_json::Value>) -> bool {
     settings.iter().all(|(name, value)| match name.as_str() {
         "dark" => value.is_null() || value.is_boolean(),
@@ -131,6 +137,10 @@ pub enum ClientMessage {
     SettingsPut {
         settings: serde_json::Value,
         base_version: u64,
+    },
+    Reconcile {
+        playback: Option<ReconciledPlayback>,
+        settings: Option<VersionedSettings>,
     },
     Ping,
 }

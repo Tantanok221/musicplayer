@@ -81,6 +81,12 @@ sync.example.com {
 
 For private tailnet access instead, run `tailscale serve --bg 8088` on the relay host and use the HTTPS URL it prints on your devices. Use Tailscale Serve, not Funnel, to keep the endpoint private. The relay doesn't proxy your music: each device still needs access to Navidrome for streaming.
 
+### Local network fallback
+
+Sonora prefers the relay when it's reachable. For sync without a relay, or when the relay goes offline, pair your devices once on the same network. Use the same Navidrome URL and username on each device. Open **Settings → Paired devices** on one device and choose **Show pairing code**. On the other, select the discovered device, enter its six-digit code, and choose **Pair with device**. For more than two devices, pair each one with the others. Revoke a device from **Paired devices** to remove its saved trust.
+
+On macOS or Windows, allow Sonora to accept incoming connections on your private network if prompted. Don't forward the LAN port to the internet. If your network blocks mDNS discovery, type the other device's local IP and its displayed listening port (for example, `192.168.1.20:8088`) in **LAN peer address**. Set a fixed **LAN listener port** on that device if you need the address to keep working after a restart. Client-isolated guest networks may block direct connections entirely; use the relay there.
+
 ## Offline use
 
 Your library, playlists, artist information and previously viewed artwork stay available without a connection. Playing music still needs the server. Sonora reconnects automatically, and a failed or interrupted refresh never removes music you already have.

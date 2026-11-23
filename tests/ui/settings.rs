@@ -15,6 +15,7 @@ pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mu
             "Playback" => "0-1",
             "Downloads" => "0-2",
             "Appearance" => "0-3",
+            "Paired devices" => "0-7",
             _ => panic!("unknown settings page"),
         };
         window.within("settings-sidebar").click(id, cx);
@@ -30,6 +31,51 @@ fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut Test
         window.input(value, cx);
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut TestAppContext) {
+    use sonora::sync::lan::{LanCode, LanPeer, LanStatus};
+
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Paired devices", cx);
+    f.backend.emit(Event::LanStatus(LanStatus {
+        port: 8088,
+        peers: vec![LanPeer {
+            id: "speaker".into(),
+            name: "Kitchen".into(),
+            address: "127.0.0.1:8089".parse().unwrap(),
+        }],
+        ..Default::default()
+    }));
+    f.settle(window, cx);
+    f.expect("generate LAN pairing code", |command, _| {
+        assert!(matches!(command, Command::LanShowCode));
+        vec![Event::LanOffer(LanCode("123456".into()))]
+    });
+    f.click(window, "lan-show-code", cx);
+    f.assert_script_finished();
+    cx.update_window(window, |_, window, _| {
+        let code = window.find("lan-pairing-code");
+        assert!(code.visible());
+        assert_eq!(code.label(), Some("123456 · use within 2 minutes"));
+    })
+    .unwrap();
+    f.expect("revoke LAN device", |command, _| {
+        assert!(matches!(command, Command::LanRevoke(device) if device == "speaker"));
+        vec![Event::LanStatus(LanStatus {
+            port: 8088,
+            peers: vec![],
+            ..Default::default()
+        })]
+    });
+    f.click(window, "lan-revoke-speaker", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("lan-revoke-speaker").is_none());
+    })
+    .unwrap();
+    f.assert_script_finished();
 }
 
 #[gpui_kit::test]

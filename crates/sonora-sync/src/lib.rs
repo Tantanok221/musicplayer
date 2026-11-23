@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod local;
 mod session;
 mod store;
 mod ws;
@@ -12,6 +13,7 @@ use std::{
 use url::Url;
 
 pub use config::{Config, ConfigError};
+pub use local::{LocalCoordinator, LocalPeer, SessionError};
 pub use store::StoreError;
 
 #[derive(thiserror::Error, Debug)]

@@ -43,6 +43,7 @@ worker suite to expose flaky timing.
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
 | Device sync, shared preferences, remote playback, transfer, and server queue | `devices.rs`, `player_bar.rs`, `settings.rs` | `sync`, `service::device_sync`, `service::play_queue` | `tests/ui/devices.rs`, `tests/ui/appearance.rs`, `tests/service_worker/device_sync.rs`, `crates/sonora-sync/tests/relay.rs` |
+| Paired LAN devices and relay fallback | `settings.rs` | `sync::lan`, `sync::lan_security`, `sync::transport` | `tests/ui/settings.rs`, `tests/service_worker/device_sync.rs`, `crates/sonora-sync/tests/relay/settings.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
 | Saved-state format compatibility | | `model`, `catalog`, `service::restore_queue` | `tests/service_worker/saved_state.rs`, `tests/fixtures/saved_state/` |

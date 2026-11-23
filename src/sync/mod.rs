@@ -5,8 +5,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[doc(hidden)]
+pub mod lan;
+#[doc(hidden)]
+pub mod lan_security;
 pub(crate) mod relay;
 pub(crate) mod settings;
+mod transport;
 pub use relay::{InvalidRelayUrl, RelayEvent};
 pub use settings::SharedPreferences;
 
