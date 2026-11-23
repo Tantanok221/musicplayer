@@ -4,6 +4,22 @@ use std::time::Duration;
 pub type TrackId = String;
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(8);
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedSettings {
+    pub settings: serde_json::Map<String, serde_json::Value>,
+    pub version: u64,
+}
+
+pub fn valid_settings(settings: &serde_json::Map<String, serde_json::Value>) -> bool {
+    settings.iter().all(|(name, value)| match name.as_str() {
+        "dark" => value.is_null() || value.is_boolean(),
+        "gain" => matches!(value.as_str(), Some("Off" | "Track" | "Album" | "Smart")),
+        "sorting" | "playlist_columns" | "favorites" => value.is_object(),
+        "all_missing_releases" => value.is_boolean(),
+        _ => false,
+    })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub username: String,

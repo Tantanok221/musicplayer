@@ -1,12 +1,12 @@
 use rusqlite::{Connection, OptionalExtension, params};
-use sonora_sync_protocol::{Device, PlaybackState};
+use sonora_sync_protocol::{Device, PlaybackState, VersionedSettings};
 use std::{path::Path, time::Duration};
 
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {
     #[error("Could not access relay database")]
     Database(#[from] rusqlite::Error),
-    #[error("Could not read or encode relay playback state")]
+    #[error("Could not read or encode relay state")]
     Json(#[from] serde_json::Error),
 }
 
@@ -26,6 +26,10 @@ impl Store {
                 PRIMARY KEY (username, id)
             );
             CREATE TABLE IF NOT EXISTS playback (
+                username TEXT PRIMARY KEY NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
                 username TEXT PRIMARY KEY NOT NULL,
                 data TEXT NOT NULL
             );",
@@ -79,6 +83,34 @@ impl Store {
             "INSERT INTO playback VALUES (?1, ?2)
              ON CONFLICT(username) DO UPDATE SET data = excluded.data",
             params![user, serde_json::to_string(state)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn settings(&self, user: &str) -> Result<VersionedSettings, StoreError> {
+        let stored: Option<String> = self
+            .0
+            .query_row(
+                "SELECT data FROM settings WHERE username = ?1",
+                [user],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .map(|stored| serde_json::from_str(&stored))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    pub fn save_settings(
+        &self,
+        user: &str,
+        settings: &VersionedSettings,
+    ) -> Result<(), StoreError> {
+        self.0.execute(
+            "INSERT INTO settings VALUES (?1, ?2)
+             ON CONFLICT(username) DO UPDATE SET data = excluded.data",
+            params![user, serde_json::to_string(settings)?],
         )?;
         Ok(())
     }

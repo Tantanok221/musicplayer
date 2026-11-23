@@ -6,7 +6,9 @@ use std::{
 };
 
 pub(crate) mod relay;
+pub(crate) mod settings;
 pub use relay::{InvalidRelayUrl, RelayEvent};
+pub use settings::SharedPreferences;
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceStatus {

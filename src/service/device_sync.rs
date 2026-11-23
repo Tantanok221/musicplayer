@@ -5,8 +5,9 @@ use crate::{
     platform::{Account, Paths},
     playback::{PlayerCommand, PlayerHandle},
     sync::{
-        DeviceStatus, RelayEvent, position_at,
+        DeviceStatus, RelayEvent, SharedPreferences, position_at,
         relay::{self, RelayTask},
+        settings::SettingsState,
         wall_ms,
     },
 };
@@ -14,6 +15,7 @@ use anyhow::Result;
 use flume::Sender;
 use sonora_sync_protocol::{
     ClientMessage, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
+    VersionedSettings, valid_settings,
 };
 use std::time::Duration;
 use tokio::{
@@ -32,12 +34,20 @@ pub(super) struct DeviceSync {
     tx: Sender<Command>,
     playback: watch::Receiver<PlaybackSnapshot>,
     transfer: Option<PreparedTransfer>,
+    settings_flight: Option<VersionedSettings>,
 }
 
 struct PreparedTransfer {
     id: String,
     backup: SavedQueue,
     was_playing: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsFrame {
+    Welcome,
+    Update,
+    Conflict,
 }
 
 impl DeviceSync {
@@ -56,6 +66,7 @@ impl DeviceSync {
             tx,
             playback,
             transfer: None,
+            settings_flight: None,
         }
     }
 
@@ -161,7 +172,8 @@ impl DeviceSync {
                         devices,
                         active_device_id,
                         state,
-                        ..
+                        settings,
+                        settings_version,
                     },
                 out,
             } => {
@@ -173,9 +185,18 @@ impl DeviceSync {
                 if let Some(state) = state {
                     self.status.accept(state);
                 }
+                self.settings_flight = None;
+                self.receive_settings(
+                    (settings, settings_version),
+                    SettingsFrame::Welcome,
+                    catalog,
+                    player,
+                    events,
+                )?;
             }
             RelayEvent::Offline => {
                 self.out = None;
+                self.settings_flight = None;
                 self.status.connected = false;
                 self.rollback_transfer(catalog, player)?;
             }
@@ -197,6 +218,26 @@ impl DeviceSync {
             }
             RelayEvent::Incoming(ServerMessage::Command { cmd, .. }) => {
                 self.apply_remote(cmd, catalog, player, events)?;
+                return Ok(());
+            }
+            RelayEvent::Incoming(ServerMessage::Settings { settings, version }) => {
+                self.receive_settings(
+                    (settings, version),
+                    SettingsFrame::Update,
+                    catalog,
+                    player,
+                    events,
+                )?;
+                return Ok(());
+            }
+            RelayEvent::Incoming(ServerMessage::SettingsConflict { settings, version }) => {
+                self.receive_settings(
+                    (settings, version),
+                    SettingsFrame::Conflict,
+                    catalog,
+                    player,
+                    events,
+                )?;
                 return Ok(());
             }
             RelayEvent::Incoming(ServerMessage::TransferRequest {
@@ -249,6 +290,81 @@ impl DeviceSync {
             .and_then(|mut tracks| tracks.pop());
         events.send(Event::DeviceSync(self.status.clone()))?;
         Ok(())
+    }
+
+    pub fn share_preferences(
+        &mut self,
+        before: &Preferences,
+        after: &Preferences,
+        catalog: &Catalog,
+    ) -> Result<()> {
+        if self.status.enabled {
+            let mut state: SettingsState = catalog.state("sync:settings")?;
+            state.record(before, after);
+            catalog.set_state("sync:settings", &state)?;
+            self.publish_settings(&state);
+        }
+        Ok(())
+    }
+
+    fn receive_settings(
+        &mut self,
+        (value, version): (serde_json::Value, u64),
+        frame: SettingsFrame,
+        catalog: &Catalog,
+        player: &PlayerHandle,
+        events: &Sender<Event>,
+    ) -> Result<()> {
+        let serde_json::Value::Object(settings) = value else {
+            return Ok(());
+        };
+        if !valid_settings(&settings) {
+            return Ok(());
+        }
+        let mut state: SettingsState = catalog.state("sync:settings")?;
+        if frame != SettingsFrame::Welcome && version < state.remote.version {
+            return Ok(());
+        }
+        if frame == SettingsFrame::Conflict
+            || self.settings_flight.as_ref().is_some_and(|flight| {
+                flight.version.checked_add(1) == Some(version) && flight.settings == settings
+            })
+        {
+            self.settings_flight = None;
+        }
+        let mut prefs: Preferences = catalog.state("preferences")?;
+        if frame == SettingsFrame::Welcome
+            && version == 0
+            && settings.is_empty()
+            && state.draft().is_none()
+        {
+            state.record(&Preferences::default(), &prefs);
+        }
+        state.receive(VersionedSettings { settings, version });
+        let prior = SharedPreferences::from_preferences(&prefs);
+        let merged = state.merged();
+        if merged.apply(&mut prefs).is_err() {
+            return Ok(());
+        }
+        catalog.set_state("sync:settings", &state)?;
+        if prior != SharedPreferences::from_preferences(&prefs) {
+            persist_preferences(catalog, player, prefs)?;
+            events.send(Event::SharedPreferences(merged))?;
+        }
+        self.publish_settings(&state);
+        Ok(())
+    }
+
+    fn publish_settings(&mut self, state: &SettingsState) {
+        if self.settings_flight.is_none()
+            && let Some(draft) = state.draft()
+            && self.outbound(ClientMessage::SettingsPut {
+                settings: draft.settings.clone().into(),
+                base_version: draft.version,
+            })
+        {
+            self.settings_flight = Some(draft);
+        }
     }
 
     pub fn transfer_to(&self, target_device_id: String, start_playing: bool) -> bool {
@@ -509,6 +625,7 @@ impl DeviceSync {
         self.configuration = None;
         self.out = None;
         self.transfer = None;
+        self.settings_flight = None;
         self.status = DeviceStatus::default();
     }
 }

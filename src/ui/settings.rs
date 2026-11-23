@@ -161,6 +161,31 @@ fn layout_choice<const N: usize>(
 }
 
 impl MusicApp {
+    pub(super) fn apply_shared_preferences(
+        &mut self,
+        shared: &crate::sync::SharedPreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = &self.preferences;
+        let mut updated = previous.clone();
+        if shared.apply(&mut updated).is_err() {
+            return;
+        }
+        let theme_changed = previous.dark != updated.dark;
+        let query_changed = previous.favorites != updated.favorites
+            || previous.sorting.albums != updated.sorting.albums
+            || previous.sorting.tracks != updated.sorting.tracks;
+        self.preferences = updated;
+        if theme_changed {
+            self.apply_theme(window, cx);
+        }
+        if query_changed {
+            self.request_query(cx);
+        }
+        self.notify_part(Part::Center, cx);
+    }
+
     pub(super) fn apply_theme(&self, window: &mut Window, cx: &mut App) {
         let mode = self.preferences.dark.map_or_else(
             || ThemeMode::from(window.appearance()),

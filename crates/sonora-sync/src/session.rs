@@ -1,6 +1,7 @@
 use crate::store::{Store, StoreError};
 use sonora_sync_protocol::{
     ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
+    VersionedSettings, valid_settings,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -55,6 +56,7 @@ struct AccountSession {
     active_deadline: Option<Instant>,
     state: Option<PlaybackState>,
     transfer: Option<Transfer>,
+    settings: VersionedSettings,
 }
 
 struct Transfer {
@@ -270,6 +272,7 @@ impl Hub {
                     .map(|d| (d.id.clone(), d))
                     .collect(),
                 state: self.store.playback(&user)?,
+                settings: self.store.settings(&user)?,
                 ..Default::default()
             }),
         };
@@ -316,8 +319,8 @@ impl Hub {
             devices: account.device_list(),
             active_device_id: account.active.clone(),
             state: account.state.clone(),
-            settings: serde_json::json!({}),
-            settings_version: 0,
+            settings: account.settings.settings.clone().into(),
+            settings_version: account.settings.version,
         })
     }
 
@@ -454,15 +457,70 @@ impl Hub {
             }
             ClientMessage::Ping => ServerMessage::Pong,
             ClientMessage::Hello(_) => error("unexpected_hello", "Already authenticated"),
-            ClientMessage::SettingsPut { .. } => {
-                error("unsupported", "Message is not supported by this relay")
-            }
+            ClientMessage::SettingsPut {
+                settings,
+                base_version,
+            } => match next_settings(&account.settings, settings, base_version) {
+                Ok(settings) => {
+                    self.store.save_settings(user, &settings)?;
+                    account.broadcast(
+                        "",
+                        ServerMessage::Settings {
+                            settings: settings.settings.clone().into(),
+                            version: settings.version,
+                        },
+                    );
+                    account.settings = settings;
+                    return Ok(None);
+                }
+                Err(rejection) => rejection.reply(&account.settings),
+            },
         };
         if let Some(peer) = account.peers.get(id) {
             peer.send(reply);
         }
         Ok(None)
     }
+}
+
+#[derive(Debug)]
+enum SettingsRejection {
+    Conflict,
+    Invalid,
+    Exhausted,
+}
+
+impl SettingsRejection {
+    fn reply(self, current: &VersionedSettings) -> ServerMessage {
+        match self {
+            Self::Conflict => ServerMessage::SettingsConflict {
+                settings: current.settings.clone().into(),
+                version: current.version,
+            },
+            Self::Invalid => error("invalid_settings", "Invalid shared settings"),
+            Self::Exhausted => error("settings_unavailable", "Settings version is exhausted"),
+        }
+    }
+}
+
+fn next_settings(
+    current: &VersionedSettings,
+    proposed: serde_json::Value,
+    base_version: u64,
+) -> Result<VersionedSettings, SettingsRejection> {
+    if base_version != current.version {
+        return Err(SettingsRejection::Conflict);
+    }
+    let serde_json::Value::Object(settings) = proposed else {
+        return Err(SettingsRejection::Invalid);
+    };
+    if !valid_settings(&settings) {
+        return Err(SettingsRejection::Invalid);
+    }
+    let Some(version) = current.version.checked_add(1) else {
+        return Err(SettingsRejection::Exhausted);
+    };
+    Ok(VersionedSettings { settings, version })
 }
 
 fn begin_transfer(
@@ -577,6 +635,22 @@ fn finish_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_conflict_returns_current_snapshot() {
+        let previous = next_settings(
+            &VersionedSettings::default(),
+            serde_json::json!({"dark": true}),
+            0,
+        )
+        .expect("initial settings");
+        assert!(
+            matches!(next_settings(&previous, serde_json::json!({"dark": false}), 0)
+            .unwrap_err().reply(&previous),
+            ServerMessage::SettingsConflict { settings, version: 1 }
+                if settings == serde_json::json!({"dark": true}))
+        );
+    }
 
     #[test]
     fn transfer_deadline_leaves_source_and_playback_unchanged() {

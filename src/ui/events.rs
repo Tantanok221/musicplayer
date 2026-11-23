@@ -347,6 +347,7 @@ impl MusicApp {
                 self.notify_part(Part::Player, cx);
                 return;
             }
+            Event::SharedPreferences(shared) => self.apply_shared_preferences(&shared, window, cx),
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
             Event::Error(error) => {

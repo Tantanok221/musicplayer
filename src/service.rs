@@ -284,6 +284,7 @@ pub enum Event {
     DeviceSync(crate::sync::DeviceStatus),
     LocalVolume(f32),
     ResumeQueue(Option<String>),
+    SharedPreferences(crate::sync::SharedPreferences),
     Status(String),
     Connection(Connection),
     Error(String),
@@ -2612,14 +2613,14 @@ fn run(
                 }
                 Command::Preferences(prefs) => {
                     let sync_server_url = prefs.sync_server_url.clone();
-                    if catalog.state::<Preferences>("preferences")?.sync_server_url
-                        != sync_server_url
-                    {
+                    let previous: Preferences = catalog.state("preferences")?;
+                    if previous.sync_server_url != sync_server_url {
                         devices.rollback_transfer(&catalog, &player)?;
                         queue_sync.dismiss(&events)?;
                     }
-                    persist_preferences(&catalog, &player, prefs)?;
+                    persist_preferences(&catalog, &player, prefs.clone())?;
                     devices.configure(&paths, account.as_ref(), &sync_server_url, &events);
+                    devices.share_preferences(&previous, &prefs, &catalog)?;
                 }
                 Command::Persist(namespace, queue) => {
                     if namespace == account.as_ref().map(Account::namespace).unwrap_or_default()

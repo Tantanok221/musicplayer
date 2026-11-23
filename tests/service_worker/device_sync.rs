@@ -12,6 +12,99 @@ use sonora::{
 use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState, ServerMessage};
 use tokio::net::TcpListener;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_settings_rebase_local_changes_without_uploading_device_preferences() {
+    let fixture = Fixture::new(Library::default());
+    let (writes, written) = flume::unbounded();
+    let relay = Router::new().route(
+        "/ws",
+        get(move |ws: WebSocketUpgrade| {
+            let writes = writes.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    assert!(matches!(socket.recv().await, Some(Ok(Message::Text(_)))));
+                    let send = |msg| Message::Text(serde_json::to_string(&msg).unwrap().into());
+                    socket
+                        .send(send(ServerMessage::Welcome {
+                            devices: vec![],
+                            active_device_id: None,
+                            state: None,
+                            settings: serde_json::json!({"dark": true, "gain": "Track"}),
+                            settings_version: 5,
+                        }))
+                        .await
+                        .unwrap();
+                    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                        if let Ok(ClientMessage::SettingsPut {
+                            settings,
+                            base_version,
+                        }) = serde_json::from_str(&text)
+                        {
+                            writes.send((settings.clone(), base_version)).unwrap();
+                            let answer = if base_version == 5 {
+                                ServerMessage::SettingsConflict {
+                                    settings: serde_json::json!({"dark": true, "gain": "Album"}),
+                                    version: 6,
+                                }
+                            } else {
+                                ServerMessage::Settings {
+                                    settings,
+                                    version: base_version + 1,
+                                }
+                            };
+                            socket.send(send(answer)).await.unwrap();
+                        }
+                    }
+                })
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+    fixture
+        .catalog()
+        .set_state(
+            "preferences",
+            &Preferences {
+                lastfm_user: "local history".into(),
+                volume: 0.35,
+                sync_server_url: url.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut worker = fixture.start();
+    event(
+        &worker,
+        |event| matches!(event, Event::DeviceSync(status) if status.connected),
+    );
+    let mut prefs: Preferences = fixture.catalog().state("preferences").unwrap();
+    assert_eq!(prefs.dark, Some(true));
+    assert_eq!(prefs.gain, sonora::model::GainMode::Track);
+    assert_eq!(prefs.lastfm_user, "local history");
+    assert_eq!(prefs.volume, 0.35);
+    prefs.dark = Some(false);
+    prefs.lastfm_user = "new local history".into();
+    worker.service().send(Command::Preferences(prefs));
+    assert_eq!(
+        written.recv_timeout(WAIT).unwrap(),
+        (serde_json::json!({"dark": false, "gain": "Track"}), 5)
+    );
+    assert_eq!(
+        written.recv_timeout(WAIT).unwrap(),
+        (serde_json::json!({"dark": false, "gain": "Album"}), 6)
+    );
+    let prefs: Preferences = fixture.catalog().state("preferences").unwrap();
+    assert_eq!(prefs.dark, Some(false));
+    assert_eq!(prefs.gain, sonora::model::GainMode::Album);
+    assert_eq!(prefs.lastfm_user, "new local history");
+    assert_eq!(prefs.sync_server_url, url);
+    worker.shutdown(WAIT).unwrap();
+    task.abort();
+    fixture.finish();
+}
+
 #[test]
 fn navidrome_queue_preserves_duplicate_occurrences_and_falls_back_without_extension() {
     for indexed in [true, false] {
