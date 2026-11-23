@@ -1,0 +1,24 @@
+services:
+  navidrome:
+    image: deluan/navidrome:latest
+    ports:
+      - "127.0.0.1:4533:4533"
+    volumes:
+      - navidrome-data:/data
+      - ${MUSIC_DIR:-./music}:/music:ro
+  sonora-sync:
+    build:
+      context: .
+      dockerfile: crates/sonora-sync/Dockerfile
+    environment:
+      NAVIDROME_URL: http://navidrome:4533
+    depends_on:
+      - navidrome
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - sonora-sync-data:/data
+
+volumes:
+  navidrome-data:
+  sonora-sync-data:

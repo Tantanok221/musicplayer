@@ -83,6 +83,7 @@ pub(crate) struct RelayTask {
 impl RelayTask {
     pub async fn run(self) {
         let mut attempts = 0;
+        let mut publisher = Publisher::default();
         loop {
             if let Ok(Some((socket, welcome))) =
                 time::timeout(CONNECT_TIMEOUT, self.connect()).await
@@ -94,11 +95,15 @@ impl RelayTask {
                 }) {
                     break;
                 }
-                self.session(socket, incoming, welcome).await;
+                let connected_at = Instant::now();
+                self.session(socket, incoming, welcome, &mut publisher)
+                    .await;
                 if !self.emit(RelayEvent::Offline) {
                     break;
                 }
-                attempts = 0;
+                if connected_at.elapsed() >= HEARTBEAT {
+                    attempts = 0;
+                }
             }
             let max_ms = (500u64 << attempts).min(30_000);
             time::sleep(Duration::from_millis(rand::random_range(
@@ -137,6 +142,7 @@ impl RelayTask {
         mut socket: Socket,
         mut outgoing: mpsc::Receiver<ClientMessage>,
         welcome: ServerMessage,
+        publisher: &mut Publisher,
     ) -> Option<()> {
         let ServerMessage::Welcome {
             active_device_id,
@@ -146,9 +152,9 @@ impl RelayTask {
         else {
             return None;
         };
-        let mut publisher = Publisher {
+        *publisher = Publisher {
             active: active_device_id,
-            latest_seq: state.map(|state| state.seq),
+            latest_seq: publisher.latest_seq.max(state.map(|state| state.seq)),
             ..Default::default()
         };
         let mut timer = time::interval(Duration::from_millis(100));

@@ -13,6 +13,116 @@ use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState
 use tokio::net::TcpListener;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_publishes_above_the_last_sequence_even_after_relay_rollback() {
+    use sonora::sync::PlaybackObservation;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let fixture = Fixture::new(Library::default());
+    let (sequences, published) = flume::unbounded();
+    let (disconnect, closed) = flume::bounded(1);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let relay = Router::new().route(
+        "/ws",
+        get(move |ws: WebSocketUpgrade| {
+            let attempt = connections.fetch_add(1, Ordering::SeqCst);
+            let closed = closed.clone();
+            let sequences = sequences.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let Some(Ok(Message::Text(text))) = socket.recv().await else {
+                        return;
+                    };
+                    let ClientMessage::Hello(hello) = serde_json::from_str(&text).unwrap() else {
+                        panic!("relay hello after reconnect");
+                    };
+                    let active = if attempt == 0 {
+                        "speaker".into()
+                    } else {
+                        hello.device_id
+                    };
+                    let welcome = ServerMessage::Welcome {
+                        devices: vec![],
+                        active_device_id: Some(active),
+                        state: Some(PlaybackState {
+                            seq: if attempt == 0 { 100 } else { 5 },
+                            ..Default::default()
+                        }),
+                        settings: serde_json::json!({}),
+                        settings_version: 0,
+                    };
+                    socket
+                        .send(Message::Text(
+                            serde_json::to_string(&welcome).unwrap().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if attempt == 0 {
+                        closed.recv_async().await.unwrap();
+                        socket.send(Message::Close(None)).await.unwrap();
+                        return;
+                    }
+                    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                        if let Ok(ClientMessage::StateUpdate { state }) =
+                            serde_json::from_str(&text)
+                        {
+                            sequences.send(state.seq).unwrap();
+                        }
+                    }
+                })
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+    fixture
+        .catalog()
+        .set_state(
+            "preferences",
+            &Preferences {
+                sync_server_url: url,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut worker = fixture.start();
+    let (account, _) = worker.wait_ready(WAIT).unwrap();
+    event(
+        &worker,
+        |event| matches!(event, Event::DeviceSync(status) if status.remote_id() == Some("speaker")),
+    );
+    disconnect.send(()).unwrap();
+    event(
+        &worker,
+        |event| matches!(event, Event::DeviceSync(status) if status.enabled && !status.connected),
+    );
+    event(
+        &worker,
+        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.remote_id().is_none()),
+    );
+    worker.publish_playback(PlaybackSnapshot {
+        sync: Some(Arc::new(PlaybackObservation {
+            namespace: account.unwrap().namespace(),
+            revision: 1,
+            volume: 50,
+            shuffle: false,
+            repeat: Default::default(),
+        })),
+        ..Default::default()
+    });
+    assert!(
+        published.recv_timeout(WAIT).unwrap() > 100,
+        "reconnect discarded the last sequence"
+    );
+    worker.shutdown(WAIT).unwrap();
+    task.abort();
+    fixture.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_settings_rebase_local_changes_without_uploading_device_preferences() {
     let fixture = Fixture::new(Library::default());
     let (writes, written) = flume::unbounded();

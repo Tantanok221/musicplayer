@@ -58,6 +58,29 @@ Open **Settings**, enter your Navidrome address (including any subpath), usernam
 
 Linux uses Ctrl instead of ⌘. On macOS, closing the window keeps music playing; reopen Sonora from the Dock. On Linux, closing the last window quits.
 
+## Sync playback across devices
+
+Run one Sonora sync relay for your Navidrome server. On each Sonora device, sign in to the same Navidrome account and enter the relay's HTTPS URL under **Settings → Device sync → Sync server URL**. Open **Devices** in the player bar to see what's playing elsewhere, control the active device, or move playback here. Shared preferences such as theme and ReplayGain follow the account; volume, paths, and Last.fm credentials stay on each device.
+
+To start a new Navidrome and relay together, set `MUSIC_DIR` to your music folder and run:
+
+```sh
+docker compose -f compose.sync.example.yaml up -d --build
+curl --fail http://127.0.0.1:8088/health
+```
+
+If you already run Navidrome, add only the relay service to your Compose project and set `NAVIDROME_URL` to the address the relay can reach, including any Navidrome subpath. Keep the relay's `/data` volume to retain its SQLite database across restarts. Without Docker, use `cargo build --locked --release -p sonora-sync` and run `target/release/sonora-sync` with `NAVIDROME_URL`, `BIND_ADDR` (default `127.0.0.1:8088`), and `DB_PATH` (default `sonora-sync.sqlite`).
+
+Use TLS for access from other devices: the relay authenticates with the saved Subsonic token and salt. Keep the relay bound to loopback on the host and forward its endpoints through a reverse proxy that supports WebSocket upgrades on `/ws`. For example, a Caddy instance running on the same host can use:
+
+```caddyfile
+sync.example.com {
+    reverse_proxy 127.0.0.1:8088
+}
+```
+
+For private tailnet access instead, run `tailscale serve --bg 8088` on the relay host and use the HTTPS URL it prints on your devices. Use Tailscale Serve, not Funnel, to keep the endpoint private. The relay doesn't proxy your music: each device still needs access to Navidrome for streaming.
+
 ## Offline use
 
 Your library, playlists, artist information and previously viewed artwork stay available without a connection. Playing music still needs the server. Sonora reconnects automatically, and a failed or interrupted refresh never removes music you already have.
