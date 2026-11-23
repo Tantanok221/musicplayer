@@ -24,6 +24,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use url::Url;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+#[path = "relay/transfer.rs"]
+mod transfer;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 struct Running {

@@ -33,6 +33,7 @@ const SIGN_IN_NOTICE: &str =
 
 mod device_sync;
 pub mod native;
+mod play_queue;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
@@ -179,6 +180,11 @@ pub enum Command {
     Preferences(Preferences),
     Player(PlayerCommand),
     RemotePlayback(sonora_sync_protocol::PlaybackCommand),
+    TransferTo(String, bool),
+    TransferPrepared(u64, String, bool),
+    TransferExpired(u64, String),
+    RemoteQueueFound(String, i64, crate::server::RemotePlayQueue),
+    ResumeServerQueue,
     DeviceSync(u64, crate::sync::RelayEvent),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
@@ -277,6 +283,7 @@ pub enum Event {
     Playback(PlaybackSnapshot),
     DeviceSync(crate::sync::DeviceStatus),
     LocalVolume(f32),
+    ResumeQueue(Option<String>),
     Status(String),
     Connection(Connection),
     Error(String),
@@ -1172,6 +1179,7 @@ fn run(
     } = service;
     let mut devices =
         device_sync::DeviceSync::new(runtime.clone(), tx.clone(), playback_sample.subscribe());
+    let mut queue_sync = play_queue::QueueSync::new(&runtime);
     let mut account = paths.account()?;
     let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
@@ -1353,10 +1361,15 @@ fn run(
             Err(flume::RecvTimeoutError::Disconnected) => break,
         };
         if let Command::Shutdown(ack) = command {
+            let _ = devices.rollback_transfer(&catalog, &player);
             let (reply, queue) = flume::bounded(1);
             player.send(PlayerCommand::SaveQueue(reply));
             if let Ok(queue) = queue.recv_timeout(std::time::Duration::from_secs(2)) {
-                catalog.set_state("queue", &queue)?;
+                queue_sync.quit(
+                    &catalog,
+                    queue,
+                    server.as_ref().filter(|_| devices.can_save_queue()),
+                )?;
             }
             player.send(PlayerCommand::Shutdown);
             let _ = ack.send(());
@@ -1517,6 +1530,13 @@ fn run(
                     let prefs: Preferences = catalog.state("preferences")?;
                     devices.configure(&paths, account.as_ref(), &prefs.sync_server_url, &events);
                     checking = false;
+                    queue_sync.connected(
+                        &value,
+                        !prefs.sync_server_url.is_empty(),
+                        &catalog,
+                        &runtime,
+                        &tx,
+                    )?;
                     last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
@@ -2478,6 +2498,27 @@ fn run(
                 Command::DeviceSync(generation, event) => {
                     devices.receive(generation, event, &catalog, &player, &events)?;
                 }
+                Command::TransferTo(id, start_playing) => {
+                    if !devices.transfer_to(id, start_playing) {
+                        events.send(Event::Error("Device is not available for transfer".into()))?;
+                    }
+                }
+                Command::TransferPrepared(generation, id, ok) => {
+                    devices.transfer_prepared(generation, id, ok, &catalog, &player)?;
+                }
+                Command::TransferExpired(generation, id) => {
+                    devices.transfer_expired(generation, &id, &catalog, &player)?;
+                }
+                Command::RemoteQueueFound(namespace, local, queue) => {
+                    if !devices.status.enabled {
+                        queue_sync.offer(queue, &namespace, local, &catalog, &events)?;
+                    }
+                }
+                Command::ResumeServerQueue => {
+                    if !devices.status.enabled {
+                        queue_sync.resume(&catalog, &player, &events)?;
+                    }
+                }
                 Command::WriteTags(edits) => {
                     let covers = crate::tags::wanted_covers(&edits);
                     if !covers.is_empty() {
@@ -2571,12 +2612,27 @@ fn run(
                 }
                 Command::Preferences(prefs) => {
                     let sync_server_url = prefs.sync_server_url.clone();
+                    if catalog.state::<Preferences>("preferences")?.sync_server_url
+                        != sync_server_url
+                    {
+                        devices.rollback_transfer(&catalog, &player)?;
+                        queue_sync.dismiss(&events)?;
+                    }
                     persist_preferences(&catalog, &player, prefs)?;
                     devices.configure(&paths, account.as_ref(), &sync_server_url, &events);
                 }
                 Command::Persist(namespace, queue) => {
-                    if namespace == account.as_ref().map(Account::namespace).unwrap_or_default() {
-                        catalog.set_state("queue", &queue)?;
+                    if namespace == account.as_ref().map(Account::namespace).unwrap_or_default()
+                        && !devices.preparing_transfer()
+                    {
+                        let playing = playback_sample.borrow().playing;
+                        queue_sync.persist(
+                            &catalog,
+                            queue,
+                            server.as_ref().filter(|_| devices.can_save_queue()),
+                            playing,
+                            &events,
+                        )?;
                     }
                 }
                 Command::Scrobble(report) => {

@@ -9,6 +9,32 @@ use sonora_sync_protocol::{Device, PlaybackCommand, PlaybackState};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[gpui_kit::test]
+fn navidrome_resume_offer_plays_only_when_selected(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _) = start(cx);
+    fixture
+        .backend
+        .emit(Event::ResumeQueue(Some("Kitchen".into())));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("resume-server-queue").label(),
+            Some("Resume from Kitchen")
+        );
+    })
+    .unwrap();
+    fixture.expect("accept saved queue", |command, _| {
+        assert!(matches!(command, Command::ResumeServerQueue));
+        vec![Event::ResumeQueue(None)]
+    });
+    fixture.click(window, "resume-server-queue", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("resume-server-queue").is_none());
+    })
+    .unwrap();
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
 fn devices_shows_remote_playback_and_controls_only_the_active_peer(cx: &mut TestAppContext) {
     let (_dir, mut fixture, window, _) = start(cx);
     let _ = fixture.backend.player_commands().try_iter().count();
@@ -67,7 +93,15 @@ fn devices_shows_remote_playback_and_controls_only_the_active_peer(cx: &mut Test
         assert!(menu.find_by_label("Laptop · This device").visible());
     })
     .unwrap();
-    fixture.press(window, "escape", cx);
+    fixture.expect("transfer to this device", |command, _| {
+        assert!(matches!(command, Command::TransferTo(id, true) if id == "local"));
+        vec![]
+    });
+    fixture.menu_item(window, "Laptop · This device", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("popup-menu").is_none());
+    })
+    .unwrap();
 
     fixture.expect("pause active remote device", |command, _| {
         assert!(matches!(

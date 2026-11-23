@@ -139,6 +139,10 @@ impl Worker {
         &self.player_commands
     }
 
+    pub fn publish_playback(&self, snapshot: crate::model::PlaybackSnapshot) {
+        self.service.playback_sample.send_replace(snapshot);
+    }
+
     pub fn wait_ready(&self, timeout: Duration) -> Result<(Option<Account>, Preferences)> {
         let deadline = Instant::now() + timeout;
         loop {

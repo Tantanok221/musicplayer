@@ -226,7 +226,7 @@ impl Request {
 
 /// Repeated parameters listing songs in order: playlist contents or additions.
 fn is_song_id(key: &str) -> bool {
-    matches!(key, "songId" | "songIdToAdd")
+    matches!(key, "songId" | "songIdToAdd" | "queueId")
 }
 
 /// A fixture Last.fm chart entry: artist, album and plays.
@@ -272,12 +272,14 @@ pub struct Library {
     pub lastfm_key: bool,
     /// Whether the account may start a scan, as Navidrome administrators can.
     pub scan_admin: bool,
+    pub indexed_play_queue: Option<Value>,
 }
 
 impl Default for Library {
     fn default() -> Self {
         Self {
             server_type: "Navidrome",
+            indexed_play_queue: None,
             native: Native::default(),
             tracks: vec![song("song", "album"), song("other-song", "other-album")],
             albums: vec![album("album"), album("other-album")],
@@ -421,7 +423,9 @@ async fn navidrome(
     for (key, value) in url::form_urlencoded::parse(raw_query.as_deref().unwrap_or("").as_bytes()) {
         if matches!(
             (endpoint.as_str(), &*key),
-            ("createPlaylist.view", "songId") | ("updatePlaylist.view", "songIdToAdd")
+            ("createPlaylist.view", "songId")
+                | ("updatePlaylist.view", "songIdToAdd")
+                | ("savePlayQueueByIndex.view" | "savePlayQueue.view", "id")
         ) {
             song_ids.push(value.into_owned());
         } else if query.insert(key.into_owned(), value.into_owned()).is_some() {
@@ -441,6 +445,9 @@ async fn navidrome(
         endpoint.as_str(),
         "ping.view"
             | "getOpenSubsonicExtensions.view"
+            | "getPlayQueueByIndex.view"
+            | "savePlayQueueByIndex.view"
+            | "savePlayQueue.view"
             | "getScanStatus.view"
             | "startScan.view"
             | "getPlaylists.view"
@@ -482,6 +489,9 @@ async fn navidrome(
                 | "includeNotPresent"
                 | "playlistId"
                 | "songIndexToRemove"
+                | "currentIndex"
+                | "current"
+                | "position"
         )
     }) {
         return state.unexpected("unknown endpoint or parameter");
@@ -551,7 +561,18 @@ async fn navidrome(
             json!({"status":"ok","type":data.library.server_type,"serverVersion":"fixture"})
         }
         "getOpenSubsonicExtensions.view" if query.is_empty() => {
-            json!({"status":"ok","openSubsonicExtensions":[]})
+            let extensions = if data.library.indexed_play_queue.is_some() {
+                json!([{"name":"indexBasedQueue", "versions":[1]}])
+            } else {
+                json!([])
+            };
+            json!({"status":"ok","openSubsonicExtensions":extensions})
+        }
+        "getPlayQueueByIndex.view" if query.is_empty() => {
+            json!({"status":"ok","playQueueByIndex":data.library.indexed_play_queue})
+        }
+        "savePlayQueueByIndex.view" | "savePlayQueue.view" if query.contains_key("position") => {
+            json!({"status":"ok"})
         }
         "getScanStatus.view" if query.is_empty() => data
             .library

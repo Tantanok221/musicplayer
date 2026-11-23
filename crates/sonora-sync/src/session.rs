@@ -1,5 +1,7 @@
 use crate::store::{Store, StoreError};
-use sonora_sync_protocol::{ClientMessage, Device, Hello, PlaybackState, ServerMessage};
+use sonora_sync_protocol::{
+    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
@@ -26,6 +28,7 @@ pub(crate) struct SessionHub(Arc<Mutex<Hub>>);
 struct Hub {
     store: Store,
     accounts: HashMap<String, AccountSession>,
+    next_transfer: u64,
 }
 
 pub(crate) struct Peer {
@@ -51,6 +54,17 @@ struct AccountSession {
     active: Option<String>,
     active_deadline: Option<Instant>,
     state: Option<PlaybackState>,
+    transfer: Option<Transfer>,
+}
+
+struct Transfer {
+    id: String,
+    requester: String,
+    target: String,
+    generation: u64,
+    state: PlaybackState,
+    start_playing: bool,
+    deadline: Instant,
 }
 
 impl AccountSession {
@@ -76,6 +90,13 @@ impl AccountSession {
     }
 
     fn expire(&mut self, now: Instant) {
+        if self
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| now >= transfer.deadline)
+        {
+            self.fail_transfer("Playback transfer timed out");
+        }
         if self.active_deadline.is_none_or(|deadline| now < deadline) {
             return;
         }
@@ -86,6 +107,28 @@ impl AccountSession {
             }
             self.devices_changed("");
             self.broadcast("", ServerMessage::ActiveDeviceChanged { device_id: None });
+        }
+    }
+
+    fn transfer_result(&self, transfer: Transfer, failure: Option<&str>) {
+        let reply = ServerMessage::TransferResult {
+            transfer_id: transfer.id,
+            ok: failure.is_none(),
+            error: failure.map(str::to_owned),
+        };
+        if let Some(peer) = self.peers.get(&transfer.requester) {
+            peer.send(reply.clone());
+        }
+        if transfer.target != transfer.requester
+            && let Some(peer) = self.peers.get(&transfer.target)
+        {
+            peer.send(reply);
+        }
+    }
+
+    fn fail_transfer(&mut self, reason: &str) {
+        if let Some(transfer) = self.transfer.take() {
+            self.transfer_result(transfer, Some(reason));
         }
     }
 
@@ -126,6 +169,7 @@ impl SessionHub {
         Self(Arc::new(Mutex::new(Hub {
             store,
             accounts: HashMap::new(),
+            next_transfer: 0,
         })))
     }
 
@@ -153,8 +197,29 @@ impl SessionHub {
         generation: u64,
         msg: ClientMessage,
     ) -> Result<(), SessionError> {
-        self.with(move |hub| hub.receive(&user, &id, generation, msg))
-            .await
+        let timer_user = user.clone();
+        let deadline = self
+            .with(move |hub| hub.receive(&user, &id, generation, msg))
+            .await?;
+        if let Some(deadline) = deadline {
+            let hub = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if hub
+                    .with(move |hub| {
+                        if let Some(account) = hub.accounts.get_mut(&timer_user) {
+                            account.expire(Instant::now());
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Could not expire playback transfer");
+                }
+            });
+        }
+        Ok(())
     }
 
     pub async fn disconnect(
@@ -219,10 +284,22 @@ impl Hub {
         };
         self.store.save_device(&user, &device)?;
         account.devices.insert(id.clone(), device);
+        if account
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.target == id)
+        {
+            account.fail_transfer("Target device reconnected");
+        }
         if let Some(old) = account.peers.insert(id.clone(), peer) {
             let _ = old.cancel.send(true);
         }
-        if account.active.is_none() {
+        if account.active.is_none()
+            && account
+                .state
+                .as_ref()
+                .is_none_or(|state| state.index.is_none())
+        {
             account.active = Some(id.clone());
             account.broadcast(
                 &id,
@@ -256,6 +333,13 @@ impl Hub {
             return Ok(false);
         }
         account.peers.remove(id);
+        if account
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.target == id)
+        {
+            account.fail_transfer("Target device disconnected");
+        }
         let active = account.active.as_deref() == Some(id);
         if active {
             account.active_deadline = Some(Instant::now() + PRESENCE_GRACE);
@@ -283,17 +367,17 @@ impl Hub {
         id: &str,
         generation: u64,
         msg: ClientMessage,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Option<Instant>, SessionError> {
         let Some(account) = self.accounts.get_mut(user) else {
-            return Ok(());
+            return Ok(None);
         };
         account.expire(Instant::now());
-        let Some(peer) = account
+        if account
             .peers
             .get(id)
-            .filter(|peer| peer.generation == generation)
-        else {
-            return Ok(());
+            .is_none_or(|peer| peer.generation != generation)
+        {
+            return Ok(None);
         };
         let reply = match msg {
             ClientMessage::StateUpdate { mut state } => match account.accepts_state(id, &state) {
@@ -317,9 +401,9 @@ impl Hub {
                             from_device_id: id.into(),
                         },
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
-                Ok(false) => return Ok(()),
+                Ok(false) => return Ok(None),
                 Err(_) => error("invalid_state", "Invalid playback state"),
             },
             ClientMessage::Command {
@@ -334,23 +418,195 @@ impl Hub {
                         from_device_id: id.into(),
                     })
                 }) {
-                    return Ok(());
+                    return Ok(None);
                 } else {
                     error("device_unavailable", "Target device is not available")
                 }
             }
+            ClientMessage::Transfer {
+                target_device_id,
+                start_playing,
+            } => {
+                self.next_transfer = self.next_transfer.wrapping_add(1);
+                let transfer_id = self.next_transfer.to_string();
+                match begin_transfer(account, id, target_device_id, start_playing, transfer_id) {
+                    Ok(deadline) => return Ok(Some(deadline)),
+                    Err(message) => error("transfer_unavailable", message),
+                }
+            }
+            ClientMessage::TransferAck {
+                transfer_id, ok, ..
+            } => {
+                if account.transfer.as_ref().is_none_or(|transfer| {
+                    transfer.id != transfer_id
+                        || transfer.target != id
+                        || transfer.generation != generation
+                }) {
+                    error("unexpected_transfer", "No matching playback transfer")
+                } else {
+                    if ok {
+                        finish_transfer(&self.store, user, account)?;
+                    } else {
+                        account.fail_transfer("Target could not prepare playback");
+                    }
+                    return Ok(None);
+                }
+            }
             ClientMessage::Ping => ServerMessage::Pong,
             ClientMessage::Hello(_) => error("unexpected_hello", "Already authenticated"),
-            _ => error("unsupported", "Message is not supported by this relay"),
+            ClientMessage::SettingsPut { .. } => {
+                error("unsupported", "Message is not supported by this relay")
+            }
         };
-        peer.send(reply);
-        Ok(())
+        if let Some(peer) = account.peers.get(id) {
+            peer.send(reply);
+        }
+        Ok(None)
     }
+}
+
+fn begin_transfer(
+    account: &mut AccountSession,
+    requester: &str,
+    target: String,
+    start_playing: bool,
+    transfer_id: String,
+) -> Result<Instant, &'static str> {
+    if account.transfer.is_some() {
+        return Err("A playback transfer is already pending");
+    }
+    if account.active.as_ref() == Some(&target) {
+        return Err("Target device is already active");
+    }
+    let peer = account
+        .peers
+        .get(&target)
+        .ok_or("Target device is not available")?;
+    let mut state = account
+        .state
+        .clone()
+        .filter(|state| state.index.is_some())
+        .ok_or("There is no playback to transfer")?;
+    if account
+        .active
+        .as_ref()
+        .is_none_or(|active| !account.peers.contains_key(active))
+    {
+        state.playing = false;
+    }
+    let deadline = Instant::now() + TRANSFER_TIMEOUT;
+    if !peer.send(ServerMessage::TransferRequest {
+        transfer_id: transfer_id.clone(),
+        state: state.clone(),
+        start_playing,
+    }) {
+        return Err("Target device is not available");
+    }
+    account.transfer = Some(Transfer {
+        id: transfer_id,
+        requester: requester.into(),
+        target,
+        generation: peer.generation,
+        state,
+        start_playing,
+        deadline,
+    });
+    Ok(deadline)
+}
+
+fn finish_transfer(
+    store: &Store,
+    user: &str,
+    account: &mut AccountSession,
+) -> Result<(), SessionError> {
+    let Some(transfer) = account.transfer.take() else {
+        return Ok(());
+    };
+    let Some(seq) = account
+        .state
+        .as_ref()
+        .and_then(|state| state.seq.checked_add(1))
+    else {
+        account.transfer_result(transfer, Some("Playback sequence is exhausted"));
+        return Ok(());
+    };
+    let mut state = transfer.state.clone();
+    let now = wall_ms();
+    if state.playing && transfer.start_playing {
+        state.position_ms = state
+            .position_ms
+            .saturating_add(now.saturating_sub(state.captured_at_ms).max(0) as u64);
+    }
+    state.seq = seq;
+    state.playing = transfer.start_playing;
+    state.captured_at_ms = now;
+    if let Err(error) = store.save_playback(user, &state) {
+        account.transfer_result(transfer, Some("Could not save playback transfer"));
+        return Err(error.into());
+    }
+    if let Some(old) = account
+        .active
+        .as_deref()
+        .and_then(|id| account.peers.get(id))
+    {
+        old.send(ServerMessage::Command {
+            cmd: PlaybackCommand::Pause,
+            from_device_id: transfer.target.clone(),
+        });
+    }
+    account.active = Some(transfer.target.clone());
+    account.active_deadline = None;
+    account.state = Some(state.clone());
+    account.broadcast(
+        "",
+        ServerMessage::ActiveDeviceChanged {
+            device_id: account.active.clone(),
+        },
+    );
+    account.broadcast(
+        "",
+        ServerMessage::State {
+            state,
+            from_device_id: transfer.target.clone(),
+        },
+    );
+    account.transfer_result(transfer, None);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_deadline_leaves_source_and_playback_unchanged() {
+        let now = Instant::now();
+        let state = PlaybackState {
+            seq: 11,
+            playing: true,
+            ..Default::default()
+        };
+        let mut account = AccountSession {
+            active: Some("source".into()),
+            state: Some(state.clone()),
+            transfer: Some(Transfer {
+                id: "1".into(),
+                requester: "source".into(),
+                target: "target".into(),
+                generation: 1,
+                state: state.clone(),
+                start_playing: true,
+                deadline: now + TRANSFER_TIMEOUT,
+            }),
+            ..Default::default()
+        };
+        account.expire(now + TRANSFER_TIMEOUT - Duration::from_millis(1));
+        assert!(account.transfer.is_some());
+        account.expire(now + TRANSFER_TIMEOUT);
+        assert!(account.transfer.is_none());
+        assert_eq!(account.active.as_deref(), Some("source"));
+        assert_eq!(account.state, Some(state));
+    }
 
     #[test]
     fn only_active_device_can_advance_sequence() {

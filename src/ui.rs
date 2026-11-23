@@ -428,6 +428,7 @@ pub struct MusicApp {
     playlist_track_scroll: ScrollHandle,
     playback: PlaybackSnapshot,
     device_status: crate::sync::DeviceStatus,
+    resume_queue: Option<String>,
     account_cache: account_cache::AccountCache,
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
     art_requested: HashMap<String, Instant>,
@@ -759,6 +760,7 @@ impl MusicApp {
             lyrics_wake: None,
             playback_at: Instant::now(),
             device_status: Default::default(),
+            resume_queue: None,
             frame_timers: HashMap::new(),
             sections: HashMap::new(),
             full_frame: true,

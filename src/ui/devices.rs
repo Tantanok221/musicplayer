@@ -3,8 +3,19 @@ use crate::sync::DeviceStatus;
 use sonora_sync_protocol::PlaybackCommand;
 
 impl MusicApp {
+    pub(super) fn resume_queue_button(&self, from: &str) -> Button {
+        let service = self.service.clone();
+        Button::new("resume-server-queue")
+            .small()
+            .label(format!("Resume from {from}"))
+            .on_click(move |_, _, _| service.send(Command::ResumeServerQueue))
+    }
+
     pub(super) fn devices_button(&self) -> impl IntoElement {
         let status = self.device_status.clone();
+        let service = self.service.clone();
+        let transferable = status.track_id().is_some() || self.playback.track.is_some();
+        let start_playing = self.display_playing() || status.active_device_id.is_none();
         Button::new("devices")
             .ghost()
             .small()
@@ -32,7 +43,17 @@ impl MusicApp {
                         "android" => Glyph::Smartphone,
                         _ => Glyph::Monitor,
                     };
-                    menu = menu.item(PopupMenuItem::new(label).icon(icon).disabled(true));
+                    let mut item = PopupMenuItem::new(label).icon(icon);
+                    if device.online && !active && transferable {
+                        let id = device.id.clone();
+                        let service = service.clone();
+                        item = item.on_click(move |_, _, _| {
+                            service.send(Command::TransferTo(id.clone(), start_playing))
+                        });
+                    } else {
+                        item = item.disabled(true);
+                    }
+                    menu = menu.item(item);
                 }
                 if let Some(state) = status.playback.as_ref()
                     && let Some(track) = status

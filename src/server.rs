@@ -16,7 +16,9 @@ use std::{
 use url::Url;
 
 mod native;
+mod play_queue;
 pub use native::NativeError;
+pub use play_queue::RemotePlayQueue;
 
 fn prepare_account(mut account: Account) -> Result<Account> {
     let mut url = Url::parse(account.url.trim())
