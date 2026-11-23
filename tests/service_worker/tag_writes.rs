@@ -289,9 +289,9 @@ fn finds_releases_and_loads_their_tracks_from_musicbrainz() {
         &[
             (
                 "query",
-                r#"release:"OK Computer" AND artist:"Radiohead" AND tracks:2"#
+                r#"+release:"OK Computer" +artist:"Radiohead" tracks:2"#
             ),
-            ("limit", "10"),
+            ("limit", "25"),
         ],
     )));
     worker.shutdown(crate::fixture::WAIT).unwrap();
@@ -435,6 +435,152 @@ fn identify_by_sound_fingerprints_the_file_and_asks_acoustid() {
         Err("AcoustID: invalid API key".to_string())
     );
     assert_eq!(identify("fixture-key"), Ok("r1".to_string()));
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn a_tag_job_runs_beside_the_catalog_and_reports_each_file() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    let (mut worker, gate) = fixture.start_tag_gated();
+    synced(&worker);
+    enable(&worker, &folder);
+    worker
+        .service()
+        .send(Command::WriteTags(vec![retitle("Written slowly")]));
+    let Event::TagProgress(progress) =
+        event(&worker, |event| matches!(event, Event::TagProgress(_)))
+    else {
+        unreachable!()
+    };
+    assert_eq!((progress.done, progress.total), (0, 1));
+    assert_eq!(progress.current, "Song song");
+
+    // The file is still being written (held by the gate); browsing must not wait for it.
+    let request = worker
+        .service()
+        .query(sonora::model::LibraryQuery::default());
+    event(
+        &worker,
+        |event| matches!(event, Event::View(id, _) if *id == request),
+    );
+    assert!(folder.title().is_empty(), "the gate holds the write");
+
+    gate.send(()).unwrap();
+    let written = report(&worker);
+    assert_eq!((written.written, written.failures.len()), (1, 0));
+    assert_eq!(folder.title(), vec!["Written slowly"]);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn an_interrupted_write_leaves_the_original_and_its_staged_copy_is_removed() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(library(&folder, false));
+    fixture.seed();
+    let original = std::fs::read(folder.file()).unwrap();
+    // Sonora stopped mid-write: the journal says pending and the staged copy
+    // still sits beside the file, where Syncthing or Navidrome would pick it up.
+    let staged = folder.file().with_file_name(".sonora-tags.01 Song.flac");
+    std::fs::write(&staged, b"half written").unwrap();
+    let catalog = fixture.catalog();
+    let track = catalog.by_ids(&["song".into()]).unwrap().remove(0);
+    catalog
+        .journal_tag_edit(1, &track, &folder.file(), &read(&folder.file()).unwrap())
+        .unwrap();
+    drop(catalog);
+
+    let mut worker = fixture.start();
+    let Event::Error(message) = event(&worker, |event| matches!(event, Event::Error(_))) else {
+        unreachable!()
+    };
+    assert!(message.contains("stopped while writing tags"), "{message}");
+    assert!(!staged.exists(), "the staged copy must be removed");
+    assert_eq!(std::fs::read(folder.file()).unwrap(), original);
+    assert!(
+        fixture
+            .catalog()
+            .interrupted_tag_edits()
+            .unwrap()
+            .is_empty()
+    );
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+fn search(
+    worker: &sonora::service::test_support::Worker,
+    query: &ReleaseQuery,
+) -> Result<Vec<sonora::autotag::ReleaseCandidate>, String> {
+    worker.service().send(Command::FindReleases(query.clone()));
+    let Event::ReleaseCandidates(_, result) = event(
+        worker,
+        |event| matches!(event, Event::ReleaseCandidates(asked, _) if asked == query),
+    ) else {
+        unreachable!()
+    };
+    result
+}
+
+fn searches(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.endpoint == "metadata/release-search")
+        .map(|request| request.params["query"].clone())
+        .collect()
+}
+
+#[test]
+fn an_edition_note_or_another_spelling_of_the_artist_still_finds_the_album() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    // Tagged with an edition note MusicBrainz keeps out of the title, by an
+    // artist spelt differently, and with one song of the release missing.
+    let query = ReleaseQuery {
+        album: "OK Computer (Collector's Edition)".into(),
+        artist: "レディオヘッド".into(),
+        tracks: 1,
+        ..Default::default()
+    };
+    let found = search(&worker, &query).expect("the search should succeed");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, "ok-computer");
+    assert_eq!(
+        searches(&fixture),
+        vec![
+            r#"+(release:"OK Computer (Collector's Edition)" OR release:"OK Computer") +artist:"レディオヘッド" tracks:1"#,
+            r#"+(release:"OK Computer (Collector's Edition)" OR release:"OK Computer") artist:"レディオヘッド" tracks:1"#,
+        ]
+    );
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn a_busy_musicbrainz_is_retried_and_then_explained() {
+    let fixture = Fixture::new(Library {
+        musicbrainz_busy: 2,
+        ..Library::default()
+    });
+    let mut worker = fixture.start();
+    let query = ReleaseQuery {
+        album: "OK Computer".into(),
+        artist: "Radiohead".into(),
+        ..Default::default()
+    };
+    let found = search(&worker, &query).expect("two busy answers are retried");
+    assert_eq!(found[0].id, "ok-computer");
+    assert_eq!(searches(&fixture).len(), 3);
+
+    fixture.edit_library(|library| library.musicbrainz_busy = 10);
+    let error = search(&worker, &query).expect_err("a server that stays busy fails");
+    assert_eq!(
+        error,
+        "MusicBrainz is busy right now. Wait a minute and try again."
+    );
     worker.shutdown(crate::fixture::WAIT).unwrap();
     fixture.finish();
 }

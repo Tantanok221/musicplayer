@@ -977,6 +977,7 @@ impl Render for MusicApp {
                 .into_any_element()
         };
         let playlist_creation = self.playlist_creation_view(cx);
+        let tag_editor = self.tag_editor_dialog(cx);
         let tabs = self.part(
             Part::Tabs,
             style()
@@ -1116,5 +1117,6 @@ impl Render for MusicApp {
             .child(status)
             .child(player)
             .children(playlist_creation)
+            .children(tag_editor)
     }
 }

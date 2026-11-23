@@ -30,6 +30,9 @@ pub struct MusicBrainz {
     last: Arc<Mutex<Option<Instant>>>,
 }
 
+/// Tries for a request MusicBrainz answers "busy" (503) before giving up.
+const BUSY_ATTEMPTS: usize = 4;
+
 impl MusicBrainz {
     pub fn new() -> Result<Self> {
         Self::with_endpoints("https://musicbrainz.org/ws/2/", Duration::from_millis(1100))
@@ -134,7 +137,7 @@ impl MusicBrainz {
         url.query_pairs_mut()
             .extend_pairs(params)
             .append_pair("fmt", "json");
-        for attempt in 0..2 {
+        for attempt in 0..BUSY_ATTEMPTS {
             {
                 let mut last = self.last.lock().await;
                 if let Some(at) = *last {
@@ -146,8 +149,19 @@ impl MusicBrainz {
                 anyhow::Error::new(error.without_url()).context("Cannot reach MusicBrainz")
             })?;
             let status = response.status();
-            if status.as_u16() == 503 && attempt == 0 {
-                tokio::time::sleep(self.interval * 3).await;
+            // MusicBrainz answers 503 when it is overloaded or the client is
+            // over its rate; back off, as long as it asks, before trying again.
+            if status.as_u16() == 503 {
+                let asked = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(|seconds| Duration::from_secs(seconds.min(10)));
+                let backoff = self.interval * 2u32.pow(attempt as u32 + 1);
+                if attempt + 1 < BUSY_ATTEMPTS {
+                    tokio::time::sleep(asked.unwrap_or(backoff).max(backoff)).await;
+                }
                 continue;
             }
             if !status.is_success() {
@@ -158,7 +172,7 @@ impl MusicBrainz {
                 .await
                 .map_err(|_| anyhow::anyhow!("MusicBrainz returned an invalid response"));
         }
-        bail!("MusicBrainz is busy")
+        bail!("MusicBrainz is busy right now. Wait a minute and try again.")
     }
 
     /// Every release group credited to the artist. Fetching by release also
@@ -405,15 +419,29 @@ impl MusicBrainz {
                 .await?;
             return Ok(recording_candidates(&found));
         }
-        let found = self
-            .get("release", &[("query", &query.lucene()), ("limit", "10")])
-            .await?;
-        Ok(found["releases"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(parse_candidate)
-            .collect())
+        let releases = |found: Value| -> Vec<ReleaseCandidate> {
+            found["releases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(parse_candidate)
+                .collect()
+        };
+        let mut found = releases(
+            self.get("release", &[("query", &query.lucene()), ("limit", "25")])
+                .await?,
+        );
+        if found.is_empty()
+            && let Some(loose) = query.loose_lucene()
+        {
+            found = releases(
+                self.get("release", &[("query", &loose), ("limit", "25")])
+                    .await?,
+            );
+        }
+        crate::autotag::rank(query, &mut found);
+        found.truncate(10);
+        Ok(found)
     }
 
     /// A release with its tracks, credits, IDs and genres.
@@ -488,6 +516,7 @@ fn parse_candidate(release: &Value) -> ReleaseCandidate {
             .map(|n| n as u32)
             .unwrap_or_else(|| edition_tracks(release)),
         score: release["score"].as_u64().unwrap_or_default() as u32,
+        disambiguation: text(&release["disambiguation"]),
     }
 }
 

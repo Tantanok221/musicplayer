@@ -1,5 +1,6 @@
 //! Real catalog actor with a private network runtime and silent player endpoint.
 use super::{Command, Event, Service};
+use crate::service::Hooks;
 use crate::{
     lastfm::LastFm,
     model::{Preferences, SavedQueue},
@@ -28,11 +29,28 @@ impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
     /// The supplied metadata and Last.fm clients must use fixture endpoints in isolated tests.
     pub fn start(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
-        Self::start_inner(paths, metadata, lastfm, false)
+        Self::start_inner(paths, metadata, lastfm, false, Hooks::default())
     }
 
     pub fn start_paused(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
-        Self::start_inner(paths, metadata, lastfm, true)
+        Self::start_inner(paths, metadata, lastfm, true, Hooks::default())
+    }
+
+    /// Like `start`, but every file of a tag job waits for a message on the
+    /// returned sender before it is written.
+    pub fn start_tag_gated(
+        paths: Paths,
+        metadata: MusicBrainz,
+        lastfm: LastFm,
+    ) -> Result<(Self, flume::Sender<()>)> {
+        let (gate, tag_gate) = flume::unbounded();
+        let hooks = Hooks {
+            tag_gate: Some(tag_gate),
+        };
+        Ok((
+            Self::start_inner(paths, metadata, lastfm, false, hooks)?,
+            gate,
+        ))
     }
 
     fn start_inner(
@@ -40,6 +58,7 @@ impl Worker {
         metadata: MusicBrainz,
         lastfm: LastFm,
         paused: bool,
+        hooks: Hooks,
     ) -> Result<Self> {
         let (tx, commands) = flume::unbounded();
         let (events, received_events) = flume::unbounded();
@@ -78,8 +97,11 @@ impl Worker {
                         worker,
                         commands,
                         events,
-                        metadata,
-                        lastfm,
+                        crate::service::Clients {
+                            musicbrainz: metadata,
+                            lastfm,
+                            hooks,
+                        },
                     );
                     // Dropping this private runtime cancels async requests/timers
                     // and waits for blocking work before reporting completion.

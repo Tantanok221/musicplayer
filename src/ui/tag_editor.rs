@@ -2,7 +2,8 @@
 //! to undo an edit.
 use super::*;
 use crate::autotag::{self, AlbumBatch, Release, ReleaseCandidate, ReleaseQuery, TrackMatch};
-use crate::tags::{Change, EditorForm, Entries, MULTIPLE_VALUES, TagField, TagReport};
+use crate::tags::{Change, EditorForm, Entries, MULTIPLE_VALUES, TagField, TagProgress, TagReport};
+use gpui_kit::base::Dialog;
 use gpui_kit::component::checkbox::Checkbox;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +23,12 @@ pub(super) struct TagEditor {
     link: Entity<InputState>,
     pattern: Entity<InputState>,
     saving: bool,
+    /// The file being written, while `saving`.
+    progress: Option<TagProgress>,
     failures: Vec<(String, String)>,
+    /// Holds the dialog's keyboard focus, so Escape reaches it.
+    focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
 }
 
 enum Lookup {
@@ -152,7 +158,15 @@ impl MusicApp {
             ),
             pattern: text_input("%track% - %title%".into(), "%track% - %title%", window, cx),
             saving: false,
+            progress: None,
             failures: vec![],
+            focus: cx.focus_handle(),
+            previous_focus: window.focused(cx),
+        });
+        cx.defer_in(window, |app, window, cx| {
+            if let Some(editor) = &app.tag_editor {
+                editor.focus.clone().focus(window, cx);
+            }
         });
         cx.notify();
     }
@@ -439,6 +453,7 @@ impl MusicApp {
     pub(super) fn tags_written(&mut self, report: TagReport) {
         if let Some(editor) = self.tag_editor.as_mut().filter(|_| !report.undo) {
             editor.saving = false;
+            editor.progress = None;
             if report.failures.is_empty() {
                 self.tag_editor = None;
             } else {
@@ -897,7 +912,28 @@ impl MusicApp {
             .into_any_element()
     }
 
-    pub(super) fn tag_editor_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Closes the editor unless files are being written, and gives focus back.
+    fn close_tag_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tag_editor.as_ref().is_some_and(|editor| editor.saving) {
+            return;
+        }
+        if let Some(editor) = self.tag_editor.take() {
+            editor
+                .previous_focus
+                .unwrap_or_else(|| self.focus.clone())
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn tag_progress(&mut self, progress: TagProgress) {
+        if let Some(editor) = self.tag_editor.as_mut().filter(|editor| editor.saving) {
+            editor.progress = Some(progress);
+        }
+    }
+
+    /// The editor as a dialog over the window, so the library keeps its place.
+    pub(super) fn tag_editor_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let editor = self.tag_editor.as_ref()?;
         let colors = ink(cx);
         let count = editor.form.tracks.len();
@@ -912,60 +948,65 @@ impl MusicApp {
             editor.lookup,
             Lookup::Searching(_) | Lookup::Loading(_) | Lookup::Identifying(_)
         );
+        let saving = editor.saving;
         let spans = ReleaseQuery::spans_albums(&editor.form.tracks);
         let identifies = editor.review.is_none()
             && editor.form.tracks.len() == 1
             && !self.preferences.metadata.acoustid_key.trim().is_empty();
-        let mut panel = div()
-            .id("tag-editor")
-            .test_support()
-            .role(Role::Dialog)
-            .aria_label(title.clone())
+        let header = div()
             .flex_shrink_0()
-            .p_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .py_3()
+            .border_b_1()
+            .border_color(colors.line)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title.clone()),
+            )
+            .when(identifies, |row| {
+                row.child(
+                    Button::new("identify-sound")
+                        .small()
+                        .label("Identify by Sound")
+                        .disabled(searching || saving)
+                        .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
+                )
+            })
+            .when(editor.review.is_none(), |row| {
+                row.child(
+                    Button::new("find-musicbrainz")
+                        .small()
+                        .label(if spans {
+                            "Find Each Album"
+                        } else {
+                            "Find on MusicBrainz"
+                        })
+                        .loading(searching)
+                        .disabled(saving)
+                        .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
+                )
+            });
+        let mut body = div()
+            .id("tag-editor-scroll")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.))
-                            .font_semibold()
-                            .child(title),
-                    )
-                    .when(identifies, |row| {
-                        row.child(
-                            Button::new("identify-sound")
-                                .small()
-                                .label("Identify by Sound")
-                                .disabled(searching)
-                                .on_click(cx.listener(|app, _, _, cx| app.identify_by_sound(cx))),
-                        )
-                    })
-                    .when(editor.review.is_none(), |row| {
-                        row.child(
-                            Button::new("find-musicbrainz")
-                                .small()
-                                .label(if spans {
-                                    "Find Each Album"
-                                } else {
-                                    "Find on MusicBrainz"
-                                })
-                                .loading(searching)
-                                .on_click(cx.listener(|app, _, _, cx| app.find_releases(cx))),
-                        )
-                    }),
-            );
+            .px_5()
+            .py_3();
         if editor.review.is_none() && !spans {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .flex()
                     .items_center()
@@ -980,13 +1021,13 @@ impl MusicApp {
                         Button::new("open-musicbrainz-link")
                             .small()
                             .label("Load Link")
-                            .disabled(searching)
+                            .disabled(searching || saving)
                             .on_click(cx.listener(|app, _, _, cx| app.open_link(cx))),
                     ),
             );
         }
         if editor.review.is_none() {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .flex()
                     .items_center()
@@ -1001,6 +1042,7 @@ impl MusicApp {
                         Button::new("fill-from-names")
                             .small()
                             .label("Fill from File Names")
+                            .disabled(saving)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.fill_from_names(window, cx)),
                             ),
@@ -1008,9 +1050,9 @@ impl MusicApp {
             );
         }
         if let Some(changes) = &editor.review {
-            panel = panel.child(self.review_panel(changes, cx));
+            body = body.child(self.review_panel(changes, cx));
         } else {
-            panel = panel
+            body = body
                 .children(self.lookup_panel(editor, cx))
                 .child(div().text_size(px(11.)).text_color(colors.muted).child(
                     "Writes to the files in your music folder. Fields you leave alone keep their \
@@ -1020,7 +1062,7 @@ impl MusicApp {
                 .children(self.track_table(editor, cx));
         }
         if warns {
-            panel = panel.child(
+            body = body.child(
                 div()
                     .id("tag-id-warning")
                     .test_support()
@@ -1037,10 +1079,16 @@ impl MusicApp {
             let summary = editor
                 .failures
                 .iter()
-                .map(|(title, reason)| format!("{title}: {reason}"))
+                .map(|(title, reason)| {
+                    if title.is_empty() {
+                        reason.clone()
+                    } else {
+                        format!("{title}: {reason}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
-            panel = panel.child(
+            body = body.child(
                 div()
                     .id("tag-failures")
                     .test_support()
@@ -1052,32 +1100,96 @@ impl MusicApp {
                     .child(summary),
             );
         }
-        if editor.review.is_some() {
-            return Some(panel.into_any_element());
-        }
+        let status = saving.then(|| {
+            editor
+                .progress
+                .as_ref()
+                .map_or_else(|| "Writing…".to_string(), TagProgress::label)
+        });
         let retry = !editor.failures.is_empty();
-        let saving = editor.saving;
-        Some(
-            panel
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Button::new("save-tags")
-                                .small()
-                                .primary()
-                                .loading(saving)
-                                .label(if retry { "Retry" } else { "Review Changes" })
-                                .on_click(cx.listener(|app, _, _, cx| app.save_tags(cx))),
+        let footer = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .py_3()
+            .border_t_1()
+            .border_color(colors.line)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(colors.muted)
+                    .when_some(status, |row, status| {
+                        row.child(
+                            div()
+                                .id("tag-progress")
+                                .test_support()
+                                .role(Role::Status)
+                                .aria_label(status.clone())
+                                .child(status),
                         )
-                        .child(Button::new("cancel-tags").small().label("Cancel").on_click(
-                            cx.listener(|app, _, _, cx| {
-                                app.tag_editor = None;
-                                cx.notify();
-                            }),
-                        )),
-                )
+                    }),
+            )
+            .when(editor.review.is_none(), |footer| {
+                footer
+                    .child(
+                        Button::new("cancel-tags")
+                            .small()
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(saving)
+                            .on_click(
+                                cx.listener(|app, _, window, cx| app.close_tag_editor(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("save-tags")
+                            .small()
+                            .primary()
+                            .loading(saving)
+                            .label(if retry { "Retry" } else { "Review Changes" })
+                            .on_click(cx.listener(|app, _, _, cx| app.save_tags(cx))),
+                    )
+            });
+        let card = div()
+            .id("tag-editor")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label(title)
+            .relative()
+            .occlude()
+            .w_full()
+            .max_w(px(980.))
+            .h_full()
+            .min_h_0()
+            .bg(colors.background)
+            .border_1()
+            .border_color(colors.line)
+            .rounded_xl()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
+            .child(footer);
+        let weak = cx.weak_entity();
+        Some(
+            Dialog::new(cx)
+                .focus_handle(editor.focus.clone())
+                .p_5()
+                .close_on_backdrop_press(false)
+                .backdrop(div().absolute().inset_0().occlude().bg(cx.theme().overlay))
+                .popup(card)
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, window, cx| {
+                    let _ = weak.update(cx, |app, cx| app.close_tag_editor(window, cx));
+                    false
+                })
                 .into_any_element(),
         )
     }

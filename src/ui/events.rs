@@ -232,6 +232,7 @@ impl MusicApp {
             }
             Event::SlskdStatus(status) => self.slskd_status = Some(status),
             Event::TagsWritten(report) => self.tags_written(report),
+            Event::TagProgress(progress) => self.tag_progress(progress),
             Event::Album(id, tracks) if self.tag_editor_album.as_ref() == Some(&id) => {
                 self.tag_editor_album = None;
                 let tracks = tracks.iter().map(|track| (**track).clone()).collect();

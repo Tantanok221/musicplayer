@@ -916,9 +916,6 @@ impl MusicApp {
         if let Some(notice) = self.tag_notice_banner(cx) {
             center = center.child(notice);
         }
-        if let Some(editor) = self.tag_editor_panel(cx) {
-            center = center.child(editor);
-        }
         if let Some(editor) = self.playlist_rename_view(cx) {
             center = center.child(editor);
         }

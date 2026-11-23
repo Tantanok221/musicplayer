@@ -579,60 +579,136 @@ pub fn write(
     path: &Path,
     fields: &BTreeMap<TagField, EditValue>,
 ) -> Result<(TagValues, TagValues)> {
-    let before = read(path)?;
-    let name = path.file_name().context("Not a file")?.to_string_lossy();
-    let temp = path.with_file_name(format!(".sonora-tags.{name}"));
+    let name = path
+        .file_name()
+        .context("Not a file")?
+        .to_string_lossy()
+        .into_owned();
+    // Edit a copy on this computer: on a network share the file then crosses
+    // the network once each way, and the tag library never works over it.
+    let local_dir = tempfile::Builder::new().prefix("sonora-tags").tempdir()?;
+    let local = local_dir.path().join(&name);
+    std::fs::copy(path, &local).with_context(|| format!("Couldn't copy {}", path.display()))?;
+    let before = read(&local)?;
+    set_tags(&local, &name, fields)?;
+    let after = read(&local)?;
+    let staged = staged_path(path);
     let result = (|| -> Result<()> {
-        std::fs::copy(path, &temp).with_context(|| format!("Couldn't copy {}", path.display()))?;
-        let mut file = lofty::probe::Probe::open(&temp)?
-            .guess_file_type()?
-            .read()?;
-        let kind = file.primary_tag_type();
-        if file.primary_tag().is_none() {
-            file.insert_tag(Tag::new(kind));
-        }
-        let tag = file
-            .primary_tag_mut()
-            .context("The file has no tag to edit")?;
-        for (field, value) in fields {
-            let Some(values) = value.values() else {
-                continue;
-            };
-            if *field == TagField::CoverArt {
-                // MP4 cover atoms carry no picture type and read back as Other.
-                tag.remove_picture_type(PictureType::CoverFront);
-                tag.remove_picture_type(PictureType::Other);
-                for value in values {
-                    tag.push_picture(picture_data(&value)?);
-                }
-                continue;
-            }
-            for key in field.keys() {
-                tag.remove_key(*key);
-            }
-            for value in values {
-                if !tag.push(TagItem::new(field.keys()[0], ItemValue::Text(value))) {
-                    bail!("{} can't hold a {} tag", name, field.label());
-                }
-            }
-        }
-        file.save_to_path(&temp, WriteOptions::default())
-            .with_context(|| format!("Couldn't write tags to {name}"))?;
-        std::fs::File::open(&temp)?.sync_all()?;
-        std::fs::rename(&temp, path)
+        std::fs::copy(&local, &staged)
+            .with_context(|| format!("Couldn't copy {name} back to the music folder"))?;
+        flush(&std::fs::File::open(&staged)?)
+            .with_context(|| format!("Couldn't save {name} to disk"))?;
+        std::fs::rename(&staged, path)
             .with_context(|| format!("Couldn't replace {}", path.display()))?;
         if let Some(dir) = path.parent()
             && let Ok(dir) = std::fs::File::open(dir)
         {
-            let _ = dir.sync_all();
+            let _ = flush(&dir);
         }
         Ok(())
     })();
     if let Err(error) = result {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
-    Ok((before, read(path)?))
+    Ok((before, after))
+}
+
+/// Applies `fields` to the tags of the file at `path`, in place.
+fn set_tags(path: &Path, name: &str, fields: &BTreeMap<TagField, EditValue>) -> Result<()> {
+    let mut file = lofty::probe::Probe::open(path)?.guess_file_type()?.read()?;
+    let kind = file.primary_tag_type();
+    if file.primary_tag().is_none() {
+        file.insert_tag(Tag::new(kind));
+    }
+    let tag = file
+        .primary_tag_mut()
+        .context("The file has no tag to edit")?;
+    for (field, value) in fields {
+        let Some(values) = value.values() else {
+            continue;
+        };
+        if *field == TagField::CoverArt {
+            // MP4 cover atoms carry no picture type and read back as Other.
+            tag.remove_picture_type(PictureType::CoverFront);
+            tag.remove_picture_type(PictureType::Other);
+            for value in values {
+                tag.push_picture(picture_data(&value)?);
+            }
+            continue;
+        }
+        for key in field.keys() {
+            tag.remove_key(*key);
+        }
+        for value in values {
+            if !tag.push(TagItem::new(field.keys()[0], ItemValue::Text(value))) {
+                bail!("{} can't hold a {} tag", name, field.label());
+            }
+        }
+    }
+    file.save_to_path(path, WriteOptions::default())
+        .with_context(|| format!("Couldn't write tags to {name}"))
+}
+
+/// Where a write stages the new file beside `path` before renaming it over.
+pub fn staged_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".sonora-tags.{name}"))
+}
+
+/// Removes the staged copy a write that was cut off left beside `path`. The
+/// file itself is untouched: it is only ever replaced by a finished copy.
+pub fn discard_staged(path: &Path) {
+    let _ = std::fs::remove_file(staged_path(path));
+}
+
+/// Flushes `file` to stable storage.
+fn flush(file: &std::fs::File) -> std::io::Result<()> {
+    flush_with(file, std::fs::File::sync_all)
+}
+
+/// macOS flushes with F_FULLFSYNC, which network shares such as SMB refuse;
+/// a plain fsync still makes the server commit the data.
+fn flush_with(
+    file: &std::fs::File,
+    full: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match full(file) {
+        Err(error) if unsupported(&error) => plain_fsync(file),
+        result => result,
+    }
+}
+
+fn unsupported(error: &std::io::Error) -> bool {
+    // ENOTSUP and EOPNOTSUPP: 45 and 102 on macOS, 95 on Linux.
+    const CODES: &[i32] = if cfg!(target_vendor = "apple") {
+        &[45, 102]
+    } else {
+        &[95]
+    };
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error
+            .raw_os_error()
+            .is_some_and(|code| CODES.contains(&code))
+}
+
+#[cfg(unix)]
+fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: the descriptor belongs to `file`, which stays open for the call.
+    if unsafe { fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
 }
 
 /// The edit that puts back `before` for the fields an edit changed.
@@ -701,6 +777,27 @@ pub struct JournalEntry {
     pub state: EditState,
 }
 
+/// How far a tag job has got: files finished out of the total, and the song
+/// being written now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TagProgress {
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+}
+
+impl TagProgress {
+    /// "Writing 3 of 16 · Title", counting the file being written.
+    pub fn label(&self) -> String {
+        let at = (self.done + 1).min(self.total.max(1));
+        if self.current.is_empty() {
+            format!("Writing {at} of {}", self.total)
+        } else {
+            format!("Writing {at} of {} · {}", self.total, self.current)
+        }
+    }
+}
+
 /// What became of a tag edit or undo, for the editor and the notice.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TagReport {
@@ -714,6 +811,62 @@ pub struct TagReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_counts_the_file_being_written() {
+        let progress = |done, current: &str| TagProgress {
+            done,
+            total: 16,
+            current: current.into(),
+        };
+        assert_eq!(
+            progress(0, "ベテルギウス").label(),
+            "Writing 1 of 16 · ベテルギウス"
+        );
+        assert_eq!(progress(15, "").label(), "Writing 16 of 16");
+        assert_eq!(progress(16, "").label(), "Writing 16 of 16");
+    }
+
+    #[test]
+    fn flushing_falls_back_to_fsync_where_the_full_flush_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("song.flac")).unwrap();
+        // What SMB answers to macOS's F_FULLFSYNC.
+        let smb = |_: &std::fs::File| Err(std::io::Error::from_raw_os_error(45));
+        if cfg!(target_vendor = "apple") {
+            assert!(flush_with(&file, smb).is_ok());
+        }
+        let refused = |_: &std::fs::File| Err(std::io::Error::from_raw_os_error(95));
+        if cfg!(target_os = "linux") {
+            assert!(flush_with(&file, refused).is_ok());
+        }
+        let broken = |_: &std::fs::File| Err(std::io::Error::other("disk gone"));
+        assert!(flush_with(&file, broken).is_err());
+        assert!(flush(&file).is_ok());
+    }
+
+    #[test]
+    fn a_write_replaces_the_file_through_a_staged_copy_and_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("01 Song.flac");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone-0.flac"),
+            &file,
+        )
+        .unwrap();
+        let fields = BTreeMap::from([(TagField::Title, EditValue::Set("New".into()))]);
+        let (before, after) = write(&file, &fields).unwrap();
+        assert!(before.get(&TagField::Title).is_none_or(Vec::is_empty));
+        assert_eq!(after[&TagField::Title], vec!["New"]);
+        assert_eq!(read(&file).unwrap()[&TagField::Title], vec!["New"]);
+        assert!(!staged_path(&file).exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        std::fs::write(staged_path(&file), b"cut off").unwrap();
+        discard_staged(&file);
+        assert!(!staged_path(&file).exists());
+        assert_eq!(read(&file).unwrap()[&TagField::Title], vec!["New"]);
+    }
 
     fn track(id: &str, album: &str, artist: &str) -> Track {
         Track {

@@ -8,7 +8,7 @@ use sonora::{
     model::{MetadataPreferences, Preferences, Track},
     platform::{Account, shortcut},
     service::{Command, Event},
-    tags::{EditValue, TagEdit, TagField, TagReport},
+    tags::{EditValue, TagEdit, TagField, TagProgress, TagReport},
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -768,6 +768,8 @@ fn identify_by_sound_needs_a_key_then_searches_the_recording(cx: &mut TestAppCon
     };
     open(&mut fixture, cx);
     assert!(!present(window, "identify-sound", cx));
+    // The editor is modal: close it before opening it again with a key set.
+    fixture.click(window, "cancel-tags", cx);
     let mut prefs: Preferences = fixture.catalog.state("preferences").unwrap();
     prefs.metadata = MetadataPreferences {
         write_tags: true,
@@ -865,4 +867,91 @@ fn one_song_can_take_the_release_cover(cx: &mut TestAppContext) {
             || change.ends_with("→ Front cover from Cover Art Archive")),
         "{changes:?}"
     );
+}
+
+fn bounds(
+    window: AnyWindowHandle,
+    id: &'static str,
+    cx: &mut TestAppContext,
+) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds()
+    })
+    .unwrap()
+}
+
+fn progress(done: usize, current: &str) -> Event {
+    Event::TagProgress(TagProgress {
+        done,
+        total: 2,
+        current: current.into(),
+    })
+}
+
+#[gpui_kit::test]
+fn the_editor_floats_over_the_library_and_shows_each_file_as_it_is_written(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    fixture.click(window, ("workspace-tab", 1_u64), cx);
+    let library = bounds(window, "library-content", cx);
+    open_album_editor(&mut fixture, window, cx);
+    assert_eq!(
+        label(window, "tag-editor", cx).as_deref(),
+        Some("Edit tags of 2 songs")
+    );
+    // A dialog over the window: the library keeps its whole area.
+    assert_eq!(bounds(window, "library-content", cx), library);
+    assert!(present(window, "tag-editor-scroll", cx));
+
+    fixture.expect("write genre", |command, _| {
+        assert!(matches!(command, Command::WriteTags(_)));
+        vec![progress(0, "First")]
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("tag-genre", cx);
+        window.press(shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("Jazz", cx);
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    fixture.click(window, "save-tags", cx);
+    fixture.click(window, "confirm-tags", cx);
+    assert_eq!(
+        label(window, "tag-progress", cx).as_deref(),
+        Some("Writing 1 of 2 · First")
+    );
+    fixture.backend.emit(progress(1, "Second"));
+    fixture.settle(window, cx);
+    assert_eq!(
+        label(window, "tag-progress", cx).as_deref(),
+        Some("Writing 2 of 2 · Second")
+    );
+    // Escape does not close the editor while files are being written.
+    fixture.press(window, "escape", cx);
+    assert!(present(window, "tag-editor", cx));
+
+    fixture.backend.emit(Event::TagsWritten(TagReport {
+        job: 1,
+        written: 2,
+        ..Default::default()
+    }));
+    fixture.settle(window, cx);
+    assert!(!present(window, "tag-editor", cx));
+    assert_eq!(
+        label(window, "tag-notice", cx).as_deref(),
+        Some("Wrote tags to 2 files")
+    );
+    fixture.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn escape_closes_the_editor_without_writing(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _app) = start(cx);
+    open_album_editor(&mut fixture, window, cx);
+    assert!(present(window, "tag-editor", cx));
+    fixture.press(window, "escape", cx);
+    assert!(!present(window, "tag-editor", cx));
+    fixture.assert_script_finished();
 }

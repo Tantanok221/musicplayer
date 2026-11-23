@@ -97,15 +97,180 @@ impl ReleaseQuery {
             }
             return terms.join(" AND ");
         }
-        let mut terms = vec![format!("release:\"{}\"", escape(&self.album))];
+        self.album_query(true)
+    }
+
+    /// A second, looser album search for when the first finds nothing: the
+    /// artist may be spelt differently on MusicBrainz, so it only ranks.
+    pub fn loose_lucene(&self) -> Option<String> {
+        (!self.is_song() && !self.artist.is_empty()).then(|| self.album_query(false))
+    }
+
+    /// The album title as tagged or without edition notes must match; the
+    /// artist must too when `artist_required`. The song count only ranks, as
+    /// a selection can leave songs out and editions add bonus tracks.
+    fn album_query(&self, artist_required: bool) -> String {
+        let titles: Vec<String> = album_titles(&self.album)
+            .iter()
+            .map(|title| format!("release:\"{}\"", escape(title)))
+            .collect();
+        let release = match titles.as_slice() {
+            [one] => one.clone(),
+            _ => format!("({})", titles.join(" OR ")),
+        };
+        let mut terms = vec![format!("+{release}")];
         if !self.artist.is_empty() {
-            terms.push(format!("artist:\"{}\"", escape(&self.artist)));
+            let artist = format!("artist:\"{}\"", escape(&self.artist));
+            terms.push(if artist_required {
+                format!("+{artist}")
+            } else {
+                artist
+            });
         }
         if self.tracks > 0 {
             terms.push(format!("tracks:{}", self.tracks));
         }
-        terms.join(" AND ")
+        terms.join(" ")
     }
+}
+
+/// The album title as tagged and, when it differs, without the edition,
+/// format or date notes taggers add, such as "(通常盤)", "[FLAC]" or
+/// "[2022-01-22]", which MusicBrainz keeps out of release titles.
+pub fn album_titles(album: &str) -> Vec<String> {
+    let album = album.trim();
+    let bare = bare_title(album);
+    if bare.is_empty() || bare == album {
+        vec![album.to_string()]
+    } else {
+        vec![album.to_string(), bare]
+    }
+}
+
+const BRACKETS: [(char, char); 6] = [
+    ('(', ')'),
+    ('[', ']'),
+    ('{', '}'),
+    ('（', '）'),
+    ('【', '】'),
+    ('〔', '〕'),
+];
+
+/// Words that mark a bracketed note as about the edition rather than the title.
+const EDITION_WORDS: [&str; 34] = [
+    "edition",
+    "deluxe",
+    "remaster",
+    "expanded",
+    "anniversary",
+    "bonus",
+    "limited",
+    "special",
+    "standard",
+    "regular",
+    "reissue",
+    "disc",
+    "cd",
+    "flac",
+    "mp3",
+    "aac",
+    "alac",
+    "wav",
+    "bit",
+    "khz",
+    "hi-res",
+    "hires",
+    "web",
+    "vinyl",
+    "lp",
+    "盤",
+    "初回",
+    "限定",
+    "通常",
+    "生産",
+    "特典",
+    "仕様",
+    "完全",
+    "リマスター",
+];
+
+fn bare_title(album: &str) -> String {
+    let mut title = album.trim().to_string();
+    loop {
+        let before = title.clone();
+        for suffix in [" - EP", " - Single"] {
+            if let Some(rest) = title.strip_suffix(suffix) {
+                title = rest.trim_end().to_string();
+            }
+        }
+        // A note at the end, or one at the start such as a release date.
+        if let Some((open, close)) = BRACKETS.iter().find(|(_, close)| title.ends_with(*close))
+            && let Some(start) = title.rfind(*open)
+        {
+            let note = &title[start + open.len_utf8()..title.len() - close.len_utf8()];
+            if edition_note(note) {
+                title = title[..start].trim_end().to_string();
+            }
+        }
+        if let Some((open, close)) = BRACKETS.iter().find(|(open, _)| title.starts_with(*open))
+            && let Some(end) = title.find(*close)
+        {
+            let note = &title[open.len_utf8()..end];
+            if edition_note(note) {
+                title = title[end + close.len_utf8()..].trim_start().to_string();
+            }
+        }
+        if title == before {
+            return title;
+        }
+    }
+}
+
+fn edition_note(note: &str) -> bool {
+    let lower = note.to_lowercase();
+    let dated = !note.is_empty()
+        && note
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '.' | '/' | ' '));
+    dated
+        || EDITION_WORDS.iter().any(|word| {
+            if word.is_ascii() && word.len() <= 3 {
+                // Short words only as whole words: "cd" but not "Vacd".
+                lower
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|part| part.trim_matches(|c: char| c.is_ascii_digit()) == *word)
+            } else {
+                lower.contains(word)
+            }
+        })
+}
+
+/// Orders search results by how well they fit the songs: MusicBrainz's own
+/// score, then the title, the artist and the number of songs.
+pub fn rank(query: &ReleaseQuery, candidates: &mut [ReleaseCandidate]) {
+    if query.is_song() {
+        return;
+    }
+    let titles = album_titles(&query.album);
+    let fit = |candidate: &ReleaseCandidate| -> f64 {
+        let title = titles
+            .iter()
+            .map(|title| similarity(title, &candidate.title))
+            .fold(0., f64::max);
+        let artist = if query.artist.is_empty() {
+            0.
+        } else {
+            similarity(&query.artist, &candidate.artist)
+        };
+        let count = match query.tracks as u32 {
+            0 => 0.,
+            wanted if candidate.tracks == wanted => 20.,
+            wanted if candidate.tracks > wanted => 8.,
+            _ => 0.,
+        };
+        f64::from(candidate.score) + 30. * title + 15. * artist + count
+    };
+    candidates.sort_by(|a, b| fit(b).total_cmp(&fit(a)));
 }
 
 /// A lookup over songs from several albums, which goes through them one
@@ -297,6 +462,8 @@ pub struct ReleaseCandidate {
     pub catalog: String,
     pub tracks: u32,
     pub score: u32,
+    /// What MusicBrainz calls the edition, such as "通常盤" or "初回生産限定盤A".
+    pub disambiguation: String,
 }
 
 impl ReleaseCandidate {
@@ -313,12 +480,19 @@ impl ReleaseCandidate {
             self.tracks,
             if self.tracks == 1 { "track" } else { "tracks" }
         );
-        [&self.date, &self.country, &self.format, &label, &tracks]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" · ")
+        [
+            &self.disambiguation,
+            &self.date,
+            &self.country,
+            &self.format,
+            &label,
+            &tracks,
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 }
 
@@ -554,12 +728,66 @@ mod tests {
         ];
         assert_eq!(
             ReleaseQuery::for_tracks(&tracks).lucene(),
-            r#"release:"Say \"Hi\"" AND artist:"A" AND tracks:2"#
+            r#"+release:"Say \"Hi\"" +artist:"A" tracks:2"#
+        );
+        assert_eq!(
+            ReleaseQuery::for_tracks(&tracks).loose_lucene().unwrap(),
+            r#"+release:"Say \"Hi\"" artist:"A" tracks:2"#
         );
         assert_eq!(
             ReleaseQuery::for_tracks(&tracks[..1]).lucene(),
-            r#"release:"Say \"Hi\"" AND artist:"A""#
+            r#"+release:"Say \"Hi\"" +artist:"A""#
         );
+    }
+
+    #[test]
+    fn edition_format_and_date_notes_are_searched_without() {
+        let bare = |album: &str| album_titles(album).last().unwrap().clone();
+        assert_eq!(bare("壱 (通常盤)"), "壱");
+        assert_eq!(bare("壱 【初回生産限定盤A】"), "壱");
+        assert_eq!(bare("OK Computer (Collector's Edition)"), "OK Computer");
+        assert_eq!(bare("found & lost [FLAC][24bit／48kHz]"), "found & lost");
+        assert_eq!(
+            bare("[190821] ヴィンランド・サガ OP 「MUKANJYO」"),
+            "ヴィンランド・サガ OP 「MUKANJYO」"
+        );
+        assert_eq!(bare("Abbey Road (2019 Remaster)"), "Abbey Road");
+        assert_eq!(bare("Lover - Single"), "Lover");
+        assert_eq!(bare("Dummy (1994)"), "Dummy");
+        // Brackets that are part of the title stay.
+        assert_eq!(
+            album_titles("(What's the Story) Morning Glory?"),
+            vec!["(What's the Story) Morning Glory?"]
+        );
+        assert_eq!(album_titles("Songs (for Vacd)"), vec!["Songs (for Vacd)"]);
+        assert_eq!(album_titles("1989 (Taylor's Version)").len(), 1);
+    }
+
+    #[test]
+    fn results_rank_the_closest_title_artist_and_song_count_first() {
+        let query = ReleaseQuery {
+            album: "壱 (通常盤)".into(),
+            artist: "優里".into(),
+            tracks: 16,
+            ..Default::default()
+        };
+        let edition = |id: &str, title: &str, tracks: u32, score: u32| ReleaseCandidate {
+            id: id.into(),
+            title: title.into(),
+            artist: "優里".into(),
+            tracks,
+            score,
+            ..Default::default()
+        };
+        let mut found = vec![
+            edition("single", "壱の歌", 2, 100),
+            edition("short", "壱", 12, 100),
+            edition("album", "壱", 16, 95),
+            edition("bonus", "壱", 18, 95),
+        ];
+        rank(&query, &mut found);
+        let order: Vec<_> = found.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(order, ["album", "bonus", "short", "single"]);
     }
 
     #[test]

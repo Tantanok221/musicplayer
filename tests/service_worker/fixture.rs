@@ -252,6 +252,8 @@ pub struct Library {
     pub hold_endpoint: Option<&'static str>,
     pub fail_artwork: bool,
     pub fail_enrichment: bool,
+    /// How many MusicBrainz searches answer 503 "busy" before the next succeeds.
+    pub musicbrainz_busy: usize,
     /// The `structuredLyrics` versions getLyricsBySongId answers with.
     pub structured_lyrics: Value,
     /// The text getLyrics answers with for any artist and title.
@@ -294,6 +296,7 @@ impl Default for Library {
             hold_endpoint: None,
             fail_artwork: false,
             fail_enrichment: false,
+            musicbrainz_busy: 0,
             structured_lyrics: json!([]),
             plain_lyrics: "",
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
@@ -935,6 +938,26 @@ async fn metadata(
             "metadata/release-search",
             &[("query", &query["query"]), ("limit", &query["limit"])],
         ));
+        {
+            let mut data = state.data.lock().unwrap();
+            if data.library.musicbrainz_busy > 0 {
+                data.library.musicbrainz_busy -= 1;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"The MusicBrainz web server is currently busy."})),
+                )
+                    .into_response();
+            }
+        }
+        // Like MusicBrainz, the fixture only knows the band by one spelling,
+        // and only by the release's title without edition notes.
+        let wanted = &query["query"];
+        let requires_other_artist =
+            wanted.contains("+artist:") && !wanted.contains("+artist:\"Radiohead\"");
+        let title_known = wanted.contains("release:\"OK Computer\"");
+        if requires_other_artist || !title_known {
+            return Json(json!({"releases":[]})).into_response();
+        }
         return Json(json!({"releases":[{
             "id":"ok-computer", "score":100, "title":"OK Computer", "date":"1997-05-21",
             "country":"GB", "track-count":2,
@@ -1269,7 +1292,22 @@ impl Fixture {
         self.start_player(true)
     }
 
+    /// A worker whose tag writes each wait for a message on the sender.
+    pub fn start_tag_gated(&self) -> (Worker, flume::Sender<()>) {
+        let (metadata, lastfm) = self.clients();
+        Worker::start_tag_gated(self.paths.clone(), metadata, lastfm).unwrap()
+    }
+
     fn start_player(&self, paused: bool) -> Worker {
+        let (metadata, lastfm) = self.clients();
+        if paused {
+            Worker::start_paused(self.paths.clone(), metadata, lastfm).unwrap()
+        } else {
+            Worker::start(self.paths.clone(), metadata, lastfm).unwrap()
+        }
+    }
+
+    fn clients(&self) -> (MusicBrainz, LastFm) {
         let metadata =
             MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
                 .and_then(|metadata| {
@@ -1286,11 +1324,7 @@ impl Fixture {
             Duration::ZERO,
         )
         .unwrap();
-        if paused {
-            Worker::start_paused(self.paths.clone(), metadata, lastfm).unwrap()
-        } else {
-            Worker::start(self.paths.clone(), metadata, lastfm).unwrap()
-        }
+        (metadata, lastfm)
     }
 
     pub fn expect_mutation(&self, request: Request, succeeds: bool) {

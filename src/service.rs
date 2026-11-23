@@ -167,6 +167,8 @@ pub enum Command {
     WriteTags(Vec<crate::tags::TagEdit>),
     /// Puts back the tags the last edit changed.
     UndoTags,
+    /// A tag job's thread finished with this report.
+    TagJobDone(crate::tags::TagReport),
     /// Searches MusicBrainz for editions of an album.
     FindReleases(crate::autotag::ReleaseQuery),
     /// Release ID: fetches its tracks for matching.
@@ -278,6 +280,8 @@ pub enum Event {
     AlbumUpdated(Arc<Album>),
     TrackUpdated(Arc<Track>),
     TagsWritten(crate::tags::TagReport),
+    /// Sent before each file of a tag job is written.
+    TagProgress(crate::tags::TagProgress),
     ReleaseCandidates(
         crate::autotag::ReleaseQuery,
         Result<Vec<crate::autotag::ReleaseCandidate>, String>,
@@ -296,9 +300,28 @@ pub struct Service {
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+/// The outside services the catalog actor calls, and its test hooks.
+pub(crate) struct Clients {
+    pub musicbrainz: MusicBrainz,
+    pub lastfm: crate::lastfm::LastFm,
+    pub hooks: Hooks,
+}
+
+/// Points where tests can hold the worker. Production passes the default.
+#[derive(Clone, Default)]
+pub(crate) struct Hooks {
+    /// Each file of a tag job waits for a message here before it is written.
+    #[cfg(feature = "test-support")]
+    pub tag_gate: Option<Receiver<()>>,
+}
+
 /// Writes an edit into every selected file it can find, journaling each
 /// file before it is touched.
-fn write_tags(catalog: &Catalog, edits: &[crate::tags::TagEdit]) -> Result<crate::tags::TagReport> {
+fn write_tags(
+    catalog: &Catalog,
+    edits: &[crate::tags::TagEdit],
+    progress: &mut dyn FnMut(crate::tags::TagProgress),
+) -> Result<crate::tags::TagReport> {
     use crate::tags::{self, EditState};
     let prefs: Preferences = catalog.state("preferences")?;
     let mut report = tags::TagReport {
@@ -326,7 +349,13 @@ fn write_tags(catalog: &Catalog, edits: &[crate::tags::TagEdit]) -> Result<crate
     let root = std::path::PathBuf::from(&prefs.metadata.library_folder);
     // A file written since the last rescan no longer matches the size Navidrome has.
     let unconfirmed = catalog.unconfirmed_tag_edits()?;
-    for (track, fields) in tracks {
+    let total = tracks.len();
+    for (done, (track, fields)) in tracks.into_iter().enumerate() {
+        progress(tags::TagProgress {
+            done,
+            total,
+            current: track.title.clone(),
+        });
         let file = match unconfirmed
             .iter()
             .rev()
@@ -369,7 +398,10 @@ fn write_tags(catalog: &Catalog, edits: &[crate::tags::TagEdit]) -> Result<crate
 }
 
 /// Puts back what the newest job changed, as a new job so it can be undone too.
-fn undo_tags(catalog: &Catalog) -> Result<crate::tags::TagReport> {
+fn undo_tags(
+    catalog: &Catalog,
+    progress: &mut dyn FnMut(crate::tags::TagProgress),
+) -> Result<crate::tags::TagReport> {
     use crate::tags::{self, EditState};
     let mut report = tags::TagReport {
         job: chrono::Utc::now().timestamp_micros(),
@@ -382,10 +414,18 @@ fn undo_tags(catalog: &Catalog) -> Result<crate::tags::TagReport> {
             .push((String::new(), "There is no tag edit to undo.".into()));
         return Ok(report);
     };
-    for entry in catalog.tag_job(job)? {
-        if !matches!(entry.state, EditState::Written | EditState::Confirmed) {
-            continue;
-        }
+    let entries: Vec<_> = catalog
+        .tag_job(job)?
+        .into_iter()
+        .filter(|entry| matches!(entry.state, EditState::Written | EditState::Confirmed))
+        .collect();
+    let total = entries.len();
+    for (done, entry) in entries.into_iter().enumerate() {
+        progress(tags::TagProgress {
+            done,
+            total,
+            current: entry.title.clone(),
+        });
         let changed: tags::TagValues = entry
             .after
             .iter()
@@ -429,6 +469,60 @@ fn undo_tags(catalog: &Catalog) -> Result<crate::tags::TagReport> {
         }
     }
     Ok(report)
+}
+
+/// What a tag job thread does.
+enum TagJob {
+    Write(Vec<crate::tags::TagEdit>),
+    Undo,
+}
+
+/// Writes or undoes tags on a thread of its own with its own catalog
+/// connection: each file crosses the network twice on a share, and browsing
+/// must not wait for that. The report comes back as `Command::TagJobDone`.
+fn start_tag_job(
+    job: TagJob,
+    catalog: PathBuf,
+    hooks: &Hooks,
+    tx: &Sender<Command>,
+    events: &Sender<Event>,
+) -> Result<()> {
+    let undo = matches!(job, TagJob::Undo);
+    let (tx, events, _hooks) = (tx.clone(), events.clone(), hooks.clone());
+    std::thread::Builder::new()
+        .name("sonora-tags".into())
+        .spawn(move || {
+            let mut progress = |progress: crate::tags::TagProgress| {
+                let _ = events.send(Event::TagProgress(progress));
+                #[cfg(feature = "test-support")]
+                if let Some(gate) = &_hooks.tag_gate {
+                    let _ = gate.recv();
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let catalog = Catalog::open(&catalog)?;
+                match &job {
+                    TagJob::Write(edits) => write_tags(&catalog, edits, &mut progress),
+                    TagJob::Undo => undo_tags(&catalog, &mut progress),
+                }
+            }));
+            let report = match result {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => failed_tag_job(undo, format!("{error:#}")),
+                Err(_) => failed_tag_job(undo, "Writing tags stopped unexpectedly.".into()),
+            };
+            let _ = tx.send(Command::TagJobDone(report));
+        })?;
+    Ok(())
+}
+
+fn failed_tag_job(undo: bool, reason: String) -> crate::tags::TagReport {
+    crate::tags::TagReport {
+        job: chrono::Utc::now().timestamp_micros(),
+        undo,
+        failures: vec![(String::new(), reason)],
+        ..Default::default()
+    }
 }
 
 /// Reports a tag job and asks Navidrome to rescan. Only administrators can
@@ -536,7 +630,12 @@ impl Service {
             .spawn(move || {
                 let result = MusicBrainz::new().and_then(|metadata| {
                     let lastfm = crate::lastfm::LastFm::new()?;
-                    run(paths, runtime, worker, rx, events.clone(), metadata, lastfm)
+                    let clients = Clients {
+                        musicbrainz: metadata,
+                        lastfm,
+                        hooks: Hooks::default(),
+                    };
+                    run(paths, runtime, worker, rx, events.clone(), clients)
                 });
                 if let Err(error) = result {
                     let _ = events.send(Event::Error(format!("{error:#}")));
@@ -1043,9 +1142,13 @@ fn run(
     service: Service,
     rx: Receiver<Command>,
     events: Sender<Event>,
-    musicbrainz: MusicBrainz,
-    lastfm: crate::lastfm::LastFm,
+    clients: Clients,
 ) -> Result<()> {
+    let Clients {
+        musicbrainz,
+        lastfm,
+        hooks,
+    } = clients;
     let Service {
         player,
         tx,
@@ -1067,10 +1170,11 @@ fn run(
     let interrupted = catalog.interrupted_tag_edits()?;
     if !interrupted.is_empty() {
         for entry in &interrupted {
+            crate::tags::discard_staged(std::path::Path::new(&entry.file));
             catalog.finish_tag_edit(entry.id, None, crate::tags::EditState::Failed)?;
         }
         events.send(Event::Error(format!(
-            "Sonora stopped while writing tags to {} file(s), starting with {}. Check them before editing again.",
+            "Sonora stopped while writing tags to {} file(s), starting with {}. Files are only replaced once fully written, so they kept their old tags or have the new ones. Check them before editing again.",
             interrupted.len(),
             interrupted[0].file
         )))?;
@@ -1115,6 +1219,8 @@ fn run(
     let mut native_editor = native::Editor::default();
     let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
+    // One tag job at a time, on its own thread.
+    let mut tag_job_running = false;
     let mut generation = 0i64;
     let mut current_query = LibraryQuery::default();
     let mut current_request = 0;
@@ -2356,13 +2462,31 @@ fn run(
                             let edits = crate::tags::with_covers(edits, &fetched);
                             let _ = tx.send(Command::WriteTags(edits));
                         });
+                    } else if tag_job_running {
+                        events.send(Event::TagsWritten(failed_tag_job(
+                            false,
+                            "Sonora is still writing the previous tag edit.".into(),
+                        )))?;
                     } else {
-                        let report = write_tags(&catalog, &edits)?;
-                        finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
+                        tag_job_running = true;
+                        let path = catalog_path(&paths, account.as_ref());
+                        start_tag_job(TagJob::Write(edits), path, &hooks, &tx, &events)?;
                     }
                 }
                 Command::UndoTags => {
-                    let report = undo_tags(&catalog)?;
+                    if tag_job_running {
+                        events.send(Event::TagsWritten(failed_tag_job(
+                            true,
+                            "Sonora is still writing the previous tag edit.".into(),
+                        )))?;
+                    } else {
+                        tag_job_running = true;
+                        let path = catalog_path(&paths, account.as_ref());
+                        start_tag_job(TagJob::Undo, path, &hooks, &tx, &events)?;
+                    }
+                }
+                Command::TagJobDone(report) => {
+                    tag_job_running = false;
                     finish_tag_job(&report, server.clone(), &runtime, &tx, &events)?;
                 }
                 Command::FindReleases(query) => {
