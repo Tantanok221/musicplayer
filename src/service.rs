@@ -183,7 +183,12 @@ pub enum Command {
     Player(PlayerCommand),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
-    Connected(Server, String, Option<flume::Receiver<()>>),
+    Connected {
+        server: Server,
+        label: String,
+        session: Option<flume::Receiver<()>>,
+        manual: bool,
+    },
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
     Synced(i64, Vec<Playlist>, bool),
@@ -250,6 +255,7 @@ pub enum Event {
     NativePasswordRequired,
     Ready(Option<Account>, Preferences),
     SignInRequired(String),
+    SignInFailed(String),
     Connected(Account, String),
     View(u64, LibraryView),
     Page(u64, u64, usize, Vec<Arc<Track>>),
@@ -1029,7 +1035,12 @@ fn reconnect(
         }
         .await;
         let _ = tx.send(match result {
-            Ok((server, label)) => Command::Connected(server, label, None),
+            Ok((server, label)) => Command::Connected {
+                server,
+                label,
+                session: None,
+                manual: false,
+            },
             Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
         });
     });
@@ -1362,6 +1373,7 @@ fn run(
             let _ = ack.send(());
             break;
         }
+        let manual_sign_in = matches!(&command, Command::Connected { manual: true, .. });
         let result: Result<()> = (|| {
             match command {
                 Command::CancelSmartPlaylist => native_editor.reset(),
@@ -1455,6 +1467,7 @@ fn run(
                 }
                 Command::Connect(account, password) => {
                     let command_tx = tx.clone();
+                    let events = events.clone();
                     let paths = paths.clone();
                     runtime.spawn(async move {
                         let result = async {
@@ -1469,16 +1482,27 @@ fn run(
                         match result {
                             Ok((server, label)) => {
                                 let session = native::sign_in_session(&server, &paths, password);
-                                let _ = command_tx.send(Command::Connected(server, label, session));
+                                let _ = command_tx.send(Command::Connected {
+                                    server,
+                                    label,
+                                    session,
+                                    manual: true,
+                                });
                             }
                             Err(error) => {
-                                let _ = command_tx
-                                    .send(Command::Error(format!("Could not connect: {error:#}")));
+                                let _ = events.send(Event::SignInFailed(format!(
+                                    "Could not connect: {error:#}"
+                                )));
                             }
                         }
                     });
                 }
-                Command::Connected(value, label, session) => {
+                Command::Connected {
+                    server: value,
+                    label,
+                    session,
+                    ..
+                } => {
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
@@ -2916,7 +2940,11 @@ fn run(
             Ok(())
         })();
         if let Err(error) = result {
-            let _ = events.send(Event::Error(format!("{error:#}")));
+            let _ = events.send(if manual_sign_in {
+                Event::SignInFailed(format!("{error:#}"))
+            } else {
+                Event::Error(format!("{error:#}"))
+            });
         }
     }
     Ok(())
