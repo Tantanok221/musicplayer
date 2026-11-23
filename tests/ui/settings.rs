@@ -1,12 +1,12 @@
 use crate::common::ui::{ARTIST, ARTIST_TARGET, Fixture, start};
-use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, test::TestWindowExt};
+use gpui_kit::{AnyWindowHandle, AppContext, TestAppContext, px, test::TestWindowExt};
 use sonora::{
     artists::{ArtistProfile, cache_key},
     model::Preferences,
     platform::{Account, shortcut},
-    service::{Command, Event},
+    service::{Command, Event, SettingsCredentials},
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
@@ -40,6 +40,22 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
     let (_dir, mut f, window, _) = start(cx);
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     page(&mut f, window, "Paired devices", cx);
+    fill(window, "LAN listener port", "8088", cx);
+    f.click(window, "lan-save-port", cx);
+    assert_eq!(
+        f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .lan_port,
+        Some(8088)
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find("settings-saved").is_some(),
+            "saving the LAN port must show the settings confirmation"
+        );
+    })
+    .unwrap();
     f.backend.emit(Event::LanStatus(LanStatus {
         port: 8088,
         peers: vec![LanPeer {
@@ -109,6 +125,89 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
     })
     .unwrap();
     f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn settings_save_toast_expires_and_ignores_navigation_saves(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    let toast = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            window.try_find("settings-saved").map(|toast| {
+                assert!(toast.visible());
+                assert_eq!(toast.label(), Some("Settings saved"));
+                let bounds = toast.bounds();
+                let status = window.find("library-status").bounds();
+                assert!(
+                    bounds.bottom() < status.top(),
+                    "leave playback controls clear"
+                );
+                assert!(status.right() - bounds.right() < px(40.));
+            })
+        })
+        .unwrap()
+        .is_some()
+    };
+
+    let saves = f.saves;
+    f.click(window, "new-tab", cx);
+    cx.executor().advance_clock(Duration::from_millis(500));
+    f.settle(window, cx);
+    assert!(f.saves > saves, "navigation must have persisted");
+    assert!(!toast(cx), "navigation persistence must not show a toast");
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    fill(window, "Last.fm username", "listener", cx);
+    assert!(!toast(cx), "typing without saving must not show a toast");
+    f.click(window, "save-lastfm", cx);
+    assert_eq!(
+        f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .lastfm_user,
+        "listener"
+    );
+    assert!(toast(cx), "a successful Settings save must show a toast");
+
+    cx.executor().advance_clock(Duration::from_secs(1));
+    f.settle(window, cx);
+    fill(window, "Last.fm username", "another-listener", cx);
+    f.click(window, "save-lastfm", cx);
+    cx.executor().advance_clock(Duration::from_millis(1500));
+    f.settle(window, cx);
+    assert!(toast(cx), "a newer save must renew the toast");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    f.settle(window, cx);
+    assert!(!toast(cx), "the toast must auto-dismiss");
+}
+
+#[gpui_kit::test]
+fn settings_save_failure_does_not_show_success(cx: &mut TestAppContext) {
+    let (dir, mut f, window, _) = start(cx);
+    let db = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_preferences BEFORE INSERT ON state
+         WHEN NEW.key = 'preferences' BEGIN SELECT RAISE(FAIL, 'test write failed'); END;",
+    )
+    .unwrap();
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    fill(window, "Last.fm username", "not-saved", cx);
+    f.click(window, "save-lastfm", cx);
+    assert!(
+        f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .lastfm_user
+            .is_empty()
+    );
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("settings-saved").is_none());
+        assert_eq!(
+            window.find("settings-save-failed").label(),
+            Some("Could not save settings")
+        );
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -195,22 +294,31 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
     fill(window, "Server address", "https://fixture.invalid/", cx);
     fill(window, "Username", "音楽 listener", cx);
     fill(window, "Password", "synthetic-nav-password", cx);
-    for attempt in 0..2 {
-        f.expect("sign-in intent without logging credentials", |command, _| {
-            assert!(matches!(command, Command::Connect(account, password) if account.url == "https://fixture.invalid/" && account.username == "音楽 listener" && password == "synthetic-nav-password"));
+    for attempt in 0..3 {
+        let (button, password) = match attempt {
+            0 => ("connect-library", "synthetic-nav-password"),
+            1 => ("retry-error", "synthetic-nav-password"),
+            _ => {
+                fill(window, "Password", "synthetic-replacement", cx);
+                ("retry-error", "synthetic-replacement")
+            }
+        };
+        f.expect("sign-in intent without logging credentials", move |command, _| {
+            assert!(matches!(command, Command::Connect(account, submitted) if account.url == "https://fixture.invalid/" && account.username == "音楽 listener" && submitted == password), "Connect and sign-in Retry must send the current form values");
             vec![]
         });
-        f.click(window, "connect-library", cx);
+        f.click(window, button, cx);
         cx.update_window(window, |_, window, _| {
-            assert_eq!(window.find("connect-library").disabled(), Some(true))
+            assert_eq!(window.find("connect-library").disabled(), Some(true));
+            assert!(window.try_find("error-banner").is_none());
         })
         .unwrap();
         // A disabled button must reject repeated actual pointer input.
         f.click(window, "connect-library", cx);
         f.assert_script_finished();
-        if attempt == 0 {
+        if attempt < 2 {
             f.backend
-                .emit(Event::Error("Fixture sign-in rejected".into()));
+                .emit(Event::SignInFailed("Fixture sign-in rejected".into()));
             f.settle(window, cx);
             cx.update_window(window, |_, window, _| {
                 assert!(window.find("error-banner").visible());
@@ -254,6 +362,16 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
         assert_eq!(window.find("Password").value().unwrap_or_default(), "");
     })
     .unwrap();
+
+    f.backend
+        .emit(Event::Error("Fixture refresh failed".into()));
+    f.settle(window, cx);
+    f.expect("ordinary errors still refresh", |command, _| {
+        assert!(matches!(command, Command::Refresh));
+        vec![]
+    });
+    f.click(window, "retry-error", cx);
+    f.assert_script_finished();
 }
 
 #[gpui_kit::test]
@@ -266,7 +384,7 @@ fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retr
     fill(window, "slskd address", " http://127.0.0.1:5030/ ", cx);
     fill(window, "API key", "synthetic-slskd-key", cx);
     f.expect("slskd API-key auth", |command, _| {
-        assert!(matches!(command, Command::SlskdAuth(key, user, password) if key == "synthetic-slskd-key" && user.is_empty() && password.is_empty())); vec![]
+        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(key, user, password), _) if key == "synthetic-slskd-key" && user.is_empty() && password.is_empty())); vec![]
     });
     f.expect("slskd test after credentials", |command, _| {
         assert!(matches!(command, Command::SlskdTest));
@@ -296,7 +414,7 @@ fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retr
     })
     .unwrap();
     // Blank fields mean reuse the saved auth, not erase it.
-    f.expect("keep saved slskd auth", |command, _| { assert!(matches!(command, Command::SlskdAuth(k, u, p) if k.is_empty() && u.is_empty() && p.is_empty())); vec![] });
+    f.expect("keep saved slskd auth", |command, _| { assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k, u, p), _) if k.is_empty() && u.is_empty() && p.is_empty())); vec![] });
     f.expect("retry saved slskd auth", |command, _| {
         assert!(matches!(command, Command::SlskdTest));
         vec![Event::SlskdStatus(Ok("Fixture linked".into()))]
@@ -304,7 +422,7 @@ fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retr
     f.click(window, "link-slskd", cx);
     fill(window, "Username", "fixture-admin", cx);
     fill(window, "Password", "synthetic-slskd-password", cx);
-    f.expect("slskd username and password", |command, _| { assert!(matches!(command, Command::SlskdAuth(k,u,p) if k.is_empty() && u == "fixture-admin" && p == "synthetic-slskd-password")); vec![] });
+    f.expect("slskd username and password", |command, _| { assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k,u,p), _) if k.is_empty() && u == "fixture-admin" && p == "synthetic-slskd-password")); vec![] });
     f.expect("test replacement slskd login", |command, _| {
         assert!(matches!(command, Command::SlskdTest));
         vec![Event::SlskdStatus(Ok("Fixture linked".into()))]
@@ -360,7 +478,7 @@ fn lastfm_api_key_is_sent_once_and_cleared_from_the_field(cx: &mut TestAppContex
     fill(window, "Last.fm username", "listener", cx);
     fill(window, "Last.fm API key", " synthetic-lastfm-key ", cx);
     f.expect("Last.fm key", |command, _| {
-        assert!(matches!(command, Command::LastFmKey(key) if key == "synthetic-lastfm-key"));
+        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::LastFm(key), _) if key == "synthetic-lastfm-key"));
         vec![]
     });
     f.click(window, "save-lastfm", cx);

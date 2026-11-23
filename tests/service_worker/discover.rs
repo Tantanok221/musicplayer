@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use sonora::{
     discover::{Dismissal, HistoryStatus, Rediscover, Shelf, seasons_between},
     model::{Album, Preferences},
-    service::{Command, Event},
+    service::{Command, Event, SettingsCredentials},
 };
 use std::sync::Arc;
 
@@ -396,9 +396,17 @@ fn a_lastfm_api_key_entered_in_settings_is_used_and_kept_privately() {
     listen_as(&worker, "listener");
     assert_eq!(settled(&worker, 1).history, HistoryStatus::Unavailable);
 
-    worker
-        .service()
-        .send(Command::LastFmKey(format!("  {LASTFM_KEY} \n")));
+    let prefs = fixture.catalog().state("preferences").unwrap();
+    assert!(
+        worker
+            .service()
+            .save_settings(
+                prefs,
+                SettingsCredentials::LastFm(format!("  {LASTFM_KEY} \n"))
+            )
+            .recv_timeout(WAIT)
+            .unwrap()
+    );
     let found = settled(&worker, 2);
     assert_eq!(found.history, HistoryStatus::Ready);
     assert_eq!(found.lane.len(), 2);
@@ -418,7 +426,14 @@ fn a_lastfm_api_key_entered_in_settings_is_used_and_kept_privately() {
         });
     assert!(!in_catalog, "the key stays out of the catalog");
 
-    worker.service().send(Command::LastFmKey(" ".into()));
+    let prefs = fixture.catalog().state("preferences").unwrap();
+    assert!(
+        worker
+            .service()
+            .save_settings(prefs, SettingsCredentials::LastFm(" ".into()))
+            .recv_timeout(WAIT)
+            .unwrap()
+    );
     assert_eq!(
         settled(&worker, 3).history,
         HistoryStatus::Ready,

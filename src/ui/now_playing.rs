@@ -720,19 +720,16 @@ impl MusicApp {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .when_some(
-                        self.error.clone().or_else(|| self.playback.error.clone()),
-                        |page, error| {
-                            page.child(
-                                div()
-                                    .px_8()
-                                    .py_2()
-                                    .text_size(px(11.))
-                                    .text_color(accent)
-                                    .child(error),
-                            )
-                        },
-                    )
+                    .when_some(self.banner_error(), |page, error| {
+                        page.child(
+                            div()
+                                .px_8()
+                                .py_2()
+                                .text_size(px(11.))
+                                .text_color(accent)
+                                .child(error),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()

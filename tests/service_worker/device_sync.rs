@@ -7,7 +7,7 @@ use axum::{
 use sonora::{
     model::{PlaybackSnapshot, Preferences, SavedQueue},
     playback::PlayerCommand,
-    service::{Command, Event},
+    service::{Command, Event, SettingsCredentials},
     sync::lan::LanOfferState,
 };
 use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState, ServerMessage};
@@ -651,6 +651,15 @@ async fn reconnect_publishes_above_the_last_sequence_even_after_relay_rollback()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_settings_rebase_local_changes_without_uploading_device_preferences() {
+    shared_settings_rebase(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledged_settings_saves_sync_only_shared_preferences() {
+    shared_settings_rebase(true).await;
+}
+
+async fn shared_settings_rebase(acknowledged: bool) {
     let fixture = Fixture::new(Library::default());
     let (writes, written) = flume::unbounded();
     let relay = Router::new().route(
@@ -723,7 +732,17 @@ async fn shared_settings_rebase_local_changes_without_uploading_device_preferenc
     assert_eq!(prefs.volume, 0.35);
     prefs.dark = Some(false);
     prefs.lastfm_user = "new local history".into();
-    worker.service().send(Command::Preferences(prefs));
+    if acknowledged {
+        assert!(
+            worker
+                .service()
+                .save_settings(prefs, SettingsCredentials::Unchanged)
+                .recv_timeout(WAIT)
+                .unwrap()
+        );
+    } else {
+        worker.service().send(Command::Preferences(prefs));
+    }
     assert_eq!(
         written.recv_timeout(WAIT).unwrap(),
         (serde_json::json!({"dark": false, "gain": "Track"}), 5)

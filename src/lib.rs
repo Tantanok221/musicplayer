@@ -21,6 +21,7 @@ pub mod playlists;
 pub mod selection;
 pub mod server;
 pub mod service;
+mod settings_save;
 pub mod slskd;
 pub mod smart_editor;
 pub mod smart_rules;

@@ -8,6 +8,7 @@ impl MusicApp {
             Event::SmartPlaylistSaved(id) => self.smart_saved(id, window, cx),
             Event::NativePasswordRequired => self.smart_password_required(window, cx),
             Event::Ready(account, prefs) => {
+                self.album_deletion = None;
                 if self
                     .account_cache
                     .reset_for_account(self.account.as_ref(), account.as_ref())
@@ -81,7 +82,13 @@ impl MusicApp {
                 self.status = message;
                 self.error = None;
             }
+            Event::SignInFailed(error) => {
+                if self.sign_in.fail(error) {
+                    self.status = "Could not connect".into();
+                }
+            }
             Event::Connected(account, label) => {
+                self.sign_in = Default::default();
                 self.account = Some(account);
                 if self.settings {
                     self.focus.focus(window, cx);
@@ -380,9 +387,6 @@ impl MusicApp {
                         self.smart.loading = false;
                         self.smart.saving = false;
                     }
-                }
-                if self.status == "Connecting…" {
-                    self.status = "Could not connect".into();
                 }
                 self.error = Some(error);
                 self.loading_more = false;

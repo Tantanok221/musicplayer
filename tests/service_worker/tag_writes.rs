@@ -1,5 +1,5 @@
 //! Opt-in tag writes: real worker, real files in a temporary music folder.
-use crate::fixture::{Fixture, Library, Request, event, synced};
+use crate::fixture::{Fixture, Library, Request, event, synced, view};
 use sonora::{
     autotag::ReleaseQuery,
     model::{MetadataPreferences, Preferences, Track},
@@ -79,6 +79,90 @@ fn scans(fixture: &Fixture) -> usize {
         .iter()
         .filter(|request| request.endpoint == "startScan.view")
         .count()
+}
+
+#[test]
+fn deletes_only_the_albums_files_and_requests_a_rescan() {
+    let folder = Folder::new();
+    let file = folder.file();
+    let album_dir = file.parent().unwrap();
+    let keep = album_dir.join("cover.jpg");
+    std::fs::write(&keep, "keep").unwrap();
+    let disc = album_dir.join("Disc 2");
+    std::fs::create_dir(&disc).unwrap();
+    std::fs::copy(&file, disc.join("02 Song.flac")).unwrap();
+    let mut library = library(&folder, true);
+    library.tracks.push(Track {
+        id: "second-song".into(),
+        path: "/music/Fixture Artist/Release album/Disc 2/02 Song.flac".into(),
+        ..library.tracks[0].clone()
+    });
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    synced(&worker);
+    enable(&worker, &folder);
+
+    worker.service().send(Command::DeleteAlbum("album".into()));
+    fixture.wait_request(&Request::new("startScan.view", &[]));
+    assert!(!file.exists());
+    assert!(!disc.exists());
+    assert!(keep.exists());
+    let local = view(&worker);
+    assert_eq!(
+        local
+            .albums
+            .iter()
+            .map(|album| album.id.as_str())
+            .collect::<Vec<_>>(),
+        ["other-album"]
+    );
+    fixture.edit_library(|library| {
+        library.tracks.retain(|track| track.album_id != "album");
+        library.albums.retain(|album| album.id != "album");
+    });
+    synced(&worker);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn album_deletion_is_disabled_until_opt_in_and_does_not_follow_symlinks() {
+    let folder = Folder::new();
+    let outside = Folder::new();
+    let file = folder.file();
+    let link = file.with_file_name("02 Song.flac");
+    std::os::unix::fs::symlink(outside.file(), &link).unwrap();
+    let mut library = library(&folder, true);
+    library.tracks.push(Track {
+        id: "second-song".into(),
+        path: "/music/Fixture Artist/Release album/02 Song.flac".into(),
+        ..library.tracks[0].clone()
+    });
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    synced(&worker);
+
+    worker.service().send(Command::DeleteAlbum("album".into()));
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message.contains("Write tags to files")),
+    );
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|request| request.endpoint == "getAlbum.view")
+    );
+    enable(&worker, &folder);
+    worker.service().send(Command::DeleteAlbum("album".into()));
+    event(
+        &worker,
+        |event| matches!(event, Event::Error(message) if message.contains("symbolic link")),
+    );
+    assert!(file.exists() && link.is_symlink() && outside.file().exists());
+    assert_eq!(scans(&fixture), 0);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
 }
 
 #[test]

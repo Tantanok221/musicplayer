@@ -20,7 +20,7 @@ use sonora::{
     catalog::Catalog,
     model::LibraryQuery,
     platform::{Account, Paths},
-    service::{Command, Event, Mutation, test_support::ControlledService},
+    service::{Command, Event, Mutation, SettingsCredentials, test_support::ControlledService},
 };
 use std::{collections::VecDeque, path::Path};
 
@@ -208,6 +208,23 @@ impl Fixture {
                         .unwrap();
                     self.saves += 1;
                 }
+                Command::SaveSettings(prefs, credentials, reply) => {
+                    let saved = self
+                        .backend
+                        .persist_preferences(&self.catalog, prefs.clone())
+                        .is_ok();
+                    if saved {
+                        self.saves += 1;
+                        if !matches!(credentials, SettingsCredentials::Unchanged) {
+                            self.respond_expected(Command::SaveSettings(
+                                prefs,
+                                credentials,
+                                reply.clone(),
+                            ));
+                        }
+                    }
+                    let _ = reply.try_send(saved);
+                }
                 Command::GroupTracks(request, query, id) => {
                     self.respond_group_tracks(request, query, id)
                 }
@@ -229,22 +246,24 @@ impl Fixture {
                 Command::EnqueueAlbum(id, placement) if self.capturing_playback() => {
                     self.record_playback(PlaybackIntent::EnqueueAlbum(id, placement))
                 }
-                command => {
-                    let expected = self.expected.pop_front().unwrap_or_else(|| {
-                        panic!(
-                            "unexpected service command in UI scenario; trace={:?}",
-                            self.trace
-                        )
-                    });
-                    self.trace
-                        .push(format!("scenario response: {}", expected.label));
-                    for event in (expected.respond)(command, &self.catalog) {
-                        self.backend.emit(event);
-                    }
-                }
+                command => self.respond_expected(command),
             }
         }
         count
+    }
+
+    fn respond_expected(&mut self, command: Command) {
+        let expected = self.expected.pop_front().unwrap_or_else(|| {
+            panic!(
+                "unexpected service command in UI scenario; trace={:?}",
+                self.trace
+            )
+        });
+        self.trace
+            .push(format!("scenario response: {}", expected.label));
+        for event in (expected.respond)(command, &self.catalog) {
+            self.backend.emit(event);
+        }
     }
 
     pub(crate) fn settle(&mut self, window: AnyWindowHandle, cx: &mut TestAppContext) {
