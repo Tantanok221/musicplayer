@@ -1581,6 +1581,13 @@ fn run(
             if changed {
                 snapshot_stamp = Some(stamp);
                 let _ = events.send(PlayerEvent::Snapshot(PlaybackSnapshot {
+                    sync: Some(Arc::new(crate::sync::PlaybackObservation {
+                        namespace: queue_account.clone(),
+                        revision,
+                        volume: crate::sync::volume(prefs.volume),
+                        shuffle: prefs.shuffle,
+                        repeat: crate::sync::repeat(prefs.repeat),
+                    })),
                     duration: track.as_ref().map_or(0., |t| t.duration),
                     track,
                     playing,

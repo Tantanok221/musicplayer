@@ -27,6 +27,9 @@ impl MusicApp {
                     self.layout_generation += 1;
                 }
                 self.preferences = prefs;
+                let sync_server_url = self.preferences.sync_server_url.clone();
+                self.sync_server_url
+                    .update(cx, |input, cx| input.set_value(sync_server_url, window, cx));
                 self.preferences.tabs = std::mem::take(&mut self.preferences.tabs).normalized();
                 self.prefs_loaded = true;
                 self.histories.clear();
@@ -304,7 +307,7 @@ impl MusicApp {
                 } else {
                     0.
                 };
-                if self.scrub.is_none() {
+                if self.scrub.is_none() && self.device_status.remote_id().is_none() {
                     self.seek.update(cx, |slider, cx| {
                         slider.set_value(progress as f32, window, cx)
                     });
@@ -325,6 +328,17 @@ impl MusicApp {
                         self.notify_part(Part::Center, cx);
                     }
                     return;
+                }
+            }
+            Event::DeviceSync(status) => {
+                self.device_status_changed(status, window, cx);
+                return;
+            }
+            Event::LocalVolume(volume) => {
+                self.preferences.volume = volume;
+                if self.device_status.remote_id().is_none() {
+                    self.volume
+                        .update(cx, |slider, cx| slider.set_value(volume, window, cx));
                 }
             }
             Event::Status(status) => self.status = status,

@@ -208,7 +208,7 @@ impl MusicApp {
                 app.select_track(now.clone(), cx);
                 if event.click_count() == 2 {
                     if let Some(playback) = &playback {
-                        app.service.player.send(playback.command());
+                        app.playback_intent(playback.command());
                     } else {
                         app.play_track(&now);
                     }
@@ -268,9 +268,9 @@ impl MusicApp {
                                     app.rating_stars(&track, &key, cx).into_any_element()
                                 };
                                 let select = track.clone();
-                                let service = app.service.clone();
-                                let service2 = service.clone();
-                                let service3 = service.clone();
+                                let service2 = app.service.clone();
+                                let service3 = app.service.clone();
+                                let play_app = cx.weak_entity();
                                 let menu_state = app.menu_state(cx);
                                 let menu_track = track.clone();
                                 let row = div()
@@ -348,15 +348,13 @@ impl MusicApp {
                                         move |app, event: &ClickEvent, _, cx| {
                                             app.select_track(select.clone(), cx);
                                             if event.click_count() == 2 {
-                                                app.service
-                                                    .player
-                                                    .send(PlayerCommand::JumpTo(index));
+                                                app.playback_intent(PlayerCommand::JumpTo(index));
                                             }
                                         },
                                     ));
                                 app.queue_reorder_row(row, index, &track.title, None, cx)
                                     .context_menu(move |menu, window, cx| {
-                                        let service = service.clone();
+                                        let play_app = play_app.clone();
                                         let service2 = service2.clone();
                                         let service3 = service3.clone();
                                         let menu = context_menu::track_rating(
@@ -365,8 +363,12 @@ impl MusicApp {
                                             &menu_track,
                                         )
                                         .item(menu_row(Glyph::Play, "Play Now").on_click(
-                                            move |_, _, _| {
-                                                service.player.send(PlayerCommand::JumpTo(index))
+                                            move |_, _, cx| {
+                                                let _ = play_app.update(cx, |app, _| {
+                                                    app.playback_intent(PlayerCommand::JumpTo(
+                                                        index,
+                                                    ))
+                                                });
                                             },
                                         ))
                                         .item(

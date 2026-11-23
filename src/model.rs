@@ -367,6 +367,8 @@ pub struct Preferences {
     pub tabs: crate::browser::Tabs,
     /// Whose Last.fm history Memory lane reaches back through; empty is off.
     pub lastfm_user: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sync_server_url: String,
 }
 /// What counts as a favorite on the Favorites page.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -440,6 +442,7 @@ impl Default for Preferences {
             favorites: FavoritesFilter::default(),
             tabs: crate::browser::Tabs::default(),
             lastfm_user: String::new(),
+            sync_server_url: String::new(),
         }
     }
 }
@@ -456,6 +459,7 @@ pub struct SavedQueue {
 
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackSnapshot {
+    pub sync: Option<Arc<crate::sync::PlaybackObservation>>,
     pub track: Option<Arc<Track>>,
     pub playing: bool,
     pub buffering: bool,

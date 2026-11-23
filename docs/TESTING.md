@@ -42,6 +42,7 @@ worker suite to expose flaky timing.
 | Sign-in, slskd settings, accounts, connection | `settings.rs`, `events.rs`, `chrome.rs` | `platform`, `ui::account_cache` | `tests/ui/{settings,worker}.rs`, `tests/service_worker/{accounts,connection}.rs`, `ui::account_cache` unit tests |
 | Light/dark theme | `settings.rs` | | `tests/ui/appearance.rs` |
 | Volume, mute, shuffle, repeat | `player_bar.rs` | | `tests/ui/playback.rs`, `tests/service_worker/preferences.rs` |
+| Device sync, presence, and remote playback | `devices.rs`, `player_bar.rs`, `settings.rs` | `sync`, `service::device_sync` | `tests/ui/devices.rs`, `tests/service_worker/device_sync.rs`, `crates/sonora-sync/tests/relay.rs` |
 | Panel layout, window size and position | `settings.rs`, `window.rs` | `ui::restored_window_bounds` | `tests/ui/layout.rs`, `tests/service_worker/preferences.rs` |
 | Service events reaching the view | `events.rs` | | all UI scenarios |
 | Saved-state format compatibility | | `model`, `catalog`, `service::restore_queue` | `tests/service_worker/saved_state.rs`, `tests/fixtures/saved_state/` |

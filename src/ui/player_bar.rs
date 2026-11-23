@@ -7,20 +7,41 @@ impl MusicApp {
         icon: Glyph,
         label: &'static str,
         command: PlayerCommand,
+        cx: &mut Context<Self>,
     ) -> Button {
-        let player = self.service.player.clone();
-        short_button(id, icon, label).on_click(move |_, _, _| player.send(command.clone()))
+        short_button(id, icon, label)
+            .on_click(cx.listener(move |app, _, _, _| app.playback_intent(command.clone())))
     }
 
-    pub(super) fn player_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn player_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = ink(cx);
         let width = f32::from(window.viewport_size().width);
         let compact = width < 1000.;
-        let track = self.playback.track.clone();
-        let title = track
-            .as_ref()
-            .map_or("No track playing".into(), |track| track.title.clone());
-        let artist_caption = if self.playback.buffering {
+        let remote = self.device_status.remote_id().is_some();
+        let track = if remote {
+            self.device_status.track.clone()
+        } else {
+            self.playback.track.clone()
+        };
+        let playing = self.display_playing();
+        if remote && playing && window.is_visible() {
+            self.request_frame_after(Duration::from_millis(250), window, cx);
+        }
+        let duration = self.display_duration();
+        let title = track.as_ref().map_or_else(
+            || {
+                if remote {
+                    self.device_status
+                        .track_id()
+                        .unwrap_or("No track playing")
+                        .to_owned()
+                } else {
+                    "No track playing".into()
+                }
+            },
+            |track| track.title.clone(),
+        );
+        let artist_caption = if !remote && self.playback.buffering {
             div().child("Buffering…").into_any_element()
         } else if let Some(track) = &track {
             self.artist_links(track.artist_credits(), "footer-artists".into(), cx)
@@ -80,7 +101,7 @@ impl MusicApp {
                 .text_color(colors.muted)
                 .child(duration_label(seconds))
         };
-        let muted = self.preferences.volume <= 0.;
+        let muted = self.display_volume() <= 0.;
         div()
             .id("player-bar")
             .w_full()
@@ -185,6 +206,7 @@ impl MusicApp {
                                     },
                                 )
                                 .selected(self.preferences.shuffle)
+                                .disabled(remote)
                                 .on_click(cx.listener(
                                     |app, _, _, cx| {
                                         app.preferences.shuffle = !app.preferences.shuffle;
@@ -198,26 +220,21 @@ impl MusicApp {
                                 Glyph::SkipBack,
                                 "Previous",
                                 PlayerCommand::Previous,
+                                cx,
                             ))
                             .child(self.player_button(
                                 "play-pause",
-                                if self.playback.playing {
-                                    Glyph::Pause
-                                } else {
-                                    Glyph::Play
-                                },
-                                if self.playback.playing {
-                                    "Pause"
-                                } else {
-                                    "Play"
-                                },
+                                if playing { Glyph::Pause } else { Glyph::Play },
+                                if playing { "Pause" } else { "Play" },
                                 PlayerCommand::Toggle,
+                                cx,
                             ))
                             .child(self.player_button(
                                 "next",
                                 Glyph::SkipForward,
                                 "Next",
                                 PlayerCommand::Next,
+                                cx,
                             ))
                             .child(
                                 short_button(
@@ -234,6 +251,7 @@ impl MusicApp {
                                     },
                                 )
                                 .selected(self.preferences.repeat != RepeatMode::Off)
+                                .disabled(remote)
                                 .on_click(cx.listener(
                                     |app, _, _, cx| {
                                         app.preferences.repeat = match app.preferences.repeat {
@@ -250,8 +268,8 @@ impl MusicApp {
                     .child(
                         time(
                             "playback-elapsed",
-                            self.scrub.map_or(self.playback.position, |value| {
-                                value as f64 / 1000. * self.playback.duration
+                            self.scrub.map_or(self.display_position(), |value| {
+                                value as f64 / 1000. * duration
                             }),
                         )
                         .text_right()
@@ -265,7 +283,7 @@ impl MusicApp {
                             .min_w(px(40.))
                             .accessibility_label("Playback position"),
                     )
-                    .child(time("playback-duration", self.playback.duration)),
+                    .child(time("playback-duration", duration)),
             )
             .child(
                 div()
@@ -273,6 +291,10 @@ impl MusicApp {
                     .items_center()
                     .flex_shrink_0()
                     .gap(px(if compact { 4. } else { 10. }))
+                    .when(
+                        self.device_status.enabled || self.device_status.connected,
+                        |row| row.child(self.devices_button()),
+                    )
                     .when_some(rating, |row, rating| row.child(rating))
                     .child(
                         div()
@@ -293,18 +315,16 @@ impl MusicApp {
                                     |app, _, window, cx| {
                                         let volume = match app.volume_before_mute.take() {
                                             Some(previous) => previous,
-                                            None if app.preferences.volume > 0. => {
-                                                app.volume_before_mute =
-                                                    Some(app.preferences.volume);
+                                            None if app.display_volume() > 0. => {
+                                                app.volume_before_mute = Some(app.display_volume());
                                                 0.
                                             }
                                             None => Preferences::default().volume,
                                         };
-                                        app.preferences.volume = volume;
+                                        app.control_volume(volume);
                                         app.volume.update(cx, |slider, cx| {
                                             slider.set_value(volume, window, cx)
                                         });
-                                        app.save_preferences();
                                         cx.notify();
                                     },
                                 )),

@@ -314,7 +314,9 @@ impl MusicApp {
                     };
                     let shade = alpha * edge;
                     let empty = line.value.trim().is_empty();
-                    let seek = is_playing.then(|| lyrics.line_position(index)).flatten();
+                    let seek = (is_playing && self.device_status.remote_id().is_none())
+                        .then(|| lyrics.line_position(index))
+                        .flatten();
                     let player = self.service.player.clone();
                     let mut row = div()
                         .id(SharedString::from(format!("lyric-{index}")))

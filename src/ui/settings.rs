@@ -633,6 +633,7 @@ impl MusicApp {
     pub(super) fn playback_settings(&self, app: WeakEntity<Self>) -> SettingPage {
         let gain = self.preferences.gain.clone();
         let selected = gain_index(&gain);
+        let sync_app = app.clone();
         SettingPage::new("Playback")
             .icon(Icon::new(Glyph::AudioLines))
             .group(
@@ -669,7 +670,7 @@ impl MusicApp {
                                     .unwrap_or(false)
                                 }
                             },
-                            move |_, cx| {
+                    move |_, cx| {
                                 let _ = app.update(cx, |app, cx| {
                                     app.preferences.gain = GainMode::Smart;
                                     app.save_preferences();
@@ -687,6 +688,33 @@ impl MusicApp {
                         "normalize",
                     ]),
                 ),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("Device sync")
+                    .item(credential_field(
+                        "Sync server URL",
+                        self.sync_server_url.clone(),
+                        Some("Use the HTTPS URL of your Sonora sync server. Leave empty to turn off device sync."),
+                        &["relay", "connect", "devices"],
+                    ))
+                    .item(SettingItem::render(move |_, _, _| {
+                        let app = sync_app.clone();
+                        Button::new("save-sync-url").label("Save").on_click(move |_, window, cx| {
+                            let _ = app.update(cx, |app, cx| {
+                                let url = app.sync_server_url.read(cx).value().trim().to_owned();
+                                if let Err(error) = crate::sync::relay::endpoint(&url) {
+                                    app.error = Some(error.to_string());
+                                } else {
+                                    app.error = None;
+                                    app.sync_server_url.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
+                                    app.preferences.sync_server_url = url;
+                                    app.save_preferences();
+                                }
+                                cx.notify();
+                            });
+                        })
+                    })),
             )
     }
 

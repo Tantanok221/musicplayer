@@ -7530,6 +7530,7 @@ dependencies = [
  "chrono",
  "directories",
  "flume 0.11.1",
+ "futures-util",
  "gpui-kit",
  "hound",
  "html-escape",
@@ -7545,10 +7546,13 @@ dependencies = [
  "rusty-chromaprint",
  "serde",
  "serde_json",
+ "sonora-sync-protocol",
  "souvlaki",
  "stream-download",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "unicode-normalization",
  "url",
 ]
@@ -8291,7 +8295,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -8553,6 +8561,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.21",
 ]

@@ -279,7 +279,7 @@ impl MusicApp {
             let menu = track_rating(menu.min_w(px(220.)), &state, &track)
                 .item(menu_row(Glyph::Play, "Play Now").on_click(move |_, _, cx| {
                     let _ = app.update(cx, |app, _| match queue_index {
-                        Some(index) => app.service.player.send(PlayerCommand::JumpTo(index)),
+                        Some(index) => app.playback_intent(PlayerCommand::JumpTo(index)),
                         None => app.play_track(&play),
                     });
                 }))

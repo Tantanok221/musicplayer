@@ -31,6 +31,7 @@ use std::{
 const SIGN_IN_NOTICE: &str =
     "Sign in once to save your login locally. Sonora no longer uses Keychain.";
 
+mod device_sync;
 pub mod native;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +178,8 @@ pub enum Command {
     IdentifyBySound(Box<Track>),
     Preferences(Preferences),
     Player(PlayerCommand),
+    RemotePlayback(sonora_sync_protocol::PlaybackCommand),
+    DeviceSync(u64, crate::sync::RelayEvent),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
     Connected(Server, String, Option<flume::Receiver<()>>),
@@ -272,6 +275,8 @@ pub enum Event {
     Backdrop(String, Arc<Backdrop>),
     Lyrics(String, Result<Arc<Lyrics>, String>),
     Playback(PlaybackSnapshot),
+    DeviceSync(crate::sync::DeviceStatus),
+    LocalVolume(f32),
     Status(String),
     Connection(Connection),
     Error(String),
@@ -295,6 +300,7 @@ pub struct Service {
     pub tx: Sender<Command>,
     pub player: PlayerHandle,
     query_epoch: Arc<AtomicU64>,
+    playback_sample: tokio::sync::watch::Sender<PlaybackSnapshot>,
 }
 
 #[cfg(feature = "test-support")]
@@ -622,11 +628,13 @@ impl Service {
             tx: tx.clone(),
             player,
             query_epoch,
+            playback_sample: tokio::sync::watch::Sender::new(PlaybackSnapshot::default()),
         };
         let event_tx = events.clone();
+        let playback_sample = service.playback_sample.clone();
         std::thread::Builder::new()
             .name("sonora-player-events".into())
-            .spawn(move || forward_player_events(player_events, tx, event_tx))
+            .spawn(move || forward_player_events(player_events, tx, event_tx, playback_sample))
             .expect("Could not start playback bridge");
         let worker = service.clone();
         std::thread::Builder::new()
@@ -661,6 +669,7 @@ fn forward_player_events(
     player_events: Receiver<PlayerEvent>,
     command_tx: Sender<Command>,
     event_tx: Sender<Event>,
+    playback_sample: tokio::sync::watch::Sender<PlaybackSnapshot>,
 ) {
     let mut playback_failed = false;
     while let Ok(event) = player_events.recv() {
@@ -672,6 +681,7 @@ fn forward_player_events(
                     let _ = command_tx.send(Command::CheckConnection(true));
                 }
                 playback_failed = failed;
+                playback_sample.send_replace(snapshot.clone());
                 let _ = event_tx.send(Event::Playback(snapshot));
             }
             PlayerEvent::Persist(namespace, queue) => {
@@ -1157,8 +1167,11 @@ fn run(
         player,
         tx,
         query_epoch,
+        playback_sample,
         ..
     } = service;
+    let mut devices =
+        device_sync::DeviceSync::new(runtime.clone(), tx.clone(), playback_sample.subscribe());
     let mut account = paths.account()?;
     let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
@@ -1169,7 +1182,8 @@ fn run(
         &player,
         account.as_ref().map(Account::namespace).unwrap_or_default(),
     )?;
-    events.send(Event::Ready(account.clone(), prefs))?;
+    events.send(Event::Ready(account.clone(), prefs.clone()))?;
+    devices.configure(&paths, account.as_ref(), &prefs.sync_server_url, &events);
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     let interrupted = catalog.interrupted_tag_edits()?;
     if !interrupted.is_empty() {
@@ -1500,6 +1514,8 @@ fn run(
                     paths.save_account(&value.account)?;
                     native_editor.session(session);
                     account = Some(value.account.clone());
+                    let prefs: Preferences = catalog.state("preferences")?;
+                    devices.configure(&paths, account.as_ref(), &prefs.sync_server_url, &events);
                     checking = false;
                     last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
@@ -1659,7 +1675,10 @@ fn run(
                     }
                 }
                 Command::PlayTrack(id) => {
-                    player.send(PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0),
+                    );
                 }
                 Command::AlbumDetails(id) => {
                     if let Some(album) = catalog.album(&id)? {
@@ -2393,16 +2412,19 @@ fn run(
                 }
                 Command::PlayIds(ids, at) => {
                     let tracks = catalog.by_ids(&ids)?;
-                    player.send(PlayerCommand::Replace(tracks, at));
+                    devices.playback_intent(&player, PlayerCommand::Replace(tracks, at));
                 }
                 Command::PlayAlbum(id) => {
-                    player.send(PlayerCommand::Replace(catalog.album_tracks(&id)?, 0));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_tracks(&id)?, 0),
+                    );
                 }
                 Command::PlayAlbumMatching(query, id) => {
-                    player.send(PlayerCommand::Replace(
-                        catalog.album_tracks_matching(&query, &id)?,
-                        0,
-                    ));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_tracks_matching(&query, &id)?, 0),
+                    );
                 }
                 Command::Enqueue(ids, placement) => {
                     player.send(PlayerCommand::Insert(catalog.by_ids(&ids)?, placement));
@@ -2448,6 +2470,14 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
+                Command::RemotePlayback(cmd) => {
+                    if !devices.send(cmd) && devices.status.remote_id().is_some() {
+                        events.send(Event::Error("Remote device is unavailable".into()))?;
+                    }
+                }
+                Command::DeviceSync(generation, event) => {
+                    devices.receive(generation, event, &catalog, &player, &events)?;
+                }
                 Command::WriteTags(edits) => {
                     let covers = crate::tags::wanted_covers(&edits);
                     if !covers.is_empty() {
@@ -2540,7 +2570,9 @@ fn run(
                     });
                 }
                 Command::Preferences(prefs) => {
+                    let sync_server_url = prefs.sync_server_url.clone();
                     persist_preferences(&catalog, &player, prefs)?;
+                    devices.configure(&paths, account.as_ref(), &sync_server_url, &events);
                 }
                 Command::Persist(namespace, queue) => {
                     if namespace == account.as_ref().map(Account::namespace).unwrap_or_default() {
