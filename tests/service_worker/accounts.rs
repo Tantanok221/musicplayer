@@ -7,6 +7,37 @@ use sonora::{
 };
 
 #[test]
+fn late_startup_reconnect_does_not_replace_the_selected_account() {
+    let a = Fixture::new(Library {
+        hold_endpoint: Some("ping.view"),
+        ..Library::default()
+    });
+    let b = Fixture::new(Library::default());
+    let mut worker = a.start_paused();
+    a.wait_request(&Request::new("ping.view", &[]));
+    switch_account(&worker, &a, &b);
+
+    a.resume_held();
+    a.wait_request(&Request::new("getOpenSubsonicExtensions.view", &[]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while let Ok(reply) = worker.events().recv_deadline(deadline) {
+        assert!(
+            !matches!(reply, Event::Connected(account, _) if account.namespace() == a.account.namespace()),
+            "the startup reconnect switched the active account back after B synced"
+        );
+    }
+    assert_eq!(
+        a.paths.account().unwrap().unwrap().namespace(),
+        b.account.namespace(),
+        "the selected account must survive the late startup reconnect"
+    );
+
+    worker.shutdown(WAIT).unwrap();
+    a.finish();
+    b.finish();
+}
+
+#[test]
 fn delayed_lyrics_reply_cannot_reach_the_new_account() {
     let a = Fixture::new(Library {
         structured_lyrics: serde_json::json!([{"line":[{"value":"Account A lyrics"}]}]),

@@ -103,6 +103,7 @@ impl Renewal {
 pub(super) fn sign_in_session(
     server: &Server,
     paths: &Paths,
+    runtime: &tokio::runtime::Handle,
     password: String,
 ) -> Option<flume::Receiver<()>> {
     if !server.is_navidrome || password.is_empty() {
@@ -111,7 +112,7 @@ pub(super) fn sign_in_session(
     let server = server.clone();
     let paths = paths.clone();
     let (done, finished) = flume::bounded(1);
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             server.native_login(&password),
