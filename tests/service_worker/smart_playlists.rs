@@ -270,7 +270,7 @@ fn password_account_switch_stores_the_session_only_for_the_new_account() {
     ));
     event(
         &worker,
-        |e| matches!(e,Event::Connected(account,_) if account.namespace()==b.account.namespace()),
+        |e| matches!(e,Event::Connected(account,..) if account.namespace()==b.account.namespace()),
     );
     synced(&worker);
     worker
@@ -629,7 +629,7 @@ fn switching_accounts_discards_pending_edits_and_scopes_tokens() {
     ));
     event(
         &worker,
-        |e| matches!(e, Event::Connected(account, _) if account.namespace() == b.account.namespace()),
+        |e| matches!(e, Event::Connected(account, ..) if account.namespace() == b.account.namespace()),
     );
     synced(&worker);
     worker

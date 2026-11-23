@@ -403,6 +403,7 @@ pub struct MusicApp {
     volume_before_mute: Option<f32>,
     account: Option<Account>,
     sign_in: sign_in::SignIn,
+    library_connection: sign_in::LibraryConnection,
     settings: bool,
     settings_save: crate::settings_save::SaveFeedback,
     /// The settings page to reopen when the settings view is rebuilt, as it
@@ -547,8 +548,8 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search music"));
-        let server_url = cx
-            .new(|cx| InputState::new(window, cx).placeholder("http://your-navidrome-server:4533"));
+        let server_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
         let password = cx.new(|cx| {
             InputState::new(window, cx)
@@ -720,6 +721,7 @@ impl MusicApp {
             volume_before_mute: None,
             account: None,
             sign_in: Default::default(),
+            library_connection: Default::default(),
             settings: false,
             settings_save: Default::default(),
             settings_page: 0,

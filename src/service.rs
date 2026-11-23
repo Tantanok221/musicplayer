@@ -190,7 +190,7 @@ pub enum Command {
         server: Server,
         label: String,
         session: Option<flume::Receiver<()>>,
-        manual: bool,
+        reconnect_id: Option<u64>,
     },
     Tracks(i64, Vec<Track>),
     Albums(i64, Vec<Album>),
@@ -204,9 +204,9 @@ pub enum Command {
     SyncFailed(i64, String),
     /// Pings the server when a check is due; `true` checks right away.
     CheckConnection(bool),
+    TestSavedConnection(u64),
     SaveWindow(crate::platform::WindowFrame),
-    /// Account namespace and whether its server answered.
-    ConnectionChecked(String, Result<(), String>),
+    ConnectionChecked(u64, Result<(), String>),
     Shutdown(Sender<()>),
 }
 
@@ -259,7 +259,7 @@ pub enum Event {
     Ready(Option<Account>, Preferences),
     SignInRequired(String),
     SignInFailed(String),
-    Connected(Account, String),
+    Connected(Account, String, bool),
     View(u64, LibraryView),
     Page(u64, u64, usize, Vec<Arc<Track>>),
     Album(String, Vec<Arc<Track>>),
@@ -287,6 +287,8 @@ pub enum Event {
     Playback(PlaybackSnapshot),
     Status(String),
     Connection(Connection),
+    LibrarySyncing(bool),
+    SavedConnectionTested(u64, Result<(), String>),
     Error(String),
     MutationDone(Mutation),
     MutationFailed(Mutation, String),
@@ -1069,9 +1071,17 @@ fn set_connection(current: &mut Connection, next: Connection, events: &Sender<Ev
     }
 }
 
+fn set_syncing(current: &mut bool, next: bool, events: &Sender<Event>) {
+    if *current != next {
+        *current = next;
+        let _ = events.send(Event::LibrarySyncing(next));
+    }
+}
+
 /// Connects with the saved login. Returns false when there is no login to use.
 fn reconnect(
     account: Account,
+    id: u64,
     paths: &Paths,
     runtime: &tokio::runtime::Handle,
     tx: &Sender<Command>,
@@ -1088,7 +1098,6 @@ fn reconnect(
             return false;
         }
     };
-    let namespace = account.namespace();
     let tx = tx.clone();
     runtime.spawn(async move {
         let result = async {
@@ -1102,9 +1111,9 @@ fn reconnect(
                 server,
                 label,
                 session: None,
-                manual: false,
+                reconnect_id: Some(id),
             },
-            Err(error) => Command::ConnectionChecked(namespace, Err(format!("{error:#}"))),
+            Err(error) => Command::ConnectionChecked(id, Err(format!("{error:#}"))),
         });
     });
     true
@@ -1286,13 +1295,14 @@ fn run(
         .into(),
     ))?;
     let mut connection = Connection::None;
-    let mut checking = false;
+    let mut next_check_id = 1;
+    let mut checking = None;
     let mut last_check = Instant::now();
-    if let Some(account) = account.clone() {
-        checking = reconnect(account, &paths, &runtime, &tx, &events);
-        if checking {
-            set_connection(&mut connection, Connection::Connecting, &events);
-        }
+    if let Some(account) = account.clone()
+        && reconnect(account, next_check_id, &paths, &runtime, &tx, &events)
+    {
+        checking = Some(next_check_id);
+        set_connection(&mut connection, Connection::Connecting, &events);
     }
     if account.is_none() {
         events.send(Event::SignInRequired(SIGN_IN_NOTICE.into()))?;
@@ -1317,6 +1327,7 @@ fn run(
     let mut native_editor = native::Editor::default();
     let mut native_renewal = native::Renewal::default();
     let mut syncing = false;
+    let mut saved_connection_tests = Vec::new();
     // One tag job at a time, on its own thread; later ones wait their turn.
     let mut tag_job_running = false;
     let mut tag_jobs: std::collections::VecDeque<TagJob> = Default::default();
@@ -1436,7 +1447,13 @@ fn run(
             let _ = ack.send(());
             break;
         }
-        let manual_sign_in = matches!(&command, Command::Connected { manual: true, .. });
+        let manual_sign_in = matches!(
+            &command,
+            Command::Connected {
+                reconnect_id: None,
+                ..
+            }
+        );
         let result: Result<()> = (|| {
             match command {
                 Command::CancelSmartPlaylist => native_editor.reset(),
@@ -1549,7 +1566,7 @@ fn run(
                                     server,
                                     label,
                                     session,
-                                    manual: true,
+                                    reconnect_id: None,
                                 });
                             }
                             Err(error) => {
@@ -1564,8 +1581,11 @@ fn run(
                     server: value,
                     label,
                     session,
-                    ..
+                    reconnect_id,
                 } => {
+                    if reconnect_id.is_some() && reconnect_id != checking {
+                        return Ok(());
+                    }
                     if account.as_ref().map(Account::namespace) != Some(value.account.namespace()) {
                         if syncing {
                             anyhow::bail!(
@@ -1601,17 +1621,26 @@ fn run(
                     paths.save_account(&value.account)?;
                     native_editor.session(session);
                     account = Some(value.account.clone());
-                    checking = false;
+                    checking = None;
                     last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
                     server = Some(value.clone());
                     artwork_queue.retry_failed(artwork_clock.now());
-                    events.send(Event::Connected(value.account.clone(), label))?;
+                    events.send(Event::Connected(
+                        value.account.clone(),
+                        label,
+                        manual_sign_in,
+                    ))?;
+                    for id in saved_connection_tests.drain(..) {
+                        if reconnect_id.is_some() {
+                            events.send(Event::SavedConnectionTested(id, Ok(())))?;
+                        }
+                    }
                     events.send(Event::NativeAvailable(value.is_navidrome))?;
                     events.send(Event::View(current_request, catalog.view(&current_query)?))?;
                     if !syncing {
-                        syncing = true;
+                        set_syncing(&mut syncing, true, &events);
                         generation = chrono::Utc::now().timestamp_micros();
                         native_renewal.start(&value, &paths, &runtime, &tx);
                         begin_sync(value, tx.clone(), events.clone(), &runtime, generation);
@@ -1623,7 +1652,7 @@ fn run(
                     events.send(Event::ArtworkRetrying)?;
                     if let Some(server) = server.clone() {
                         if !syncing {
-                            syncing = true;
+                            set_syncing(&mut syncing, true, &events);
                             generation = chrono::Utc::now().timestamp_micros();
                             native_renewal.start(&server, &paths, &runtime, &tx);
                             begin_sync(server, tx.clone(), events.clone(), &runtime, generation);
@@ -1636,7 +1665,7 @@ fn run(
                     if generation == batch_generation && !failed_generations.contains(&generation) {
                         if let Err(error) = catalog.put_tracks(&tracks, generation) {
                             failed_generations.insert(generation);
-                            syncing = false;
+                            set_syncing(&mut syncing, false, &events);
                             return Err(error);
                         }
                         published += tracks.len();
@@ -1655,7 +1684,7 @@ fn run(
                         && let Err(error) = catalog.put_albums(&albums, generation)
                     {
                         failed_generations.insert(generation);
-                        syncing = false;
+                        set_syncing(&mut syncing, false, &events);
                         return Err(error);
                     }
                 }
@@ -1692,7 +1721,7 @@ fn run(
                                 events.send(Event::TrackUpdated(track))?;
                             }
                         }
-                        syncing = false;
+                        set_syncing(&mut syncing, false, &events);
                         events.send(Event::Playlists(catalog.playlist_summaries()?))?;
                         for id in refresh {
                             tx.send(Command::Playlist(id))?;
@@ -3014,41 +3043,64 @@ fn run(
                 Command::SyncFailed(failed, error) => {
                     failed_generations.insert(failed);
                     if failed == generation {
-                        syncing = false;
+                        set_syncing(&mut syncing, false, &events);
                         events.send(Event::Error(error))?;
                         let _ = tx.send(Command::CheckConnection(true));
                     }
                 }
                 Command::SaveWindow(frame) => paths.save_window_frame(&frame)?,
+                Command::TestSavedConnection(id) => {
+                    if account.is_some() {
+                        saved_connection_tests.push(id);
+                        if checking.is_none() {
+                            tx.send(Command::CheckConnection(true))?;
+                        }
+                    } else {
+                        events.send(Event::SavedConnectionTested(
+                            id,
+                            Err("No server is saved.".into()),
+                        ))?;
+                    }
+                }
                 Command::CheckConnection(now) => {
-                    if !checking && (now || last_check.elapsed() >= connection.check_interval()) {
+                    if checking.is_none()
+                        && (now || last_check.elapsed() >= connection.check_interval())
+                    {
                         if let Some(server) = server.clone() {
-                            checking = true;
+                            next_check_id += 1;
+                            let id = next_check_id;
+                            checking = Some(id);
                             last_check = Instant::now();
                             let tx = tx.clone();
                             runtime.spawn(async move {
                                 let result =
                                     server.ping().await.map_err(|error| format!("{error:#}"));
-                                let _ = tx.send(Command::ConnectionChecked(
-                                    server.account.namespace(),
-                                    result,
-                                ));
+                                let _ = tx.send(Command::ConnectionChecked(id, result));
                             });
                         } else if let Some(account) = account.clone()
-                            && matches!(connection, Connection::Offline(_))
+                            && (matches!(connection, Connection::Offline(_))
+                                || !saved_connection_tests.is_empty())
                         {
                             // The first connection failed; connecting again also starts a sync.
                             last_check = Instant::now();
-                            checking = reconnect(account, &paths, &runtime, &tx, &events);
-                            if !checking {
+                            next_check_id += 1;
+                            if reconnect(account, next_check_id, &paths, &runtime, &tx, &events) {
+                                checking = Some(next_check_id);
+                            } else {
                                 set_connection(&mut connection, Connection::None, &events);
+                                for id in saved_connection_tests.drain(..) {
+                                    events.send(Event::SavedConnectionTested(
+                                        id,
+                                        Err(SIGN_IN_NOTICE.into()),
+                                    ))?;
+                                }
                             }
                         }
                     }
                 }
-                Command::ConnectionChecked(namespace, result) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
-                        checking = false;
+                Command::ConnectionChecked(id, result) => {
+                    if checking == Some(id) {
+                        checking = None;
                         last_check = Instant::now();
                         let reconnected =
                             matches!(connection, Connection::Offline(_)) && result.is_ok();
@@ -3056,7 +3108,7 @@ fn run(
                             artwork_queue.retry_failed(artwork_clock.now());
                             events.send(Event::ArtworkRetrying)?;
                             if !syncing && let Some(server) = server.clone() {
-                                syncing = true;
+                                set_syncing(&mut syncing, true, &events);
                                 generation = chrono::Utc::now().timestamp_micros();
                                 native_renewal.start(&server, &paths, &runtime, &tx);
                                 begin_sync(
@@ -3068,14 +3120,14 @@ fn run(
                                 );
                             }
                         }
-                        set_connection(
-                            &mut connection,
-                            match result {
-                                Ok(()) => Connection::Online,
-                                Err(reason) => Connection::Offline(reason),
-                            },
-                            &events,
-                        );
+                        let next = match &result {
+                            Ok(()) => Connection::Online,
+                            Err(reason) => Connection::Offline(reason.clone()),
+                        };
+                        set_connection(&mut connection, next, &events);
+                        for id in saved_connection_tests.drain(..) {
+                            events.send(Event::SavedConnectionTested(id, result.clone()))?;
+                        }
                     }
                 }
                 Command::Error(error) => {

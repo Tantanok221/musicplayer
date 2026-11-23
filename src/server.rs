@@ -18,15 +18,20 @@ use url::Url;
 mod native;
 pub use native::NativeError;
 
-fn prepare_account(mut account: Account) -> Result<Account> {
-    let mut url = Url::parse(account.url.trim())
-        .context("Enter a complete server URL, including https://")?;
+pub(crate) fn validate_server_address(address: &str) -> Result<Url> {
+    let url =
+        Url::parse(address.trim()).context("Enter a complete server URL, including https://")?;
     if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
         bail!("Use an http:// or https:// server URL");
     }
     if !url.username().is_empty() || url.password().is_some() {
         bail!("Enter credentials in the username and password fields");
     }
+    Ok(url)
+}
+
+fn prepare_account(mut account: Account) -> Result<Account> {
+    let mut url = validate_server_address(&account.url)?;
     url.set_query(None);
     url.set_fragment(None);
     if !url.path().ends_with('/') {

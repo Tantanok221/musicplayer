@@ -1096,6 +1096,7 @@ fn offline_indicator_keeps_cached_music_browsable_and_playable_then_retry_resync
 
 #[gpui_kit::test]
 fn sign_in_fields_and_connect_reach_the_real_worker(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
     let fixture = Fixture::new(Library::default());
     std::fs::remove_file(fixture.paths.data.join("account.json")).unwrap();
     let (worker, tx, window, app) = mount_worker(&fixture, cx);
@@ -1128,6 +1129,26 @@ fn sign_in_fields_and_connect_reach_the_real_worker(cx: &mut TestAppContext) {
             .is_some()
     );
     assert_eq!(fixture.catalog().count().unwrap(), 2);
+    cx.update_window(window, |_, window, cx| {
+        window.press(sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("connection-card-status").label(),
+            Some("Connected")
+        );
+        window.click("check-saved-connection", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        matches!(event, Event::SavedConnectionTested(_, Ok(())))
+    });
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("saved-connection-result").label(),
+            Some("Connection successful.")
+        );
+    })
+    .unwrap();
     close_worker(worker, window, app, cx);
     fixture.finish();
 }
@@ -1140,27 +1161,31 @@ fn invalid_sign_in_returns_to_an_enabled_form_and_valid_retry_connects(cx: &mut 
     deliver_until(&worker, &tx, window, cx, |e, _| {
         matches!(e, Event::SignInRequired(_))
     });
-    cx.update_window(window, |_, window, cx| window.click("connect-library", cx))
-        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click("Server address", cx);
+        window.input(fixture.account.url.as_str(), cx);
+        window.click("Username", cx);
+        window.input("no-saved-login", cx);
+        window.click("connect-library", cx);
+    })
+    .unwrap();
     deliver_until(&worker, &tx, window, cx, |e, _| {
         matches!(e, Event::SignInFailed(_))
     });
     cx.update_window(window, |_, window, cx| {
         assert_ne!(window.find("connect-library").disabled(), Some(true));
-        assert!(window.find("error-banner").visible());
+        assert!(window.find("sign-in-error").visible());
+        assert!(window.try_find("error-banner").is_none());
         assert!(
             fixture.requests().is_empty(),
             "invalid credentials must fail before HTTP"
         );
-        for (field, value) in [
-            ("Server address", fixture.account.url.as_str()),
-            ("Username", "fixture"),
-            ("Password", "synthetic-password"),
-        ] {
-            window.click(field, cx);
-            window.input(value, cx);
-        }
-        window.click("retry-error", cx);
+        window.click("Username", cx);
+        window.press(sonora::platform::shortcut("cmd-a", "ctrl-a"), cx);
+        window.input("fixture", cx);
+        window.click("Password", cx);
+        window.input("synthetic-password", cx);
+        window.click("retry-sign-in", cx);
     })
     .unwrap();
     wait_library(&worker, &tx, window, cx, "explorer-album-album");

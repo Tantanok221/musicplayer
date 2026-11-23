@@ -851,8 +851,9 @@ impl MusicApp {
     }
 
     pub(super) fn banner_error(&self) -> Option<String> {
-        self.sign_in
-            .error()
+        (!self.settings)
+            .then(|| self.sign_in.error())
+            .flatten()
             .map(str::to_owned)
             .or_else(|| self.error.clone())
             .or_else(|| self.playback.error.clone())
@@ -899,7 +900,7 @@ impl MusicApp {
                         .child(div().flex_1().min_w_0().child(error))
                         .child(Button::new("retry-error").small().label("Retry").on_click(
                             cx.listener(|app, _, _, cx| {
-                                if app.sign_in.error().is_some() {
+                                if !app.settings && app.sign_in.error().is_some() {
                                     app.connect_library(cx);
                                     return;
                                 }
@@ -916,7 +917,9 @@ impl MusicApp {
                         ))
                         .child(short_button("dismiss-error", Glyph::X, "Dismiss").on_click(
                             cx.listener(|app, _, _, cx| {
-                                app.sign_in.dismiss_error();
+                                if !app.settings {
+                                    app.sign_in.dismiss_error();
+                                }
                                 app.error = None;
                                 app.playback.error = None;
                                 app.feedback.dismiss();
