@@ -444,6 +444,7 @@ async fn navidrome(
             | "getScanStatus.view"
             | "startScan.view"
             | "getPlaylists.view"
+            | "getAlbum.view"
             | "getPlaylist.view"
             | "createPlaylist.view"
             | "updatePlaylist.view"
@@ -565,6 +566,24 @@ async fn navidrome(
         }
         "startScan.view" if query.is_empty() => {
             json!({"status":"failed","error":{"code":50,"message":"Not an administrator"}})
+        }
+        "getAlbum.view" if query.len() == 1 && query.contains_key("id") => {
+            let id = &query["id"];
+            match data.library.albums.iter().find(|album| &album.id == id) {
+                Some(album) => {
+                    let mut album = serde_json::to_value(album).unwrap();
+                    let songs = data
+                        .library
+                        .tracks
+                        .iter()
+                        .filter(|track| &track.album_id == id)
+                        .collect::<Vec<_>>();
+                    album["songCount"] = json!(songs.len());
+                    album["song"] = json!(songs);
+                    json!({"status":"ok","album":album})
+                }
+                None => json!({"status":"failed","error":{"code":70,"message":"Album not found"}}),
+            }
         }
         "getPlaylists.view" if query.is_empty() => {
             data.library.playlists_response.clone().unwrap_or_else(

@@ -8,6 +8,7 @@ impl MusicApp {
             Event::SmartPlaylistSaved(id) => self.smart_saved(id, window, cx),
             Event::NativePasswordRequired => self.smart_password_required(window, cx),
             Event::Ready(account, prefs) => {
+                self.album_deletion = None;
                 if self
                     .account_cache
                     .reset_for_account(self.account.as_ref(), account.as_ref())

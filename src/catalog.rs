@@ -446,6 +446,16 @@ impl Catalog {
         *self.facets.borrow_mut() = None;
         Ok(())
     }
+
+    pub(crate) fn remove_deleted_album(&mut self, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM tracks WHERE album_id=?1", [id])?;
+        tx.execute("DELETE FROM albums WHERE id=?1", [id])?;
+        tx.commit()?;
+        self.revision += 1;
+        *self.facets.borrow_mut() = None;
+        Ok(())
+    }
     pub fn count(&self) -> Result<usize> {
         Ok(self
             .conn
