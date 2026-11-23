@@ -17,6 +17,7 @@ fn writes_tags(fixture: &mut Fixture, on: bool) {
     prefs.metadata = MetadataPreferences {
         write_tags: on,
         library_folder: "/Volumes/music".into(),
+        verified_library_folder: Some("/Volumes/music".into()),
         ..Default::default()
     };
     fixture.backend.emit(Event::Ready(
@@ -774,6 +775,7 @@ fn identify_by_sound_needs_a_key_then_searches_the_recording(cx: &mut TestAppCon
     prefs.metadata = MetadataPreferences {
         write_tags: true,
         library_folder: "/Volumes/music".into(),
+        verified_library_folder: Some("/Volumes/music".into()),
         acoustid_key: "key".into(),
     };
     fixture.backend.emit(Event::Ready(

@@ -178,6 +178,7 @@ pub enum Command {
     LoadRelease(String),
     /// Fingerprints the song's file and asks AcoustID which recording it is.
     IdentifyBySound(Box<Track>),
+    CheckMusicFolder(PathBuf, Sender<crate::tags::MusicFolderCheck>),
     Preferences(Preferences),
     SaveSettings(Preferences, SettingsCredentials, Sender<bool>),
     Player(PlayerCommand),
@@ -338,7 +339,7 @@ fn write_tags(
             tracks.push((track, &edit.fields));
         }
     }
-    if !prefs.metadata.write_tags {
+    if !prefs.metadata.tag_writes_enabled() {
         report.failures = tracks
             .iter()
             .map(|(track, _)| {
@@ -2483,6 +2484,21 @@ fn run(
                             .map_err(|error| format!("{error:#}"));
                         let _ = events.send(Event::ReleaseCandidates(query, result));
                     });
+                }
+                Command::CheckMusicFolder(folder, reply) => {
+                    const SAMPLE_SIZE: usize = 5;
+                    match catalog.tracks(&LibraryQuery::default(), 0, SAMPLE_SIZE) {
+                        Ok(tracks) => {
+                            runtime.spawn_blocking(move || {
+                                let _ =
+                                    reply.send(crate::tags::check_music_folder(&folder, &tracks));
+                            });
+                        }
+                        Err(error) => {
+                            let _ = reply
+                                .send(crate::tags::MusicFolderCheck::Failed(format!("{error:#}")));
+                        }
+                    }
                 }
                 Command::IdentifyBySound(track) => {
                     let prefs: Preferences = catalog.state("preferences")?;

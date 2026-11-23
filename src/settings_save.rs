@@ -1,6 +1,6 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
-    Saved,
+    Saved(&'static str),
     Failed,
 }
 
@@ -46,7 +46,7 @@ mod tests {
         let mut feedback = SaveFeedback::default();
         let first = feedback.begin();
         assert_eq!(feedback.outcome(), None);
-        assert!(feedback.complete(first, SaveOutcome::Saved));
+        assert!(feedback.complete(first, SaveOutcome::Saved("Settings saved")));
         let second = feedback.begin();
         assert!(feedback.complete(second, SaveOutcome::Failed));
         assert!(!feedback.expire(first));
@@ -60,9 +60,10 @@ mod tests {
         let mut feedback = SaveFeedback::default();
         let first = feedback.begin();
         let second = feedback.begin();
-        assert!(!feedback.complete(first, SaveOutcome::Saved));
+        assert!(!feedback.complete(first, SaveOutcome::Saved("Settings saved")));
         assert_eq!(feedback.outcome(), None);
-        assert!(feedback.complete(second, SaveOutcome::Saved));
-        assert_eq!(feedback.outcome(), Some(SaveOutcome::Saved));
+        let saved = SaveOutcome::Saved("Music folder saved · verified");
+        assert!(feedback.complete(second, saved));
+        assert_eq!(feedback.outcome(), Some(saved));
     }
 }

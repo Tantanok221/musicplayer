@@ -39,9 +39,7 @@ impl MusicApp {
                 self.volume.update(cx, |slider, cx| {
                     slider.set_value(self.preferences.volume, window, cx)
                 });
-                let folder = self.preferences.metadata.library_folder.clone();
-                self.metadata_folder
-                    .update(cx, |input, cx| input.set_value(folder, window, cx));
+                self.restore_metadata_folder(window, cx);
                 let key = self.preferences.metadata.acoustid_key.clone();
                 self.acoustid_key
                     .update(cx, |input, cx| input.set_value(key, window, cx));

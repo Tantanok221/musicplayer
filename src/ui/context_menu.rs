@@ -433,7 +433,7 @@ impl MusicApp {
 fn writes_tags(state: &MenuState, cx: &App) -> bool {
     state
         .app
-        .read_with(cx, |app, _| app.preferences.metadata.write_tags)
+        .read_with(cx, |app, _| app.preferences.metadata.tag_writes_enabled())
         .unwrap_or(false)
 }
 

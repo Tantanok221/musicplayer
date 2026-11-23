@@ -5,7 +5,7 @@ use sonora::{
     model::{MetadataPreferences, Preferences, Track},
     playback::PlayerCommand,
     service::{Command, Event, Mutation},
-    tags::{EditValue, TagEdit, TagField, TagReport, read},
+    tags::{EditValue, MusicFolderCheck, TagEdit, TagField, TagReport, read},
 };
 use std::{collections::BTreeMap, path::Path};
 
@@ -52,6 +52,7 @@ fn enable(worker: &sonora::service::test_support::Worker, folder: &Folder) {
         metadata: MetadataPreferences {
             write_tags: true,
             library_folder: folder.dir.path().to_string_lossy().into(),
+            verified_library_folder: Some(folder.dir.path().to_string_lossy().into()),
             ..Default::default()
         },
         ..Default::default()
@@ -79,6 +80,71 @@ fn scans(fixture: &Fixture) -> usize {
         .iter()
         .filter(|request| request.endpoint == "startScan.view")
         .count()
+}
+
+#[test]
+fn checks_indexed_music_files_without_writing_or_rescanning() {
+    let folder = Folder::new();
+    let original = std::fs::read(folder.file()).unwrap();
+    let mut library = library(&folder, true);
+    library.tracks.truncate(1);
+    let fixture = Fixture::new(library);
+    let mut worker = fixture.start();
+    synced(&worker);
+    let check = |path: &Path| {
+        let (reply, result) = flume::bounded(1);
+        worker
+            .service()
+            .send(Command::CheckMusicFolder(path.into(), reply));
+        result.recv_timeout(crate::fixture::WAIT).unwrap()
+    };
+    assert_eq!(
+        check(folder.dir.path()),
+        MusicFolderCheck::Passed {
+            found: 1,
+            server_path: PATH.into(),
+            local_path: folder.file(),
+        }
+    );
+    assert_eq!(std::fs::read(folder.file()).unwrap(), original);
+    let missing = folder.dir.path().join("missing");
+    assert_eq!(check(&missing), MusicFolderCheck::MissingFolder);
+    std::fs::create_dir(&missing).unwrap();
+    assert_eq!(
+        check(&missing),
+        MusicFolderCheck::Unmatched { found: 0, total: 1 }
+    );
+    std::fs::write(folder.file(), b"not the same file").unwrap();
+    let MusicFolderCheck::FileProblem(problem) = check(folder.dir.path()) else {
+        panic!("expected a size mismatch");
+    };
+    assert!(problem.contains(&folder.file().display().to_string()));
+    assert!(problem.contains("different file"));
+    assert_eq!(scans(&fixture), 0);
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
+fn an_existing_folder_is_not_verified_without_indexed_tracks() {
+    let folder = Folder::new();
+    let fixture = Fixture::new(Library {
+        tracks: vec![],
+        albums: vec![],
+        ..Default::default()
+    });
+    let mut worker = fixture.start();
+    synced(&worker);
+    let (reply, result) = flume::bounded(1);
+    worker
+        .service()
+        .send(Command::CheckMusicFolder(folder.dir.path().into(), reply));
+    assert_eq!(
+        result.recv_timeout(crate::fixture::WAIT).unwrap(),
+        MusicFolderCheck::NoTracks
+    );
+    worker.shutdown(crate::fixture::WAIT).unwrap();
+    fixture.finish();
 }
 
 #[test]
@@ -407,6 +473,7 @@ fn identify_by_sound_fingerprints_the_file_and_asks_acoustid() {
                 write_tags: true,
                 library_folder: folder.dir.path().to_string_lossy().into(),
                 acoustid_key: key.into(),
+                ..Default::default()
             },
             ..Default::default()
         }));

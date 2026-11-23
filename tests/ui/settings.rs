@@ -5,8 +5,9 @@ use sonora::{
     model::Preferences,
     platform::{Account, shortcut},
     service::{Command, Event, SettingsCredentials},
+    tags::MusicFolderCheck,
 };
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
@@ -15,6 +16,7 @@ pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mu
             "Playback" => "0-1",
             "Downloads" => "0-2",
             "Appearance" => "0-3",
+            "Metadata" => "0-5",
             _ => panic!("unknown settings page"),
         };
         window.within("settings-sidebar").click(id, cx);
@@ -28,6 +30,122 @@ fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut Test
         window.click(field, cx);
         window.press(shortcut("cmd-a", "ctrl-a"), cx);
         window.input(value, cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn metadata_folder_starts_with_a_picker_and_writes_disabled(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Metadata", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("choose-music-folder").visible());
+        assert!(window.find("check-music-folder").visible());
+        assert_eq!(window.find("write-tags-to-files").disabled(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn picked_folder_checks_automatically_and_only_its_pass_unlocks_tag_writing(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Metadata", cx);
+    let assert_gate = |disabled, cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(
+                window
+                    .find("write-tags-to-files")
+                    .disabled()
+                    .unwrap_or(false),
+                disabled
+            );
+        })
+        .unwrap();
+    };
+    f.click(window, "choose-music-folder", cx);
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| None);
+    f.settle(window, cx);
+    assert_gate(true, cx);
+
+    let folder = PathBuf::from("/fixture/music");
+    let checked = folder.clone();
+    f.expect(
+        "automatically check the picked folder",
+        move |command, _| {
+            let Command::CheckMusicFolder(path, reply) = command else {
+                panic!("expected a music folder check");
+            };
+            assert_eq!(path, checked);
+            reply
+                .send(MusicFolderCheck::Passed {
+                    found: 5,
+                    server_path: "/music/Artist/Song.flac".into(),
+                    local_path: path.join("Artist/Song.flac"),
+                })
+                .unwrap();
+            vec![]
+        },
+    );
+    f.click(window, "choose-music-folder", cx);
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.directories && !options.files && !options.multiple);
+        Some(vec![folder])
+    });
+    f.settle(window, cx);
+    assert_gate(false, cx);
+    cx.update_window(window, |_, window, _| {
+        let result = window.find("music-folder-check-result");
+        assert!(result.visible());
+        assert!(result.label().unwrap().contains("Found 5/5 sample tracks"));
+    })
+    .unwrap();
+    assert!(
+        !f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .metadata
+            .write_tags
+    );
+    f.click(window, "write-tags-to-files", cx);
+    assert!(
+        f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .metadata
+            .write_tags
+    );
+
+    fill(window, "Music folder", "/fixture/missing", cx);
+    f.settle(window, cx);
+    assert_gate(true, cx);
+    f.expect("check a pasted folder", |command, _| {
+        let Command::CheckMusicFolder(path, reply) = command else {
+            panic!("expected a music folder check");
+        };
+        assert_eq!(path, PathBuf::from("/fixture/missing"));
+        reply.send(MusicFolderCheck::MissingFolder).unwrap();
+        vec![]
+    });
+    f.click(window, "check-music-folder", cx);
+    assert_gate(true, cx);
+    f.click(window, "save-music-folder", cx);
+    assert!(
+        !f.catalog
+            .state::<Preferences>("preferences")
+            .unwrap()
+            .metadata
+            .write_tags
+    );
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("settings-saved").label(),
+            Some("Music folder saved · not verified")
+        );
     })
     .unwrap();
 }
