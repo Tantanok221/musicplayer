@@ -5,6 +5,11 @@ edition = "2024"
 description = "An album-first Navidrome player for macOS and Linux"
 license = "MIT"
 
+[workspace]
+members = ["crates/sonora-sync", "crates/sonora-sync-protocol"]
+default-members = ["."]
+resolver = "3"
+
 [features]
 # Controlled handles for application tests; never enabled by the local bundler.
 test-support = []
