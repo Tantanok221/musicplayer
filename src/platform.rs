@@ -227,27 +227,44 @@ impl Paths {
         .context("Could not save login locally")
     }
 
-    /// The Last.fm API key entered in Settings, if any.
-    pub fn lastfm_key(&self) -> Result<Option<String>> {
-        match std::fs::read_to_string(self.data.join("credentials").join("lastfm.key")) {
+    /// The key or token a history service was given in Settings, if any.
+    pub fn history_secret(
+        &self,
+        provider: crate::history::HistoryProvider,
+    ) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.data.join("credentials").join(provider.secret_file())) {
             Ok(text) => Ok(Some(text.trim().to_string()).filter(|key| !key.is_empty())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => anyhow::bail!("Could not read the saved Last.fm API key. Enter it again."),
+            Err(_) => anyhow::bail!(
+                "Could not read the saved {} {}. Enter it again.",
+                provider.name(),
+                provider.secret_name()
+            ),
         }
     }
 
-    /// Saves a Last.fm API key; an empty field keeps the saved one.
-    pub fn save_lastfm_key(&self, key: &str) -> Result<()> {
-        let key = key.trim();
-        if key.is_empty() {
+    /// Saves a history service's key or token; an empty field keeps the saved one.
+    pub fn save_history_secret(
+        &self,
+        provider: crate::history::HistoryProvider,
+        secret: &str,
+    ) -> Result<()> {
+        let secret = secret.trim();
+        if secret.is_empty() {
             return Ok(());
         }
         self.credentials_directory()?;
         atomic_write(
-            &self.data.join("credentials").join("lastfm.key"),
-            key.as_bytes(),
+            &self.data.join("credentials").join(provider.secret_file()),
+            secret.as_bytes(),
         )
-        .context("Could not save the Last.fm API key")
+        .with_context(|| {
+            format!(
+                "Could not save the {} {}",
+                provider.name(),
+                provider.secret_name()
+            )
+        })
     }
 
     fn credentials_directory(&self) -> Result<()> {

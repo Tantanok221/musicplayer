@@ -125,12 +125,13 @@ impl NavigatorView {
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Workspace {
+    /// Saved tabs and history from builds that had Discover open Music Explorer.
     #[default]
+    #[serde(alias = "Discover")]
     Explorer,
     Queue,
     Playlists,
     NowPlaying,
-    Discover,
 }
 impl Workspace {
     pub const ALL: [Self; 4] = [
@@ -145,7 +146,6 @@ impl Workspace {
             Self::Queue => "Queue",
             Self::Playlists => "Playlists",
             Self::NowPlaying => "Now Playing",
-            Self::Discover => "Discover",
         }
     }
 }
