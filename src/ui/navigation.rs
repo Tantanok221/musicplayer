@@ -143,7 +143,7 @@ impl MusicApp {
             }
             Workspace::Playlists => self.playlists.search().to_owned(),
             Workspace::Queue => self.queue_search.clone(),
-            Workspace::NowPlaying | Workspace::Discover => String::new(),
+            Workspace::NowPlaying => String::new(),
         };
         self.search.update(cx, |input, cx| {
             input.set_value(self.search_text.clone(), window, cx)
@@ -153,9 +153,6 @@ impl MusicApp {
         }
         if workspace == Workspace::Queue {
             self.queue_ui.focus.focus(window, cx);
-        }
-        if workspace == Workspace::Discover {
-            self.request_discover();
         }
         cx.notify();
     }

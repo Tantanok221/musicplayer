@@ -9,8 +9,6 @@ mod artwork;
 mod connection;
 #[path = "service_worker/device_sync.rs"]
 mod device_sync;
-#[path = "service_worker/discover.rs"]
-mod discover;
 #[path = "service_worker/feedback.rs"]
 mod feedback;
 #[path = "service_worker/fixture.rs"]

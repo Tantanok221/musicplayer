@@ -1,8 +1,15 @@
 //! Read-only Last.fm lookups of a listener's public album charts.
-use crate::discover::ChartAlbum;
+use crate::history::{
+    BoxFuture, ChartAlbum, History, HistoryProvider, HistoryUpdate, ListeningHistory, Report,
+    SeasonChart,
+};
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::Instant};
 use url::Url;
 
@@ -10,7 +17,8 @@ use url::Url;
 pub struct LastFm {
     http: reqwest::Client,
     base: Url,
-    key: Option<String>,
+    /// Shared by clones, so a key entered in Settings reaches every holder.
+    key: Arc<RwLock<Option<String>>>,
     /// Last.fm asks clients to stay well under five requests a second.
     interval: Duration,
     last: Arc<Mutex<Option<Instant>>>,
@@ -35,23 +43,33 @@ impl LastFm {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             base: Url::parse(base)?,
-            key,
+            key: Arc::new(RwLock::new(key)),
             interval,
             last: Arc::default(),
         })
     }
 
     /// Uses an API key entered in Settings.
-    pub fn set_key(&mut self, key: String) {
-        self.key = Some(key);
+    pub fn set_key(&self, key: String) {
+        *self
+            .key
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(key);
     }
 
     pub fn has_key(&self) -> bool {
-        self.key.is_some()
+        self.key().is_some()
+    }
+
+    fn key(&self) -> Option<String> {
+        self.key
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     async fn get(&self, user: &str, method: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let Some(key) = &self.key else {
+        let Some(key) = self.key() else {
             bail!("Add a Last.fm API key in Settings");
         };
         let mut url = self.base.clone();
@@ -59,7 +77,7 @@ impl LastFm {
             .append_pair("method", method)
             .append_pair("user", user)
             .extend_pairs(params)
-            .append_pair("api_key", key)
+            .append_pair("api_key", &key)
             .append_pair("format", "json");
         {
             let mut last = self.last.lock().await;
@@ -134,5 +152,57 @@ impl LastFm {
                 })
             })
             .collect())
+    }
+}
+
+impl ListeningHistory for LastFm {
+    fn provider(&self) -> HistoryProvider {
+        HistoryProvider::LastFm
+    }
+
+    fn ready(&self) -> bool {
+        self.has_key()
+    }
+
+    fn set_secret(&self, secret: String) {
+        self.set_key(secret);
+    }
+
+    fn needs_sync(&self, history: &History, now: DateTime<Utc>) -> bool {
+        history.registered.is_none() || !crate::history::stale_seasons(history, now).is_empty()
+    }
+
+    /// Fetches the profile's creation date if unknown, then every season
+    /// whose chart is missing or unfinished.
+    fn sync<'a>(
+        &'a self,
+        user: &'a str,
+        mut history: History,
+        report: Report<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if history.registered.is_none() {
+                let registered = self.registered(user).await?;
+                report(HistoryUpdate::Registered(registered));
+                history.registered = Some(registered);
+            }
+            let seasons = crate::history::stale_seasons(&history, Utc::now());
+            let total = seasons.len();
+            for (done, season) in seasons.into_iter().enumerate() {
+                let albums = self.album_chart(user, season.from, season.to).await?;
+                report(HistoryUpdate::Season {
+                    key: season.key,
+                    chart: SeasonChart {
+                        from: season.from,
+                        to: season.to,
+                        fetched_ms: Utc::now().timestamp_millis(),
+                        albums,
+                    },
+                    done: done + 1,
+                    total,
+                });
+            }
+            Ok(())
+        })
     }
 }

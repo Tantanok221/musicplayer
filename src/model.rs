@@ -371,6 +371,11 @@ pub struct Preferences {
     pub sync_server_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lan_port: Option<u16>,
+    /// Whose ListenBrainz history Memory lane reaches back through; empty is off.
+    pub listenbrainz_user: String,
+    /// Which service Memory lane reads; unset in preferences saved before
+    /// ListenBrainz, where `history()` picks one.
+    pub history_provider: Option<crate::history::HistoryProvider>,
 }
 /// What counts as a favorite on the Favorites page.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -459,7 +464,25 @@ impl Default for Preferences {
             lastfm_user: String::new(),
             sync_server_url: String::new(),
             lan_port: None,
+            listenbrainz_user: String::new(),
+            history_provider: None,
         }
+    }
+}
+
+impl Preferences {
+    /// The history service Memory lane reads and whose listener, trimmed;
+    /// an empty name turns history off.
+    pub fn history(&self) -> (crate::history::HistoryProvider, &str) {
+        use crate::history::HistoryProvider;
+        let provider = self
+            .history_provider
+            .unwrap_or_else(|| crate::history::default_provider(&self.lastfm_user, false));
+        let user = match provider {
+            HistoryProvider::ListenBrainz => &self.listenbrainz_user,
+            HistoryProvider::LastFm => &self.lastfm_user,
+        };
+        (provider, user.trim())
     }
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

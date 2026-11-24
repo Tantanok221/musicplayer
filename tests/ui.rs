@@ -5,8 +5,6 @@ mod album_feedback;
 mod common;
 #[path = "ui/devices.rs"]
 mod devices;
-#[path = "ui/discover.rs"]
-mod discover;
 #[path = "ui/downloads.rs"]
 mod downloads;
 #[path = "ui/explorer.rs"]

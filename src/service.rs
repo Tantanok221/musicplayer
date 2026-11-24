@@ -4,7 +4,6 @@ use crate::{
     backdrop::{self, Backdrop},
     catalog::{Catalog, LibraryView},
     discography::{self, Discography, DiscographyView, ReleaseDetails},
-    discover::History,
     listening::ListenReport,
     lyrics::Lyrics,
     model::*,
@@ -19,7 +18,7 @@ use crate::{
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -39,7 +38,6 @@ mod play_queue;
 pub enum SettingsCredentials {
     Unchanged,
     Slskd(String, String, String),
-    LastFm(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,20 +107,6 @@ pub enum Command {
     Album(String),
     AlbumDetails(String),
     Artist(u64, String, String),
-    Discover(u64),
-    HideDiscover(String, crate::discover::Dismissal),
-    /// Account namespace, Last.fm user and when their profile was created.
-    LastFmRegistered(String, String, i64),
-    /// Account namespace, Last.fm user, season key, its chart, and progress.
-    LastFmSeason(
-        String,
-        String,
-        String,
-        crate::discover::SeasonChart,
-        usize,
-        usize,
-    ),
-    LastFmDone(String, String, Result<(), String>),
     ArtistProfile(String, String, bool),
     ArtistProfileLoaded(String, String, bool, Result<ArtistProfile, String>),
     TopSongs(String, String),
@@ -278,7 +262,6 @@ pub enum Event {
     Album(String, Vec<Arc<Track>>),
     AlbumDetails(Arc<Album>),
     Artist(u64, ArtistPageData),
-    Discover(u64, Arc<crate::discover::Rediscover>),
     ArtistProfile(String, Arc<ArtistProfile>),
     TopSongs(String, Arc<TopSongs>),
     Discography(String, Arc<DiscographyView>),
@@ -336,7 +319,6 @@ pub mod test_support;
 /// The outside services the catalog actor calls, and its test hooks.
 pub(crate) struct Clients {
     pub musicbrainz: MusicBrainz,
-    pub lastfm: crate::lastfm::LastFm,
     pub hooks: Hooks,
 }
 
@@ -728,10 +710,8 @@ impl Service {
             .name("sonora-catalog".into())
             .spawn(move || {
                 let result = MusicBrainz::new().and_then(|metadata| {
-                    let lastfm = crate::lastfm::LastFm::new()?;
                     let clients = Clients {
                         musicbrainz: metadata,
-                        lastfm,
                         hooks: Hooks::default(),
                     };
                     run(paths, runtime, worker, rx, events.clone(), clients)
@@ -1144,114 +1124,6 @@ impl ArtworkClock {
     }
 }
 
-struct LastFmFetch {
-    done: usize,
-    total: usize,
-}
-
-fn lastfm_state(user: &str) -> String {
-    format!("lastfm-history:v1:{}", user.to_lowercase())
-}
-
-fn load_history(catalog: &Catalog, user: &str) -> Result<History> {
-    Ok(catalog
-        .state::<Option<History>>(&lastfm_state(user))?
-        .unwrap_or_else(|| History {
-            user: user.into(),
-            ..Default::default()
-        }))
-}
-
-/// Fetches the profile's creation date if unknown, then every season whose
-/// chart is missing or unfinished, handing each back as it arrives.
-async fn fetch_lastfm(
-    lastfm: crate::lastfm::LastFm,
-    tx: Sender<Command>,
-    namespace: String,
-    user: String,
-    mut history: History,
-) {
-    let result = async {
-        if history.registered.is_none() {
-            let registered = lastfm.registered(&user).await?;
-            let _ = tx.send(Command::LastFmRegistered(
-                namespace.clone(),
-                user.clone(),
-                registered,
-            ));
-            history.registered = Some(registered);
-        }
-        let seasons = crate::discover::stale_seasons(&history, chrono::Utc::now());
-        let total = seasons.len();
-        for (done, season) in seasons.into_iter().enumerate() {
-            let albums = lastfm.album_chart(&user, season.from, season.to).await?;
-            let _ = tx.send(Command::LastFmSeason(
-                namespace.clone(),
-                user.clone(),
-                season.key,
-                crate::discover::SeasonChart {
-                    from: season.from,
-                    to: season.to,
-                    fetched_ms: chrono::Utc::now().timestamp_millis(),
-                    albums,
-                },
-                done + 1,
-                total,
-            ));
-        }
-        Ok(())
-    }
-    .await
-    .map_err(|error: anyhow::Error| format!("{error:#}"));
-    let _ = tx.send(Command::LastFmDone(namespace, user, result));
-}
-
-fn publish_discover(
-    catalog: &Catalog,
-    events: &Sender<Event>,
-    lastfm: &crate::lastfm::LastFm,
-    request: u64,
-    fetches: &HashMap<(String, String), LastFmFetch>,
-    account: Option<&Account>,
-    failure: Option<&(String, String)>,
-) -> Result<()> {
-    use crate::discover::HistoryStatus;
-    let user = catalog
-        .state::<Preferences>("preferences")?
-        .lastfm_user
-        .trim()
-        .to_string();
-    let history: Option<History> = if user.is_empty() || !lastfm.has_key() {
-        None
-    } else {
-        catalog.state(&lastfm_state(&user))?
-    };
-    let fetch = account.and_then(|account| fetches.get(&(account.namespace(), user.clone())));
-    let hidden: Option<crate::discover::Hidden> = catalog.state("discover-hidden")?;
-    let mut shelves = crate::discover::rediscover(
-        &catalog.rediscover_candidates()?,
-        history.as_ref(),
-        &hidden.unwrap_or_default(),
-        chrono::Utc::now(),
-    );
-    shelves.history = if user.is_empty() {
-        HistoryStatus::Off
-    } else if !lastfm.has_key() {
-        HistoryStatus::Unavailable
-    } else if let Some(fetch) = fetch {
-        HistoryStatus::Loading {
-            done: fetch.done,
-            total: fetch.total,
-        }
-    } else if let Some((_, message)) = failure.filter(|(failed, _)| *failed == user) {
-        HistoryStatus::Failed(message.clone())
-    } else {
-        HistoryStatus::Ready
-    };
-    events.send(Event::Discover(request, Arc::new(shelves)))?;
-    Ok(())
-}
-
 fn run(
     paths: Paths,
     runtime: tokio::runtime::Handle,
@@ -1260,11 +1132,7 @@ fn run(
     events: Sender<Event>,
     clients: Clients,
 ) -> Result<()> {
-    let Clients {
-        musicbrainz,
-        lastfm,
-        hooks,
-    } = clients;
+    let Clients { musicbrainz, hooks } = clients;
     let Service {
         player,
         tx,
@@ -1364,14 +1232,6 @@ fn run(
     let mut deleted_playlists = HashSet::new();
     let mut submission_requests = HashSet::new();
     let mut discography_requests = HashSet::new();
-    let mut discover_request = 0;
-    let mut lastfm = lastfm;
-    // A key entered in Settings wins over one this build was made with.
-    if let Ok(Some(key)) = paths.lastfm_key() {
-        lastfm.set_key(key);
-    }
-    let mut lastfm_fetches = HashMap::new();
-    let mut lastfm_failure: Option<(String, String)> = None;
     let mut release_requests: HashSet<String> = HashSet::new();
     let mut open_artist: Option<(u64, String, String)> = None;
     let mut slskd: Option<(String, Slskd)> = None;
@@ -1828,95 +1688,6 @@ fn run(
                             }
                         });
                     }
-                }
-                Command::Discover(request) => {
-                    discover_request = request;
-                    let user = catalog
-                        .state::<Preferences>("preferences")?
-                        .lastfm_user
-                        .trim()
-                        .to_string();
-                    let namespace = account.as_ref().map(Account::namespace);
-                    if let Some(namespace) = namespace
-                        && !user.is_empty()
-                        && lastfm.has_key()
-                        && !lastfm_fetches.contains_key(&(namespace.clone(), user.clone()))
-                    {
-                        let history = load_history(&catalog, &user)?;
-                        if history.registered.is_none()
-                            || !crate::discover::stale_seasons(&history, chrono::Utc::now())
-                                .is_empty()
-                        {
-                            lastfm_failure = None;
-                            lastfm_fetches.insert(
-                                (namespace.clone(), user.clone()),
-                                LastFmFetch { done: 0, total: 0 },
-                            );
-                            let tx = tx.clone();
-                            let lastfm = lastfm.clone();
-                            runtime.spawn(fetch_lastfm(lastfm, tx, namespace, user, history));
-                        }
-                    }
-                    publish_discover(
-                        &catalog,
-                        &events,
-                        &lastfm,
-                        request,
-                        &lastfm_fetches,
-                        account.as_ref(),
-                        lastfm_failure.as_ref(),
-                    )?;
-                }
-                Command::LastFmRegistered(namespace, user, registered) => {
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
-                        let mut history = load_history(&catalog, &user)?;
-                        history.registered = Some(registered);
-                        catalog.set_state(&lastfm_state(&user), &Some(&history))?;
-                    }
-                }
-                Command::LastFmSeason(namespace, user, season, chart, done, total) => {
-                    if account.as_ref().map(Account::namespace).as_ref() == Some(&namespace) {
-                        let mut history = load_history(&catalog, &user)?;
-                        history.seasons.insert(season, chart);
-                        catalog.set_state(&lastfm_state(&user), &Some(&history))?;
-                        if let Some(fetch) = lastfm_fetches.get_mut(&(namespace, user)) {
-                            fetch.done = done;
-                            fetch.total = total;
-                        }
-                        publish_discover(
-                            &catalog,
-                            &events,
-                            &lastfm,
-                            discover_request,
-                            &lastfm_fetches,
-                            account.as_ref(),
-                            lastfm_failure.as_ref(),
-                        )?;
-                    }
-                }
-                Command::LastFmDone(namespace, user, result) => {
-                    lastfm_fetches.remove(&(namespace.clone(), user.clone()));
-                    if account.as_ref().map(Account::namespace) == Some(namespace) {
-                        if let Err(message) = result {
-                            lastfm_failure = Some((user, message));
-                        }
-                        publish_discover(
-                            &catalog,
-                            &events,
-                            &lastfm,
-                            discover_request,
-                            &lastfm_fetches,
-                            account.as_ref(),
-                            lastfm_failure.as_ref(),
-                        )?;
-                    }
-                }
-                Command::HideDiscover(id, dismissal) => {
-                    let mut hidden: crate::discover::Hidden = catalog
-                        .state::<Option<_>>("discover-hidden")?
-                        .unwrap_or_default();
-                    hidden.hide(&id, dismissal, chrono::Utc::now());
-                    catalog.set_state("discover-hidden", &hidden)?;
                 }
                 Command::Artist(request, name, id) => {
                     events.send(Event::Artist(request, catalog.artist_page(&name, &id)?))?;
@@ -2829,7 +2600,6 @@ fn run(
                     let Some((credentials, reply)) = confirmation else {
                         return persisted;
                     };
-                    let lastfm_user = prefs.lastfm_user.trim().to_string();
                     let saved = persisted.is_ok()
                         && match credentials {
                             SettingsCredentials::Unchanged => true,
@@ -2843,25 +2613,6 @@ fn run(
                                     events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
                                 }
                                 saved.is_ok()
-                            }
-                            SettingsCredentials::LastFm(key) => {
-                                let key = key.trim().to_string();
-                                if key.is_empty() {
-                                    true
-                                } else {
-                                    match paths.save_lastfm_key(&key) {
-                                        Ok(()) => {
-                                            lastfm.set_key(key);
-                                            lastfm_failure = None;
-                                            true
-                                        }
-                                        Err(error) => {
-                                            lastfm_failure =
-                                                Some((lastfm_user, format!("{error:#}")));
-                                            false
-                                        }
-                                    }
-                                }
                             }
                         };
                     let _ = reply.send(saved);

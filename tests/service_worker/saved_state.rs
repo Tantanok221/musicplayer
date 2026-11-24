@@ -2,7 +2,7 @@ use crate::fixture::{Fixture, Library, WAIT, event, synced};
 use serde_json::Value;
 use sonora::{
     catalog::Catalog,
-    discover::History,
+    history::History,
     model::{Playlist, Preferences, SavedQueue},
     playback::PlayerCommand,
     service::{Command, Event},
@@ -155,6 +155,8 @@ fn golden_defaults_and_missing_records_remain_compatible() {
     defaults["playlist_columns"] = json(include_str!(
         "../fixtures/saved_state/playlist-columns-default.json"
     ));
+    defaults["listenbrainz_user"] = json(r#""""#);
+    defaults["history_provider"] = Value::Null;
     for (actual, expected) in [
         (
             serde_json::to_value(catalog.state::<Preferences>("preferences").unwrap()).unwrap(),

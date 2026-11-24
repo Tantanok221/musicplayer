@@ -26,6 +26,15 @@ pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mu
     f.settle(window, cx);
 }
 
+/// Picks a ReplayGain mode, a setting that saves as soon as it changes.
+fn gain(f: &mut Fixture, window: AnyWindowHandle, index: usize, cx: &mut TestAppContext) {
+    cx.update_window(window, |_, window, cx| {
+        window.within("replay-gain").click(index, cx)
+    })
+    .unwrap();
+    f.settle(window, cx);
+}
+
 fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut TestAppContext) {
     cx.update_window(window, |_, window, cx| {
         window.click(field, cx);
@@ -273,23 +282,21 @@ fn settings_save_toast_expires_and_ignores_navigation_saves(cx: &mut TestAppCont
     assert!(f.saves > saves, "navigation must have persisted");
     assert!(!toast(cx), "navigation persistence must not show a toast");
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
-    page(&mut f, window, "Library", cx);
-    fill(window, "Last.fm username", "listener", cx);
-    assert!(!toast(cx), "typing without saving must not show a toast");
-    f.click(window, "save-lastfm", cx);
+    page(&mut f, window, "Playback", cx);
+    assert!(
+        !toast(cx),
+        "opening Settings without saving must not show a toast"
+    );
+    gain(&mut f, window, 1, cx);
     assert_eq!(
-        f.catalog
-            .state::<Preferences>("preferences")
-            .unwrap()
-            .lastfm_user,
-        "listener"
+        f.catalog.state::<Preferences>("preferences").unwrap().gain,
+        sonora::model::GainMode::Track
     );
     assert!(toast(cx), "a successful Settings save must show a toast");
 
     cx.executor().advance_clock(Duration::from_secs(1));
     f.settle(window, cx);
-    fill(window, "Last.fm username", "another-listener", cx);
-    f.click(window, "save-lastfm", cx);
+    gain(&mut f, window, 2, cx);
     cx.executor().advance_clock(Duration::from_millis(1500));
     f.settle(window, cx);
     assert!(toast(cx), "a newer save must renew the toast");
@@ -308,15 +315,11 @@ fn settings_save_failure_does_not_show_success(cx: &mut TestAppContext) {
     )
     .unwrap();
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
-    page(&mut f, window, "Library", cx);
-    fill(window, "Last.fm username", "not-saved", cx);
-    f.click(window, "save-lastfm", cx);
-    assert!(
-        f.catalog
-            .state::<Preferences>("preferences")
-            .unwrap()
-            .lastfm_user
-            .is_empty()
+    page(&mut f, window, "Playback", cx);
+    gain(&mut f, window, 1, cx);
+    assert_eq!(
+        f.catalog.state::<Preferences>("preferences").unwrap().gain,
+        sonora::model::GainMode::Smart
     );
     cx.update_window(window, |_, window, _| {
         assert!(window.try_find("settings-saved").is_none());
@@ -558,61 +561,5 @@ fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retr
         );
     })
     .unwrap();
-    f.assert_script_finished();
-}
-
-#[gpui_kit::test]
-fn lastfm_username_is_saved_trimmed_for_memory_lane(cx: &mut TestAppContext) {
-    let (_dir, mut f, window, _) = start(cx);
-    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
-    page(&mut f, window, "Library", cx);
-    fill(window, "Last.fm username", "  listener ", cx);
-    f.click(window, "save-lastfm", cx);
-    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
-    assert_eq!(prefs.lastfm_user, "listener");
-    cx.update_window(window, |_, window, _| {
-        assert_eq!(
-            window.find("Last.fm username").value().unwrap_or_default(),
-            "listener"
-        );
-    })
-    .unwrap();
-
-    fill(window, "Last.fm username", " ", cx);
-    f.click(window, "save-lastfm", cx);
-    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
-    assert_eq!(
-        prefs.lastfm_user, "",
-        "clearing the name turns Last.fm history off"
-    );
-    f.assert_script_finished();
-}
-
-#[gpui_kit::test]
-fn lastfm_api_key_is_sent_once_and_cleared_from_the_field(cx: &mut TestAppContext) {
-    let (_dir, mut f, window, _) = start(cx);
-    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
-    page(&mut f, window, "Library", cx);
-    fill(window, "Last.fm username", "listener", cx);
-    fill(window, "Last.fm API key", " synthetic-lastfm-key ", cx);
-    f.expect("Last.fm key", |command, _| {
-        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::LastFm(key), _) if key == "synthetic-lastfm-key"));
-        vec![]
-    });
-    f.click(window, "save-lastfm", cx);
-    cx.update_window(window, |_, window, _| {
-        assert_eq!(
-            window.find("Last.fm API key").value().unwrap_or_default(),
-            ""
-        );
-    })
-    .unwrap();
-    let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
-    assert_eq!(prefs.lastfm_user, "listener");
-    let saved = serde_json::to_string(&prefs).unwrap();
-    assert!(!saved.contains("synthetic-lastfm-key"));
-
-    // An empty key field keeps the saved key and sends nothing.
-    f.click(window, "save-lastfm", cx);
     f.assert_script_finished();
 }

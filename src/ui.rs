@@ -41,7 +41,6 @@ mod artist_page;
 mod bindings;
 mod chrome;
 mod devices;
-mod discover;
 mod events;
 mod feedback;
 mod information;
@@ -386,8 +385,6 @@ pub struct MusicApp {
     playlist_name: Entity<InputState>,
     smart: smart_playlists::SmartUi,
     slskd_url: Entity<InputState>,
-    lastfm_user: Entity<InputState>,
-    lastfm_key: Entity<InputState>,
     slskd_key: Entity<InputState>,
     slskd_username: Entity<InputState>,
     slskd_password: Entity<InputState>,
@@ -478,9 +475,6 @@ pub struct MusicApp {
     artist_name: Option<String>,
     artist_id: String,
     artist_request: u64,
-    discover_request: u64,
-    discover: Option<Arc<crate::discover::Rediscover>>,
-    discover_visit: crate::discover::Visit,
     artist_data: Option<ArtistPageData>,
     biography_expanded: bool,
     popular_expanded: bool,
@@ -579,12 +573,6 @@ impl MusicApp {
         });
         let slskd_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://your-slskd-host:5030"));
-        let lastfm_user = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
-        let lastfm_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Optional")
-                .masked(true)
-        });
         let slskd_key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Optional")
@@ -636,7 +624,7 @@ impl MusicApp {
                             }
                             Workspace::Playlists => app.playlists.set_search(value),
                             Workspace::Queue => app.queue_search = value,
-                            Workspace::NowPlaying | Workspace::Discover => {
+                            Workspace::NowPlaying => {
                                 app.workspace = Workspace::Explorer;
                                 app.query = app.explorer_query.clone();
                                 app.query.text = value;
@@ -720,8 +708,6 @@ impl MusicApp {
             playlist_name,
             smart: Default::default(),
             slskd_url,
-            lastfm_user,
-            lastfm_key,
             slskd_key,
             slskd_username,
             slskd_password,
@@ -791,9 +777,6 @@ impl MusicApp {
             artist_name: None,
             artist_id: String::new(),
             artist_request: 0,
-            discover_request: 0,
-            discover: None,
-            discover_visit: Default::default(),
             artist_data: None,
             biography_expanded: false,
             popular_expanded: false,

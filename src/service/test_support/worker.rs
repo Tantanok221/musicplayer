@@ -2,7 +2,6 @@
 use super::{Command, Event, Service};
 use crate::service::Hooks;
 use crate::{
-    lastfm::LastFm,
     model::{Preferences, SavedQueue},
     musicbrainz::MusicBrainz,
     platform::{Account, Paths},
@@ -27,13 +26,13 @@ pub struct Worker {
 
 impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
-    /// The supplied metadata and Last.fm clients must use fixture endpoints in isolated tests.
-    pub fn start(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
-        Self::start_inner(paths, metadata, lastfm, false, Hooks::default())
+    /// The supplied metadata client must use fixture endpoints in isolated tests.
+    pub fn start(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
+        Self::start_inner(paths, metadata, false, Hooks::default())
     }
 
-    pub fn start_paused(paths: Paths, metadata: MusicBrainz, lastfm: LastFm) -> Result<Self> {
-        Self::start_inner(paths, metadata, lastfm, true, Hooks::default())
+    pub fn start_paused(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
+        Self::start_inner(paths, metadata, true, Hooks::default())
     }
 
     /// Like `start`, but every file of a tag job waits for a message on the
@@ -41,22 +40,17 @@ impl Worker {
     pub fn start_tag_gated(
         paths: Paths,
         metadata: MusicBrainz,
-        lastfm: LastFm,
     ) -> Result<(Self, flume::Sender<()>)> {
         let (gate, tag_gate) = flume::unbounded();
         let hooks = Hooks {
             tag_gate: Some(tag_gate),
         };
-        Ok((
-            Self::start_inner(paths, metadata, lastfm, false, hooks)?,
-            gate,
-        ))
+        Ok((Self::start_inner(paths, metadata, false, hooks)?, gate))
     }
 
     fn start_inner(
         paths: Paths,
         metadata: MusicBrainz,
-        lastfm: LastFm,
         paused: bool,
         hooks: Hooks,
     ) -> Result<Self> {
@@ -106,7 +100,6 @@ impl Worker {
                         events,
                         crate::service::Clients {
                             musicbrainz: metadata,
-                            lastfm,
                             hooks,
                         },
                     );

@@ -5,7 +5,7 @@ These are frozen examples of Sonora's JSON stored in SQLite `state.data`
 The `*-empty` and `preferences-default` snapshots record today's defaults;
 the populated examples exercise non-default values and Unicode. Preferences
 and playlist entries intentionally omit some defaulted fields to also cover
-older, sparse records. History here is Last.fm listening history, not the
+older, sparse records. History here is listening history saved by Last.fm for the removed Discover page; `sonora::history::History` still reads it, not the
 in-memory Back/Forward stack.
 
 Do not regenerate these to make a compatibility failure disappear. Preserve

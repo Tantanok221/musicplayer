@@ -194,3 +194,39 @@ fn new_tab_button_follows_the_last_tab_without_extra_space(cx: &mut TestAppConte
         fixture.click(window, "new-tab", cx);
     }
 }
+
+#[gpui_kit::test]
+fn discover_is_gone_and_a_saved_discover_tab_opens_music_explorer(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.bind_keys(tab_bindings());
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(&dir.path().join("catalog.sqlite"));
+    fixture.seed();
+    // Tabs saved by a build that still had Discover.
+    let mut saved = serde_json::to_value(Preferences::default()).unwrap();
+    saved["tabs"]["tabs"][0]["page"]["workspace"] = serde_json::json!("Discover");
+    saved["tabs"]["tabs"][1]["page"]["workspace"] = serde_json::json!("Discover");
+    saved["tabs"]["tabs"][1]["locked"] = serde_json::json!(true);
+    saved["tabs"]["tabs"][1]["home"] = saved["tabs"]["tabs"][1]["page"].clone();
+    fixture.catalog.set_state("preferences", &saved).unwrap();
+    let (window, app) = fixture.mount(cx);
+    fixture.settle(window, cx);
+    fixture.diagnose("saved discover tabs", window, &app, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("nav-discover").is_none());
+        for id in [1_u64, 2] {
+            assert_eq!(
+                window.find(("workspace-tab", id)).label(),
+                Some("Music Explorer")
+            );
+        }
+        assert!(window.find("nav-explorer").visible());
+    })
+    .unwrap();
+    // Any request for Discover would be an unscripted command and fail here.
+    fixture.click(window, ("workspace-tab", 2_u64), cx);
+    fixture.assert_script_finished();
+}
