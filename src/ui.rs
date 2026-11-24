@@ -56,6 +56,7 @@ mod sign_in;
 mod slskd_settings;
 mod smart_playlists;
 mod tracks;
+mod updates;
 mod window;
 pub use bindings::{playback_bindings, queue_bindings, settings_bindings};
 pub use window::restored_window_bounds;
@@ -380,6 +381,8 @@ pub struct MusicApp {
     lan_status: crate::sync::lan::LanStatus,
     /// The active remote device's queue, shown in place of the local one.
     remote_queue: Option<PlaybackSnapshot>,
+    /// This build's version and update progress, once the service reports it.
+    update: Option<crate::update::UpdateStatus>,
     username: Entity<InputState>,
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
@@ -700,6 +703,7 @@ impl MusicApp {
             lan_port,
             lan_status: Default::default(),
             remote_queue: None,
+            update: None,
             username,
             password,
             playlist_name,

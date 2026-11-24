@@ -1,0 +1,85 @@
+name: Release
+
+# Publishes each commit on main that passed CI as a signed Linux build. Installed
+# Linux copies of Sonora check the latest release and update themselves.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86-64
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      COMMIT: ${{ github.event.workflow_run.head_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Skip commits that are no longer the tip of main
+        id: tip
+        run: |
+          tip=$(git ls-remote origin refs/heads/main | cut -f 1)
+          if [ "$tip" = "$COMMIT" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main moved on to $tip; skipping $COMMIT"
+          fi
+      - name: Install Linux build dependencies
+        if: steps.tip.outputs.current == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libssl-dev libzstd-dev libasound2-dev libdbus-1-dev libvulkan-dev
+      - name: Install pinned Rust toolchain
+        if: steps.tip.outputs.current == 'true'
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        if: steps.tip.outputs.current == 'true'
+        with:
+          key: release
+      - name: Build
+        if: steps.tip.outputs.current == 'true'
+        env:
+          SONORA_COMMIT: ${{ env.COMMIT }}
+        run: cargo build --release --locked --bin sonora
+      - name: Sign
+        if: steps.tip.outputs.current == 'true'
+        env:
+          SONORA_UPDATE_SIGNING_KEY: ${{ secrets.SONORA_UPDATE_SIGNING_KEY }}
+        run: scripts/sign-release.sh target/release/sonora "$COMMIT" dist/release
+      - name: Publish
+        if: steps.tip.outputs.current == 'true'
+        run: |
+          short=${COMMIT:0:7}
+          gh release create "sonora-$short" dist/release/* \
+            --target "$COMMIT" \
+            --title "Sonora $short" \
+            --notes "Linux x86-64 build of $COMMIT. Installed copies update automatically." \
+            --latest
+      - name: Keep the five newest releases
+        if: steps.tip.outputs.current == 'true'
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+          while read -r tag; do
+            gh release delete "$tag" --yes --cleanup-tag
+          done

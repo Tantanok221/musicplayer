@@ -36,6 +36,7 @@ const SIGN_IN_NOTICE: &str =
 mod device_sync;
 pub mod native;
 mod play_queue;
+mod updates;
 
 #[derive(Clone)]
 pub enum SettingsCredentials {
@@ -178,6 +179,10 @@ pub enum Command {
     TransferTo(String, bool),
     /// Show and control another device's playback, or `None` for this device's.
     ControlDevice(Option<String>),
+    /// Look for a newer release now instead of waiting for the next check.
+    CheckForUpdates,
+    /// Start the installed update once this process exits; the UI then quits.
+    RestartToUpdate,
     TransferPrepared(u64, String, bool),
     TransferExpired(u64, String),
     DeviceSync(u64, crate::sync::RelayEvent),
@@ -284,6 +289,9 @@ pub enum Event {
     Playback(PlaybackSnapshot),
     DeviceSync(crate::sync::DeviceStatus),
     LocalVolume(f32),
+    Update(crate::update::UpdateStatus),
+    /// The installed update will start when Sonora quits, which it should do now.
+    Relaunching,
     SharedPreferences(crate::sync::SharedPreferences),
     LanStatus(crate::sync::lan::LanStatus),
     Status(String),
@@ -321,6 +329,8 @@ pub mod test_support;
 pub(crate) struct Clients {
     pub musicbrainz: MusicBrainz,
     pub hooks: Hooks,
+    /// Replaces this build with newer releases; `None` when it can't.
+    pub updater: Option<crate::update::Updater>,
 }
 
 /// Points where tests can hold the worker. Production passes the default.
@@ -714,6 +724,7 @@ impl Service {
                     let clients = Clients {
                         musicbrainz: metadata,
                         hooks: Hooks::default(),
+                        updater: crate::update::Updater::github(),
                     };
                     run(paths, runtime, worker, rx, events.clone(), clients)
                 });
@@ -1149,7 +1160,11 @@ fn run(
     events: Sender<Event>,
     clients: Clients,
 ) -> Result<()> {
-    let Clients { musicbrainz, hooks } = clients;
+    let Clients {
+        musicbrainz,
+        hooks,
+        updater,
+    } = clients;
     let Service {
         player,
         tx,
@@ -1171,6 +1186,7 @@ fn run(
         account.as_ref().map(Account::namespace).unwrap_or_default(),
     )?;
     events.send(Event::Ready(account.clone(), prefs.clone()))?;
+    let updates = updates::Updates::start(updater, &runtime, events.clone());
     devices.configure(&paths, account.as_ref(), &prefs, &events);
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     let interrupted = catalog.interrupted_tag_edits()?;
@@ -2401,6 +2417,8 @@ fn run(
                         events.send(Event::Error("Local device sync is unavailable".into()))?;
                     }
                 }
+                Command::CheckForUpdates => updates.check(),
+                Command::RestartToUpdate => updates.restart(&events)?,
                 Command::ControlDevice(device) => devices.control(device, &catalog, &events)?,
                 Command::TransferTo(id, start_playing) => {
                     if !devices.transfer_to(id, start_playing) {

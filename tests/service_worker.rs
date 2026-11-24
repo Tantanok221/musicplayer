@@ -35,3 +35,5 @@ mod smart_playlists;
 mod sync;
 #[path = "service_worker/tag_writes.rs"]
 mod tag_writes;
+#[path = "service_worker/updates.rs"]
+mod updates;

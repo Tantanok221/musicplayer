@@ -336,6 +336,15 @@ impl MusicApp {
                     return;
                 }
             }
+            Event::Update(status) => {
+                self.update_changed(status, cx);
+                return;
+            }
+            // The installed update starts once this process has exited.
+            Event::Relaunching => {
+                cx.quit();
+                return;
+            }
             Event::DeviceSync(status) => {
                 self.device_status_changed(status, window, cx);
                 return;

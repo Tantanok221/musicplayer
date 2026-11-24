@@ -23,7 +23,11 @@ Requires a Wayland or X11 session with a working Vulkan driver, Rust, a C/C++ to
 ./scripts/install-linux.sh
 ```
 
-This installs `~/.local/bin/sonora` and a **Sonora** launcher entry, without administrator access. To update, run `git pull --ff-only` and the installer again; a failed build keeps the previous version. To uninstall, remove `~/.local/bin/sonora`, `~/.local/share/applications/app.sonora.player.desktop` and `~/.local/share/icons/hicolor/512x512/apps/app.sonora.player.png`.
+This installs `~/.local/bin/sonora` and a **Sonora** launcher entry, without administrator access.
+
+On x86-64, an installed Sonora updates itself. Every commit on `main` that passes CI is published as a [GitHub release](https://github.com/Tantanok221/musicplayer/releases) with a signed Linux build. Sonora checks for a newer one shortly after it starts, then every six hours. It installs a release only when its signature matches Sonora's release key, its checksum matches, and its commit comes after the one you're running. When an update is installed, **Restart to update** appears in the status bar; until then you keep running the current version. **Settings → About** shows your version and lets you check now. Release builds need a recent distribution (glibc 2.39 or newer, as on current Arch, Fedora or Ubuntu 24.04).
+
+To update from source instead, run `git pull --ff-only` and the installer again; a failed build keeps the previous version. To uninstall, remove `~/.local/bin/sonora`, `~/.local/share/applications/app.sonora.player.desktop` and `~/.local/share/icons/hicolor/512x512/apps/app.sonora.player.png`.
 
 ## Connect your library
 

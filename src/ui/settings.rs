@@ -552,7 +552,8 @@ impl MusicApp {
                         SettingPage::new("Paired devices")
                             .icon(Icon::new(Glyph::Monitor))
                             .group(self.paired_devices_settings(app)),
-                    ),
+                    )
+                    .page(self.about_settings()),
             )
             .into_any_element()
     }

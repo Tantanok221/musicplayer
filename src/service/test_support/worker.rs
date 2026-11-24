@@ -28,11 +28,20 @@ impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
     /// The supplied metadata client must use fixture endpoints in isolated tests.
     pub fn start(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, false, Hooks::default())
+        Self::start_inner(paths, metadata, false, Hooks::default(), None)
+    }
+
+    /// Like `start`, with an updater that uses fixture endpoints.
+    pub fn start_with_updater(
+        paths: Paths,
+        metadata: MusicBrainz,
+        updater: crate::update::Updater,
+    ) -> Result<Self> {
+        Self::start_inner(paths, metadata, false, Hooks::default(), Some(updater))
     }
 
     pub fn start_paused(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, true, Hooks::default())
+        Self::start_inner(paths, metadata, true, Hooks::default(), None)
     }
 
     /// Like `start`, but every file of a tag job waits for a message on the
@@ -45,7 +54,10 @@ impl Worker {
         let hooks = Hooks {
             tag_gate: Some(tag_gate),
         };
-        Ok((Self::start_inner(paths, metadata, false, hooks)?, gate))
+        Ok((
+            Self::start_inner(paths, metadata, false, hooks, None)?,
+            gate,
+        ))
     }
 
     fn start_inner(
@@ -53,6 +65,7 @@ impl Worker {
         metadata: MusicBrainz,
         paused: bool,
         hooks: Hooks,
+        updater: Option<crate::update::Updater>,
     ) -> Result<Self> {
         let (tx, commands) = flume::unbounded();
         let (events, received_events) = flume::unbounded();
@@ -101,6 +114,7 @@ impl Worker {
                         crate::service::Clients {
                             musicbrainz: metadata,
                             hooks,
+                            updater,
                         },
                     );
                     // Dropping this private runtime cancels async requests/timers

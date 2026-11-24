@@ -18,6 +18,7 @@ pub(super) fn page(f: &mut Fixture, window: AnyWindowHandle, name: &str, cx: &mu
             "Appearance" => "0-3",
             "Metadata" => "0-5",
             "Paired devices" => "0-7",
+            "About" => "0-8",
             _ => panic!("unknown settings page"),
         };
         window.within("settings-sidebar").click(id, cx);

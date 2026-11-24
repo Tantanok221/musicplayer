@@ -31,4 +31,5 @@ pub mod sync;
 pub mod tags;
 pub mod thumbnail;
 pub mod ui;
+pub mod update;
 pub mod visualizer;

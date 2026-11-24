@@ -23,6 +23,8 @@ mod playlists;
 mod smart_playlists;
 #[path = "ui/tabs.rs"]
 mod tabs;
+#[path = "ui/updates.rs"]
+mod updates;
 #[path = "ui/worker.rs"]
 mod worker;
 // This target shares the strict HTTP fixture, not its worker-only scenarios.

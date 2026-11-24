@@ -284,6 +284,7 @@ impl MusicApp {
                 self.queue_playback().queue.len(),
                 duration_label(queue_time)
             )))
+            .children(self.update_restart_button())
             .child(
                 short_button(
                     "status-right-panel",

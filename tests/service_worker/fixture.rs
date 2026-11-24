@@ -1337,6 +1337,10 @@ impl Fixture {
         Worker::start(paths, self.clients()).unwrap()
     }
 
+    pub fn start_with_updater(&self, updater: sonora::update::Updater) -> Worker {
+        Worker::start_with_updater(self.paths.clone(), self.clients(), updater).unwrap()
+    }
+
     pub fn start_paused(&self) -> Worker {
         self.start_player(true)
     }
