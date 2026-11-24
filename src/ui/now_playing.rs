@@ -76,6 +76,10 @@ fn readable_on(color: Hsla, toward: Hsla, under: f32) -> Hsla {
 impl MusicApp {
     /// Playback position extrapolated from the last snapshot, which arrives every ~200ms.
     pub(super) fn live_position(&self) -> f64 {
+        if self.device_status.remote_id().is_some() {
+            // Remote positions are extrapolated from the device's clock already.
+            return self.display_position();
+        }
         let mut position = self.playback.position;
         if self.playback.playing && !self.playback.buffering {
             position += self.playback_at.elapsed().as_secs_f64().min(0.5);
@@ -88,7 +92,7 @@ impl MusicApp {
 
     /// Whether lyrics showing the playing track are out of date for its position.
     pub(super) fn lyrics_need_redraw(&self) -> bool {
-        let Some(track) = &self.playback.track else {
+        let Some(track) = &self.display_track() else {
             return false;
         };
         let Some((_, shown)) = self
@@ -216,9 +220,7 @@ impl MusicApp {
         match self.lyrics.get(&track.id).cloned() {
             Some(Ok(lyrics)) if !lyrics.is_empty() => {
                 let is_playing = self
-                    .playback
-                    .track
-                    .as_ref()
+                    .display_track()
                     .is_some_and(|playing| playing.id == track.id);
                 let following = is_playing && lyrics.is_timed();
                 let now = self.live_position();
@@ -314,10 +316,8 @@ impl MusicApp {
                     };
                     let shade = alpha * edge;
                     let empty = line.value.trim().is_empty();
-                    let seek = (is_playing && self.device_status.remote_id().is_none())
-                        .then(|| lyrics.line_position(index))
-                        .flatten();
-                    let player = self.service.player.clone();
+                    let seek = is_playing.then(|| lyrics.line_position(index)).flatten();
+                    let app = cx.weak_entity();
                     let mut row = div()
                         .id(SharedString::from(format!("lyric-{index}")))
                         .test_support()
@@ -358,8 +358,11 @@ impl MusicApp {
                                     .bg(ink_color.opacity(0.07 * edge))
                                     .text_color(ink_color.opacity(shade.max(0.8 * edge)))
                             })
-                            .on_click(move |_, _, _| {
-                                player.send(PlayerCommand::Seek(position));
+                            .on_click(move |_, _, cx| {
+                                // Seeks the controlled device when there is one.
+                                let _ = app.update(cx, |app, _| {
+                                    app.playback_intent(PlayerCommand::Seek(position))
+                                });
                             })
                     }));
                 }
@@ -414,7 +417,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.display_track() else {
             return div().into_any_element();
         };
         let theme_dark = cx.theme().is_dark();
@@ -621,7 +624,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.display_track() else {
             return div().into_any_element();
         };
         let theme_dark = cx.theme().is_dark();
@@ -637,7 +640,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.display_track() else {
             return div().into_any_element();
         };
         let legible = self.backdrop_ink(&track.cover_art, cx.theme().is_dark());
@@ -665,7 +668,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.display_track() else {
             return div().into_any_element();
         };
         let legible = self.backdrop_ink(&track.cover_art, cx.theme().is_dark());
@@ -686,7 +689,7 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.display_track() else {
             return self.empty(
                 "Play an album or track to see its artwork, details, and lyrics here.",
                 cx,
@@ -1067,17 +1070,20 @@ impl MusicApp {
             .px_8()
             .pt_2()
             .pb_3()
-            .when(self.playback.buffering, |band| {
-                band.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right(px(32.))
-                        .text_size(px(10.))
-                        .text_color(colors.muted)
-                        .child("Buffering…"),
-                )
-            })
+            .when(
+                self.playback.buffering && self.device_status.remote_id().is_none(),
+                |band| {
+                    band.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right(px(32.))
+                            .text_size(px(10.))
+                            .text_color(colors.muted)
+                            .child("Buffering…"),
+                    )
+                },
+            )
             .child(bars)
             .child(scale)
             .into_any_element()

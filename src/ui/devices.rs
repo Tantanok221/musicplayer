@@ -111,6 +111,16 @@ impl MusicApp {
         self.service.send(Command::RemotePlayback(command));
     }
 
+    /// The track the player bar, track information and Now Playing show: the
+    /// controlled device's, or this device's.
+    pub(super) fn display_track(&self) -> Option<Arc<Track>> {
+        if self.device_status.remote_id().is_some() {
+            self.device_status.track.clone()
+        } else {
+            self.playback.track.clone()
+        }
+    }
+
     pub(super) fn display_playing(&self) -> bool {
         if self.device_status.remote_id().is_some() {
             self.device_status
@@ -163,6 +173,7 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) {
         let remote_changed = self.device_status.remote_id() != status.remote_id();
+        let shown_track = self.display_track().map(|track| track.id.clone());
         let shows_remote = self.remote_queue.is_some();
         self.remote_queue = status.queue_snapshot();
         if shows_remote || self.remote_queue.is_some() {
@@ -175,6 +186,18 @@ impl MusicApp {
         if remote_changed {
             self.volume_before_mute = None;
             self.scrub = None;
+        }
+        if self.display_track().map(|track| track.id.clone()) != shown_track {
+            for part in [
+                Part::InfoHeader,
+                Part::InfoBody,
+                Part::NowBackdrop,
+                Part::NowDetails,
+                Part::NowLyrics,
+                Part::Center,
+            ] {
+                self.notify_part(part, cx);
+            }
         }
         if self.scrub.is_none() {
             let progress = if self.display_duration() > 0. {

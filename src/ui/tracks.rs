@@ -60,13 +60,15 @@ impl Render for TrackDragPreview {
 
 impl MusicApp {
     pub(super) fn queue_places(&self) -> Rc<QueuePlaces> {
-        let current = self.playback.track.as_ref();
+        // Where "Play next" and "Queue last" insert: the queue being shown.
+        let shown = self.queue_playback();
+        let current = shown.track.as_ref();
         Rc::new(QueuePlaces {
             current_track: current.map(|track| track.title.clone()),
             current_album: current
                 .filter(|track| !track.album_id.is_empty())
                 .map(|track| track.album.clone()),
-            last_album: self.playback.queue.last().map(|track| {
+            last_album: shown.queue.last().map(|track| {
                 if track.album.is_empty() {
                     track.title.clone()
                 } else {
@@ -161,7 +163,7 @@ impl MusicApp {
             )
             .child(div().w(px(13.)).flex_shrink_0().when(active, |s| {
                 s.child(
-                    Icon::new(if self.playback.playing {
+                    Icon::new(if self.display_playing() {
                         Glyph::Volume2
                     } else {
                         Glyph::Pause

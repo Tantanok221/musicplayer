@@ -209,3 +209,107 @@ fn queue_panel_shows_and_edits_the_active_devices_queue(cx: &mut TestAppContext)
         "the local queue is not edited"
     );
 }
+
+#[gpui_kit::test]
+fn track_information_and_lyrics_follow_the_controlled_device(cx: &mut TestAppContext) {
+    use sonora::lyrics::{LyricLine, Lyrics};
+    use sonora::model::PlaybackSnapshot;
+    use std::sync::Arc;
+
+    let (_dir, mut fixture, window, _) = start(cx);
+    let local = fixture
+        .catalog
+        .by_ids(&["track-1".into()])
+        .unwrap()
+        .remove(0);
+    let remote = fixture
+        .catalog
+        .by_ids(&["track-2".into()])
+        .unwrap()
+        .remove(0);
+    fixture.backend.emit(Event::Playback(PlaybackSnapshot {
+        track: Some(local.clone()),
+        queue: Arc::new(vec![local]),
+        queue_ids: Arc::new(vec![1]),
+        queue_revision: 1,
+        index: Some(0),
+        duration: 120.,
+        ..Default::default()
+    }));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    fixture.backend.emit(Event::DeviceSync(DeviceStatus {
+        playback: Some(PlaybackState {
+            queue: vec!["track-2".into()],
+            index: Some(0),
+            position_ms: 1_200,
+            captured_at_ms: now,
+            playing: false,
+            seq: 5,
+            ..Default::default()
+        }),
+        track: Some(remote.clone()),
+        queue: Arc::new(vec![remote]),
+        ..kitchen_playing(Some("remote"))
+    }));
+    fixture.settle(window, cx);
+    fixture.click(window, "info-Playing", cx);
+    fixture.click(window, "info-tab-Details", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("inspected-track").label(),
+            Some("Playing track: Second song")
+        );
+    })
+    .unwrap();
+
+    fixture.expect("lyrics for the controlled device's track", |command, _| {
+        assert!(matches!(command, Command::Lyrics(track) if track.id == "track-2"));
+        let line = |start, value: &str| LyricLine {
+            start: Some(start),
+            value: value.into(),
+        };
+        vec![Event::Lyrics(
+            "track-2".into(),
+            Ok(Arc::new(Lyrics {
+                synced: true,
+                offset: 100,
+                line: vec![line(1000, "Remote first"), line(2000, "Remote second")],
+            })),
+        )]
+    });
+    fixture.click(window, "info-tab-Lyrics", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("lyrics-scroll").label(),
+            Some("Lyrics for Second song")
+        );
+        assert_eq!(
+            window.find("lyric-0").label(),
+            Some("Current lyric: Remote first"),
+            "lyrics follow the controlled device's position"
+        );
+    })
+    .unwrap();
+
+    let _ = fixture.backend.player_commands().try_iter().count();
+    fixture.expect("seek the controlled device from a lyric", |command, _| {
+        assert!(matches!(
+            command,
+            Command::RemotePlayback(PlaybackCommand::Seek { ms }) if ms == 1_900
+        ));
+        vec![]
+    });
+    fixture.click(window, "lyric-1", cx);
+    fixture.assert_script_finished();
+    assert!(
+        fixture
+            .backend
+            .player_commands()
+            .try_iter()
+            .all(|command| matches!(command, PlayerCommand::Preferences(_))),
+        "this device's player doesn't seek"
+    );
+}

@@ -316,6 +316,11 @@ impl DeviceSync {
                 }
             }
             RelayEvent::Incoming(ServerMessage::ActiveDeviceChanged { device_id }) => {
+                if self.status.active_device_id != device_id {
+                    // Sequences only order one device's frames; a restarted device
+                    // counts again from the start.
+                    self.status.playback = None;
+                }
                 self.status.active_device_id = device_id;
             }
             RelayEvent::Incoming(ServerMessage::DevicesChanged { devices }) => {

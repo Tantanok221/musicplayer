@@ -18,11 +18,7 @@ impl MusicApp {
         let width = f32::from(window.viewport_size().width);
         let compact = width < 1000.;
         let remote = self.device_status.remote_id().is_some();
-        let track = if remote {
-            self.device_status.track.clone()
-        } else {
-            self.playback.track.clone()
-        };
+        let track = self.display_track();
         let playing = self.display_playing();
         if remote && playing && window.is_visible() {
             self.request_frame_after(Duration::from_millis(250), window, cx);

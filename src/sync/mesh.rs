@@ -173,6 +173,21 @@ impl Mesh {
         if let Some(claim) = claim {
             effects.extend(self.consider_claim(claim, Some(&id)));
         }
+        // Playback started here before the link outranks an older claim held by
+        // a device that is paused, so the device that is actually playing stays active.
+        let own_playing = self
+            .states
+            .get(&self.own.id)
+            .is_some_and(|state| state.playing);
+        let active_paused = self.active().is_some_and(|active| {
+            active != self.own.id && self.states.get(active).is_none_or(|state| !state.playing)
+        });
+        if own_playing && active_paused {
+            effects.extend(self.take_claim());
+            if let Some(state) = self.states.get(&self.own.id).cloned() {
+                effects.push(Effect::Broadcast(PeerMessage::State { state }));
+            }
+        }
         effects.extend(self.consider_settings(settings, Some(&id)));
         effects.extend(self.active_changed(before));
         effects
@@ -695,6 +710,39 @@ mod tests {
             "the last device to play is active"
         );
         assert_eq!(active_change(&mac_session), Some(Some("linux")));
+    }
+
+    #[test]
+    fn a_device_that_started_playing_before_linking_outranks_a_paused_claim() {
+        let mut mac = Mesh::new(device("mac"));
+        let mut linux = Mesh::new(device("linux"));
+        // The Mac played many times, so its claim is newer, but it is paused now.
+        mac.states.insert(
+            "mac".into(),
+            PlaybackState {
+                playing: false,
+                ..state(5)
+            },
+        );
+        mac.claim = Some(Claim {
+            epoch: 9,
+            device_id: "mac".into(),
+        });
+        linux.session_message(
+            ClientMessage::StateUpdate { state: state(1) },
+            Instant::now(),
+        );
+        let (mac_session, _) = link(&mut mac, &mut linux);
+        assert_eq!(linux.active(), Some("linux"));
+        assert_eq!(
+            mac.active(),
+            Some("linux"),
+            "the playing device stays active"
+        );
+        assert!(mac_session.iter().any(|message| matches!(
+            message,
+            ServerMessage::State { state, from_device_id } if from_device_id == "linux" && state.playing
+        )));
     }
 
     #[test]

@@ -1457,3 +1457,59 @@ async fn lan_playing_locally_takes_over_without_other_devices_following() {
     linux.shutdown(WAIT).unwrap();
     fixture.finish();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_device_that_restarts_and_resumes_its_saved_queue_shows_as_playing() {
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![]),
+        ..Default::default()
+    });
+    let mut paths = sign_in_devices(&fixture, &[MAC, LINUX]).into_iter();
+    let (mac_paths, linux_paths) = (paths.next().unwrap(), paths.next().unwrap());
+    let linux_again = linux_paths.clone();
+    let mut mac = fixture.start_on(mac_paths);
+    mac.wait_ready(WAIT).unwrap();
+    let mut linux = fixture.start_on(linux_paths);
+    linux.wait_ready(WAIT).unwrap();
+    device_sync(&mac, |status| {
+        status.devices.iter().any(|device| device.id == LINUX)
+    });
+
+    // The Linux PC plays for a while, then the Mac takes over and pauses.
+    linux.publish_playback(playing(&fixture, &["song"]));
+    device_sync(&mac, |status| {
+        status.active_device_id.as_deref() == Some(LINUX)
+            && status.playback.as_ref().is_some_and(|state| state.playing)
+    });
+    mac.publish_playback(playing(&fixture, &["other-song"]));
+    device_sync(&linux, |status| {
+        status.active_device_id.as_deref() == Some(MAC)
+    });
+    mac.publish_playback(PlaybackSnapshot {
+        playing: false,
+        ..playing(&fixture, &["other-song"])
+    });
+    linux.shutdown(WAIT).unwrap();
+    device_sync(&mac, |status| {
+        status.devices.iter().all(|device| device.id != LINUX)
+    });
+
+    // The Linux PC opens again and plays the queue it restored, straight away.
+    let mut linux = fixture.start_on(linux_again);
+    linux.wait_ready(WAIT).unwrap();
+    linux.publish_playback(playing(&fixture, &["song"]));
+    device_sync(&mac, |status| {
+        status.active_device_id.as_deref() == Some(LINUX)
+            && status
+                .playback
+                .as_ref()
+                .is_some_and(|state| state.playing && state.queue == ["song"])
+    });
+    device_sync(&linux, |status| {
+        status.active_device_id.as_deref() == Some(LINUX)
+    });
+
+    mac.shutdown(WAIT).unwrap();
+    linux.shutdown(WAIT).unwrap();
+    fixture.finish();
+}

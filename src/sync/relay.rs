@@ -209,6 +209,7 @@ impl SyncTask {
             publisher.remember(active, state);
         }
         publisher.set_active(
+            &self.device_id,
             active_device_id,
             stamp(&self.playback.borrow(), &self.namespace),
         );
@@ -233,7 +234,7 @@ impl SyncTask {
                                     publisher.remember(from_device_id, state);
                                 }
                                 ServerMessage::ActiveDeviceChanged { device_id } => {
-                                    publisher.set_active(device_id.clone(), stamp(&self.playback.borrow(), &self.namespace));
+                                    publisher.set_active(&self.device_id, device_id.clone(), stamp(&self.playback.borrow(), &self.namespace));
                                     publisher.last_sent = None;
                                 }
                                 ServerMessage::Settings { settings, version }
@@ -374,11 +375,13 @@ impl Publisher {
         }
     }
 
-    /// `current` is this device's playback at the moment, kept as the baseline
-    /// that must change before playing here takes over from another device.
-    fn set_active(&mut self, active: Option<String>, current: Option<Stamp>) {
+    /// When another device displaces this one, `current` (this device's playback
+    /// at that moment) must change before playing here takes over again. Playback
+    /// that started before this device learned of the other one is new and counts.
+    fn set_active(&mut self, device: &str, active: Option<String>, current: Option<Stamp>) {
+        let displaced = self.active.as_deref() == Some(device);
         self.active = active;
-        self.yielded = current;
+        self.yielded = current.filter(|_| displaced);
         self.taking_over = false;
     }
 

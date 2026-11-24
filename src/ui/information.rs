@@ -12,8 +12,8 @@ impl MusicApp {
                         .and_then(|a| self.group_tracks.get(&a.id))
                         .and_then(|tracks| tracks.first().cloned())
                 })
-                .or_else(|| self.playback.track.clone()),
-            InfoSource::Playing => self.playback.track.clone(),
+                .or_else(|| self.display_track()),
+            InfoSource::Playing => self.display_track(),
         }
     }
 
