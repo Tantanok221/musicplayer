@@ -754,67 +754,21 @@ impl MusicApp {
         };
         let page = page.group(self.connection_summary(account, app.clone()));
         let page = if self.library_connection.editing {
-            page.group(self.connection_form(app.clone()))
+            page.group(self.connection_form(app))
         } else {
             page
         };
         let server = account.url.clone();
-        let lastfm_app = app;
-        page
-            .group(
-                SettingGroup::new()
-                    .title("Scrobbling")
-                    .description("Sonora reports plays only to Navidrome. Link Last.fm in your server's personal settings to forward them. Artist information follows the server's metadata-agent order. Uncertain submissions are not resent, to avoid duplicates.")
-                    .item(SettingItem::render(move |_, _, _| {
-                        Link::new("open-navidrome")
-                            .href(server.clone())
-                            .child("Open Navidrome")
-                    }).keywords(["last.fm", "scrobble", "navidrome"])),
-            )
-            .group(
-                SettingGroup::new()
-                    .title("Last.fm history")
-                    .description("Memory lane on Discover reaches back through your public Last.fm listening history. Sonora reads your album charts one season at a time and keeps them on this Mac.")
-                    .item(credential_field(
-                        "Last.fm username",
-                        self.lastfm_user.clone(),
-                        None,
-                        &["last.fm", "lastfm", "history", "discover", "memory lane"],
-                    ))
-                    .item(credential_field(
-                        "Last.fm API key",
-                        self.lastfm_key.clone(),
-                        Some("Create one at last.fm/api/account/create. Leave empty to keep the saved key. Saved in a private file on this Mac."),
-                        &["last.fm", "lastfm", "api", "key", "token"],
-                    ))
-                    .item(SettingItem::render(move |_, _, _| {
-                        let app = lastfm_app.clone();
-                        Button::new("save-lastfm")
-                            .label("Save")
-                            .on_click(move |_, window, cx| {
-                                let _ = app.update(cx, |app, cx| {
-                                    let user = app.lastfm_user.read(cx).value().trim().to_string();
-                                    app.lastfm_user.update(cx, |input, cx| {
-                                        input.set_value(user.clone(), window, cx)
-                                    });
-                                    app.preferences.lastfm_user = user;
-                                    let key = app.lastfm_key.read(cx).value().trim().to_string();
-                                    if key.is_empty() {
-                                        app.save_settings(cx);
-                                    } else {
-                                        app.save_settings_with(SettingsCredentials::LastFm(key), cx);
-                                        app.lastfm_key.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                    }
-                                    if app.discover.is_some() {
-                                        app.request_discover();
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                    })),
-            )
+        page.group(
+            SettingGroup::new()
+                .title("Scrobbling")
+                .description("Sonora reports plays only to Navidrome. Link ListenBrainz or Last.fm in your server's personal settings to forward them. Artist information follows the server's metadata-agent order. Uncertain submissions are not resent, to avoid duplicates.")
+                .item(SettingItem::render(move |_, _, _| {
+                    Link::new("open-navidrome")
+                        .href(server.clone())
+                        .child("Open Navidrome")
+                }).keywords(["listenbrainz", "last.fm", "scrobble", "navidrome"])),
+        )
     }
 
     pub(super) fn download_settings(&self, app: WeakEntity<Self>) -> SettingPage {

@@ -130,19 +130,6 @@ impl MusicApp {
                     )
                     .child(
                         self.navigation_row(
-                            "nav-discover",
-                            "Discover",
-                            Glyph::Compass,
-                            self.workspace == Workspace::Discover && self.artist_name.is_none(),
-                            cx,
-                        )
-                        .test_support()
-                        .on_click(cx.listener(|app, _, window, cx| {
-                            app.switch_workspace(Workspace::Discover, window, cx)
-                        })),
-                    )
-                    .child(
-                        self.navigation_row(
                             "nav-queue",
                             "Queue",
                             Glyph::ListMusic,

@@ -171,7 +171,7 @@ impl MusicApp {
         if !self.group_tracks.contains_key(id) && self.group_requested.insert(id.into()) {
             self.service.send(Command::GroupTracks(
                 self.request,
-                if self.artist_name.is_some() || self.workspace == Workspace::Discover {
+                if self.artist_name.is_some() {
                     LibraryQuery::default()
                 } else {
                     self.query.clone()
@@ -829,9 +829,6 @@ impl MusicApp {
         }
         if self.workspace == Workspace::Playlists {
             return self.playlists_view(cx);
-        }
-        if self.workspace == Workspace::Discover {
-            return self.discover_view(cx);
         }
         if self.view.track_count == 0 {
             return self.empty(

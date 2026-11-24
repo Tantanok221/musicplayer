@@ -8,7 +8,6 @@ use axum::{
 use serde_json::{Value, json};
 use sonora::{
     catalog::{Catalog, LibraryView},
-    lastfm::LastFm,
     model::{Album, LibraryQuery, Playlist, Track},
     musicbrainz::MusicBrainz,
     platform::{Account, Paths, ServerCredentials},
@@ -229,9 +228,6 @@ fn is_song_id(key: &str) -> bool {
     matches!(key, "songId" | "songIdToAdd")
 }
 
-/// A fixture Last.fm chart entry: artist, album and plays.
-pub type ChartEntry = (&'static str, &'static str, u64);
-
 pub struct Library {
     pub server_type: &'static str,
     pub native: Native,
@@ -261,15 +257,6 @@ pub struct Library {
     pub releases: Vec<(&'static str, &'static str, &'static str)>,
     pub artist_mbid: &'static str,
     pub prolific: bool,
-    /// Unix seconds the fixture Last.fm profile was created.
-    pub lastfm_registered: i64,
-    pub hold_lastfm: bool,
-    /// Album charts by season start: artist, album and plays.
-    pub lastfm_charts: Vec<(i64, Vec<ChartEntry>)>,
-    /// A Last.fm error code every Last.fm request answers with.
-    pub lastfm_error: Option<u32>,
-    /// Whether the worker is built with a Last.fm API key.
-    pub lastfm_key: bool,
     /// Whether the account may start a scan, as Navidrome administrators can.
     pub scan_admin: bool,
 }
@@ -302,11 +289,6 @@ impl Default for Library {
             releases: vec![("missing-release", "Missing Release", "2020-01-01")],
             artist_mbid: "mb-artist",
             prolific: false,
-            lastfm_registered: 0,
-            hold_lastfm: false,
-            lastfm_charts: vec![],
-            lastfm_error: None,
-            lastfm_key: true,
             scan_admin: false,
         }
     }
@@ -381,7 +363,6 @@ struct StateData {
 
 #[derive(Clone)]
 struct ServerState {
-    lastfm_gate: flume::Receiver<()>,
     data: Arc<Mutex<StateData>>,
     received: flume::Sender<Request>,
     metadata_gate: flume::Receiver<()>,
@@ -816,85 +797,6 @@ async fn navidrome(
     envelope(body)
 }
 
-pub const LASTFM_KEY: &str = "fixture-lastfm-key";
-
-async fn lastfm(
-    State(state): State<ServerState>,
-    method: Method,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> Response {
-    let param = |key: &str| query.get(key).cloned().unwrap_or_default();
-    if method != Method::GET
-        || param("api_key") != LASTFM_KEY
-        || param("format") != "json"
-        || !["listener", "listener-new"].contains(&param("user").as_str())
-    {
-        return state.unexpected("invalid Last.fm request");
-    }
-    let (registered, charts, error) = {
-        let data = state.data.lock().unwrap();
-        (
-            data.library.lastfm_registered,
-            data.library.lastfm_charts.clone(),
-            data.library.lastfm_error,
-        )
-    };
-    let (endpoint, params) = match param("method").as_str() {
-        "user.getinfo" if query.len() == 4 => ("lastfm/getinfo", vec![]),
-        "user.getweeklyalbumchart" if query.len() == 6 => (
-            "lastfm/chart",
-            vec![("from", param("from")), ("to", param("to"))],
-        ),
-        _ => return state.unexpected("unknown Last.fm method"),
-    };
-    let params = params
-        .iter()
-        .map(|(key, value)| (*key, value.as_str()))
-        .collect::<Vec<_>>();
-    state.record(Request::new(endpoint, &params));
-    let hold = state.data.lock().unwrap().library.hold_lastfm;
-    if endpoint == "lastfm/chart" && param("user") == "listener" && hold {
-        let _ = state.lastfm_gate.recv_async().await;
-    }
-    if let Some(code) = error {
-        let message = match code {
-            6 => "User not found",
-            17 => "Login: User required to be logged in",
-            _ => "Fixture error",
-        };
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": code, "message": message})),
-        )
-            .into_response();
-    }
-    if endpoint == "lastfm/getinfo" {
-        return Json(json!({"user": {"name": "listener", "registered": {
-            "unixtime": registered.to_string(), "#text": registered
-        }}}))
-        .into_response();
-    }
-    let from: i64 = param("from").parse().unwrap_or_default();
-    let albums = charts
-        .iter()
-        .find(|(start, _)| *start == from)
-        .map(|(_, albums)| albums.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(artist, name, plays)| {
-            json!({"artist": {"mbid": "", "#text": artist}, "name": name, "mbid": "",
-                   "playcount": plays.to_string(), "@attr": {"rank": "1"}})
-        })
-        .collect::<Vec<_>>();
-    // Last.fm sends a lone chart entry as an object rather than a one-item list.
-    let album = match albums.as_slice() {
-        [one] => one.clone(),
-        _ => json!(albums),
-    };
-    Json(json!({"weeklyalbumchart": {"album": album, "@attr": {"user": "listener"}}}))
-        .into_response()
-}
-
 async fn acoustid(
     State(state): State<ServerState>,
     Query(query): Query<BTreeMap<String, String>>,
@@ -1153,7 +1055,6 @@ async fn unexpected(State(state): State<ServerState>) -> Response {
 }
 
 pub struct Fixture {
-    release_lastfm: flume::Sender<()>,
     _dir: tempfile::TempDir,
     pub paths: Paths,
     pub account: Account,
@@ -1192,12 +1093,10 @@ impl Fixture {
             .unwrap();
         let (received, requests) = flume::unbounded();
         let (release_metadata, metadata_gate) = flume::bounded(1);
-        let (release_lastfm, lastfm_gate) = flume::unbounded();
         let (release_sync, sync_gate) = flume::unbounded();
         let (release_scrobble, scrobble_gate) = flume::unbounded();
         let (release_held, held_gate) = flume::unbounded();
         let state = ServerState {
-            lastfm_gate,
             data: Arc::new(Mutex::new(StateData {
                 library,
                 requests: vec![],
@@ -1219,7 +1118,6 @@ impl Fixture {
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/coverart/{*path}", any(cover_art))
             .route("/acoustid/lookup", any(acoustid))
-            .route("/lastfm/", any(lastfm))
             .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
             .with_state(state.clone());
@@ -1250,7 +1148,6 @@ impl Fixture {
             state,
             requests,
             stop,
-            release_lastfm,
             release_metadata,
             release_sync,
             release_scrobble,
@@ -1313,37 +1210,24 @@ impl Fixture {
 
     /// A worker whose tag writes each wait for a message on the sender.
     pub fn start_tag_gated(&self) -> (Worker, flume::Sender<()>) {
-        let (metadata, lastfm) = self.clients();
-        Worker::start_tag_gated(self.paths.clone(), metadata, lastfm).unwrap()
+        let metadata = self.clients();
+        Worker::start_tag_gated(self.paths.clone(), metadata).unwrap()
     }
 
     fn start_player(&self, paused: bool) -> Worker {
-        let (metadata, lastfm) = self.clients();
+        let metadata = self.clients();
         if paused {
-            Worker::start_paused(self.paths.clone(), metadata, lastfm).unwrap()
+            Worker::start_paused(self.paths.clone(), metadata).unwrap()
         } else {
-            Worker::start(self.paths.clone(), metadata, lastfm).unwrap()
+            Worker::start(self.paths.clone(), metadata).unwrap()
         }
     }
 
-    fn clients(&self) -> (MusicBrainz, LastFm) {
-        let metadata =
-            MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
-                .and_then(|metadata| {
-                    metadata.with_covers(&format!("{}coverart/", self.account.url))
-                })
-                .and_then(|metadata| {
-                    metadata.with_acoustid(&format!("{}acoustid/", self.account.url))
-                })
-                .unwrap();
-        let key = self.state.data.lock().unwrap().library.lastfm_key;
-        let lastfm = LastFm::with_endpoints(
-            &format!("{}lastfm/", self.account.url),
-            key.then(|| LASTFM_KEY.to_string()),
-            Duration::ZERO,
-        )
-        .unwrap();
-        (metadata, lastfm)
+    fn clients(&self) -> MusicBrainz {
+        MusicBrainz::with_endpoints(&format!("{}metadata/", self.account.url), Duration::ZERO)
+            .and_then(|metadata| metadata.with_covers(&format!("{}coverart/", self.account.url)))
+            .and_then(|metadata| metadata.with_acoustid(&format!("{}acoustid/", self.account.url)))
+            .unwrap()
     }
 
     pub fn expect_mutation(&self, request: Request, succeeds: bool) {
@@ -1377,11 +1261,6 @@ impl Fixture {
         let _ = self.release_sync.send(());
     }
 
-    pub fn resume_lastfm(&self) {
-        self.edit_library(|library| library.hold_lastfm = false);
-        let _ = self.release_lastfm.send(());
-    }
-
     pub fn resume_scrobble(&self) {
         self.edit_library(|library| library.hold_scrobble = false);
         let _ = self.release_scrobble.send(());
@@ -1396,7 +1275,6 @@ impl Fixture {
         if self.thread.is_some() {
             let _ = self.release_metadata.try_send(());
             self.resume_sync();
-            self.resume_lastfm();
             self.resume_scrobble();
             self.resume_held();
             let _ = self.stop.try_send(());
@@ -1466,7 +1344,6 @@ pub fn event(worker: &Worker, mut wanted: impl FnMut(&Event) -> bool) -> Event {
             Event::Status(..) => "Status",
             Event::Connection(..) => "Connection",
             Event::Discography(..) => "Discography",
-            Event::Discover(..) => "Discover",
             _ => "other event",
         };
         eprintln!("scenario={} worker event={name}", scenario());

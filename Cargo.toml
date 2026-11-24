@@ -44,6 +44,7 @@ url = "2"
 lofty = "0.25"
 base64 = "0.22"
 rusty-chromaprint = "0.3"
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 axum = "0.8"

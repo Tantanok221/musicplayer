@@ -48,9 +48,6 @@ impl MusicApp {
                 let slskd = self.preferences.downloads.url.clone();
                 self.slskd_url
                     .update(cx, |input, cx| input.set_value(slskd, window, cx));
-                let lastfm = self.preferences.lastfm_user.clone();
-                self.lastfm_user
-                    .update(cx, |input, cx| input.set_value(lastfm, window, cx));
                 self.discographies.clear();
                 if let Some(account) = account {
                     self.server_url
@@ -102,9 +99,6 @@ impl MusicApp {
             }
             Event::View(request, view) => {
                 if request == self.request {
-                    if self.workspace == Workspace::Discover && self.artist_name.is_none() {
-                        self.request_discover();
-                    }
                     if let Some(name) = &self.artist_name {
                         self.service.send(Command::Artist(
                             self.artist_request,
@@ -192,11 +186,6 @@ impl MusicApp {
                         let row = self.cover_rows().row_for_album(index);
                         self.cover_list.splice(row..row + 1, 1);
                     }
-                }
-            }
-            Event::Discover(request, shelves) => {
-                if request == self.discover_request {
-                    self.discover = Some(shelves);
                 }
             }
             Event::Artist(request, data) => {
