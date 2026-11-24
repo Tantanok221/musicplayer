@@ -473,6 +473,28 @@ impl EditorForm {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MusicFolderCheck {
+    Passed {
+        found: usize,
+        server_path: String,
+        local_path: PathBuf,
+    },
+    MissingFolder,
+    NoTracks,
+    Unmatched {
+        found: usize,
+        total: usize,
+    },
+    FileProblem(String),
+    Failed(String),
+}
+
+enum ResolveProblem {
+    Unmatched(String),
+    File(String),
+}
+
 /// Finds the local file for a track under the mapped library folder.
 ///
 /// Navidrome reports either a path relative to its library or, with Report
@@ -488,6 +510,12 @@ pub fn resolve(root: &Path, track: &Track) -> Result<PathBuf, String> {
             root.display()
         ));
     }
+    resolve_track(root, track).map_err(|problem| match problem {
+        ResolveProblem::Unmatched(message) | ResolveProblem::File(message) => message,
+    })
+}
+
+fn resolve_track(root: &Path, track: &Track) -> Result<PathBuf, ResolveProblem> {
     let parts: Vec<_> = Path::new(&track.path)
         .components()
         .filter_map(|part| match part {
@@ -500,17 +528,27 @@ pub fn resolve(root: &Path, track: &Track) -> Result<PathBuf, String> {
             .components()
             .any(|c| c == Component::ParentDir)
     {
-        return Err(format!(
+        return Err(ResolveProblem::Unmatched(format!(
             "Navidrome reported no file path for {}.",
             track.title
-        ));
+        )));
     }
+    let mut unreadable = None;
     for start in 0..parts.len() {
         let candidate = parts[start..]
             .iter()
             .fold(root.to_path_buf(), |path, part| path.join(part));
-        let Ok(meta) = std::fs::metadata(&candidate) else {
-            continue;
+        let meta = match std::fs::metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(error) => {
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) {
+                    unreadable.get_or_insert_with(|| unreadable_path(&candidate, &error));
+                }
+                continue;
+            }
         };
         if !meta.is_file() {
             continue;
@@ -518,19 +556,78 @@ pub fn resolve(root: &Path, track: &Track) -> Result<PathBuf, String> {
         if let Some(size) = track.size
             && size != meta.len()
         {
-            return Err(format!(
+            return Err(ResolveProblem::File(format!(
                 "{} is a different file from the one Navidrome has ({} bytes here, {size} on the server).",
                 candidate.display(),
                 meta.len()
-            ));
+            )));
         }
         return Ok(candidate);
     }
-    Err(format!(
+    if let Some(message) = unreadable {
+        return Err(ResolveProblem::File(message));
+    }
+    Err(ResolveProblem::Unmatched(format!(
         "Couldn't find {} in {}. Check the music folder, and turn on Report Real Path for Sonora in Navidrome's player settings.",
         track.path,
         root.display()
-    ))
+    )))
+}
+
+fn unreadable_path(path: &Path, error: &std::io::Error) -> String {
+    format!("Couldn't read {}: {error}", path.display())
+}
+
+pub(crate) fn check_music_folder(
+    root: &Path,
+    tracks: &[std::sync::Arc<Track>],
+) -> MusicFolderCheck {
+    match std::fs::metadata(root) {
+        Ok(meta) if !meta.is_dir() => return MusicFolderCheck::MissingFolder,
+        Err(error) => {
+            return match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                    MusicFolderCheck::MissingFolder
+                }
+                _ => MusicFolderCheck::FileProblem(unreadable_path(root, &error)),
+            };
+        }
+        Ok(_) => {}
+    }
+    if let Err(error) = std::fs::read_dir(root) {
+        return MusicFolderCheck::FileProblem(unreadable_path(root, &error));
+    }
+    if tracks.is_empty() {
+        return MusicFolderCheck::NoTracks;
+    }
+    let mut found = 0;
+    let mut mapping = None;
+    for track in tracks {
+        match resolve_track(root, track) {
+            Ok(path) => {
+                if let Err(error) = std::fs::File::open(&path) {
+                    return MusicFolderCheck::FileProblem(unreadable_path(&path, &error));
+                }
+                found += 1;
+                mapping.get_or_insert_with(|| (track.path.clone(), path));
+            }
+            Err(ResolveProblem::Unmatched(_)) => {}
+            Err(ResolveProblem::File(message)) => return MusicFolderCheck::FileProblem(message),
+        }
+    }
+    if found == tracks.len()
+        && let Some((server_path, local_path)) = mapping
+    {
+        return MusicFolderCheck::Passed {
+            found,
+            server_path,
+            local_path,
+        };
+    }
+    MusicFolderCheck::Unmatched {
+        found,
+        total: tracks.len(),
+    }
 }
 
 /// Reads the editable tags of a file.

@@ -412,8 +412,21 @@ pub struct MetadataPreferences {
     pub write_tags: bool,
     /// The local or network folder that holds Navidrome's music library.
     pub library_folder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_library_folder: Option<String>,
     /// The AcoustID application key; Identify by Sound stays off without one.
     pub acoustid_key: String,
+}
+
+impl MetadataPreferences {
+    pub fn folder_verified(&self) -> bool {
+        !self.library_folder.is_empty()
+            && self.verified_library_folder.as_deref() == Some(self.library_folder.as_str())
+    }
+
+    pub fn tag_writes_enabled(&self) -> bool {
+        self.write_tags && self.folder_verified()
+    }
 }
 
 /// Where the user's slskd lives. Its API key is kept in a private file instead.

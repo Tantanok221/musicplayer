@@ -507,6 +507,7 @@ pub struct MusicApp {
     /// Tag edits handed to the service, oldest first, and the running one's progress.
     tag_jobs: crate::tags::TagJobs<tag_editor::TagEditor>,
     metadata_folder: Entity<InputState>,
+    metadata_check: settings::FolderCheck,
     acoustid_key: Entity<InputState>,
     status: String,
     connection: Connection,
@@ -600,6 +601,7 @@ impl MusicApp {
                 view.update(cx, |_, cx| cx.notify()).ok();
             }),
             cx.subscribe_in(&playlist_name, window, Self::playlist_name_event),
+            cx.subscribe_in(&metadata_folder, window, Self::metadata_folder_input),
             cx.subscribe_in(&search, window, |app, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = app.search.read(cx).value().to_string();
@@ -801,6 +803,7 @@ impl MusicApp {
             tag_notice: None,
             tag_jobs: Default::default(),
             metadata_folder,
+            metadata_check: Default::default(),
             acoustid_key,
             status: "Opening library…".into(),
             connection: Connection::None,
