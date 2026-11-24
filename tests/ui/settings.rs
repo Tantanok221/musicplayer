@@ -4,7 +4,7 @@ use sonora::{
     artists::{ArtistProfile, cache_key},
     model::Preferences,
     platform::{Account, shortcut},
-    service::{Command, Event, SettingsCredentials},
+    service::{Command, Connection, Event, SettingsCredentials},
     tags::MusicFolderCheck,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -267,12 +267,13 @@ fn reconnect_keeps_artist_profile_but_account_switch_drops_it(cx: &mut TestAppCo
 
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     page(&mut f, window, "Library", cx);
+    f.click(window, "change-library-login", cx);
     f.expect("same-account reconnect", |command, _| {
         let Command::Connect(account, _) = command else {
             panic!("expected connect command");
         };
         assert_eq!(account.username, "fixture");
-        vec![Event::Connected(account, "Connected".into())]
+        vec![Event::Connected(account, "Connected".into(), true)]
     });
     f.click(window, "connect-library", cx);
     assert_profile(true, cx);
@@ -284,6 +285,7 @@ fn reconnect_keeps_artist_profile_but_account_switch_drops_it(cx: &mut TestAppCo
     };
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     page(&mut f, window, "Library", cx);
+    f.click(window, "change-library-login", cx);
     fill(window, "Username", "other-listener", cx);
     f.expect("switch to another account", move |command, _| {
         let Command::Connect(account, _) = command else {
@@ -292,11 +294,89 @@ fn reconnect_keeps_artist_profile_but_account_switch_drops_it(cx: &mut TestAppCo
         assert_eq!(account.username, "other-listener");
         vec![
             Event::Ready(Some(account.clone()), prefs),
-            Event::Connected(account, "Connected".into()),
+            Event::Connected(account, "Connected".into(), true),
         ]
     });
     f.click(window, "connect-library", cx);
     assert_profile(false, cx);
+    f.assert_script_finished();
+}
+
+#[gpui_kit::test]
+fn first_run_shows_only_the_connection_form_and_validates_it_inline(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = Fixture::open(&dir.path().join("catalog.sqlite"));
+    f.seed();
+    f.signed_out();
+    let (window, _) = f.mount(cx);
+    f.settle(window, cx);
+    fill(window, "Server address", "ftp://music.example.com", cx);
+    f.click(window, "connect-library", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("server-address-error").visible());
+        assert!(window.find("username-error").visible());
+        assert!(window.try_find("Last.fm username").is_none());
+        assert_ne!(window.find("connect-library").disabled(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn signed_in_library_shows_live_status_checks_saved_connection_and_reveals_the_form(
+    cx: &mut TestAppContext,
+) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Library", cx);
+    f.backend.emit(Event::Connection(Connection::Online));
+    f.backend.emit(Event::LibrarySyncing(true));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("connection-card-status").label(),
+            Some("Syncing library…")
+        );
+    })
+    .unwrap();
+    f.backend.emit(Event::LibrarySyncing(false));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("Server address").is_none());
+        assert!(window.try_find("Last.fm username").is_none());
+        assert_eq!(
+            window.find("connection-card-status").label(),
+            Some("Connected")
+        );
+    })
+    .unwrap();
+    f.expect("check the saved server", |command, _| {
+        let Command::TestSavedConnection(id) = command else {
+            panic!("expected a saved-server ping");
+        };
+        vec![
+            Event::Connection(Connection::Offline("Server unreachable".into())),
+            Event::SavedConnectionTested(id, Err("Server unreachable".into())),
+        ]
+    });
+    f.click(window, "check-saved-connection", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("connection-card-status").label(),
+            Some("Offline")
+        );
+        assert_eq!(
+            window.find("saved-connection-result").label(),
+            Some("Server unreachable")
+        );
+    })
+    .unwrap();
+    f.click(window, "change-library-login", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("Username").value(), Some("fixture"));
+        assert!(window.find("connect-library").visible());
+    })
+    .unwrap();
     f.assert_script_finished();
 }
 
@@ -323,10 +403,10 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
     for attempt in 0..3 {
         let (button, password) = match attempt {
             0 => ("connect-library", "synthetic-nav-password"),
-            1 => ("retry-error", "synthetic-nav-password"),
+            1 => ("retry-sign-in", "synthetic-nav-password"),
             _ => {
                 fill(window, "Password", "synthetic-replacement", cx);
-                ("retry-error", "synthetic-replacement")
+                ("retry-sign-in", "synthetic-replacement")
             }
         };
         f.expect("sign-in intent without logging credentials", move |command, _| {
@@ -336,6 +416,8 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
         f.click(window, button, cx);
         cx.update_window(window, |_, window, _| {
             assert_eq!(window.find("connect-library").disabled(), Some(true));
+            assert!(window.find("sign-in-progress").visible());
+            assert!(window.try_find("sign-in-error").is_none());
             assert!(window.try_find("error-banner").is_none());
         })
         .unwrap();
@@ -347,7 +429,8 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
                 .emit(Event::SignInFailed("Fixture sign-in rejected".into()));
             f.settle(window, cx);
             cx.update_window(window, |_, window, _| {
-                assert!(window.find("error-banner").visible());
+                assert!(window.find("sign-in-error").visible());
+                assert!(window.try_find("error-banner").is_none());
                 assert_eq!(
                     window.find("Server address").value(),
                     Some("https://fixture.invalid/")
@@ -375,6 +458,7 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
             username: "音楽 listener".into(),
         },
         "Connected".into(),
+        true,
     ));
     f.settle(window, cx);
     cx.update_window(window, |_, window, _| {
@@ -383,6 +467,7 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
     })
     .unwrap();
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    f.click(window, "change-library-login", cx);
     cx.update_window(window, |_, window, _| {
         assert!(window.find("connect-library").visible());
         assert_eq!(window.find("Password").value().unwrap_or_default(), "");

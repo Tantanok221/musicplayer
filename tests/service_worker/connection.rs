@@ -2,6 +2,31 @@ use crate::fixture::{Fixture, Library, WAIT, album, event, song, synced, view};
 use sonora::service::{Command, Connection, Event};
 
 #[test]
+fn checking_the_saved_server_reports_each_result_and_updates_reachability() {
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    event(&worker, |e| matches!(e, Event::LibrarySyncing(true)));
+    event(&worker, |e| matches!(e, Event::LibrarySyncing(false)));
+    synced(&worker);
+
+    worker.service().send(Command::TestSavedConnection(1));
+    event(&worker, |e| {
+        matches!(e, Event::SavedConnectionTested(1, Ok(())))
+    });
+    fixture.edit_library(|l| l.offline = true);
+    worker.service().send(Command::TestSavedConnection(2));
+    event(&worker, |e| {
+        matches!(e, Event::Connection(Connection::Offline(_)))
+    });
+    event(&worker, |e| {
+        matches!(e, Event::SavedConnectionTested(2, Err(_)))
+    });
+    assert_eq!(view(&worker).track_count, 2);
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn reconnect_checks_without_sleep_preserves_cache_and_resyncs() {
     let fixture = Fixture::new(Library::default());
     let mut worker = fixture.start();

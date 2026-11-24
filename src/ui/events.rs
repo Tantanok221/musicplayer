@@ -13,6 +13,7 @@ impl MusicApp {
                     .account_cache
                     .reset_for_account(self.account.as_ref(), account.as_ref())
                 {
+                    self.library_connection.account_changed();
                     self.close_playlist_creation(window, cx);
                     self.playlist_rename = None;
                     self.smart = Default::default();
@@ -62,6 +63,7 @@ impl MusicApp {
             }
             Event::SignInRequired(message) => {
                 self.settings = true;
+                self.library_connection.editing = self.account.is_some();
                 self.status = message;
                 self.error = None;
             }
@@ -70,13 +72,16 @@ impl MusicApp {
                     self.status = "Could not connect".into();
                 }
             }
-            Event::Connected(account, label) => {
-                self.sign_in = Default::default();
+            Event::Connected(account, label, submitted) => {
                 self.account = Some(account);
-                if self.settings {
-                    self.focus.focus(window, cx);
+                if submitted {
+                    self.sign_in = Default::default();
+                    self.library_connection.account_changed();
+                    if self.settings {
+                        self.focus.focus(window, cx);
+                    }
+                    self.settings = false;
                 }
-                self.settings = false;
                 self.status = label;
                 self.error = None;
                 self.art_requested.clear();
@@ -323,6 +328,10 @@ impl MusicApp {
             }
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,
+            Event::LibrarySyncing(syncing) => self.library_connection.syncing = syncing,
+            Event::SavedConnectionTested(id, result) => {
+                self.library_connection.complete_check(id, result)
+            }
             Event::Error(error) => {
                 if self.fail_album_playlist_creation(&error) {
                     cx.notify();
