@@ -1097,6 +1097,7 @@ impl MusicApp {
         };
         let peers = self.lan_status.peers.clone();
         let discovered = self.lan_status.discovered.clone();
+        let automatic = self.lan_status.automatic.clone();
         SettingGroup::new()
             .title("Paired devices")
             .item(credential_field(
@@ -1217,20 +1218,55 @@ impl MusicApp {
                                 });
                             })
                     }))
-                    .children(peers.iter().map(|peer| {
+                    .children(automatic.iter().map(|peer| {
                         let service = controls.clone();
                         let id = peer.id.clone();
+                        let label = format!("{} · Trusted via Navidrome", peer.name);
                         h_flex()
                             .gap_2()
-                            .child(format!("{} · {}", peer.name, peer.address))
                             .child(
-                                Button::new(SharedString::from(format!("lan-revoke-{}", peer.id)))
+                                div()
+                                    .id(SharedString::from(format!("lan-trust-{id}")))
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_label(label.clone())
+                                    .child(label),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("lan-revoke-{id}")))
                                     .label("Revoke")
                                     .on_click(move |_, _, _| {
                                         service.send(Command::LanRevoke(id.clone()))
                                     }),
                             )
                     }))
+                    .children(
+                        peers
+                            .iter()
+                            .filter(|peer| automatic.iter().all(|auto| auto.id != peer.id))
+                            .map(|peer| {
+                                let service = controls.clone();
+                                let id = peer.id.clone();
+                                h_flex()
+                                    .gap_2()
+                                    .child(format!(
+                                        "{} · Manually paired · {}",
+                                        peer.name, peer.address
+                                    ))
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "lan-revoke-{}",
+                                            peer.id
+                                        )))
+                                        .label("Revoke")
+                                        .on_click(
+                                            move |_, _, _| {
+                                                service.send(Command::LanRevoke(id.clone()))
+                                            },
+                                        ),
+                                    )
+                            }),
+                    )
             }))
     }
 

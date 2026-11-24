@@ -30,15 +30,52 @@ pub struct Link {
 
 impl Link {
     pub async fn establish(
-        mut socket: Socket,
+        socket: Socket,
         initiator: bool,
         account: &[u8; 32],
         identity: &[u8; 32],
         trust: Trust<'_>,
     ) -> Result<(Self, PublicKey), LinkError> {
-        let psk = match trust {
-            Trust::Pair(code) => Some(pair_key(&mut socket, initiator, account, code).await?),
-            Trust::Paired(_) => None,
+        match trust {
+            Trust::Pair(code) => {
+                Self::establish_with(
+                    socket,
+                    initiator,
+                    account,
+                    identity,
+                    Some(code),
+                    |_| async { true },
+                )
+                .await
+            }
+            Trust::Paired(pins) => {
+                Self::establish_with(
+                    socket,
+                    initiator,
+                    account,
+                    identity,
+                    None,
+                    |key| async move { pins.contains(&key) },
+                )
+                .await
+            }
+        }
+    }
+
+    pub(super) async fn establish_with<F>(
+        mut socket: Socket,
+        initiator: bool,
+        account: &[u8; 32],
+        identity: &[u8; 32],
+        code: Option<&str>,
+        approve: impl FnOnce(PublicKey) -> F,
+    ) -> Result<(Self, PublicKey), LinkError>
+    where
+        F: Future<Output = bool>,
+    {
+        let psk = match code {
+            Some(code) => Some(pair_key(&mut socket, initiator, account, code).await?),
+            None => None,
         };
         let protocol = if psk.is_some() {
             "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
@@ -94,11 +131,6 @@ impl Link {
         let incoming = link.recv().await?;
         let (key, signature) = incoming.split_at_checked(32).ok_or(LinkError)?;
         let key: PublicKey = key.try_into().map_err(|_| LinkError)?;
-        if let Trust::Paired(pins) = trust
-            && !pins.contains(&key)
-        {
-            return Err(LinkError);
-        }
         VerifyingKey::from_bytes(&key)
             .map_err(|_| LinkError)?
             .verify_strict(
@@ -106,6 +138,9 @@ impl Link {
                 &Signature::from_slice(signature).map_err(|_| LinkError)?,
             )
             .map_err(|_| LinkError)?;
+        if !approve(key).await {
+            return Err(LinkError);
+        }
         if initiator {
             link.send(&[1]).await?;
         } else {

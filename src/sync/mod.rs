@@ -7,6 +7,7 @@ use std::{
 
 #[doc(hidden)]
 pub mod lan;
+pub(crate) mod lan_registry;
 #[doc(hidden)]
 pub mod lan_security;
 pub(crate) mod relay;

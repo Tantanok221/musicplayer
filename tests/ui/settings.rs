@@ -139,6 +139,31 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
 }
 
 #[gpui_kit::test]
+fn paired_devices_identifies_automatic_trust_from_navidrome(cx: &mut TestAppContext) {
+    use sonora::sync::lan::{LanDevice, LanStatus};
+
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Paired devices", cx);
+    f.backend.emit(Event::LanStatus(LanStatus {
+        port: 8088,
+        automatic: vec![LanDevice {
+            id: "kitchen".into(),
+            name: "Kitchen".into(),
+        }],
+        ..Default::default()
+    }));
+    f.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        let label = window.find("lan-trust-kitchen");
+        assert!(label.visible());
+        assert_eq!(label.label(), Some("Kitchen · Trusted via Navidrome"));
+        assert!(window.find("lan-revoke-kitchen").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn metadata_folder_starts_with_a_picker_and_writes_disabled(cx: &mut TestAppContext) {
     let (_dir, mut f, window, _) = start(cx);
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);

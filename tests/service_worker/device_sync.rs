@@ -14,6 +14,160 @@ use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState
 use tokio::net::TcpListener;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lan_trust_accepts_known_keys_offline_and_revokes_them() {
+    use ed25519_dalek::SigningKey;
+    use sonora::{
+        platform::{Paths, ServerCredentials},
+        server::Server,
+        service::test_support::Worker,
+        sync::{
+            lan::user_hash,
+            lan_security::{Link, Trust},
+        },
+    };
+
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![]),
+        ..Default::default()
+    });
+    let first = "00000000000000000000000000000001";
+    let second = "00000000000000000000000000000002";
+    let second_paths = Paths {
+        data: fixture.paths.data.join("speaker"),
+        cache: fixture.paths.cache.join("speaker"),
+    };
+    for (paths, id, key) in [
+        (&fixture.paths, first, [1u8; 32]),
+        (&second_paths, second, [2u8; 32]),
+    ] {
+        std::fs::create_dir_all(&paths.data).unwrap();
+        std::fs::create_dir_all(&paths.cache).unwrap();
+        paths.save_account(&fixture.account).unwrap();
+        paths
+            .save_credentials(
+                &fixture.account,
+                &ServerCredentials::from_password("synthetic-password").unwrap(),
+            )
+            .unwrap();
+        std::fs::write(paths.data.join("sync-device-id"), id).unwrap();
+        std::fs::write(paths.data.join("sync-signing-key"), key).unwrap();
+    }
+
+    let start = |paths: Paths| {
+        let worker = fixture.start_on(paths);
+        worker.wait_ready(WAIT).unwrap();
+        worker
+    };
+    let trusted_port = |worker: &Worker, id: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            if let Event::LanStatus(status) = worker
+                .events()
+                .recv_deadline(deadline)
+                .unwrap_or_else(|_| panic!("automatic trust did not converge for {id}"))
+                && status.automatic.iter().any(|peer| peer.id == id)
+            {
+                break status.port;
+            }
+        }
+    };
+    let mut left = start(fixture.paths.clone());
+    let mut right = start(second_paths);
+    let port = trusted_port(&left, second);
+    trusted_port(&right, first);
+    let group = user_hash(&fixture.account);
+    let left_key = [SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes()];
+    let dial = |port, identity| async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (socket, _) = tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), tcp)
+            .await
+            .unwrap();
+        Link::establish(socket, true, &group, &identity, Trust::Paired(&left_key)).await
+    };
+    let assert_trusted = |port| async move {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if let Ok((mut link, _)) = dial(port, [2; 32]).await
+                    && let Ok(body) = link.recv().await
+                    && matches!(
+                        serde_json::from_slice(&body),
+                        Ok(ServerMessage::Welcome { .. })
+                    )
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("trusted worker accepts authenticated loopback client");
+    };
+    assert_trusted(port).await;
+    assert!(
+        dial(port, [3; 32]).await.is_err(),
+        "unknown key authenticated"
+    );
+    let await_roster = async |second_revoked: bool| {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let mut matches = false;
+                fixture.edit_library(|library| {
+                    let lists = library.device_playlists.as_ref().unwrap();
+                    let [list] = lists.as_slice() else {
+                        return;
+                    };
+                    if list.public || !list.comment.starts_with("Sonora's device list.") {
+                        return;
+                    }
+                    let (_, payload) = list.comment.split_once("Sonora devices v1:").unwrap();
+                    let roster: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    matches = roster["devices"][first].is_object()
+                        && if second_revoked {
+                            roster["devices"][second].is_null()
+                                && roster["revoked"] == serde_json::json!([second])
+                        } else {
+                            roster["devices"][second].is_object()
+                        };
+                });
+                if matches {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("concurrent device publishes converge and revocations are retained");
+    };
+    await_roster(false).await;
+    let server = Server::new(fixture.account.clone(), "synthetic-password".into()).unwrap();
+    assert!(
+        server.playlists().await.unwrap().is_empty(),
+        "the roster is hidden from Sonora playlists"
+    );
+    right.shutdown(WAIT).unwrap();
+    left.shutdown(WAIT).unwrap();
+
+    fixture.edit_library(|library| library.offline = true);
+    let mut left = start(fixture.paths.clone());
+    let port = trusted_port(&left, second);
+    assert_trusted(port).await;
+    left.service().send(Command::LanRevoke(second.into()));
+    event(
+        &left,
+        |event| matches!(event, Event::LanStatus(status) if status.automatic.is_empty()),
+    );
+    left.shutdown(WAIT).unwrap();
+
+    fixture.edit_library(|library| library.offline = false);
+    let mut left = start(fixture.paths.clone());
+    await_roster(true).await;
+    left.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_falls_back_to_paired_lan_and_returns_to_relay() {
     use sonora::sync::lan::LanNode;
     use std::sync::Arc;

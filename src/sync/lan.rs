@@ -1,4 +1,5 @@
 use super::{
+    lan_registry::LanRegistry,
     lan_security::{Link, PublicKey, Socket, Trust},
     transport::{Frame, SyncLink, SyncTransport},
 };
@@ -112,6 +113,13 @@ pub struct LanStatus {
     pub port: u16,
     pub peers: Vec<LanPeer>,
     pub discovered: Vec<LanPeer>,
+    pub automatic: Vec<LanDevice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanDevice {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +147,7 @@ struct Network {
     group: [u8; 32],
     pins: Mutex<HashMap<PublicKey, Pin>>,
     pins_path: Option<PathBuf>,
+    registry: Option<LanRegistry>,
     discovery: Mutex<HashMap<String, Vec<LanPeer>>>,
     change: watch::Sender<()>,
     hosting: watch::Sender<Option<LocalCoordinator>>,
@@ -153,7 +162,7 @@ pub struct LanNode {
 
 impl LanNode {
     pub fn paired_count(&self) -> usize {
-        self.network.pins.lock().map_or(0, |pins| pins.len())
+        self.network.trusted().len()
     }
 
     pub(crate) fn status(&self) -> LanStatus {
@@ -163,6 +172,7 @@ impl LanNode {
             .lock()
             .map(|pins| {
                 pins.values()
+                    .filter(|pin| !self.network.revoked(&pin.device.id))
                     .map(|pin| LanPeer {
                         id: pin.device.id.clone(),
                         name: pin.device.name.clone(),
@@ -172,6 +182,15 @@ impl LanNode {
             })
             .unwrap_or_default();
         peers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        let automatic: Vec<_> = self
+            .network
+            .automatic()
+            .into_iter()
+            .map(|(_, device)| LanDevice {
+                id: device.id,
+                name: device.name,
+            })
+            .collect();
         let mut discovered = self
             .network
             .discovery
@@ -180,7 +199,11 @@ impl LanNode {
                 devices
                     .values()
                     .flatten()
-                    .filter(|device| peers.iter().all(|pin| pin.id != device.id))
+                    .filter(|device| {
+                        peers.iter().all(|pin| pin.id != device.id)
+                            && automatic.iter().all(|peer| peer.id != device.id)
+                            && !self.network.revoked(&device.id)
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -196,6 +219,7 @@ impl LanNode {
             port: self.address().port(),
             peers,
             discovered,
+            automatic,
         }
     }
 
@@ -204,6 +228,9 @@ impl LanNode {
     }
 
     pub fn revoke(&self, id: &str) -> Result<()> {
+        if let Some(registry) = &self.network.registry {
+            registry.revoke(id)?;
+        }
         let mut pins = self
             .network
             .pins
@@ -217,13 +244,17 @@ impl LanNode {
         Ok(())
     }
 
+    pub(crate) async fn refresh_registry(&self) {
+        self.network.refresh_registry().await;
+    }
+
     pub async fn listen(
         device: Device,
         identity: [u8; 32],
         group: [u8; 32],
         port: u16,
     ) -> Result<Self> {
-        Self::start(device, identity, group, port, None).await
+        Self::start(device, identity, group, port, None, None).await
     }
 
     pub(crate) async fn start(
@@ -232,6 +263,7 @@ impl LanNode {
         group: [u8; 32],
         port: u16,
         pins_path: Option<PathBuf>,
+        registry: Option<LanRegistry>,
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
         let pins = if let Some(path) = &pins_path {
@@ -255,6 +287,7 @@ impl LanNode {
             group,
             pins: Mutex::new(pins),
             pins_path,
+            registry,
             discovery: Mutex::default(),
             change: watch::channel(()).0,
             hosting: watch::channel(None).0,
@@ -338,10 +371,28 @@ impl LanNode {
                 .await
                 .context("LAN connection unavailable");
         }
-        let pin = self.network.pins.lock().ok().and_then(|pins| {
-            pins.iter()
-                .find_map(|(key, pin)| (pin.address == address).then_some(*key))
-        });
+        let pin = self
+            .network
+            .pins
+            .lock()
+            .ok()
+            .and_then(|pins| {
+                pins.iter()
+                    .find_map(|(key, pin)| (pin.address == address).then_some(*key))
+            })
+            .or_else(|| {
+                let discovered = self.network.discovery.lock().ok()?;
+                self.network
+                    .automatic()
+                    .into_iter()
+                    .find_map(|(key, device)| {
+                        discovered
+                            .values()
+                            .flatten()
+                            .any(|peer| peer.id == device.id && peer.address == address)
+                            .then_some(key)
+                    })
+            });
         LanTransport {
             node: self,
             address,
@@ -420,26 +471,23 @@ impl LanNode {
         authority: Option<&str>,
     ) -> Option<(LanConnection, ServerMessage)> {
         let options = {
-            let pins = self.network.pins.lock().ok()?;
-            if pins.is_empty() {
-                return None;
-            }
+            let trusted = self.network.trusted();
             let own = &self.network.announcement.device.id;
             let discovered = self.network.discovery.lock().ok()?;
             let mut options = Vec::new();
-            for (key, pin) in pins
-                .iter()
-                .filter(|(_, pin)| authority.map_or(&pin.device.id < own, |id| pin.device.id == id))
+            for (key, (device, fallback)) in trusted
+                .into_iter()
+                .filter(|(_, (device, _))| authority.map_or(&device.id < own, |id| device.id == id))
             {
                 let addresses = discovered
                     .values()
                     .flatten()
-                    .filter(|peer| peer.id == pin.device.id)
+                    .filter(|peer| peer.id == device.id)
                     .map(|peer| peer.address);
                 options.extend(
                     addresses
-                        .chain([pin.address])
-                        .map(|address| (pin.device.id.clone(), *key, address)),
+                        .chain(fallback)
+                        .map(|address| (device.id.clone(), key, address)),
                 );
             }
             options.sort_unstable();
@@ -562,6 +610,50 @@ fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()
 }
 
 impl Network {
+    fn automatic(&self) -> Vec<(PublicKey, Device)> {
+        self.registry
+            .as_ref()
+            .map_or_else(Vec::new, LanRegistry::devices)
+    }
+
+    fn revoked(&self, id: &str) -> bool {
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.revoked(id))
+    }
+
+    fn trusted(&self) -> HashMap<PublicKey, (Device, Option<SocketAddr>)> {
+        let automatic = self.automatic();
+        let mut trusted: HashMap<_, _> = self
+            .pins
+            .lock()
+            .map(|pins| {
+                pins.iter()
+                    .filter(|(key, pin)| {
+                        !self.revoked(&pin.device.id)
+                            && automatic
+                                .iter()
+                                .all(|(known, device)| device.id != pin.device.id || known == *key)
+                    })
+                    .map(|(key, pin)| (*key, (pin.device.clone(), Some(pin.address))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (key, device) in automatic {
+            let address = trusted.get(&key).and_then(|(_, address)| *address);
+            trusted.insert(key, (device, address));
+        }
+        trusted
+    }
+
+    async fn refresh_registry(&self) {
+        if let Some(registry) = &self.registry
+            && registry.refresh().await.unwrap_or(false)
+        {
+            self.change.send_replace(());
+        }
+    }
+
     fn take_offer(&self) -> Option<LanCode> {
         let mut available = None;
         self.offer.send_if_modified(|offer| {
@@ -589,8 +681,15 @@ impl Network {
             "Invalid LAN device"
         );
         ensure!(
-            device.id != self.announcement.device.id,
-            "Cannot pair this device with itself"
+            device.id != self.announcement.device.id && !self.revoked(&device.id),
+            "Cannot pair with this LAN device"
+        );
+        ensure!(
+            !self
+                .automatic()
+                .iter()
+                .any(|(known, auto)| auto.id == device.id && known != &key),
+            "LAN device identifier already has a trusted key"
         );
         let mut pins = self
             .pins
@@ -705,38 +804,32 @@ impl Network {
             link.send(&serde_json::to_vec(&self.announcement)?).await?;
             return Ok(None);
         }
+        let (link, key) = Link::establish_with(
+            socket,
+            false,
+            &self.group,
+            &self.identity,
+            None,
+            |key| async move {
+                if !self.has_key(&key) {
+                    self.refresh_registry().await;
+                }
+                self.has_key(&key)
+            },
+        )
+        .await?;
         let coordinator = self
             .hosting
             .borrow()
             .clone()
             .context("LAN coordinator is not active")?;
-        let keys: Vec<_> = self
-            .pins
-            .lock()
-            .map_err(|_| anyhow::anyhow!("LAN pairing unavailable"))?
-            .keys()
-            .copied()
-            .collect();
-        let (link, key) = Link::establish(
-            socket,
-            false,
-            &self.group,
-            &self.identity,
-            Trust::Paired(&keys),
-        )
-        .await?;
-        let device = self
-            .pins
-            .lock()
-            .ok()
-            .and_then(|pins| pins.get(&key).map(|pin| pin.device.clone()))
-            .context("Unpaired LAN device")?;
+        let (device, _) = self.trusted().remove(&key).context("Unpaired LAN device")?;
         let (peer, welcome) = coordinator.join(device).await?;
         Ok(Some((link, peer, welcome, key)))
     }
 
     fn has_key(&self, key: &PublicKey) -> bool {
-        self.pins.lock().is_ok_and(|pins| pins.contains_key(key))
+        self.trusted().contains_key(key)
     }
 }
 
@@ -752,6 +845,9 @@ impl SyncTransport for LanTransport<'_> {
     async fn connect(&self) -> Option<(Self::Link, ServerMessage)> {
         let network = &self.node.network;
         let pin = self.pin?;
+        if !network.has_key(&pin) {
+            return None;
+        }
         time::timeout(TIMEOUT, async {
             let socket = dial(self.address, "/ws").await.ok()?;
             let (mut link, _) = Link::establish(

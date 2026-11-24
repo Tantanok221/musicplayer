@@ -270,6 +270,8 @@ pub struct Playlist {
     pub name: String,
     pub comment: String,
     pub owner: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
     pub readonly: bool,
     pub valid_until: Option<String>,
     pub song_count: u32,

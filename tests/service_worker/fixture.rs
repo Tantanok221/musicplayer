@@ -234,6 +234,7 @@ pub struct Library {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
+    pub device_playlists: Option<Vec<Playlist>>,
     pub fail_song_offset: Option<usize>,
     pub sync_response: Option<(&'static str, Value)>,
     pub playlists_response: Option<Value>,
@@ -271,6 +272,7 @@ impl Default for Library {
             tracks: vec![song("song", "album"), song("other-song", "other-album")],
             albums: vec![album("album"), album("other-album")],
             playlists: vec![],
+            device_playlists: None,
             fail_song_offset: None,
             sync_response: None,
             playlists_response: None,
@@ -361,6 +363,8 @@ struct StateData {
     requests: Vec<Request>,
     expected_mutations: VecDeque<(Request, bool)>,
     unexpected: Vec<&'static str>,
+    device_reads: usize,
+    device_creates: usize,
 }
 
 #[derive(Clone)]
@@ -371,6 +375,7 @@ struct ServerState {
     sync_gate: flume::Receiver<()>,
     scrobble_gate: flume::Receiver<()>,
     held_gate: flume::Receiver<()>,
+    device_bootstrap: Arc<tokio::sync::Barrier>,
 }
 
 impl ServerState {
@@ -393,11 +398,86 @@ fn envelope(body: Value) -> Response {
     Json(json!({"subsonic-response":body})).into_response()
 }
 
+async fn device_playlist_request(state: &ServerState, endpoint: &str, body: &[u8]) -> Response {
+    let form: BTreeMap<_, _> = url::form_urlencoded::parse(body).into_owned().collect();
+    let (snapshot, parallel_bootstrap) = {
+        let mut data = state.data.lock().unwrap();
+        if data.library.offline {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if data.library.device_playlists.is_none() {
+            return StatusCode::NOT_IMPLEMENTED.into_response();
+        }
+        match endpoint {
+            "getPlaylists.view" if form.is_empty() => {
+                data.device_reads += 1;
+                (
+                    json!({"status":"ok","playlists":{"playlist":data.library.device_playlists}}),
+                    data.device_reads <= 2,
+                )
+            }
+            "createPlaylist.view"
+                if form
+                    .get("name")
+                    .is_some_and(|name| name == "Sonora devices (sync keys — do not edit)") =>
+            {
+                data.device_creates += 1;
+                let playlist = Playlist {
+                    id: format!("device-list-{}", data.device_creates),
+                    name: form["name"].clone(),
+                    owner: "fixture".into(),
+                    public: true,
+                    ..Default::default()
+                };
+                data.library
+                    .device_playlists
+                    .as_mut()
+                    .unwrap()
+                    .push(playlist.clone());
+                (json!({"status":"ok","playlist":playlist}), false)
+            }
+            "updatePlaylist.view" if form.get("public").is_some_and(|value| value == "false") => {
+                let Some(playlist) = data
+                    .library
+                    .device_playlists
+                    .as_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|playlist| Some(&playlist.id) == form.get("playlistId"))
+                else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                playlist.comment = form["comment"].clone();
+                playlist.name = form["name"].clone();
+                playlist.public = false;
+                (json!({"status":"ok"}), false)
+            }
+            "deletePlaylist.view" => {
+                data.library
+                    .device_playlists
+                    .as_mut()
+                    .unwrap()
+                    .retain(|playlist| Some(&playlist.id) != form.get("id"));
+                (json!({"status":"ok"}), false)
+            }
+            _ => {
+                data.unexpected.push("unexpected device playlist request");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    };
+    if parallel_bootstrap {
+        state.device_bootstrap.wait().await;
+    }
+    envelope(snapshot)
+}
+
 async fn navidrome(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
     method: Method,
     RawQuery(raw_query): RawQuery,
+    body: axum::body::Bytes,
 ) -> Response {
     let mut query = BTreeMap::new();
     let mut song_ids = Vec::new();
@@ -419,6 +499,9 @@ async fn navidrome(
         && query.remove("v").as_deref() == Some("1.16.1")
         && query.remove("c").as_deref() == Some("Sonora")
         && query.remove("f").as_deref() == Some("json");
+    if authenticated && method == Method::POST && query.is_empty() {
+        return device_playlist_request(&state, &endpoint, &body).await;
+    }
     if !authenticated || method != Method::GET || query.contains_key("p") {
         return state.unexpected("invalid method or authentication");
     }
@@ -588,9 +671,12 @@ async fn navidrome(
             }
         }
         "getPlaylists.view" if query.is_empty() => {
-            data.library.playlists_response.clone().unwrap_or_else(
-                || json!({"status":"ok","playlists":{"playlist":data.library.playlists}}),
-            )
+            let mut playlists = data.library.playlists.clone();
+            playlists.extend(data.library.device_playlists.iter().flatten().cloned());
+            data.library
+                .playlists_response
+                .clone()
+                .unwrap_or_else(|| json!({"status":"ok","playlists":{"playlist":playlists}}))
         }
         "getPlaylist.view" if data.library.fail_playlist => {
             json!({"status":"failed","error":{"code":70,"message":"Fixture playlist unavailable"}})
@@ -1123,12 +1209,15 @@ impl Fixture {
                 requests: vec![],
                 expected_mutations: VecDeque::new(),
                 unexpected: vec![],
+                device_reads: 0,
+                device_creates: 0,
             })),
             received,
             metadata_gate,
             sync_gate,
             scrobble_gate,
             held_gate,
+            device_bootstrap: Arc::new(tokio::sync::Barrier::new(2)),
         };
         let app = Router::new()
             .route("/auth/login", any(native))
@@ -1223,6 +1312,10 @@ impl Fixture {
 
     pub fn start(&self) -> Worker {
         self.start_player(false)
+    }
+
+    pub fn start_on(&self, paths: Paths) -> Worker {
+        Worker::start(paths, self.clients()).unwrap()
     }
 
     pub fn start_paused(&self) -> Worker {

@@ -4,9 +4,11 @@ use crate::{
     model::{PlaybackSnapshot, Preferences, SavedQueue},
     platform::{Account, Paths},
     playback::{PlayerCommand, PlayerHandle},
+    server::Server,
     sync::{
         DeviceStatus, RelayEvent, SharedPreferences,
         lan::{LanNode, user_hash},
+        lan_registry::LanRegistry,
         position_at,
         relay::{self, RelayTransport, SyncTask},
         settings::SettingsState,
@@ -147,6 +149,7 @@ impl DeviceSync {
         if self.status.enabled || previous_enabled {
             events.send(Event::DeviceSync(self.status.clone()))?;
         }
+        let registry_server = Server::with_credentials(account.clone(), credentials.clone()).ok();
         let relay = endpoint.map(|endpoint| RelayTransport {
             endpoint,
             hello: Hello {
@@ -169,6 +172,15 @@ impl DeviceSync {
         let identity = paths.sync_signing_key()?;
         let group = user_hash(account);
         let pins = paths.data.join(format!("sync-pins-{namespace}.json"));
+        let registry = registry_server.and_then(|server| {
+            LanRegistry::open(
+                server,
+                &device,
+                &identity,
+                paths.data.join(format!("sync-devices-{namespace}.json")),
+            )
+            .ok()
+        });
         let task = SyncTask {
             relay,
             device_id,
@@ -181,7 +193,7 @@ impl DeviceSync {
         self.lan = Some(actions);
         let events = events.clone();
         self.task = Some(self.runtime.spawn(async move {
-            let Ok(node) = LanNode::start(device, identity, group, port, Some(pins)).await else {
+            let Ok(node) = LanNode::start(device, identity, group, port, Some(pins), registry).await else {
                 let _ = events.send(Event::LanStatus(Default::default()));
                 let _ = events.send(Event::LanOffer(Default::default()));
                 let _ = events.send(Event::Error("Could not start local device sync".into()));
@@ -205,6 +217,9 @@ impl DeviceSync {
                             Ok(LanAction::Revoke(id)) => {
                                 if node.revoke(&id).is_err() {
                                     let _ = events.send(Event::Error("Could not revoke LAN device".into()));
+                                } else {
+                                    let _ = events.send(Event::LanStatus(node.status()));
+                                    node.refresh_registry().await;
                                 }
                             }
                             Err(_) => break,
@@ -224,10 +239,25 @@ impl DeviceSync {
                     }
                 }
             };
+            let directory = async {
+                let mut changes = node.changes();
+                let mut refresh = tokio::time::interval(Duration::from_secs(5));
+                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = refresh.tick() => node.refresh_registry().await,
+                        changed = changes.changed() => {
+                            if changed.is_err() { break; }
+                            node.refresh_registry().await;
+                        }
+                    }
+                }
+            };
             tokio::select! {
                 _ = Box::pin(task.run(Some(&node))) => {}
                 _ = control => {}
                 _ = offers => {}
+                _ = directory => {}
             }
         }));
         Ok(())
