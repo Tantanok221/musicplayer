@@ -1,5 +1,106 @@
 use sonora::{catalog::Catalog, model::*};
 
+const V1_CATALOG: &str = include_str!("fixtures/catalog-v1.sql");
+
+fn materialize_v1(path: &std::path::Path) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(V1_CATALOG)
+        .unwrap();
+}
+
+#[test]
+fn frozen_v1_catalog_survives_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.sqlite");
+    materialize_v1(&path);
+    let db = Catalog::open(&path).unwrap();
+    assert_eq!(db.count().unwrap(), 2);
+    let tracks = db.by_ids(&["song-1".into(), "song-2".into()]).unwrap();
+    assert_eq!(tracks[0].title, "Frozen Moon");
+    assert_eq!(tracks[0].user_rating, Some(5));
+    assert_eq!(tracks[1].title, "Night River");
+    assert!(db.by_ids(&["missing".into()]).unwrap().is_empty());
+    let search = |text: &str| {
+        db.tracks(
+            &LibraryQuery {
+                text: text.into(),
+                ..Default::default()
+            },
+            0,
+            20,
+        )
+        .unwrap()
+    };
+    assert_eq!(search("frozen")[0].id, "song-1");
+    assert!(search("unmatched").is_empty());
+    assert_eq!(db.album_count().unwrap(), 1);
+    let album = db.album("album-1").unwrap().unwrap();
+    assert_eq!(album.name, "Winter Lights");
+    assert_eq!(album.song_count, 2);
+    assert_eq!(db.album_tracks("album-1").unwrap().len(), 2);
+    assert!(db.album("missing").unwrap().is_none());
+    let queue: SavedQueue = db.state("queue").unwrap();
+    assert_eq!(queue.ids, ["song-1", "song-2"]);
+    assert_eq!(queue.index, Some(1));
+    assert_eq!(queue.position, 42.5);
+    let missing: SavedQueue = db.state("missing").unwrap();
+    assert!(missing.ids.is_empty());
+    assert_eq!(db.playlists().unwrap().len(), 1);
+    let playlist = db.playlist("playlist-1").unwrap().unwrap();
+    assert_eq!(playlist.name, "Winter favorites");
+    assert_eq!(playlist.entry[0].id, "song-2");
+    assert!(db.playlist("missing").unwrap().is_none());
+    let profile = db.artist_profile("artist-1").unwrap().unwrap();
+    assert_eq!(profile.biography, "A frozen artist biography.");
+    assert_eq!(profile.popular[0].id, "song-1");
+    assert!(db.artist_profile("missing").unwrap().is_none());
+    let pending = db.pending_scrobbles("fixture-account").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, 101);
+    assert_eq!(pending[0].track_id, "song-1");
+    assert_eq!(pending[0].started_ms, 1700000000000);
+}
+
+fn schema(conn: &rusqlite::Connection) -> Vec<(String, String, String, String)> {
+    conn.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name",
+    )
+    .unwrap()
+    .query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+#[test]
+fn frozen_v1_schema_requires_versioned_migration_on_drift() {
+    let frozen = rusqlite::Connection::open_in_memory().unwrap();
+    frozen.execute_batch(V1_CATALOG).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.sqlite");
+    drop(Catalog::open(&path).unwrap());
+    let live = rusqlite::Connection::open(path).unwrap();
+    let version = |conn: &rusqlite::Connection| {
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert_eq!(
+        version(&frozen),
+        1,
+        "The frozen v1 fixture must never change"
+    );
+    if version(&live) == 1 {
+        assert_eq!(
+            schema(&live),
+            schema(&frozen),
+            "Catalog schema drifted while user_version is 1: bump user_version, add a migration, and add a new frozen fixture (do not update catalog-v1.sql)."
+        );
+    }
+}
+
 fn sample(id: &str, title: &str) -> Track {
     Track {
         id: id.into(),
