@@ -91,20 +91,12 @@ pub(crate) struct SyncTask {
     pub playback: watch::Receiver<PlaybackSnapshot>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SessionKind {
-    Relay,
-    LanHost,
-    LanPeer,
-}
-
 impl SyncTask {
     pub async fn run(self, lan: Option<&LanNode>) {
         let mut attempts = 0;
         let mut next_attempt = Instant::now();
         let mut publisher = Publisher::default();
         let mut ready = None;
-        let mut lan_ready = None;
         loop {
             if ready.is_none() && Instant::now() >= next_attempt {
                 ready = self.try_relay().await;
@@ -113,13 +105,8 @@ impl SyncTask {
                 }
             }
             if let Some((socket, welcome)) = ready.take() {
-                drop(lan_ready.take());
                 let connected_at = Instant::now();
-                if self
-                    .serve(socket, welcome, &mut publisher, SessionKind::Relay)
-                    .await
-                    .is_none()
-                {
+                if self.serve(socket, welcome, &mut publisher).await.is_none() {
                     break;
                 }
                 if connected_at.elapsed() >= HEARTBEAT {
@@ -127,26 +114,8 @@ impl SyncTask {
                 }
                 next_attempt = retry_at(&mut attempts);
             }
-            if let Some(lan) = lan
-                && let Some((socket, welcome)) = match lan_ready.take() {
-                    Some(link) => Some(link),
-                    None => {
-                        lan.preferred(
-                            publisher.authority.as_deref(),
-                            publisher.snapshot.as_ref(),
-                            publisher.settings.as_ref(),
-                        )
-                        .await
-                    }
-                }
-            {
-                let local = socket.is_local();
-                let bootstrap = publisher.authority.is_none();
-                let kind = if local {
-                    SessionKind::LanHost
-                } else {
-                    SessionKind::LanPeer
-                };
+            if let Some(lan) = lan {
+                let (socket, welcome) = lan.session();
                 let retry = async {
                     if self.relay.is_none() {
                         return std::future::pending().await;
@@ -159,17 +128,6 @@ impl SyncTask {
                         next_attempt = retry_at(&mut attempts);
                     }
                 };
-                let better = async {
-                    if !local || !bootstrap {
-                        return std::future::pending().await;
-                    }
-                    loop {
-                        time::sleep(Duration::from_secs(3)).await;
-                        if let Some(link) = lan.preferred_remote(None).await {
-                            break Some(link);
-                        }
-                    }
-                };
                 tokio::select! {
                     biased;
                     relay = retry => {
@@ -177,12 +135,7 @@ impl SyncTask {
                         ready = relay;
                         continue;
                     }
-                    better = better => {
-                        if !self.emit(RelayEvent::Offline) { break; }
-                        lan_ready = better;
-                        continue;
-                    }
-                    done = self.serve(socket, welcome, &mut publisher, kind) => {
+                    done = self.serve(socket, welcome, &mut publisher) => {
                         if done.is_none() { break; }
                     }
                 }
@@ -202,7 +155,6 @@ impl SyncTask {
         mut socket: impl SyncLink,
         welcome: ServerMessage,
         publisher: &mut Publisher,
-        kind: SessionKind,
     ) -> Option<()> {
         if let ServerMessage::Welcome { state, .. } = &welcome
             && let Some(playback) = publisher
@@ -226,8 +178,7 @@ impl SyncTask {
         }) {
             return None;
         }
-        self.session(socket, incoming, welcome, publisher, kind)
-            .await;
+        self.session(socket, incoming, welcome, publisher).await;
         self.emit(RelayEvent::Offline).then_some(())
     }
 
@@ -243,7 +194,6 @@ impl SyncTask {
         mut outgoing: mpsc::Receiver<ClientMessage>,
         welcome: ServerMessage,
         publisher: &mut Publisher,
-        kind: SessionKind,
     ) -> Option<()> {
         let ServerMessage::Welcome {
             active_device_id,
@@ -255,9 +205,6 @@ impl SyncTask {
         else {
             return None;
         };
-        if kind == SessionKind::Relay || (kind == SessionKind::LanPeer && state.is_some()) {
-            publisher.authority.clone_from(&active_device_id);
-        }
         if let (Some(active), Some(state)) = (&active_device_id, &state) {
             publisher.remember(active, state);
         }
@@ -271,7 +218,6 @@ impl SyncTask {
         timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut last_received = Instant::now();
         let mut last_heartbeat = Instant::now();
-        let mut handing_off = false;
         loop {
             tokio::select! {
                 frame = socket.receive() => {
@@ -282,27 +228,15 @@ impl SyncTask {
                                 ServerMessage::State { state, from_device_id } => {
                                     publisher.latest_seq = Some(publisher.latest_seq.map_or(state.seq, |seq| seq.max(state.seq)));
                                     publisher.remember(from_device_id, state);
-                                    if publisher.active.as_ref() == Some(from_device_id) {
-                                        publisher.authority = Some(from_device_id.clone());
-                                        if kind == SessionKind::LanHost && from_device_id != &self.device_id && !handing_off {
-                                            // Drain the committed transfer result before closing the host link.
-                                            socket.send(ClientMessage::Ping).await?;
-                                            handing_off = true;
-                                        }
-                                    }
                                 }
                                 ServerMessage::ActiveDeviceChanged { device_id } => {
                                     publisher.active.clone_from(device_id);
-                                    if kind == SessionKind::Relay {
-                                        publisher.authority.clone_from(device_id);
-                                    }
                                     publisher.last_sent = None;
                                 }
                                 ServerMessage::Settings { settings, version }
                                 | ServerMessage::SettingsConflict { settings, version } => {
                                     publisher.remember_settings(settings, *version);
                                 }
-                                ServerMessage::Pong if handing_off => return Some(()),
                                 ServerMessage::Pong => continue,
                                 _ => {}
                             }
@@ -381,7 +315,6 @@ impl SyncLink for Socket {
 #[derive(Default)]
 struct Publisher {
     active: Option<String>,
-    authority: Option<String>,
     latest_seq: Option<u64>,
     snapshot: Option<ReconciledPlayback>,
     settings: Option<VersionedSettings>,

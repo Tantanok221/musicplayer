@@ -1306,8 +1306,18 @@ impl Fixture {
     }
 
     pub fn seed(&self) {
+        self.seed_on(&self.paths);
+    }
+
+    /// Seeds the catalog of another device signed in to this fixture's account.
+    pub fn seed_on(&self, paths: &Paths) {
         let data = self.state.data.lock().unwrap();
-        let mut catalog = self.catalog();
+        let mut catalog = Catalog::open(
+            &paths
+                .data
+                .join(format!("{}.sqlite", self.account.namespace())),
+        )
+        .unwrap();
         catalog.put_tracks(&data.library.tracks, 1).unwrap();
         catalog.put_albums(&data.library.albums, 1).unwrap();
         catalog

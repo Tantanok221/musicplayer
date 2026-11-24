@@ -1,26 +1,34 @@
+//! Direct device-to-device sync on the local network.
+//!
+//! Every device listens on a remembered port and keeps one encrypted link to each
+//! device trusted through the Navidrome device list. Addresses come from that list,
+//! from multicast discovery, and from incoming links, so one reachable direction is
+//! enough. [`Mesh`] owns the shared state; this module only moves bytes.
+
+pub use super::lan_registry::Trusted;
 use super::{
-    lan_registry::LanRegistry,
+    lan_registry::{LanRegistry, MAX_ADDRESSES},
     lan_security::{Link, PublicKey, Socket, Trust},
-    transport::{Frame, SyncLink, SyncTransport},
+    mesh::{Effect, Mesh, PeerMessage},
+    transport::{Frame, SyncLink},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use rand::Rng;
-use serde::{Deserialize, Serialize};
-use sonora_sync::{LocalCoordinator, LocalPeer};
-use sonora_sync_protocol::{
-    ClientMessage, Device, ReconciledPlayback, ServerMessage, VersionedSettings,
-};
+use sonora_sync_protocol::{ClientMessage, Device, ServerMessage};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, watch},
+    sync::{Semaphore, mpsc, watch},
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -34,192 +42,211 @@ use tokio_tungstenite::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(7);
-const OFFER_TTL: Duration = Duration::from_secs(120);
+const DIAL_TIMEOUT: Duration = Duration::from_millis(1500);
+const REDIAL: Duration = Duration::from_secs(3);
+const HEARTBEAT: Duration = Duration::from_secs(15);
+const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 const SERVICE_TYPE: &str = "_sonora._tcp.local.";
-const PROTOCOL_VERSION: &str = "1";
-
-#[derive(Clone)]
-pub struct LanCode(pub String);
-
-#[derive(Clone, Debug, Default)]
-pub enum LanOfferState {
-    #[default]
-    Idle,
-    Available(LanCode),
-    UsedOrExpired,
-}
-
-impl std::fmt::Debug for LanCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LanCode([REDACTED])")
-    }
-}
-
-pub(crate) enum PairingOffer {
-    Idle,
-    Available(LanCode, Instant),
-    UsedOrExpired,
-}
-
-impl PairingOffer {
-    pub(crate) fn state(&self) -> LanOfferState {
-        match self {
-            Self::Idle => LanOfferState::Idle,
-            Self::Available(code, _) => LanOfferState::Available(code.clone()),
-            Self::UsedOrExpired => LanOfferState::UsedOrExpired,
-        }
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        match self {
-            Self::Available(_, expires) => Some(*expires),
-            _ => None,
-        }
-    }
-}
-
-async fn expire_offers(offers: &watch::Sender<PairingOffer>) {
-    let mut changes = offers.subscribe();
-    loop {
-        let deadline = changes.borrow_and_update().deadline();
-        let elapsed = async {
-            match deadline {
-                Some(deadline) => time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            _ = elapsed => {
-                offers.send_if_modified(|offer| {
-                    if offer.deadline().is_some_and(|deadline| deadline <= Instant::now()) {
-                        *offer = PairingOffer::UsedOrExpired;
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
-            changed = changes.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
+const PROTOCOL_VERSION: &str = "2";
 
 #[derive(Clone, Debug, Default)]
 pub struct LanStatus {
     pub port: u16,
-    pub peers: Vec<LanPeer>,
-    pub discovered: Vec<LanPeer>,
-    pub automatic: Vec<LanDevice>,
+    /// Every trusted device and whether this device can reach it.
+    pub devices: Vec<LanDevice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LanDevice {
     pub id: String,
     pub name: String,
+    pub reach: LanReach,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanReach {
+    #[default]
+    NotFound,
+    Found(SocketAddr),
+    Connected(SocketAddr),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LanPeer {
-    pub id: String,
-    pub name: String,
-    pub address: SocketAddr,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Announcement {
-    device: Device,
-    port: u16,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Pin {
-    device: Device,
+struct LanPeer {
+    id: String,
     address: SocketAddr,
 }
 
+/// How the LAN listener picks its port.
+pub(crate) enum Port {
+    /// Exactly this port; 0 picks any free port each time.
+    Fixed(u16),
+    /// The port saved in this file, or a new free one that is then saved.
+    Remembered(PathBuf),
+}
+
+impl Port {
+    async fn bind(self) -> Result<TcpListener> {
+        let path = match self {
+            Self::Fixed(port) => {
+                return Ok(TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?);
+            }
+            Self::Remembered(path) => path,
+        };
+        let saved = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|port| port.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0);
+        if let Some(port) = saved
+            && let Ok(listener) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await
+        {
+            return Ok(listener);
+        }
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+        crate::platform::atomic_write(&path, listener.local_addr()?.port().to_string().as_bytes())?;
+        Ok(listener)
+    }
+}
+
+struct Slot {
+    serial: u64,
+    /// The device that dialed this link; duplicates keep the lower ID's dial.
+    dialer: String,
+    address: SocketAddr,
+    out: mpsc::Sender<PeerMessage>,
+    close: watch::Sender<bool>,
+}
+
 struct Network {
-    announcement: Announcement,
+    own: Device,
+    port: u16,
     identity: [u8; 32],
     group: [u8; 32],
-    pins: Mutex<HashMap<PublicKey, Pin>>,
-    pins_path: Option<PathBuf>,
     registry: Option<LanRegistry>,
+    /// Trust supplied directly, used only without a Navidrome device list.
+    fixed: Mutex<Vec<Trusted>>,
     discovery: Mutex<HashMap<String, Vec<LanPeer>>>,
     change: watch::Sender<()>,
-    hosting: watch::Sender<Option<LocalCoordinator>>,
-    offer: watch::Sender<PairingOffer>,
+    links: Mutex<HashMap<String, Slot>>,
+    dialing: Mutex<HashSet<String>>,
+    serial: AtomicU64,
+    mesh: Mutex<Mesh>,
+    session: Mutex<Option<mpsc::Sender<ServerMessage>>>,
 }
 
 pub struct LanNode {
     network: Arc<Network>,
-    task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
     mdns: Option<(ServiceDaemon, JoinHandle<()>)>,
 }
 
 impl LanNode {
+    /// Starts a node that trusts exactly `trusted`, without a Navidrome device list.
+    pub async fn listen(
+        device: Device,
+        identity: [u8; 32],
+        group: [u8; 32],
+        port: u16,
+        trusted: Vec<Trusted>,
+    ) -> Result<Self> {
+        Self::start(device, identity, group, Port::Fixed(port), None, trusted).await
+    }
+
+    pub(crate) async fn start(
+        device: Device,
+        identity: [u8; 32],
+        group: [u8; 32],
+        port: Port,
+        registry: Option<LanRegistry>,
+        fixed: Vec<Trusted>,
+    ) -> Result<Self> {
+        let listener = port.bind().await?;
+        // Test builds never use multicast discovery, so scenarios prove the Navidrome addresses alone.
+        let discover = registry.is_some() && !cfg!(feature = "test-support");
+        let network = Arc::new(Network {
+            mesh: Mutex::new(Mesh::new(device.clone())),
+            own: device,
+            port: listener.local_addr()?.port(),
+            identity,
+            group,
+            registry,
+            fixed: Mutex::new(fixed),
+            discovery: Mutex::default(),
+            change: watch::channel(()).0,
+            links: Mutex::default(),
+            dialing: Mutex::default(),
+            serial: AtomicU64::new(0),
+            session: Mutex::default(),
+        });
+        network.publish_addresses();
+        let tasks = vec![
+            tokio::spawn(accept_links(network.clone(), listener)),
+            tokio::spawn(dial_links(network.clone())),
+        ];
+        let mdns = discover
+            .then(|| discover_peers(network.clone()).ok())
+            .flatten();
+        Ok(Self {
+            network,
+            tasks,
+            mdns,
+        })
+    }
+
+    /// A local address of this node's listener, for tests on one machine.
+    pub fn address(&self) -> SocketAddr {
+        (Ipv4Addr::LOCALHOST, self.network.port).into()
+    }
+
     pub fn paired_count(&self) -> usize {
         self.network.trusted().len()
     }
 
-    pub(crate) fn status(&self) -> LanStatus {
-        let mut peers = self
+    /// IDs of the devices this node currently has a live link with.
+    pub fn linked(&self) -> Vec<String> {
+        let mut linked: Vec<_> = self
             .network
-            .pins
+            .links
             .lock()
-            .map(|pins| {
-                pins.values()
-                    .filter(|pin| !self.network.revoked(&pin.device.id))
-                    .map(|pin| LanPeer {
-                        id: pin.device.id.clone(),
-                        name: pin.device.name.clone(),
-                        address: pin.address,
-                    })
-                    .collect::<Vec<_>>()
+            .map(|links| links.keys().cloned().collect())
+            .unwrap_or_default();
+        linked.sort();
+        linked
+    }
+
+    pub(crate) fn status(&self) -> LanStatus {
+        let links: HashMap<String, SocketAddr> = self
+            .network
+            .links
+            .lock()
+            .map(|links| {
+                links
+                    .iter()
+                    .map(|(id, slot)| (id.clone(), slot.address))
+                    .collect()
             })
             .unwrap_or_default();
-        peers.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
-        let automatic: Vec<_> = self
+        let mut devices: Vec<_> = self
             .network
-            .automatic()
-            .into_iter()
-            .map(|(_, device)| LanDevice {
-                id: device.id,
-                name: device.name,
+            .trusted()
+            .into_values()
+            .map(|trusted| LanDevice {
+                reach: match links.get(&trusted.device.id) {
+                    Some(address) => LanReach::Connected(*address),
+                    None => self
+                        .network
+                        .addresses(&trusted)
+                        .first()
+                        .map_or(LanReach::NotFound, |address| LanReach::Found(*address)),
+                },
+                id: trusted.device.id,
+                name: trusted.device.name,
             })
             .collect();
-        let mut discovered = self
-            .network
-            .discovery
-            .lock()
-            .map(|devices| {
-                devices
-                    .values()
-                    .flatten()
-                    .filter(|device| {
-                        peers.iter().all(|pin| pin.id != device.id)
-                            && automatic.iter().all(|peer| peer.id != device.id)
-                            && !self.network.revoked(&device.id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        discovered.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
-                .then(left.id.cmp(&right.id))
-                .then(left.address.cmp(&right.address))
-        });
-        discovered.dedup_by(|left, right| left.id == right.id);
+        devices.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
         LanStatus {
-            port: self.address().port(),
-            peers,
-            discovered,
-            automatic,
+            port: self.network.port,
+            devices,
         }
     }
 
@@ -231,15 +258,9 @@ impl LanNode {
         if let Some(registry) = &self.network.registry {
             registry.revoke(id)?;
         }
-        let mut pins = self
-            .network
-            .pins
-            .lock()
-            .map_err(|_| anyhow::anyhow!("LAN pairing unavailable"))?;
-        let mut updated = pins.clone();
-        updated.retain(|_, pin| pin.device.id != id);
-        self.network.save_pins(&updated)?;
-        *pins = updated;
+        if let Ok(mut fixed) = self.network.fixed.lock() {
+            fixed.retain(|trusted| trusted.device.id != id);
+        }
         self.network.change.send_replace(());
         Ok(())
     }
@@ -248,288 +269,526 @@ impl LanNode {
         self.network.refresh_registry().await;
     }
 
-    pub async fn listen(
-        device: Device,
-        identity: [u8; 32],
-        group: [u8; 32],
-        port: u16,
-    ) -> Result<Self> {
-        Self::start(device, identity, group, port, None, None).await
-    }
-
-    pub(crate) async fn start(
-        device: Device,
-        identity: [u8; 32],
-        group: [u8; 32],
-        port: u16,
-        pins_path: Option<PathBuf>,
-        registry: Option<LanRegistry>,
-    ) -> Result<Self> {
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
-        let pins = if let Some(path) = &pins_path {
-            match std::fs::read(path) {
-                Ok(bytes) => serde_json::from_slice::<Vec<(PublicKey, Pin)>>(&bytes)?
-                    .into_iter()
-                    .collect(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            HashMap::new()
-        };
-        let discover = pins_path.is_some();
-        let network = Arc::new(Network {
-            announcement: Announcement {
-                device,
-                port: listener.local_addr()?.port(),
-            },
-            identity,
-            group,
-            pins: Mutex::new(pins),
-            pins_path,
-            registry,
-            discovery: Mutex::default(),
-            change: watch::channel(()).0,
-            hosting: watch::channel(None).0,
-            offer: watch::Sender::new(PairingOffer::Idle),
-        });
-        let accepted = network.clone();
-        let task = tokio::spawn(async move {
-            let limit = Arc::new(Semaphore::new(24));
-            let mut sessions = tokio::task::JoinSet::new();
-            let expiry = expire_offers(&accepted.offer);
-            tokio::pin!(expiry);
-            loop {
-                tokio::select! {
-                    _ = &mut expiry => break,
-                    _ = sessions.join_next(), if !sessions.is_empty() => {}
-                    Ok((stream, address)) = listener.accept() => {
-                        if let Ok(permit) = limit.clone().try_acquire_owned() {
-                            let network = accepted.clone();
-                            sessions.spawn(async move {
-                                let _permit = permit;
-                                let _ = network.accept(stream, address.ip()).await;
-                            });
-                        }
-                    }
-                }
-            }
-        });
-        let mdns = discover
-            .then(|| discover_peers(network.clone()).ok())
-            .flatten();
-        Ok(Self {
-            network,
-            task,
-            mdns,
-        })
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        (Ipv4Addr::LOCALHOST, self.network.announcement.port).into()
-    }
-
-    pub fn offer_code(&self) -> String {
-        let code = format!("{:06}", rand::rng().random_range(0..1_000_000));
-        self.network.offer.send_replace(PairingOffer::Available(
-            LanCode(code.clone()),
-            Instant::now() + OFFER_TTL,
-        ));
-        code
-    }
-
-    pub(crate) fn offers(&self) -> watch::Receiver<PairingOffer> {
-        self.network.offer.subscribe()
-    }
-
-    pub async fn pair(&self, address: SocketAddr, code: &str) -> Result<()> {
-        time::timeout(TIMEOUT, async {
-            let socket = dial(address, "/pair").await?;
-            let (mut link, key) = Link::establish(
-                socket,
-                true,
-                &self.network.group,
-                &self.network.identity,
-                Trust::Pair(code),
-            )
-            .await?;
-            link.send(&serde_json::to_vec(&self.network.announcement)?)
-                .await?;
-            self.network.remember(
-                address.ip(),
-                key,
-                serde_json::from_slice(&link.recv().await?)?,
-            )
-        })
-        .await?
-    }
-
-    pub async fn connect(&self, address: SocketAddr) -> Result<(LanConnection, ServerMessage)> {
-        if address == self.address() {
-            return self
-                .host(None, None)
-                .await
-                .context("LAN connection unavailable");
+    /// Opens this device's sync session over its LAN links. A newer session
+    /// replaces an older one.
+    pub fn session(&self) -> (LanSession, ServerMessage) {
+        let (sender, inbox) = mpsc::channel(256);
+        if let Ok(mut session) = self.network.session.lock() {
+            *session = Some(sender.clone());
         }
-        let pin = self
+        let welcome = self
             .network
-            .pins
+            .mesh
             .lock()
-            .ok()
-            .and_then(|pins| {
-                pins.iter()
-                    .find_map(|(key, pin)| (pin.address == address).then_some(*key))
-            })
-            .or_else(|| {
-                let discovered = self.network.discovery.lock().ok()?;
-                self.network
-                    .automatic()
-                    .into_iter()
-                    .find_map(|(key, device)| {
-                        discovered
-                            .values()
-                            .flatten()
-                            .any(|peer| peer.id == device.id && peer.address == address)
-                            .then_some(key)
-                    })
+            .map(|mesh| mesh.welcome())
+            .unwrap_or(ServerMessage::Welcome {
+                devices: Vec::new(),
+                active_device_id: None,
+                state: None,
+                settings: serde_json::json!({}),
+                settings_version: 0,
             });
-        LanTransport {
-            node: self,
-            address,
-            pin,
-        }
-        .connect()
-        .await
-        .context("LAN connection unavailable")
-    }
-
-    pub(crate) async fn preferred(
-        &self,
-        authority: Option<&str>,
-        playback: Option<&ReconciledPlayback>,
-        settings: Option<&VersionedSettings>,
-    ) -> Option<(LanConnection, ServerMessage)> {
-        if self.paired_count() == 0 {
-            return None;
-        }
-        let own = &self.network.announcement.device.id;
-        if authority == Some(own) {
-            return self.host(playback, settings).await;
-        }
-        if let Some(preferred) = self.preferred_remote(authority).await {
-            return Some(preferred);
-        }
-        if authority.is_some() {
-            return None;
-        }
-        self.host(playback, settings).await
-    }
-
-    async fn host(
-        &self,
-        playback: Option<&ReconciledPlayback>,
-        settings: Option<&VersionedSettings>,
-    ) -> Option<(LanConnection, ServerMessage)> {
-        let network = &self.network;
-        let coordinator = LocalCoordinator::new().ok()?;
-        let (peer, mut welcome) = coordinator
-            .join(network.announcement.device.clone())
-            .await
-            .ok()?;
-        let playback =
-            playback.filter(|snapshot| snapshot.device_id == network.announcement.device.id);
-        if playback.is_some() || settings.is_some() {
-            peer.send(ClientMessage::Reconcile {
-                playback: playback.cloned(),
-                settings: settings.cloned(),
-            })
-            .await
-            .ok()?;
-            if let ServerMessage::Welcome {
-                state,
-                settings: shared,
-                settings_version,
-                ..
-            } = &mut welcome
-            {
-                *state = playback.map(|snapshot| snapshot.state.clone());
-                if let Some(settings) = settings {
-                    *shared = settings.settings.clone().into();
-                    *settings_version = settings.version;
-                }
-            }
-        }
-        network.hosting.send_replace(Some(coordinator));
-        Some((
-            LanConnection(Connection::Local(peer, network.hosting.clone())),
+        (
+            LanSession {
+                network: self.network.clone(),
+                sender,
+                inbox,
+            },
             welcome,
-        ))
+        )
     }
-
-    pub(crate) async fn preferred_remote(
-        &self,
-        authority: Option<&str>,
-    ) -> Option<(LanConnection, ServerMessage)> {
-        let options = {
-            let trusted = self.network.trusted();
-            let own = &self.network.announcement.device.id;
-            let discovered = self.network.discovery.lock().ok()?;
-            let mut options = Vec::new();
-            for (key, (device, fallback)) in trusted
-                .into_iter()
-                .filter(|(_, (device, _))| authority.map_or(&device.id < own, |id| device.id == id))
-            {
-                let addresses = discovered
-                    .values()
-                    .flatten()
-                    .filter(|peer| peer.id == device.id)
-                    .map(|peer| peer.address);
-                options.extend(
-                    addresses
-                        .chain(fallback)
-                        .map(|address| (device.id.clone(), key, address)),
-                );
-            }
-            options.sort_unstable();
-            options.dedup();
-            options
-        };
-        time::timeout(Duration::from_secs(2), async {
-            for (_, key, address) in options {
-                let transport = LanTransport {
-                    node: self,
-                    address,
-                    pin: Some(key),
-                };
-                if let Ok(Some(session)) =
-                    time::timeout(Duration::from_millis(650), transport.connect()).await
-                {
-                    return Some(session);
-                }
-            }
-            None
-        })
-        .await
-        .ok()?
-    }
-}
-
-pub fn user_hash(account: &crate::platform::Account) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    hash.update(account.url.as_bytes());
-    hash.update(account.username.as_bytes());
-    hash.finalize().into()
 }
 
 impl Drop for LanNode {
     fn drop(&mut self) {
-        self.task.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
+        if let Ok(links) = self.network.links.lock() {
+            for slot in links.values() {
+                slot.close.send_replace(true);
+            }
+        }
         if let Some((daemon, task)) = self.mdns.take() {
             task.abort();
             let _ = daemon.shutdown();
         }
     }
+}
+
+/// Domain separation for LAN handshakes: the devices of one Navidrome user,
+/// whichever server address each of them signed in with.
+pub fn user_hash(account: &crate::platform::Account) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"sonora-lan-user:");
+    hash.update(account.username.trim().to_lowercase().as_bytes());
+    hash.finalize().into()
+}
+
+/// This device's sync session over the LAN mesh.
+pub struct LanSession {
+    network: Arc<Network>,
+    sender: mpsc::Sender<ServerMessage>,
+    inbox: mpsc::Receiver<ServerMessage>,
+}
+
+impl LanSession {
+    pub fn send(&mut self, message: ClientMessage) {
+        let effects = self
+            .network
+            .mesh
+            .lock()
+            .map(|mut mesh| mesh.session_message(message, Instant::now()))
+            .unwrap_or_default();
+        self.network.apply(effects);
+    }
+
+    pub async fn receive(&mut self) -> Option<ServerMessage> {
+        loop {
+            let deadline = self
+                .network
+                .mesh
+                .lock()
+                .ok()
+                .and_then(|mesh| mesh.next_deadline());
+            let expiry = async {
+                match deadline {
+                    Some(deadline) => time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                message = self.inbox.recv() => return message,
+                () = expiry => {
+                    let effects = self
+                        .network
+                        .mesh
+                        .lock()
+                        .map(|mut mesh| mesh.expire(Instant::now()))
+                        .unwrap_or_default();
+                    self.network.apply(effects);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LanSession {
+    fn drop(&mut self) {
+        if let Ok(mut session) = self.network.session.lock()
+            && session
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&self.sender))
+        {
+            *session = None;
+        }
+    }
+}
+
+impl SyncLink for LanSession {
+    async fn send(&mut self, message: ClientMessage) -> Option<()> {
+        LanSession::send(self, message);
+        Some(())
+    }
+
+    async fn receive(&mut self) -> Option<Frame> {
+        LanSession::receive(self).await.map(Frame::Data)
+    }
+}
+
+impl Network {
+    fn revoked(&self, id: &str) -> bool {
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.revoked(id))
+    }
+
+    fn trusted(&self) -> HashMap<PublicKey, Trusted> {
+        let devices = match &self.registry {
+            Some(registry) => registry.devices(),
+            None => self
+                .fixed
+                .lock()
+                .map(|fixed| fixed.clone())
+                .unwrap_or_default(),
+        };
+        devices
+            .into_iter()
+            .filter(|trusted| trusted.device.id != self.own.id && !self.revoked(&trusted.device.id))
+            .map(|trusted| (trusted.key, trusted))
+            .collect()
+    }
+
+    fn has_key(&self, key: &PublicKey) -> bool {
+        self.trusted().contains_key(key)
+    }
+
+    /// Where a trusted device may be listening: what discovery found, then what it published.
+    fn addresses(&self, trusted: &Trusted) -> Vec<SocketAddr> {
+        let mut addresses: Vec<_> = self
+            .discovery
+            .lock()
+            .map(|found| {
+                found
+                    .values()
+                    .flatten()
+                    .filter(|peer| peer.id == trusted.device.id)
+                    .map(|peer| peer.address)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for address in &trusted.addresses {
+            if !addresses.contains(address) {
+                addresses.push(*address);
+            }
+        }
+        addresses
+    }
+
+    fn publish_addresses(&self) {
+        if let Some(registry) = &self.registry {
+            registry.set_addresses(local_addresses(self.port));
+        }
+    }
+
+    async fn refresh_registry(&self) {
+        self.publish_addresses();
+        if let Some(registry) = &self.registry
+            && registry.refresh().await.unwrap_or(false)
+        {
+            self.change.send_replace(());
+        }
+    }
+
+    fn apply(&self, effects: Vec<Effect>) {
+        if effects.is_empty() {
+            return;
+        }
+        let session = self.session.lock().ok().and_then(|session| session.clone());
+        let Ok(links) = self.links.lock() else {
+            return;
+        };
+        for effect in effects {
+            match effect {
+                Effect::Session(message) => {
+                    if let Some(session) = &session {
+                        let _ = session.try_send(message);
+                    }
+                }
+                Effect::Peer(id, message) => {
+                    if let Some(slot) = links.get(&id)
+                        && slot.out.try_send(message).is_err()
+                    {
+                        slot.close.send_replace(true);
+                    }
+                }
+                Effect::Broadcast(message) => {
+                    for slot in links.values() {
+                        if slot.out.try_send(message.clone()).is_err() {
+                            slot.close.send_replace(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs one authenticated link until it closes, then forgets it.
+    async fn run_link(
+        self: Arc<Self>,
+        mut link: Link,
+        key: PublicKey,
+        dialer: String,
+        address: impl FnOnce(u16) -> SocketAddr,
+    ) -> Result<()> {
+        let hello = self
+            .mesh
+            .lock()
+            .map_err(|_| anyhow::anyhow!("LAN sync unavailable"))?
+            .hello(self.port);
+        time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&hello)?)).await??;
+        let hello: PeerMessage =
+            serde_json::from_slice(&time::timeout(TIMEOUT, link.recv()).await??)?;
+        let PeerMessage::Hello { device, port, .. } = &hello else {
+            anyhow::bail!("Expected a LAN hello");
+        };
+        let trusted = self
+            .trusted()
+            .remove(&key)
+            .context("Untrusted LAN device")?;
+        anyhow::ensure!(
+            device.id == trusted.device.id && *port != 0,
+            "LAN device mismatch"
+        );
+        let id = trusted.device.id.clone();
+        let address = address(*port);
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+        let (out, mut outgoing) = mpsc::channel(256);
+        let (close, mut closed) = watch::channel(false);
+        {
+            let mut links = self
+                .links
+                .lock()
+                .map_err(|_| anyhow::anyhow!("LAN sync unavailable"))?;
+            // Both devices may dial at once; both keep the link the lower ID dialed.
+            let preferred = std::cmp::min(&self.own.id, &id).clone();
+            if let Some(existing) = links.get(&id) {
+                if existing.dialer == preferred || dialer != preferred {
+                    return Ok(());
+                }
+                existing.close.send_replace(true);
+            }
+            links.insert(
+                id.clone(),
+                Slot {
+                    serial,
+                    dialer,
+                    address,
+                    out,
+                    close,
+                },
+            );
+        }
+        let effects = self
+            .mesh
+            .lock()
+            .map(|mut mesh| mesh.linked(trusted.device.clone(), hello))
+            .unwrap_or_default();
+        self.apply(effects);
+        self.change.send_replace(());
+
+        let mut trust = self.change.subscribe();
+        let mut heartbeat = time::interval(HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let result = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = async { let _ = closed.wait_for(|closed| *closed).await; } => return Ok(()),
+                    changed = trust.changed() => {
+                        if changed.is_err() || !self.has_key(&key) {
+                            return Ok(());
+                        }
+                    }
+                    message = outgoing.recv() => {
+                        let Some(message) = message else { return Ok(()) };
+                        time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&message)?)).await??;
+                    }
+                    _ = heartbeat.tick() => {
+                        let ping = serde_json::to_vec(&PeerMessage::Ping)?;
+                        time::timeout(TIMEOUT, link.send(&ping)).await??;
+                    }
+                    data = time::timeout(SILENCE_LIMIT, link.recv()) => {
+                        let message: PeerMessage = serde_json::from_slice(&data??)?;
+                        let effects = self
+                            .mesh
+                            .lock()
+                            .map(|mut mesh| mesh.peer_message(&id, message))
+                            .unwrap_or_default();
+                        self.apply(effects);
+                    }
+                }
+            }
+        }
+        .await;
+
+        let current = self.links.lock().is_ok_and(|mut links| {
+            let current = links.get(&id).is_some_and(|slot| slot.serial == serial);
+            if current {
+                links.remove(&id);
+            }
+            current
+        });
+        if current {
+            let effects = self
+                .mesh
+                .lock()
+                .map(|mut mesh| mesh.unlinked(&id))
+                .unwrap_or_default();
+            self.apply(effects);
+            self.change.send_replace(());
+        }
+        result
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn accept(self: Arc<Self>, stream: TcpStream) -> Result<()> {
+        let ip = stream.peer_addr()?.ip();
+        let (link, key) = time::timeout(TIMEOUT, async {
+            let socket = accept_hdr_async_with_config(
+                stream,
+                |req: &Request, resp: Response| match req.uri().path() {
+                    "/ws" => Ok(resp),
+                    _ => {
+                        let mut rejected =
+                            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+                                None,
+                            );
+                        *rejected.status_mut() = StatusCode::NOT_FOUND;
+                        Err(rejected)
+                    }
+                },
+                Some(socket_config()),
+            )
+            .await?;
+            let network = self.clone();
+            Ok::<_, anyhow::Error>(
+                Link::establish_with(
+                    socket,
+                    false,
+                    &self.group,
+                    &self.identity,
+                    |key| async move {
+                        if !network.has_key(&key) {
+                            network.refresh_registry().await;
+                        }
+                        network.has_key(&key)
+                    },
+                )
+                .await?,
+            )
+        })
+        .await??;
+        let dialer = self
+            .trusted()
+            .remove(&key)
+            .context("Untrusted LAN device")?
+            .device
+            .id;
+        self.run_link(link, key, dialer, |port| (ip, port).into())
+            .await
+    }
+
+    /// Tries every known address of `trusted` at once and keeps the first link.
+    async fn dial(self: Arc<Self>, trusted: Trusted) {
+        let mut attempts: FuturesUnordered<_> = self
+            .addresses(&trusted)
+            .into_iter()
+            .map(|address| {
+                let network = self.clone();
+                async move {
+                    time::timeout(DIAL_TIMEOUT, async {
+                        let socket = dial(address, "/ws").await.ok()?;
+                        let (link, key) = Link::establish(
+                            socket,
+                            true,
+                            &network.group,
+                            &network.identity,
+                            Trust::Paired(&[trusted.key]),
+                        )
+                        .await
+                        .ok()?;
+                        Some((link, key, address))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+            })
+            .collect();
+        let mut connected = None;
+        while let Some(attempt) = attempts.next().await {
+            if attempt.is_some() {
+                connected = attempt;
+                break;
+            }
+        }
+        drop(attempts);
+        if let Ok(mut dialing) = self.dialing.lock() {
+            dialing.remove(&trusted.device.id);
+        }
+        if let Some((link, key, address)) = connected {
+            let own = self.own.id.clone();
+            let _ = self.run_link(link, key, own, |_| address).await;
+        }
+    }
+}
+
+async fn accept_links(network: Arc<Network>, listener: TcpListener) {
+    let limit = Arc::new(Semaphore::new(24));
+    let mut sessions = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
+            Ok((stream, _)) = listener.accept() => {
+                if let Ok(permit) = limit.clone().try_acquire_owned() {
+                    let network = network.clone();
+                    sessions.spawn(async move {
+                        let _permit = permit;
+                        let _ = network.accept(stream).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Keeps dialing trusted devices that have no live link.
+async fn dial_links(network: Arc<Network>) {
+    let mut changes = network.change.subscribe();
+    let mut retry = time::interval(REDIAL);
+    retry.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut dials = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = dials.join_next(), if !dials.is_empty() => continue,
+            _ = retry.tick() => {}
+            changed = changes.changed() => if changed.is_err() { return },
+        }
+        let linked: HashSet<String> = network
+            .links
+            .lock()
+            .map(|links| links.keys().cloned().collect())
+            .unwrap_or_default();
+        for trusted in network.trusted().into_values() {
+            let id = trusted.device.id.clone();
+            if linked.contains(&id) || network.addresses(&trusted).is_empty() {
+                continue;
+            }
+            let fresh = network
+                .dialing
+                .lock()
+                .is_ok_and(|mut dialing| dialing.insert(id));
+            if fresh {
+                dials.spawn(network.clone().dial(trusted));
+            }
+        }
+    }
+}
+
+/// The IPv4 endpoints other devices on the network may use to reach this listener.
+fn local_addresses(port: u16) -> Vec<SocketAddr> {
+    const VIRTUAL: [&str; 7] = [
+        "docker", "br-", "veth", "virbr", "bridge", "vmnet", "vboxnet",
+    ];
+    let mut addresses: Vec<SocketAddr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| {
+            !VIRTUAL
+                .iter()
+                .any(|prefix| interface.name.starts_with(prefix))
+        })
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(ip) if ip.is_private() || is_shared(ip) => Some((ip, port).into()),
+            _ => None,
+        })
+        .collect();
+    // Test scenarios run every device on one machine without a private network.
+    if cfg!(feature = "test-support") {
+        addresses.insert(0, (Ipv4Addr::LOCALHOST, port).into());
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(MAX_ADDRESSES);
+    addresses
+}
+
+/// Carrier-grade NAT space, which Tailscale uses for device addresses.
+fn is_shared(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..128).contains(&b)
 }
 
 fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()>)> {
@@ -538,7 +797,7 @@ fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let device = &network.announcement.device;
+    let device = &network.own;
     let properties = [
         ("device_id", device.id.as_str()),
         ("device_name", device.name.as_str()),
@@ -551,7 +810,7 @@ fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()
         &device.id,
         &format!("sonora-{}.local.", device.id),
         "",
-        network.announcement.port,
+        network.port,
         &properties[..],
     )?
     .enable_addr_auto();
@@ -568,391 +827,53 @@ fn discover_peers(network: Arc<Network>) -> Result<(ServiceDaemon, JoinHandle<()
     };
     let task = tokio::spawn(async move {
         while let Ok(event) = events.recv_async().await {
-            let Ok(mut addresses) = network.discovery.lock() else {
-                break;
-            };
-            match event {
-                ServiceEvent::ServiceResolved(service)
-                    if service.get_property_val_str("user_hash") == Some(hash.as_str())
-                        && service.get_property_val_str("proto_version")
-                            == Some(PROTOCOL_VERSION) =>
-                {
-                    let Some(id) = service
-                        .get_property_val_str("device_id")
-                        .filter(|id| *id != network.announcement.device.id && id.len() <= 128)
-                    else {
-                        continue;
-                    };
-                    if addresses.len() >= 64 && !addresses.contains_key(service.get_fullname()) {
-                        continue;
+            let changed = {
+                let Ok(mut addresses) = network.discovery.lock() else {
+                    break;
+                };
+                match event {
+                    ServiceEvent::ServiceResolved(service)
+                        if service.get_property_val_str("user_hash") == Some(hash.as_str())
+                            && service.get_property_val_str("proto_version")
+                                == Some(PROTOCOL_VERSION) =>
+                    {
+                        let Some(id) = service
+                            .get_property_val_str("device_id")
+                            .filter(|id| *id != network.own.id && id.len() <= 128)
+                        else {
+                            continue;
+                        };
+                        if addresses.len() >= 64 && !addresses.contains_key(service.get_fullname())
+                        {
+                            continue;
+                        }
+                        let endpoints = service
+                            .get_addresses_v4()
+                            .into_iter()
+                            .map(|ip| LanPeer {
+                                id: id.to_owned(),
+                                address: (ip, service.get_port()).into(),
+                            })
+                            .collect();
+                        addresses.insert(service.get_fullname().to_owned(), endpoints);
+                        true
                     }
-                    let name = service.get_property_val_str("device_name").unwrap_or(id);
-                    let endpoints = service
-                        .get_addresses_v4()
-                        .into_iter()
-                        .map(|ip| LanPeer {
-                            id: id.to_owned(),
-                            name: name.to_owned(),
-                            address: (ip, service.get_port()).into(),
-                        })
-                        .collect();
-                    addresses.insert(service.get_fullname().to_owned(), endpoints);
-                    network.change.send_replace(());
+                    ServiceEvent::ServiceRemoved(_, name) => addresses.remove(&name).is_some(),
+                    _ => false,
                 }
-                ServiceEvent::ServiceRemoved(_, name) if addresses.remove(&name).is_some() => {
-                    network.change.send_replace(());
-                }
-                _ => {}
+            };
+            if changed {
+                network.change.send_replace(());
             }
         }
     });
     Ok((daemon, task))
 }
 
-impl Network {
-    fn automatic(&self) -> Vec<(PublicKey, Device)> {
-        self.registry
-            .as_ref()
-            .map_or_else(Vec::new, LanRegistry::devices)
-    }
-
-    fn revoked(&self, id: &str) -> bool {
-        self.registry
-            .as_ref()
-            .is_some_and(|registry| registry.revoked(id))
-    }
-
-    fn trusted(&self) -> HashMap<PublicKey, (Device, Option<SocketAddr>)> {
-        let automatic = self.automatic();
-        let mut trusted: HashMap<_, _> = self
-            .pins
-            .lock()
-            .map(|pins| {
-                pins.iter()
-                    .filter(|(key, pin)| {
-                        !self.revoked(&pin.device.id)
-                            && automatic
-                                .iter()
-                                .all(|(known, device)| device.id != pin.device.id || known == *key)
-                    })
-                    .map(|(key, pin)| (*key, (pin.device.clone(), Some(pin.address))))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (key, device) in automatic {
-            let address = trusted.get(&key).and_then(|(_, address)| *address);
-            trusted.insert(key, (device, address));
-        }
-        trusted
-    }
-
-    async fn refresh_registry(&self) {
-        if let Some(registry) = &self.registry
-            && registry.refresh().await.unwrap_or(false)
-        {
-            self.change.send_replace(());
-        }
-    }
-
-    fn take_offer(&self) -> Option<LanCode> {
-        let mut available = None;
-        self.offer.send_if_modified(|offer| {
-            let PairingOffer::Available(code, expires) = offer else {
-                return false;
-            };
-            if Instant::now() < *expires {
-                available = Some(code.clone());
-            }
-            *offer = PairingOffer::UsedOrExpired;
-            true
-        });
-        available
-    }
-
-    fn remember(&self, ip: IpAddr, key: PublicKey, peer: Announcement) -> Result<()> {
-        let device = peer.device;
-        ensure!(
-            peer.port != 0
-                && !device.id.is_empty()
-                && device.id.len() <= 128
-                && !device.name.is_empty()
-                && device.name.len() <= 128
-                && device.os.len() <= 64,
-            "Invalid LAN device"
-        );
-        ensure!(
-            device.id != self.announcement.device.id && !self.revoked(&device.id),
-            "Cannot pair with this LAN device"
-        );
-        ensure!(
-            !self
-                .automatic()
-                .iter()
-                .any(|(known, auto)| auto.id == device.id && known != &key),
-            "LAN device identifier already has a trusted key"
-        );
-        let mut pins = self
-            .pins
-            .lock()
-            .map_err(|_| anyhow::anyhow!("LAN pairing unavailable"))?;
-        ensure!(
-            !pins
-                .iter()
-                .any(|(known, pin)| known != &key && pin.device.id == device.id),
-            "LAN device identifier is already paired"
-        );
-        let mut updated = pins.clone();
-        updated.insert(
-            key,
-            Pin {
-                device,
-                address: (ip, peer.port).into(),
-            },
-        );
-        self.save_pins(&updated)?;
-        *pins = updated;
-        self.change.send_replace(());
-        Ok(())
-    }
-
-    fn save_pins(&self, pins: &HashMap<PublicKey, Pin>) -> Result<()> {
-        ensure!(pins.len() <= 32, "Too many paired LAN devices");
-        if let Some(path) = &self.pins_path {
-            let data = serde_json::to_vec(&pins.iter().collect::<Vec<_>>())?;
-            crate::platform::atomic_write(path, &data)?;
-        }
-        Ok(())
-    }
-
-    async fn accept(&self, stream: TcpStream, ip: IpAddr) -> Result<()> {
-        let mut hosting = self.hosting.subscribe();
-        let Some((mut link, mut peer, welcome, key)) =
-            time::timeout(TIMEOUT, self.accept_link(stream, ip)).await??
-        else {
-            return Ok(());
-        };
-        let mut changed = self.change.subscribe();
-        let Some((device, _)) = self.trusted().remove(&key) else {
-            return Ok(());
-        };
-        if hosting.borrow_and_update().is_none() {
-            return Ok(());
-        }
-        time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&welcome)?)).await??;
-        let idle = Duration::from_secs(45);
-        loop {
-            tokio::select! {
-                biased;
-                update = changed.changed() => {
-                    if update.is_err() || !self.has_key(&key) { return Ok(()); }
-                }
-                message = peer.receive() => {
-                    let Some(message) = message else { return Ok(()) };
-                    time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&message)?)).await??;
-                }
-                _ = hosting.changed() => return Ok(()),
-                data = time::timeout(idle, link.recv()) => {
-                    let mut message = serde_json::from_slice(&data??)?;
-                    let own = &self.announcement.device.id;
-                    match &mut message {
-                        ClientMessage::Command { target_device_id, .. } if target_device_id != own => continue,
-                        // A peer may reconcile its own playback or the host's, never a third device's.
-                        ClientMessage::Reconcile { playback, .. }
-                            if playback.as_ref().is_some_and(|snapshot| {
-                                snapshot.device_id != *own && snapshot.device_id != device.id
-                            }) => {
-                            *playback = None;
-                        }
-                        _ => {}
-                    }
-                    peer.send(message).await?;
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::result_large_err)]
-    async fn accept_link(
-        &self,
-        stream: TcpStream,
-        ip: IpAddr,
-    ) -> Result<Option<(Link, LocalPeer, ServerMessage, PublicKey)>> {
-        let mut pairing = false;
-        let socket = accept_hdr_async_with_config(
-            stream,
-            |req: &Request, resp: Response| match req.uri().path() {
-                "/pair" => {
-                    pairing = true;
-                    Ok(resp)
-                }
-                "/ws" => Ok(resp),
-                _ => {
-                    let mut rejected =
-                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(None);
-                    *rejected.status_mut() = StatusCode::NOT_FOUND;
-                    Err(rejected)
-                }
-            },
-            Some(socket_config()),
-        )
-        .await?;
-        if pairing {
-            let code = self.take_offer().context("No active pairing code")?;
-            let (mut link, key) = Link::establish(
-                socket,
-                false,
-                &self.group,
-                &self.identity,
-                Trust::Pair(&code.0),
-            )
-            .await?;
-            self.remember(ip, key, serde_json::from_slice(&link.recv().await?)?)?;
-            link.send(&serde_json::to_vec(&self.announcement)?).await?;
-            return Ok(None);
-        }
-        let (link, key) = Link::establish_with(
-            socket,
-            false,
-            &self.group,
-            &self.identity,
-            None,
-            |key| async move {
-                if !self.has_key(&key) {
-                    self.refresh_registry().await;
-                }
-                self.has_key(&key)
-            },
-        )
-        .await?;
-        let coordinator = self
-            .hosting
-            .borrow()
-            .clone()
-            .context("LAN coordinator is not active")?;
-        let (device, _) = self.trusted().remove(&key).context("Unpaired LAN device")?;
-        let (peer, welcome) = coordinator.join(device).await?;
-        Ok(Some((link, peer, welcome, key)))
-    }
-
-    fn has_key(&self, key: &PublicKey) -> bool {
-        self.trusted().contains_key(key)
-    }
-}
-
-struct LanTransport<'a> {
-    node: &'a LanNode,
-    address: SocketAddr,
-    pin: Option<PublicKey>,
-}
-
-impl SyncTransport for LanTransport<'_> {
-    type Link = LanConnection;
-
-    async fn connect(&self) -> Option<(Self::Link, ServerMessage)> {
-        let network = &self.node.network;
-        let pin = self.pin?;
-        if !network.has_key(&pin) {
-            return None;
-        }
-        time::timeout(TIMEOUT, async {
-            let socket = dial(self.address, "/ws").await.ok()?;
-            let (mut link, _) = Link::establish(
-                socket,
-                true,
-                &network.group,
-                &network.identity,
-                Trust::Paired(&[pin]),
-            )
-            .await
-            .ok()?;
-            let welcome = serde_json::from_slice(&link.recv().await.ok()?).ok()?;
-            matches!(welcome, ServerMessage::Welcome { .. }).then_some((
-                LanConnection(Connection::Remote(Box::new(Remote {
-                    link,
-                    key: pin,
-                    network: network.clone(),
-                    changes: network.change.subscribe(),
-                }))),
-                welcome,
-            ))
-        })
-        .await
-        .ok()?
-    }
-}
-
-pub struct LanConnection(Connection);
-
-enum Connection {
-    Local(LocalPeer, watch::Sender<Option<LocalCoordinator>>),
-    Remote(Box<Remote>),
-}
-
-struct Remote {
-    link: Link,
-    key: PublicKey,
-    network: Arc<Network>,
-    changes: watch::Receiver<()>,
-}
-
-impl LanConnection {
-    pub(crate) fn is_local(&self) -> bool {
-        matches!(self.0, Connection::Local(..))
-    }
-
-    pub async fn send(&mut self, message: ClientMessage) -> Result<()> {
-        match &mut self.0 {
-            Connection::Local(peer, _) => peer.send(message).await?,
-            Connection::Remote(remote) => {
-                ensure!(
-                    remote.network.has_key(&remote.key),
-                    "LAN device was revoked"
-                );
-                time::timeout(TIMEOUT, remote.link.send(&serde_json::to_vec(&message)?)).await??
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn receive(&mut self) -> Result<ServerMessage> {
-        match &mut self.0 {
-            Connection::Local(peer, _) => peer.receive().await.context("LAN connection closed"),
-            Connection::Remote(remote) => loop {
-                ensure!(
-                    remote.network.has_key(&remote.key),
-                    "LAN device was revoked"
-                );
-                tokio::select! {
-                    update = remote.changes.changed() => update?,
-                    message = remote.link.recv() => return Ok(serde_json::from_slice(&message?)?),
-                }
-            },
-        }
-    }
-}
-
-impl Drop for LanConnection {
-    fn drop(&mut self) {
-        if let Connection::Local(_, hosting) = &self.0 {
-            hosting.send_replace(None);
-        }
-    }
-}
-
-impl SyncLink for LanConnection {
-    async fn send(&mut self, message: ClientMessage) -> Option<()> {
-        self.send(message).await.ok()
-    }
-
-    async fn receive(&mut self) -> Option<Frame> {
-        self.receive().await.ok().map(Frame::Data)
-    }
-}
-
 fn socket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .read_buffer_size(16 * 1024)
-        .max_message_size(Some(65_535))
+        .max_message_size(Some(512 * 1024))
         .max_frame_size(Some(65_535))
 }
 
@@ -965,31 +886,4 @@ async fn dial(address: SocketAddr, path: &str) -> Result<Socket> {
     )
     .await?;
     Ok(socket)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn unused_offer_expires_and_notifies_subscribers() {
-        let (offer, mut updates) = watch::channel(PairingOffer::Available(
-            LanCode("123456".into()),
-            Instant::now() + Duration::from_millis(10),
-        ));
-        time::timeout(Duration::from_secs(2), async {
-            tokio::select! {
-                _ = expire_offers(&offer) => panic!("offer expiry watcher stopped"),
-                result = updates.wait_for(|offer| matches!(offer, PairingOffer::UsedOrExpired)) => {
-                    assert!(result.is_ok());
-                }
-            }
-        })
-        .await
-        .expect("unused code should expire");
-        assert!(matches!(
-            updates.borrow().state(),
-            LanOfferState::UsedOrExpired
-        ));
-    }
 }

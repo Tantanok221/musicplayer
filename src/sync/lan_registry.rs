@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sonora_sync_protocol::Device;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
     path::PathBuf,
     sync::Mutex,
     time::Duration,
@@ -18,6 +19,7 @@ const MARKER: &str =
     "Sonora's device list. This private playlist stores Sonora device-sync keys. Do not edit.";
 const PREFIX: &str = "Sonora devices v1:";
 const MAX_DEVICES: usize = 32;
+pub(crate) const MAX_ADDRESSES: usize = 8;
 const MAX_REVOKED: usize = 128;
 const MAX_BYTES: usize = 16 * 1024;
 const MIN_REFRESH_DELAY: Duration = Duration::from_secs(2);
@@ -32,6 +34,17 @@ struct Entry {
     name: String,
     os: String,
     key: String,
+    /// LAN endpoints the device listens on. Older versions omit this and ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<SocketAddr>,
+}
+
+/// A device trusted through the Navidrome device list, with the endpoints it published.
+#[derive(Clone, Debug)]
+pub struct Trusted {
+    pub key: PublicKey,
+    pub device: Device,
+    pub addresses: Vec<SocketAddr>,
 }
 
 impl Entry {
@@ -66,6 +79,11 @@ impl Roster {
                         && !entry.name.is_empty()
                         && entry.name.len() <= 128
                         && entry.os.len() <= 64
+                        && entry.addresses.len() <= MAX_ADDRESSES
+                        && entry
+                            .addresses
+                            .iter()
+                            .all(|address| address.port() != 0 && !address.ip().is_unspecified())
                         && entry.key().is_some_and(|key| keys.insert(key))
                 }),
             "Invalid Sonora device list"
@@ -122,7 +140,7 @@ impl Roster {
 pub(crate) struct LanRegistry {
     server: Server,
     local_id: String,
-    local_entry: Entry,
+    local_entry: Mutex<Entry>,
     path: PathBuf,
     roster: Mutex<Roster>,
     last_refresh: AsyncMutex<Option<Instant>>,
@@ -143,19 +161,30 @@ impl LanRegistry {
         Ok(Self {
             server,
             local_id: device.id.clone(),
-            local_entry: Entry {
+            local_entry: Mutex::new(Entry {
                 name: device.name.clone(),
                 os: device.os.clone(),
                 key: URL_SAFE_NO_PAD
                     .encode(SigningKey::from_bytes(identity).verifying_key().as_bytes()),
-            },
+                addresses: Vec::new(),
+            }),
             path,
             roster: Mutex::new(roster),
             last_refresh: AsyncMutex::new(None),
         })
     }
 
-    pub fn devices(&self) -> Vec<(PublicKey, Device)> {
+    /// Replaces the LAN endpoints this device publishes on the next refresh.
+    pub fn set_addresses(&self, mut addresses: Vec<SocketAddr>) {
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses.truncate(MAX_ADDRESSES);
+        if let Ok(mut entry) = self.local_entry.lock() {
+            entry.addresses = addresses;
+        }
+    }
+
+    pub fn devices(&self) -> Vec<Trusted> {
         let Ok(roster) = self.roster.lock() else {
             return Vec::new();
         };
@@ -166,16 +195,17 @@ impl LanRegistry {
                 if id == &self.local_id || roster.revoked.contains(id) {
                     return None;
                 }
-                Some((
-                    entry.key()?,
-                    Device {
+                Some(Trusted {
+                    key: entry.key()?,
+                    device: Device {
                         id: id.clone(),
                         name: entry.name.clone(),
                         os: entry.os.clone(),
                         online: false,
                         last_seen: 0,
                     },
-                ))
+                    addresses: entry.addresses.clone(),
+                })
             })
             .collect()
     }
@@ -251,9 +281,12 @@ impl LanRegistry {
                     .devices
                     .retain(|id, _| !desired.revoked.contains(id));
                 if !desired.revoked.contains(&self.local_id) {
-                    desired
-                        .devices
-                        .insert(self.local_id.clone(), self.local_entry.clone());
+                    let local = self
+                        .local_entry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("LAN trust unavailable"))?
+                        .clone();
+                    desired.devices.insert(self.local_id.clone(), local);
                 }
                 desired
             };

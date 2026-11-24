@@ -377,10 +377,9 @@ pub struct MusicApp {
     server_url: Entity<InputState>,
     sync_server_url: Entity<InputState>,
     lan_port: Entity<InputState>,
-    lan_address: Entity<InputState>,
-    lan_code: Entity<InputState>,
     lan_status: crate::sync::lan::LanStatus,
-    lan_offer: crate::sync::lan::LanOfferState,
+    /// The active remote device's queue, shown in place of the local one.
+    remote_queue: Option<PlaybackSnapshot>,
     username: Entity<InputState>,
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
@@ -556,8 +555,6 @@ impl MusicApp {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search music"));
         let sync_server_url = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
         let lan_port = cx.new(|cx| InputState::new(window, cx).placeholder("Automatic"));
-        let lan_address = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20:8088"));
-        let lan_code = cx.new(|cx| InputState::new(window, cx).placeholder("Six-digit code"));
         let server_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
@@ -702,10 +699,8 @@ impl MusicApp {
             server_url,
             sync_server_url,
             lan_port,
-            lan_address,
-            lan_code,
             lan_status: Default::default(),
-            lan_offer: Default::default(),
+            remote_queue: None,
             username,
             password,
             playlist_name,

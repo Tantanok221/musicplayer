@@ -8,7 +8,6 @@ use sonora::{
     model::{PlaybackSnapshot, Preferences, SavedQueue},
     playback::PlayerCommand,
     service::{Command, Event, SettingsCredentials},
-    sync::lan::LanOfferState,
 };
 use sonora_sync_protocol::{ClientMessage, Device, PlaybackCommand, PlaybackState, ServerMessage};
 use tokio::net::TcpListener;
@@ -65,7 +64,7 @@ async fn account_lan_trust_accepts_known_keys_offline_and_revokes_them() {
                 .events()
                 .recv_deadline(deadline)
                 .unwrap_or_else(|_| panic!("automatic trust did not converge for {id}"))
-                && status.automatic.iter().any(|peer| peer.id == id)
+                && status.devices.iter().any(|device| device.id == id)
             {
                 break status.port;
             }
@@ -91,10 +90,8 @@ async fn account_lan_trust_accepts_known_keys_offline_and_revokes_them() {
             loop {
                 if let Ok((mut link, _)) = dial(port, [2; 32]).await
                     && let Ok(body) = link.recv().await
-                    && matches!(
-                        serde_json::from_slice(&body),
-                        Ok(ServerMessage::Welcome { .. })
-                    )
+                    && serde_json::from_slice::<serde_json::Value>(&body)
+                        .is_ok_and(|hello| hello["type"] == "Hello")
                 {
                     break;
                 }
@@ -156,7 +153,7 @@ async fn account_lan_trust_accepts_known_keys_offline_and_revokes_them() {
     left.service().send(Command::LanRevoke(second.into()));
     event(
         &left,
-        |event| matches!(event, Event::LanStatus(status) if status.automatic.is_empty()),
+        |event| matches!(event, Event::LanStatus(status) if status.devices.is_empty()),
     );
     left.shutdown(WAIT).unwrap();
 
@@ -165,532 +162,6 @@ async fn account_lan_trust_accepts_known_keys_offline_and_revokes_them() {
     await_roster(true).await;
     left.shutdown(WAIT).unwrap();
     fixture.finish();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn worker_falls_back_to_paired_lan_and_returns_to_relay() {
-    use sonora::sync::lan::LanNode;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let fixture = Fixture::new(Library::default());
-    let speaker = "ffffffffffffffffffffffffffffffff";
-    std::fs::write(
-        fixture.paths.data.join("sync-device-id"),
-        "00000000000000000000000000000001",
-    )
-    .unwrap();
-    let allow_relay = Arc::new(AtomicBool::new(true));
-    let (disconnect, closed) = flume::bounded::<()>(1);
-    let (sent, reconciled) = flume::unbounded();
-    let relay_available = allow_relay.clone();
-    let relay = Router::new().route(
-        "/ws",
-        get(move |ws: WebSocketUpgrade| {
-            let available = relay_available.load(Ordering::SeqCst);
-            let closed = closed.clone();
-            let sent = sent.clone();
-            async move {
-                ws.on_upgrade(move |mut socket| async move {
-                    if !available {
-                        return;
-                    }
-                    if !matches!(socket.recv().await, Some(Ok(Message::Text(_)))) {
-                        return;
-                    }
-                    let msg = ServerMessage::Welcome {
-                        devices: vec![],
-                        active_device_id: Some(speaker.into()),
-                        state: None,
-                        settings: serde_json::json!({}),
-                        settings_version: 0,
-                    };
-                    socket
-                        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-                        .await
-                        .unwrap();
-                    loop {
-                        tokio::select! {
-                            _ = closed.recv_async() => {
-                                let _ = socket.send(Message::Close(None)).await;
-                                break;
-                            }
-                            incoming = socket.recv() => {
-                                let Some(Ok(Message::Text(text))) = incoming else { break };
-                                if let Ok(ClientMessage::Reconcile { playback, settings }) = serde_json::from_str(&text) {
-                                    sent.send((playback, settings)).unwrap();
-                                }
-                            }
-                        }
-                    }
-                })
-            }
-        }),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    fixture
-        .catalog()
-        .set_state(
-            "preferences",
-            &Preferences {
-                sync_server_url: format!("ws://{}", listener.local_addr().unwrap()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let task = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
-    let mut worker = fixture.start();
-    let (account, _) = worker.wait_ready(WAIT).unwrap();
-    let device = Device {
-        id: speaker.into(),
-        name: "LAN speaker".into(),
-        os: "linux".into(),
-        online: true,
-        last_seen: 0,
-    };
-    let node = LanNode::listen(
-        device,
-        [7; 32],
-        sonora::sync::lan::user_hash(&account.unwrap()),
-        0,
-    )
-    .await
-    .unwrap();
-    let (mut local, _) = node.connect(node.address()).await.unwrap();
-    local
-        .send(ClientMessage::StateUpdate {
-            state: PlaybackState {
-                seq: 25,
-                queue: vec!["lan-track".into()],
-                index: Some(0),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
-    local
-        .send(ClientMessage::SettingsPut {
-            settings: serde_json::json!({"dark": true}),
-            base_version: 0,
-        })
-        .await
-        .unwrap();
-    event(
-        &worker,
-        |event| matches!(event, Event::DeviceSync(status) if status.remote_id() == Some(speaker)),
-    );
-    worker
-        .service()
-        .send(Command::LanPair(node.address(), node.offer_code()));
-    // Let the paired node report the pin before simulating an outage.
-    tokio::time::timeout(WAIT, async {
-        loop {
-            if node.paired_count() == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("worker paired to the LAN peer");
-    allow_relay.store(false, Ordering::SeqCst);
-    disconnect.send(()).unwrap();
-    event(
-        &worker,
-        |event| matches!(event, Event::DeviceSync(status) if status.remote_id() == Some(speaker) && status.playback.as_ref().is_some_and(|state| state.seq == 25)),
-    );
-    worker
-        .service()
-        .send(Command::RemotePlayback(PlaybackCommand::Next));
-    tokio::time::timeout(WAIT, async {
-        loop {
-            if matches!(
-                local.receive().await.unwrap(),
-                ServerMessage::Command {
-                    cmd: PlaybackCommand::Next,
-                    ..
-                }
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("the LAN command reaches the last active, higher-ID device");
-    allow_relay.store(true, Ordering::SeqCst);
-    event(
-        &worker,
-        |event| matches!(event, Event::DeviceSync(status) if status.remote_id() == Some(speaker) && status.playback.is_none()),
-    );
-    let mut playback_seen = false;
-    let mut settings_seen = false;
-    while !playback_seen || !settings_seen {
-        let (playback, settings) = reconciled.recv_timeout(WAIT).unwrap();
-        playback_seen |= playback
-            .is_some_and(|snapshot| snapshot.device_id == speaker && snapshot.state.seq == 25);
-        settings_seen |= settings.is_some_and(|snapshot| {
-            snapshot.version == 1 && snapshot.settings.get("dark") == Some(&serde_json::json!(true))
-        });
-    }
-    worker.shutdown(WAIT).unwrap();
-    task.abort();
-    fixture.finish();
-}
-
-#[tokio::test]
-async fn paired_lan_nodes_transfer_over_manual_loopback_addresses() {
-    use sonora::sync::lan::LanNode;
-
-    let device = |id: &str| Device {
-        id: id.into(),
-        name: id.into(),
-        os: "linux".into(),
-        online: true,
-        last_seen: 0,
-    };
-    let a = LanNode::listen(device("a"), [1; 32], [3; 32], 0)
-        .await
-        .unwrap();
-    let b = LanNode::listen(device("b"), [2; 32], [3; 32], 0)
-        .await
-        .unwrap();
-    assert!(b.connect(a.address()).await.is_err());
-    b.pair(a.address(), &a.offer_code()).await.unwrap();
-    let (mut source, _) = a.connect(a.address()).await.unwrap();
-    let (mut target, _) = b.connect(a.address()).await.unwrap();
-    let state = PlaybackState {
-        queue: vec!["track".into()],
-        index: Some(0),
-        playing: true,
-        position_ms: 313,
-        seq: 1,
-        ..Default::default()
-    };
-    source
-        .send(ClientMessage::StateUpdate {
-            state: state.clone(),
-        })
-        .await
-        .unwrap();
-    loop {
-        let incoming = tokio::time::timeout(WAIT, target.receive())
-            .await
-            .unwrap()
-            .unwrap();
-        if matches!(incoming, ServerMessage::State {state: received, ..} if received.seq == 1) {
-            break;
-        }
-    }
-    source
-        .send(ClientMessage::Transfer {
-            target_device_id: "b".into(),
-            start_playing: true,
-        })
-        .await
-        .unwrap();
-    let id = loop {
-        let incoming = tokio::time::timeout(WAIT, target.receive())
-            .await
-            .unwrap()
-            .unwrap();
-        if let ServerMessage::TransferRequest {
-            transfer_id,
-            state: requested,
-            start_playing,
-        } = incoming
-        {
-            assert_eq!(requested.queue, state.queue);
-            assert!(start_playing);
-            break transfer_id;
-        }
-    };
-    target
-        .send(ClientMessage::TransferAck {
-            transfer_id: id,
-            ok: true,
-            error: None,
-        })
-        .await
-        .unwrap();
-    loop {
-        let incoming = tokio::time::timeout(WAIT, source.receive())
-            .await
-            .unwrap()
-            .unwrap();
-        if matches!(incoming, ServerMessage::TransferResult { ok: true, .. }) {
-            break;
-        }
-    }
-    a.revoke("b").unwrap();
-    assert!(b.connect(a.address()).await.is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lan_authority_moves_to_the_higher_id_after_transfer() {
-    let source_id = "00000000000000000000000000000001";
-    let target_id = "ffffffffffffffffffffffffffffffff";
-    let source = Fixture::new(Library::default());
-    let mut target = Fixture::new(Library::default());
-    target.account = source.account.clone();
-    target.paths.save_account(&target.account).unwrap();
-    target
-        .paths
-        .save_credentials(
-            &target.account,
-            &source.paths.credentials(&source.account).unwrap().unwrap(),
-        )
-        .unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
-    for (fixture, id) in [(&source, source_id), (&target, target_id)] {
-        std::fs::write(fixture.paths.data.join("sync-device-id"), id).unwrap();
-        fixture.seed();
-        fixture
-            .catalog()
-            .set_state(
-                "preferences",
-                &Preferences {
-                    sync_server_url: url.clone(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-    }
-    let (disconnect, down) = tokio::sync::watch::channel(false);
-    let relay = Router::new().route(
-        "/ws",
-        get(move |ws: WebSocketUpgrade| {
-            let mut down = down.clone();
-            async move {
-                ws.on_upgrade(move |mut socket| async move {
-                    if *down.borrow() || !matches!(socket.recv().await, Some(Ok(Message::Text(_))))
-                    {
-                        return;
-                    }
-                    let welcome = ServerMessage::Welcome {
-                        devices: vec![],
-                        active_device_id: Some(source_id.into()),
-                        state: Some(PlaybackState {
-                            queue: vec!["song".into()],
-                            index: Some(0),
-                            seq: 10,
-                            ..Default::default()
-                        }),
-                        settings: serde_json::json!({}),
-                        settings_version: 0,
-                    };
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&welcome).unwrap().into(),
-                        ))
-                        .await
-                        .unwrap();
-                    let _ = down.wait_for(|&down| down).await;
-                    let _ = socket.send(Message::Close(None)).await;
-                })
-            }
-        }),
-    );
-    let relay = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
-    let mut old = source.start();
-    let mut new = target.start();
-    let Event::LanStatus(status) = event(
-        &old,
-        |event| matches!(event, Event::LanStatus(status) if status.port != 0),
-    ) else {
-        unreachable!();
-    };
-    for worker in [&old, &new] {
-        event(
-            worker,
-            |event| matches!(event, Event::DeviceSync(status) if status.connected && status.active_device_id.as_deref() == Some(source_id)),
-        );
-    }
-    old.service().send(Command::LanShowCode);
-    let Event::LanOffer(LanOfferState::Available(code)) = event(&old, |event| {
-        matches!(event, Event::LanOffer(LanOfferState::Available(_)))
-    }) else {
-        unreachable!();
-    };
-    new.service().send(Command::LanPair(
-        ([127, 0, 0, 1], status.port).into(),
-        code.0,
-    ));
-    event(
-        &new,
-        |event| matches!(event, Event::LanStatus(status) if status.peers.iter().any(|peer| peer.id == source_id)),
-    );
-    disconnect.send(true).unwrap();
-    event(
-        &old,
-        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.devices.iter().any(|device| device.id == target_id && device.online)),
-    );
-
-    old.service()
-        .send(Command::TransferTo(target_id.into(), false));
-    let deadline = std::time::Instant::now() + WAIT;
-    let reply = loop {
-        let command = new.player_commands().recv_deadline(deadline).unwrap();
-        if let PlayerCommand::SaveQueue(reply) = command {
-            break reply;
-        }
-    };
-    reply
-        .send(SavedQueue {
-            ids: vec!["song".into()],
-            index: Some(0),
-            ..Default::default()
-        })
-        .unwrap();
-
-    event(
-        &old,
-        |event| matches!(event, Event::DeviceSync(status) if !status.connected),
-    );
-    event(&old, |event| {
-        matches!(event, Event::DeviceSync(status)
-        if status.remote_id() == Some(target_id) && status.playback.as_ref().is_some_and(|state| state.seq == 11))
-    });
-    old.service()
-        .send(Command::RemotePlayback(PlaybackCommand::Next));
-    let deadline = std::time::Instant::now() + WAIT;
-    while !matches!(
-        new.player_commands().recv_deadline(deadline).unwrap(),
-        PlayerCommand::Next
-    ) {}
-
-    old.shutdown(WAIT).unwrap();
-    new.shutdown(WAIT).unwrap();
-    relay.abort();
-    source.finish();
-    target.finish();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lan_pairing_offer_is_invalidated_after_wrong_code_and_after_success() {
-    use sonora::sync::lan::{LanNode, user_hash};
-
-    let fixture = Fixture::new(Library::default());
-    let mut worker = fixture.start();
-    let (account, _) = worker.wait_ready(WAIT).unwrap();
-    let Event::LanStatus(status) = event(
-        &worker,
-        |event| matches!(event, Event::LanStatus(status) if status.port != 0),
-    ) else {
-        unreachable!();
-    };
-    let address = ([127, 0, 0, 1], status.port).into();
-    let peer = LanNode::listen(
-        Device {
-            id: "pairing-peer".into(),
-            name: "Pairing peer".into(),
-            os: "linux".into(),
-            online: true,
-            last_seen: 0,
-        },
-        [8; 32],
-        user_hash(&account.unwrap()),
-        0,
-    )
-    .await
-    .unwrap();
-    let offer = || {
-        worker.service().send(Command::LanShowCode);
-        let Event::LanOffer(LanOfferState::Available(code)) = event(&worker, |event| {
-            matches!(event, Event::LanOffer(LanOfferState::Available(_)))
-        }) else {
-            unreachable!();
-        };
-        code
-    };
-    let code = offer();
-    let wrong = if code.0 == "000000" {
-        "000001"
-    } else {
-        "000000"
-    };
-    assert!(peer.pair(address, wrong).await.is_err());
-    assert!(
-        peer.pair(address, &code.0).await.is_err(),
-        "only one attempt per offer"
-    );
-    event(&worker, |event| {
-        matches!(event, Event::LanOffer(LanOfferState::UsedOrExpired))
-    });
-
-    let replacement = offer();
-    peer.pair(address, &replacement.0).await.unwrap();
-    event(&worker, |event| {
-        matches!(event, Event::LanOffer(LanOfferState::UsedOrExpired))
-    });
-    worker.shutdown(WAIT).unwrap();
-    fixture.finish();
-}
-
-#[tokio::test]
-async fn loopback_lan_pairs_and_authenticates_only_pinned_keys() {
-    use sonora::sync::lan_security::{Link, Trust};
-    use tokio::net::TcpStream;
-    use tokio_tungstenite::{accept_async, client_async};
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let exchange = async |dial_trust, listen_trust, dial_identity| {
-        let initiator = async {
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let (socket, _) = client_async(format!("ws://{addr}/ws"), stream)
-                .await
-                .unwrap();
-            Link::establish(socket, true, &[3; 32], dial_identity, dial_trust).await
-        };
-        let responder = async {
-            let (stream, _) = listener.accept().await.unwrap();
-            let socket = accept_async(stream).await.unwrap();
-            Link::establish(socket, false, &[3; 32], &[2; 32], listen_trust).await
-        };
-        tokio::time::timeout(WAIT, async { tokio::join!(initiator, responder) })
-            .await
-            .unwrap()
-    };
-    let (left, right) = exchange(Trust::Pair("123456"), Trust::Pair("123456"), &[1; 32]).await;
-    let (_, right_key) = left.expect("matching one-time code pairs the initiating device");
-    let (_, left_key) = right.expect("matching one-time code pairs the listening device");
-    let trusted_left = [left_key];
-    let trusted_right = [right_key];
-    let (left, right) = exchange(
-        Trust::Paired(&trusted_right),
-        Trust::Paired(&trusted_left),
-        &[1; 32],
-    )
-    .await;
-    let (mut left, _) = left.unwrap();
-    let (mut right, _) = right.unwrap();
-    let queue_payload = vec![42; 128_000];
-    let (sent, received) = tokio::join!(left.send(&queue_payload), right.recv());
-    sent.unwrap();
-    assert_eq!(received.unwrap(), queue_payload);
-
-    let (left, right) = exchange(
-        Trust::Paired(&trusted_right),
-        Trust::Paired(&trusted_left),
-        &[4; 32],
-    )
-    .await;
-    assert!(
-        left.is_err() && right.is_err(),
-        "unpaired devices never receive a session"
-    );
-    let (left, right) = exchange(Trust::Pair("123456"), Trust::Pair("654321"), &[1; 32]).await;
-    assert!(
-        left.is_err() && right.is_err(),
-        "a wrong code never pairs either device"
-    );
-    let (left, right) = exchange(Trust::Paired(&trusted_right), Trust::Paired(&[]), &[1; 32]).await;
-    assert!(
-        left.is_err() && right.is_err(),
-        "a revoked pin no longer authenticates"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1180,126 +651,367 @@ async fn configured_worker_uses_saved_login_and_bridges_relay_controls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lan_peer_keeps_its_playback_when_joining_an_idle_host() {
-    use sonora::sync::PlaybackObservation;
-    use std::sync::Arc;
+async fn navidrome_devices_connect_through_published_lan_addresses() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::SigningKey;
+    use sonora::{
+        model::Playlist,
+        platform::{Paths, ServerCredentials},
+        service::test_support::Worker,
+        sync::lan::{LanReach, LanStatus},
+    };
 
-    let low_id = "00000000000000000000000000000001";
-    let high_id = "ffffffffffffffffffffffffffffffff";
-    let low = Fixture::new(Library::default());
-    let mut high = Fixture::new(Library::default());
-    high.account = low.account.clone();
-    high.paths.save_account(&high.account).unwrap();
-    high.paths
-        .save_credentials(
-            &high.account,
-            &low.paths.credentials(&low.account).unwrap().unwrap(),
-        )
-        .unwrap();
-    for (fixture, id) in [(&low, low_id), (&high, high_id)] {
-        std::fs::write(fixture.paths.data.join("sync-device-id"), id).unwrap();
-        fixture.seed();
+    let first = "00000000000000000000000000000001";
+    let second = "00000000000000000000000000000002";
+    let absent = "00000000000000000000000000000003";
+    // A device another Sonora published without any LAN address (for example an older version).
+    let absent_key =
+        URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[9; 32]).verifying_key().as_bytes());
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![Playlist {
+            id: "device-list-0".into(),
+            name: "Sonora devices (sync keys — do not edit)".into(),
+            comment: format!(
+                "Sonora's device list. This private playlist stores Sonora device-sync keys. Do not edit.\nSonora devices v1:{}",
+                serde_json::json!({
+                    "devices": {absent: {"name": "Old laptop", "os": "linux", "key": absent_key}},
+                    "revoked": [],
+                })
+            ),
+            owner: "fixture".into(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    let second_paths = Paths {
+        data: fixture.paths.data.join("speaker"),
+        cache: fixture.paths.cache.join("speaker"),
+    };
+    for (paths, id, key) in [
+        (&fixture.paths, first, [1u8; 32]),
+        (&second_paths, second, [2u8; 32]),
+    ] {
+        std::fs::create_dir_all(&paths.data).unwrap();
+        std::fs::create_dir_all(&paths.cache).unwrap();
+        paths.save_account(&fixture.account).unwrap();
+        paths
+            .save_credentials(
+                &fixture.account,
+                &ServerCredentials::from_password("synthetic-password").unwrap(),
+            )
+            .unwrap();
+        std::fs::write(paths.data.join("sync-device-id"), id).unwrap();
+        std::fs::write(paths.data.join("sync-signing-key"), key).unwrap();
+    }
+    let start = |paths: Paths| {
+        let worker = fixture.start_on(paths);
+        worker.wait_ready(WAIT).unwrap();
+        worker
+    };
+    let lan_status = |worker: &Worker, wanted: &dyn Fn(&LanStatus) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Event::LanStatus(status) = worker
+                .events()
+                .recv_deadline(deadline)
+                .expect("LAN status before deadline")
+                && wanted(&status)
+            {
+                break status;
+            }
+        }
+    };
+    let found = |status: &LanStatus, id: &str, port: u16| {
+        status.devices.iter().any(|device| {
+            device.id == id
+                && matches!(device.reach, LanReach::Found(address) | LanReach::Connected(address) if address.port() == port)
+        })
+    };
+
+    let mut left = start(fixture.paths.clone());
+    let left_port = lan_status(&left, &|status| status.port != 0).port;
+    let mut right = start(second_paths.clone());
+    let right_port = lan_status(&right, &|status| status.port != 0).port;
+
+    // Each device learns the other's address from Navidrome, without network discovery.
+    let status = lan_status(&left, &|status| found(status, second, right_port));
+    assert!(
+        status.devices.iter().any(|device| device.id == absent
+            && device.name == "Old laptop"
+            && device.reach == LanReach::NotFound),
+        "a trusted device without a published address is shown as not found"
+    );
+    lan_status(&right, &|status| found(status, first, left_port));
+    for (worker, other) in [(&left, second), (&right, first)] {
+        event(worker, |event| {
+            matches!(event, Event::DeviceSync(status)
+                if status.connected && status.devices.iter().any(|device| device.id == other && device.online))
+        });
     }
 
-    // The lower-ID device keeps a fixed port so its pinned address survives a restart.
-    let low_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    low.catalog()
-        .set_state(
-            "preferences",
-            &Preferences {
-                lan_port: Some(low_port),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-    let mut playing = high.start();
-    let (account, _) = playing.wait_ready(WAIT).unwrap();
-    let mut idle = low.start();
-    event(
-        &idle,
-        |event| matches!(event, Event::LanStatus(status) if status.port == low_port),
-    );
-    idle.service().send(Command::LanShowCode);
-    let Event::LanOffer(LanOfferState::Available(code)) = event(&idle, |event| {
-        matches!(event, Event::LanOffer(LanOfferState::Available(_)))
-    }) else {
-        unreachable!();
-    };
-    playing
-        .service()
-        .send(Command::LanPair(([127, 0, 0, 1], low_port).into(), code.0));
-    event(
-        &playing,
-        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.devices.iter().any(|device| device.id == low_id && device.online)),
+    // The listener port is remembered, so published addresses stay valid after a restart.
+    right.shutdown(WAIT).unwrap();
+    let mut right = start(second_paths);
+    assert_eq!(
+        lan_status(&right, &|status| status.port != 0).port,
+        right_port
     );
 
-    // The lower-ID device closes; the higher-ID device plays alone and becomes the authority.
-    idle.shutdown(WAIT).unwrap();
-    event(
-        &playing,
-        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.devices.iter().all(|device| device.id != low_id)),
-    );
-    playing.publish_playback(PlaybackSnapshot {
+    right.shutdown(WAIT).unwrap();
+    left.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+const MAC: &str = "00000000000000000000000000000001";
+const LINUX: &str = "00000000000000000000000000000002";
+
+/// Signs each ID in to the fixture's Navidrome account as its own device, seeded
+/// with the fixture library. The first device uses the fixture's own paths.
+fn sign_in_devices(fixture: &Fixture, ids: &[&str]) -> Vec<sonora::platform::Paths> {
+    use sonora::platform::{Paths, ServerCredentials};
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let paths = if index == 0 {
+                fixture.paths.clone()
+            } else {
+                Paths {
+                    data: fixture.paths.data.join(id),
+                    cache: fixture.paths.cache.join(id),
+                }
+            };
+            std::fs::create_dir_all(&paths.data).unwrap();
+            std::fs::create_dir_all(&paths.cache).unwrap();
+            paths.save_account(&fixture.account).unwrap();
+            paths
+                .save_credentials(
+                    &fixture.account,
+                    &ServerCredentials::from_password("synthetic-password").unwrap(),
+                )
+                .unwrap();
+            std::fs::write(paths.data.join("sync-device-id"), id).unwrap();
+            std::fs::write(paths.data.join("sync-signing-key"), [index as u8 + 1; 32]).unwrap();
+            fixture.seed_on(&paths);
+            paths
+        })
+        .collect()
+}
+
+fn playing(fixture: &Fixture, ids: &[&str]) -> PlaybackSnapshot {
+    use sonora::sync::PlaybackObservation;
+    use std::sync::Arc;
+    let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    PlaybackSnapshot {
         sync: Some(Arc::new(PlaybackObservation {
-            namespace: account.unwrap().namespace(),
+            namespace: fixture.account.namespace(),
             revision: 1,
             volume: 50,
             shuffle: false,
             repeat: Default::default(),
         })),
-        queue: high.catalog().by_ids(&["song".into()]).unwrap().into(),
+        queue: fixture.catalog().by_ids(&ids).unwrap().into(),
         index: Some(0),
         playing: true,
         ..Default::default()
+    }
+}
+
+/// Waits up to 15 s for a device-sync status, since LAN links redial every few seconds.
+fn device_sync(
+    worker: &sonora::service::test_support::Worker,
+    wanted: impl Fn(&sonora::sync::DeviceStatus) -> bool,
+) -> sonora::sync::DeviceStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Event::DeviceSync(status) = worker
+            .events()
+            .recv_deadline(deadline)
+            .expect("device sync status before deadline")
+            && wanted(&status)
+        {
+            return status;
+        }
+    }
+}
+
+fn player_command(
+    worker: &sonora::service::test_support::Worker,
+    wanted: impl Fn(&PlayerCommand) -> bool,
+) -> PlayerCommand {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let command = worker
+            .player_commands()
+            .recv_deadline(deadline)
+            .expect("player command before deadline");
+        if wanted(&command) {
+            return command;
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_controller_sees_and_controls_the_playing_device() {
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![]),
+        ..Default::default()
     });
-    // Let the solo host publish the higher-ID device as the active player.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let mut paths = sign_in_devices(&fixture, &[MAC, LINUX]).into_iter();
+    let (mac_paths, linux_paths) = (paths.next().unwrap(), paths.next().unwrap());
+    let mut mac = fixture.start_on(mac_paths);
+    mac.wait_ready(WAIT).unwrap();
+    device_sync(&mac, |status| status.connected);
+    mac.publish_playback(playing(&fixture, &["song"]));
+    device_sync(&mac, |status| {
+        status.active_device_id.as_deref() == Some(MAC)
+    });
 
-    // The idle lower-ID device opens again; the playing device joins its session.
-    let mut idle = low.start();
+    // The Linux PC opens later and sees the Mac's session.
+    let mut linux = fixture.start_on(linux_paths);
+    linux.wait_ready(WAIT).unwrap();
+    device_sync(&linux, |status| {
+        status.remote_id() == Some(MAC)
+            && status
+                .playback
+                .as_ref()
+                .is_some_and(|state| state.playing && state.queue == ["song"])
+            && status
+                .devices
+                .iter()
+                .any(|device| device.id == MAC && device.online)
+    });
 
-    // Both must end up in one session that shows the other device and the high device playing.
-    for (worker, other) in [(&idle, high_id), (&playing, low_id)] {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let event = worker
-                .events()
-                .recv_deadline(deadline)
-                .expect("the joining device stays active with its playback in the shared session");
-            if matches!(&event, Event::DeviceSync(status)
-                if status.connected
-                    && status.active_device_id.as_deref() == Some(high_id)
-                    && status.playback.as_ref().is_some_and(|state| state.playing)
-                    && status.devices.iter().any(|device| device.id == other && device.online))
-            {
-                break;
+    // Transport controls and picking a song both run on the Mac.
+    linux
+        .service()
+        .send(Command::RemotePlayback(PlaybackCommand::Next));
+    player_command(&mac, |command| matches!(command, PlayerCommand::Next));
+    linux
+        .service()
+        .send(Command::RemotePlayback(PlaybackCommand::SetQueue {
+            track_ids: vec!["other-song".into()],
+            index: Some(0),
+            position_ms: 0,
+        }));
+    player_command(&mac, |command| {
+        matches!(command, PlayerCommand::Restore(tracks, 0, _, None)
+            if tracks.iter().map(|track| track.id.as_str()).eq(["other-song"]))
+    });
+
+    // Queue edits made on the Linux PC apply to the Mac's queue.
+    linux.service().send(Command::Enqueue(
+        vec!["other-song".into()],
+        sonora::playback::Placement::Last,
+    ));
+    player_command(&mac, |command| {
+        matches!(command, PlayerCommand::Insert(tracks, sonora::playback::Placement::Last)
+            if tracks.iter().map(|track| track.id.as_str()).eq(["other-song"]))
+    });
+    let edit = |queue: &[&str], index| {
+        let queue: Vec<String> = queue.iter().map(|id| (*id).to_owned()).collect();
+        Command::RemotePlayback(PlaybackCommand::EditQueue {
+            queue: sonora_sync_protocol::queue_fingerprint(&queue),
+            change: sonora_sync_protocol::QueueChange::RemoveAt { index },
+        })
+    };
+    // An edit made against a queue the Mac no longer has is ignored.
+    linux.service().send(edit(&["song", "other-song"], 1));
+    linux.service().send(edit(&["song"], 0));
+    assert!(matches!(
+        player_command(&mac, |command| matches!(command, PlayerCommand::Remove(_))),
+        PlayerCommand::Remove(0)
+    ));
+
+    // When the Mac closes, the Linux PC no longer shows it as the active device.
+    mac.shutdown(WAIT).unwrap();
+    device_sync(&linux, |status| {
+        status.connected
+            && status.remote_id().is_none()
+            && status.devices.iter().all(|device| device.id != MAC)
+    });
+    linux.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_transfer_moves_playback_and_keeps_the_source_on_failure() {
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![]),
+        ..Default::default()
+    });
+    let mut paths = sign_in_devices(&fixture, &[MAC, LINUX]).into_iter();
+    let (mac_paths, linux_paths) = (paths.next().unwrap(), paths.next().unwrap());
+    let mut mac = fixture.start_on(mac_paths);
+    mac.wait_ready(WAIT).unwrap();
+    let mut linux = fixture.start_on(linux_paths);
+    linux.wait_ready(WAIT).unwrap();
+    device_sync(&mac, |status| {
+        status.devices.iter().any(|device| device.id == LINUX)
+    });
+    mac.publish_playback(playing(&fixture, &["song"]));
+    device_sync(&linux, |status| status.remote_id() == Some(MAC));
+
+    let prepare = |saved: Vec<&str>| {
+        let reply = loop {
+            if let PlayerCommand::SaveQueue(reply) = player_command(&linux, |command| {
+                matches!(command, PlayerCommand::SaveQueue(_))
+            }) {
+                break reply;
             }
-        }
-    }
+        };
+        reply
+            .send(SavedQueue {
+                ids: saved.into_iter().map(str::to_owned).collect(),
+                index: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+    };
 
-    // The idle device never takes control back from the playing one.
-    let stable = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(event) = playing.events().recv_deadline(stable) {
-        if let Event::DeviceSync(status) = event {
-            assert_eq!(status.active_device_id.as_deref(), Some(high_id));
-        }
-    }
+    // A target that cannot prepare the queue leaves the Mac in control.
+    mac.service().send(Command::TransferTo(LINUX.into(), false));
+    prepare(vec!["other-song"]);
+    event(&mac, |event| matches!(event, Event::Error(_)));
+    assert_eq!(
+        device_sync(&linux, |status| status.active_device_id.is_some())
+            .active_device_id
+            .as_deref(),
+        Some(MAC)
+    );
 
-    idle.shutdown(WAIT).unwrap();
-    playing.shutdown(WAIT).unwrap();
-    low.finish();
-    high.finish();
+    mac.service().send(Command::TransferTo(LINUX.into(), false));
+    prepare(vec!["song"]);
+    device_sync(&mac, |status| {
+        status.remote_id() == Some(LINUX)
+            && status
+                .playback
+                .as_ref()
+                .is_some_and(|state| state.queue == ["song"])
+    });
+    player_command(&mac, |command| matches!(command, PlayerCommand::Pause));
+
+    // The Mac now controls playback on the Linux PC.
+    mac.service()
+        .send(Command::RemotePlayback(PlaybackCommand::Next));
+    player_command(&linux, |command| matches!(command, PlayerCommand::Next));
+
+    mac.shutdown(WAIT).unwrap();
+    linux.shutdown(WAIT).unwrap();
+    fixture.finish();
 }
 
 #[tokio::test]
-async fn lan_host_accepts_only_the_peers_own_or_its_own_playback() {
-    use sonora::sync::lan::LanNode;
-    use sonora_sync_protocol::ReconciledPlayback;
+async fn lan_nodes_keep_one_link_and_drop_untrusted_or_revoked_devices() {
+    use ed25519_dalek::SigningKey;
+    use sonora::sync::lan::{LanNode, Trusted};
 
     let device = |id: &str| Device {
         id: id.into(),
@@ -1308,53 +1020,366 @@ async fn lan_host_accepts_only_the_peers_own_or_its_own_playback() {
         online: true,
         last_seen: 0,
     };
-    let host = LanNode::listen(device("a"), [1; 32], [3; 32], 0)
-        .await
-        .unwrap();
-    let guest = LanNode::listen(device("b"), [2; 32], [3; 32], 0)
-        .await
-        .unwrap();
-    guest
-        .pair(host.address(), &host.offer_code())
-        .await
-        .unwrap();
-    let (mut local, _) = host.connect(host.address()).await.unwrap();
-    let (mut remote, _) = guest.connect(host.address()).await.unwrap();
-    let snapshot = |device_id: &str, seq| ReconciledPlayback {
-        device_id: device_id.into(),
-        state: PlaybackState {
-            queue: vec!["track".into()],
-            index: Some(0),
-            playing: true,
-            seq,
-            ..Default::default()
-        },
+    let trust = |id: &str, seed: u8, port: u16| Trusted {
+        key: SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+        device: device(id),
+        addresses: vec![([127, 0, 0, 1], port).into()],
     };
-    for playback in [snapshot("c", 7), snapshot("b", 5)] {
-        remote
-            .send(ClientMessage::Reconcile {
-                playback: Some(playback),
-                settings: None,
-            })
-            .await
-            .unwrap();
+    let (a_port, b_port) = (free_port(), free_port());
+    let a = LanNode::listen(
+        device("a"),
+        [1; 32],
+        [3; 32],
+        a_port,
+        vec![trust("b", 2, b_port)],
+    )
+    .await
+    .unwrap();
+    let b = LanNode::listen(
+        device("b"),
+        [2; 32],
+        [3; 32],
+        b_port,
+        vec![trust("a", 1, a_port)],
+    )
+    .await
+    .unwrap();
+    // An unknown key that trusts `a` never gets a link.
+    let stranger = LanNode::listen(
+        device("c"),
+        [9; 32],
+        [3; 32],
+        0,
+        vec![trust("a", 1, a_port)],
+    )
+    .await
+    .unwrap();
+    let linked = async |wanted: &dyn Fn() -> bool| {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !wanted() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("LAN links settle");
+    };
+    linked(&|| a.linked() == ["b"] && b.linked() == ["a"]).await;
+
+    let (mut player, _) = a.session();
+    let (mut controller, _) = b.session();
+    let state = |seq| PlaybackState {
+        queue: vec!["song".into()],
+        index: Some(0),
+        playing: true,
+        seq,
+        ..Default::default()
+    };
+    player.send(ClientMessage::StateUpdate { state: state(1) });
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(ServerMessage::State {
+                state,
+                from_device_id,
+            }) = controller.receive().await
+                && from_device_id == "a"
+                && state.seq == 1
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the controller sees the playing device's state");
+    // A controller cannot publish over the active device.
+    controller.send(ClientMessage::StateUpdate { state: state(2) });
+    // Both devices dial each other; a duplicate link must not replace the kept one.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert_eq!(a.linked(), ["b"]);
+    assert!(stranger.linked().is_empty(), "an untrusted key never links");
+    while let Ok(Some(message)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), player.receive()).await
+    {
+        assert!(
+            !matches!(&message, ServerMessage::State { from_device_id, .. } if from_device_id == "b"),
+            "a controller's playback never replaces the active device's"
+        );
+        assert!(
+            !matches!(&message, ServerMessage::DevicesChanged { devices } if devices.len() != 2),
+            "the kept link never dropped"
+        );
     }
-    loop {
-        let incoming = tokio::time::timeout(WAIT, local.receive())
+
+    a.revoke("b").unwrap();
+    linked(&|| a.linked().is_empty() && b.linked().is_empty()).await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(ServerMessage::ActiveDeviceChanged { device_id: None }) =
+                controller.receive().await
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("losing the playing device clears it on the controller");
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(a.linked().is_empty(), "a revoked device cannot link again");
+}
+
+#[tokio::test]
+async fn loopback_lan_links_authenticate_only_trusted_keys() {
+    use ed25519_dalek::SigningKey;
+    use sonora::sync::lan_security::{Link, Trust};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{accept_async, client_async};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let exchange = async |dial_trust, listen_trust, dial_identity| {
+        let initiator = async {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (socket, _) = client_async(format!("ws://{addr}/ws"), stream)
+                .await
+                .unwrap();
+            Link::establish(socket, true, &[3; 32], dial_identity, dial_trust).await
+        };
+        let responder = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = accept_async(stream).await.unwrap();
+            Link::establish(socket, false, &[3; 32], &[2; 32], listen_trust).await
+        };
+        tokio::time::timeout(WAIT, async { tokio::join!(initiator, responder) })
             .await
             .unwrap()
-            .unwrap();
-        if let ServerMessage::State {
-            state,
-            from_device_id,
-        } = incoming
-        {
-            assert_eq!(
-                (from_device_id.as_str(), state.seq),
-                ("b", 5),
-                "a third device's forged playback is dropped"
-            );
-            break;
+    };
+    let key = |seed: u8| {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    };
+    let trusted_left = [key(1)];
+    let trusted_right = [key(2)];
+    let (left, right) = exchange(
+        Trust::Paired(&trusted_right),
+        Trust::Paired(&trusted_left),
+        &[1; 32],
+    )
+    .await;
+    let (mut left, _) = left.unwrap();
+    let (mut right, _) = right.unwrap();
+    let queue_payload = vec![42; 128_000];
+    let (sent, received) = tokio::join!(left.send(&queue_payload), right.recv());
+    sent.unwrap();
+    assert_eq!(received.unwrap(), queue_payload);
+
+    let (left, right) = exchange(
+        Trust::Paired(&trusted_right),
+        Trust::Paired(&trusted_left),
+        &[4; 32],
+    )
+    .await;
+    assert!(
+        left.is_err() && right.is_err(),
+        "untrusted devices never receive a session"
+    );
+    let (left, right) = exchange(Trust::Paired(&trusted_right), Trust::Paired(&[]), &[1; 32]).await;
+    assert!(
+        left.is_err() && right.is_err(),
+        "a revoked key no longer authenticates"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_falls_back_to_lan_and_returns_to_relay() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::SigningKey;
+    use sonora::sync::lan::{LanNode, Trusted, user_hash};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let speaker = "ffffffffffffffffffffffffffffffff";
+    let fixture = Fixture::new(Library::default());
+    std::fs::write(fixture.paths.data.join("sync-device-id"), MAC).unwrap();
+    std::fs::write(fixture.paths.data.join("sync-signing-key"), [1; 32]).unwrap();
+    let key = |seed: u8| {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    };
+    let speaker_port = free_port();
+    // The worker trusts the speaker through its cached Navidrome device list.
+    std::fs::write(
+        fixture
+            .paths
+            .data
+            .join(format!("sync-devices-{}.json", fixture.account.namespace())),
+        format!(
+            "Sonora's device list. This private playlist stores Sonora device-sync keys. Do not edit.\nSonora devices v1:{}",
+            serde_json::json!({
+                "devices": {speaker: {
+                    "name": "LAN speaker",
+                    "os": "linux",
+                    "key": URL_SAFE_NO_PAD.encode(key(7)),
+                    "addresses": [format!("127.0.0.1:{speaker_port}")],
+                }},
+                "revoked": [],
+            })
+        ),
+    )
+    .unwrap();
+
+    let allow_relay = Arc::new(AtomicBool::new(true));
+    let (disconnect, closed) = flume::bounded::<()>(1);
+    let (sent, reconciled) = flume::unbounded();
+    let relay_available = allow_relay.clone();
+    let relay = Router::new().route(
+        "/ws",
+        get(move |ws: WebSocketUpgrade| {
+            let available = relay_available.load(Ordering::SeqCst);
+            let closed = closed.clone();
+            let sent = sent.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    if !available || !matches!(socket.recv().await, Some(Ok(Message::Text(_)))) {
+                        return;
+                    }
+                    let msg = ServerMessage::Welcome {
+                        devices: vec![],
+                        active_device_id: Some(speaker.into()),
+                        state: None,
+                        settings: serde_json::json!({}),
+                        settings_version: 0,
+                    };
+                    socket
+                        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        tokio::select! {
+                            _ = closed.recv_async() => {
+                                let _ = socket.send(Message::Close(None)).await;
+                                break;
+                            }
+                            incoming = socket.recv() => {
+                                let Some(Ok(Message::Text(text))) = incoming else { break };
+                                if let Ok(ClientMessage::Reconcile { playback, settings }) = serde_json::from_str(&text) {
+                                    sent.send((playback, settings)).unwrap();
+                                }
+                            }
+                        }
+                    }
+                })
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fixture
+        .catalog()
+        .set_state(
+            "preferences",
+            &Preferences {
+                sync_server_url: format!("ws://{}", listener.local_addr().unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+    let mut worker = fixture.start();
+    worker.wait_ready(WAIT).unwrap();
+    let node = LanNode::listen(
+        Device {
+            id: speaker.into(),
+            name: "LAN speaker".into(),
+            os: "linux".into(),
+            online: true,
+            last_seen: 0,
+        },
+        [7; 32],
+        user_hash(&fixture.account),
+        speaker_port,
+        vec![Trusted {
+            key: key(1),
+            device: Device {
+                id: MAC.into(),
+                name: "Mac".into(),
+                os: "macos".into(),
+                online: true,
+                last_seen: 0,
+            },
+            addresses: vec![],
+        }],
+    )
+    .await
+    .unwrap();
+    let (mut local, _) = node.session();
+    local.send(ClientMessage::StateUpdate {
+        state: PlaybackState {
+            seq: 25,
+            queue: vec!["lan-track".into()],
+            index: Some(0),
+            ..Default::default()
+        },
+    });
+    local.send(ClientMessage::SettingsPut {
+        settings: serde_json::json!({"dark": true}),
+        base_version: 0,
+    });
+    device_sync(&worker, |status| status.remote_id() == Some(speaker));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while node.linked() != [MAC] {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    })
+    .await
+    .expect("the worker links to the trusted speaker");
+
+    // The relay goes away; the worker follows the speaker over the LAN.
+    allow_relay.store(false, Ordering::SeqCst);
+    disconnect.send(()).unwrap();
+    device_sync(&worker, |status| {
+        status.remote_id() == Some(speaker)
+            && status
+                .playback
+                .as_ref()
+                .is_some_and(|state| state.seq == 25)
+    });
+    worker
+        .service()
+        .send(Command::RemotePlayback(PlaybackCommand::Next));
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if matches!(
+                local.receive().await,
+                Some(ServerMessage::Command {
+                    cmd: PlaybackCommand::Next,
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the LAN command reaches the playing speaker");
+
+    // The relay returns; the worker hands it the playback and settings it learned on the LAN.
+    allow_relay.store(true, Ordering::SeqCst);
+    device_sync(&worker, |status| {
+        status.remote_id() == Some(speaker) && status.playback.is_none()
+    });
+    let mut playback_seen = false;
+    let mut settings_seen = false;
+    while !playback_seen || !settings_seen {
+        let (playback, settings) = reconciled.recv_timeout(WAIT).unwrap();
+        playback_seen |= playback
+            .is_some_and(|snapshot| snapshot.device_id == speaker && snapshot.state.seq == 25);
+        settings_seen |= settings.is_some_and(|snapshot| {
+            snapshot.version == 1 && snapshot.settings.get("dark") == Some(&serde_json::json!(true))
+        });
     }
+    worker.shutdown(WAIT).unwrap();
+    task.abort();
+    fixture.finish();
 }

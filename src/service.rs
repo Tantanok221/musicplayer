@@ -181,8 +181,6 @@ pub enum Command {
     RemoteQueueFound(String, i64, crate::server::RemotePlayQueue),
     ResumeServerQueue,
     DeviceSync(u64, crate::sync::RelayEvent),
-    LanPair(std::net::SocketAddr, String),
-    LanShowCode,
     LanRevoke(String),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
@@ -289,7 +287,6 @@ pub enum Event {
     ResumeQueue(Option<String>),
     SharedPreferences(crate::sync::SharedPreferences),
     LanStatus(crate::sync::lan::LanStatus),
-    LanOffer(crate::sync::lan::LanOfferState),
     Status(String),
     Connection(Connection),
     LibrarySyncing(bool),
@@ -782,15 +779,16 @@ fn forward_player_events(
 fn enqueue_playlist(
     playlist: Option<Playlist>,
     placement: Placement,
+    devices: &device_sync::DeviceSync,
     player: &PlayerHandle,
     events: &Sender<Event>,
 ) -> Result<()> {
     match playlist {
         Some(playlist) if !playlist.entry.is_empty() => {
-            player.send(PlayerCommand::Insert(
-                playlist.entry.as_ref().clone(),
-                placement,
-            ));
+            devices.playback_intent(
+                player,
+                PlayerCommand::Insert(playlist.entry.as_ref().clone(), placement),
+            );
         }
         Some(_) => events.send(Event::Status("This playlist is empty.".into()))?,
         None => events.send(Event::Error(
@@ -2348,10 +2346,16 @@ fn run(
                     );
                 }
                 Command::Enqueue(ids, placement) => {
-                    player.send(PlayerCommand::Insert(catalog.by_ids(&ids)?, placement));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Insert(catalog.by_ids(&ids)?, placement),
+                    );
                 }
                 Command::EnqueueAlbum(id, placement) => {
-                    player.send(PlayerCommand::Insert(catalog.album_tracks(&id)?, placement));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Insert(catalog.album_tracks(&id)?, placement),
+                    );
                 }
                 Command::EnqueuePlaylist(id, placement) => {
                     if let Some(server) =
@@ -2367,12 +2371,12 @@ fn run(
                         let cached = catalog
                             .playlist(&id)?
                             .filter(|p| !p.entry.is_empty() || p.song_count == 0);
-                        enqueue_playlist(cached, placement, &player, &events)?;
+                        enqueue_playlist(cached, placement, &devices, &player, &events)?;
                     }
                 }
                 Command::PlaylistForQueue(epoch, placement, playlist) => {
                     if epoch == account_epoch {
-                        enqueue_playlist(playlist, placement, &player, &events)?;
+                        enqueue_playlist(playlist, placement, &devices, &player, &events)?;
                     }
                 }
                 Command::AlbumToPlaylist(id, target) => {
@@ -2399,19 +2403,9 @@ fn run(
                 Command::DeviceSync(generation, event) => {
                     devices.receive(generation, event, &catalog, &player, &events)?;
                 }
-                Command::LanPair(address, code) => {
-                    if !devices.lan(device_sync::LanAction::Pair(address, code)) {
-                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
-                    }
-                }
-                Command::LanShowCode => {
-                    if !devices.lan(device_sync::LanAction::ShowCode) {
-                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
-                    }
-                }
                 Command::LanRevoke(id) => {
                     if !devices.lan(device_sync::LanAction::Revoke(id)) {
-                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                        events.send(Event::Error("Local device sync is unavailable".into()))?;
                     }
                 }
                 Command::TransferTo(id, start_playing) => {

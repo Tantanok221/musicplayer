@@ -45,8 +45,8 @@ fn fill(window: AnyWindowHandle, field: &'static str, value: &str, cx: &mut Test
 }
 
 #[gpui_kit::test]
-fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut TestAppContext) {
-    use sonora::sync::lan::{LanCode, LanOfferState, LanPeer, LanStatus};
+fn paired_devices_show_reachability_and_revoke_without_pairing(cx: &mut TestAppContext) {
+    use sonora::sync::lan::{LanDevice, LanReach, LanStatus};
 
     let (_dir, mut f, window, _) = start(cx);
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
@@ -65,102 +65,75 @@ fn paired_devices_settings_shows_pairing_code_and_revokes_a_device(cx: &mut Test
             window.try_find("settings-saved").is_some(),
             "saving the LAN port must show the settings confirmation"
         );
+        for removed in ["lan-show-code", "lan-pair"] {
+            assert!(
+                window.try_find(removed).is_none(),
+                "devices on one Navidrome account never need a pairing code"
+            );
+        }
     })
     .unwrap();
+    let device = |id: &str, name: &str, reach| LanDevice {
+        id: id.into(),
+        name: name.into(),
+        reach,
+    };
     f.backend.emit(Event::LanStatus(LanStatus {
         port: 8088,
-        peers: vec![LanPeer {
-            id: "speaker".into(),
-            name: "Kitchen".into(),
-            address: "127.0.0.1:8089".parse().unwrap(),
-        }],
-        ..Default::default()
+        devices: vec![
+            device(
+                "mac",
+                "Mac · 139b71",
+                LanReach::Connected("192.168.0.162:47800".parse().unwrap()),
+            ),
+            device(
+                "linux",
+                "Linux · 47cb47",
+                LanReach::Found("192.168.0.20:47800".parse().unwrap()),
+            ),
+            device("laptop", "Old laptop", LanReach::NotFound),
+        ],
     }));
     f.settle(window, cx);
-    f.expect("generate LAN pairing code", |command, _| {
-        assert!(matches!(command, Command::LanShowCode));
-        vec![Event::LanOffer(LanOfferState::Available(LanCode(
-            "123456".into(),
-        )))]
-    });
-    f.click(window, "lan-show-code", cx);
-    f.assert_script_finished();
     cx.update_window(window, |_, window, _| {
-        let code = window.find("lan-pairing-code");
-        assert!(code.visible());
-        assert_eq!(code.label(), Some("123456 · use within 2 minutes"));
-    })
-    .unwrap();
-    f.backend
-        .emit(Event::LanOffer(LanOfferState::UsedOrExpired));
-    f.settle(window, cx);
-    cx.update_window(window, |_, window, _| {
-        assert!(
-            window.try_find("lan-pairing-code").is_none(),
-            "a used or expired code must not stay visible"
-        );
-        let notice = window.find("lan-pairing-code-unavailable");
-        assert!(notice.visible());
-        assert_eq!(
-            notice.label(),
-            Some("Code used or expired — generate a new code")
-        );
-    })
-    .unwrap();
-    f.expect("replace used LAN pairing code", |command, _| {
-        assert!(matches!(command, Command::LanShowCode));
-        vec![Event::LanOffer(LanOfferState::Available(LanCode(
-            "654321".into(),
-        )))]
-    });
-    f.click(window, "lan-show-code", cx);
-    cx.update_window(window, |_, window, _| {
-        assert_eq!(
-            window.find("lan-pairing-code").label(),
-            Some("654321 · use within 2 minutes")
-        );
-        assert!(window.try_find("lan-pairing-code-unavailable").is_none());
+        for (row, revoke, label) in [
+            (
+                "lan-device-mac",
+                "lan-revoke-mac",
+                "Mac · 139b71 · Connected · 192.168.0.162:47800",
+            ),
+            (
+                "lan-device-linux",
+                "lan-revoke-linux",
+                "Linux · 47cb47 · Found · 192.168.0.20:47800",
+            ),
+            (
+                "lan-device-laptop",
+                "lan-revoke-laptop",
+                "Old laptop · Not found on this network",
+            ),
+        ] {
+            let row = window.find(row);
+            assert!(row.visible());
+            assert_eq!(row.label(), Some(label));
+            assert!(window.find(revoke).visible());
+        }
     })
     .unwrap();
     f.expect("revoke LAN device", |command, _| {
-        assert!(matches!(command, Command::LanRevoke(device) if device == "speaker"));
+        assert!(matches!(command, Command::LanRevoke(device) if device == "laptop"));
         vec![Event::LanStatus(LanStatus {
             port: 8088,
-            peers: vec![],
-            ..Default::default()
+            devices: vec![],
         })]
     });
-    f.click(window, "lan-revoke-speaker", cx);
+    f.click(window, "lan-revoke-laptop", cx);
     cx.update_window(window, |_, window, _| {
-        assert!(window.try_find("lan-revoke-speaker").is_none());
+        assert!(window.try_find("lan-device-laptop").is_none());
+        assert!(window.try_find("lan-revoke-mac").is_none());
     })
     .unwrap();
     f.assert_script_finished();
-}
-
-#[gpui_kit::test]
-fn paired_devices_identifies_automatic_trust_from_navidrome(cx: &mut TestAppContext) {
-    use sonora::sync::lan::{LanDevice, LanStatus};
-
-    let (_dir, mut f, window, _) = start(cx);
-    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
-    page(&mut f, window, "Paired devices", cx);
-    f.backend.emit(Event::LanStatus(LanStatus {
-        port: 8088,
-        automatic: vec![LanDevice {
-            id: "kitchen".into(),
-            name: "Kitchen".into(),
-        }],
-        ..Default::default()
-    }));
-    f.settle(window, cx);
-    cx.update_window(window, |_, window, _| {
-        let label = window.find("lan-trust-kitchen");
-        assert!(label.visible());
-        assert_eq!(label.label(), Some("Kitchen · Trusted via Navidrome"));
-        assert!(window.find("lan-revoke-kitchen").visible());
-    })
-    .unwrap();
 }
 
 #[gpui_kit::test]

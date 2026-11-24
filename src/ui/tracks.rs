@@ -221,7 +221,7 @@ impl MusicApp {
     pub(super) fn playing_tracks(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let colors = ink(cx);
-        let count = self.playback.queue.len();
+        let count = self.queue_playback().queue.len();
         div()
             .size_full()
             .flex()
@@ -255,9 +255,9 @@ impl MusicApp {
                     entity.update(cx, |app, cx| {
                         range
                             .map(|index| {
-                                let track = app.playback.queue[index].clone();
-                                let active = app.playback.index == Some(index);
-                                let key = match app.playback.queue_ids.get(index) {
+                                let track = app.queue_playback().queue[index].clone();
+                                let active = app.queue_playback().index == Some(index);
+                                let key = match app.queue_playback().queue_ids.get(index) {
                                     Some(id) => format!("queue-side-{id}"),
                                     None => format!("queue-side-index-{index}"),
                                 };
@@ -268,8 +268,6 @@ impl MusicApp {
                                     app.rating_stars(&track, &key, cx).into_any_element()
                                 };
                                 let select = track.clone();
-                                let service2 = app.service.clone();
-                                let service3 = app.service.clone();
                                 let play_app = cx.weak_entity();
                                 let menu_state = app.menu_state(cx);
                                 let menu_track = track.clone();
@@ -293,7 +291,7 @@ impl MusicApp {
                                         active,
                                         |s| {
                                             s.child(
-                                                Icon::new(if app.playback.playing {
+                                                Icon::new(if app.queue_playback().playing {
                                                     Glyph::Volume2
                                                 } else {
                                                     Glyph::Pause
@@ -355,8 +353,8 @@ impl MusicApp {
                                 app.queue_reorder_row(row, index, &track.title, None, cx)
                                     .context_menu(move |menu, window, cx| {
                                         let play_app = play_app.clone();
-                                        let service2 = service2.clone();
-                                        let service3 = service3.clone();
+                                        let move_app = play_app.clone();
+                                        let remove_app = play_app.clone();
                                         let menu = context_menu::track_rating(
                                             menu.min_w(px(220.)),
                                             &menu_state,
@@ -373,11 +371,13 @@ impl MusicApp {
                                         ))
                                         .item(
                                             menu_row(Glyph::ArrowUp, "Move Earlier").on_click(
-                                                move |_, _, _| {
-                                                    service2.player.send(PlayerCommand::Move(
-                                                        index,
-                                                        index.saturating_sub(1),
-                                                    ))
+                                                move |_, _, cx| {
+                                                    let _ = move_app.update(cx, |app, _| {
+                                                        app.playback_intent(PlayerCommand::Move(
+                                                            index,
+                                                            index.saturating_sub(1),
+                                                        ))
+                                                    });
                                                 },
                                             ),
                                         );
@@ -391,10 +391,12 @@ impl MusicApp {
                                         .separator()
                                         .item(
                                             menu_row(Glyph::ListX, "Remove from Queue").on_click(
-                                                move |_, _, _| {
-                                                    service3
-                                                        .player
-                                                        .send(PlayerCommand::Remove(index))
+                                                move |_, _, cx| {
+                                                    let _ = remove_app.update(cx, |app, _| {
+                                                        app.playback_intent(PlayerCommand::Remove(
+                                                            index,
+                                                        ))
+                                                    });
                                                 },
                                             ),
                                         )

@@ -1,5 +1,5 @@
 use crate::model::{RepeatMode, Track};
-use sonora_sync_protocol::{Device, PlaybackState, Repeat};
+use sonora_sync_protocol::{Device, Placement, PlaybackState, QueueChange, Repeat};
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -7,9 +7,11 @@ use std::{
 
 #[doc(hidden)]
 pub mod lan;
-pub(crate) mod lan_registry;
+#[doc(hidden)]
+pub mod lan_registry;
 #[doc(hidden)]
 pub mod lan_security;
+pub(crate) mod mesh;
 pub(crate) mod relay;
 pub(crate) mod settings;
 mod transport;
@@ -25,6 +27,8 @@ pub struct DeviceStatus {
     pub devices: Vec<Device>,
     pub playback: Option<PlaybackState>,
     pub track: Option<Arc<Track>>,
+    /// The active remote device's queue, resolved from the catalog in queue order.
+    pub queue: Arc<Vec<Arc<Track>>>,
 }
 
 impl DeviceStatus {
@@ -44,6 +48,24 @@ impl DeviceStatus {
             return 0.;
         };
         position_at(state, wall_ms()) as f64 / 1000.
+    }
+
+    /// The active remote device's queue in the shape the queue views render.
+    /// Entry IDs are queue positions, and there is no local undo history.
+    pub fn queue_snapshot(&self) -> Option<crate::model::PlaybackSnapshot> {
+        self.remote_id()?;
+        let state = self.playback.as_ref()?;
+        Some(crate::model::PlaybackSnapshot {
+            track: self.track.clone(),
+            playing: state.playing,
+            position: self.remote_position(),
+            duration: self.track.as_ref().map_or(0., |track| track.duration),
+            index: state.index,
+            queue: self.queue.clone(),
+            queue_ids: Arc::new((0..self.queue.len() as u64).collect()),
+            queue_revision: state.seq,
+            ..Default::default()
+        })
     }
 
     pub(crate) fn accept(&mut self, state: PlaybackState) -> bool {
@@ -93,6 +115,47 @@ pub(crate) fn repeat(value: RepeatMode) -> Repeat {
     }
 }
 
+/// The remote form of a local queue edit, or `None` for commands that are not queue edits.
+pub fn queue_change(command: &crate::playback::PlayerCommand) -> Option<QueueChange> {
+    use crate::playback::{PlayerCommand, QueueEdit};
+    Some(match command {
+        PlayerCommand::Insert(tracks, placement) => QueueChange::Insert {
+            track_ids: tracks.iter().map(|track| track.id.clone()).collect(),
+            placement: remote_placement(*placement),
+        },
+        PlayerCommand::Remove(index) => QueueChange::RemoveAt { index: *index },
+        PlayerCommand::Move(from, to) => QueueChange::MoveTo {
+            from: *from,
+            to: *to,
+        },
+        PlayerCommand::EditQueue(_, QueueEdit::Remove(indices)) => QueueChange::Remove {
+            indices: indices.clone(),
+        },
+        PlayerCommand::EditQueue(_, QueueEdit::Move { indices, before }) => QueueChange::Move {
+            indices: indices.clone(),
+            before: *before,
+        },
+        PlayerCommand::EditQueue(_, QueueEdit::ClearUpcoming) => QueueChange::ClearUpcoming,
+        _ => return None,
+    })
+}
+
+fn remote_placement(placement: crate::playback::Placement) -> Placement {
+    match placement {
+        crate::playback::Placement::Next => Placement::Next,
+        crate::playback::Placement::AfterAlbum => Placement::AfterAlbum,
+        crate::playback::Placement::Last => Placement::Last,
+    }
+}
+
+pub(crate) fn local_placement(placement: Placement) -> crate::playback::Placement {
+    match placement {
+        Placement::Next => crate::playback::Placement::Next,
+        Placement::AfterAlbum => crate::playback::Placement::AfterAlbum,
+        Placement::Last => crate::playback::Placement::Last,
+    }
+}
+
 pub(crate) fn milliseconds(seconds: f64) -> u64 {
     (seconds * 1000.).round() as u64
 }
@@ -104,6 +167,43 @@ pub(crate) fn volume(level: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_snapshot_shows_only_an_active_remote_queue() {
+        let track = |id: &str| {
+            Arc::new(Track {
+                id: id.into(),
+                ..Default::default()
+            })
+        };
+        let mut status = DeviceStatus {
+            connected: true,
+            local_device_id: "local".into(),
+            active_device_id: Some("remote".into()),
+            playback: Some(PlaybackState {
+                queue: vec!["a".into(), "b".into()],
+                index: Some(1),
+                seq: 9,
+                ..Default::default()
+            }),
+            queue: Arc::new(vec![track("a"), track("b")]),
+            ..Default::default()
+        };
+        let snapshot = status.queue_snapshot().expect("remote queue");
+        assert_eq!(*snapshot.queue_ids, [0, 1]);
+        assert_eq!(snapshot.index, Some(1));
+        assert_eq!(snapshot.queue_revision, 9);
+        assert!(!snapshot.can_undo_queue);
+
+        status.active_device_id = Some("local".into());
+        assert!(
+            status.queue_snapshot().is_none(),
+            "this device shows its own queue"
+        );
+        status.active_device_id = Some("remote".into());
+        status.connected = false;
+        assert!(status.queue_snapshot().is_none());
+    }
 
     #[test]
     fn ignores_equal_or_older_remote_frames() {

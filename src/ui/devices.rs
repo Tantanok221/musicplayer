@@ -71,9 +71,27 @@ impl MusicApp {
             })
     }
 
+    /// The queue the queue views show: the active remote device's, or this device's.
+    pub(super) fn queue_playback(&self) -> &PlaybackSnapshot {
+        self.remote_queue.as_ref().unwrap_or(&self.playback)
+    }
+
     pub(super) fn playback_intent(&self, command: PlayerCommand) {
         if self.device_status.remote_id().is_none() {
             self.service.player.send(command);
+            return;
+        }
+        if let Some(change) = crate::sync::queue_change(&command) {
+            let queue = self
+                .device_status
+                .playback
+                .as_ref()
+                .map_or(&[][..], |state| state.queue.as_slice());
+            self.service
+                .send(Command::RemotePlayback(PlaybackCommand::EditQueue {
+                    queue: sonora_sync_protocol::queue_fingerprint(queue),
+                    change,
+                }));
             return;
         }
         let command = match command {
@@ -88,7 +106,7 @@ impl MusicApp {
             PlayerCommand::JumpTo(i)
                 if self.device_status.playback.as_ref().is_some_and(|state| {
                     state.queue.iter().map(String::as_str).eq(self
-                        .playback
+                        .queue_playback()
                         .queue
                         .iter()
                         .map(|track| track.id.as_str()))
@@ -167,7 +185,15 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) {
         let remote_changed = self.device_status.remote_id() != status.remote_id();
+        let shows_remote = self.remote_queue.is_some();
+        self.remote_queue = status.queue_snapshot();
+        if shows_remote || self.remote_queue.is_some() {
+            self.notify_part(Part::SidebarQueue, cx);
+            self.notify_part(Part::Center, cx);
+        }
         self.device_status = status;
+        let shown = self.queue_playback().queue_ids.clone();
+        self.queue_ui.retain_selection(&shown);
         if remote_changed {
             self.volume_before_mute = None;
             self.scrub = None;

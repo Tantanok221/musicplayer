@@ -342,7 +342,7 @@ impl MusicApp {
                         .item(menu_row(Glyph::ListX, "Remove from Queue").on_click(
                             move |_, _, cx| {
                                 let _ = app.update(cx, |app, _| {
-                                    app.service.player.send(PlayerCommand::Remove(index))
+                                    app.playback_intent(PlayerCommand::Remove(index))
                                 });
                             },
                         ))

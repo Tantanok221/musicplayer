@@ -100,6 +100,74 @@ pub enum PlaybackCommand {
         index: Option<usize>,
         position_ms: u64,
     },
+    /// Edit the active device's queue. `queue` is the [`queue_fingerprint`] of the
+    /// queue the edit was made against; the device ignores edits to a queue that
+    /// has changed since. Insertions do not depend on it.
+    EditQueue {
+        queue: String,
+        change: QueueChange,
+    },
+}
+
+/// Where inserted tracks go in the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Placement {
+    Next,
+    AfterAlbum,
+    Last,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum QueueChange {
+    Insert {
+        track_ids: Vec<TrackId>,
+        placement: Placement,
+    },
+    /// Remove one entry at any position.
+    RemoveAt {
+        index: usize,
+    },
+    /// Move one entry from one position to another.
+    MoveTo {
+        from: usize,
+        to: usize,
+    },
+    /// Remove upcoming entries.
+    Remove {
+        indices: Vec<usize>,
+    },
+    /// Move upcoming entries before a position.
+    Move {
+        indices: Vec<usize>,
+        before: usize,
+    },
+    ClearUpcoming,
+}
+
+impl QueueChange {
+    fn valid(&self) -> bool {
+        match self {
+            Self::Insert { track_ids, .. } => !track_ids.is_empty() && queue_valid(track_ids, None),
+            Self::Remove { indices } | Self::Move { indices, .. } => {
+                !indices.is_empty() && indices.len() <= 10_000
+            }
+            Self::RemoveAt { .. } | Self::MoveTo { .. } | Self::ClearUpcoming => true,
+        }
+    }
+}
+
+/// A short, stable identifier for a queue's exact track order.
+pub fn queue_fingerprint(queue: &[TrackId]) -> String {
+    // FNV-1a over each ID and a separator, so the result is the same on every platform.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in queue {
+        for byte in id.bytes().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{:016x}-{}", hash, queue.len())
 }
 
 impl PlaybackCommand {
@@ -109,6 +177,7 @@ impl PlaybackCommand {
             Self::SetQueue {
                 track_ids, index, ..
             } => queue_valid(track_ids, *index),
+            Self::EditQueue { queue, change } => queue.len() <= 64 && change.valid(),
             _ => true,
         }
     }

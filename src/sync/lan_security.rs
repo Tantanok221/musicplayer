@@ -1,7 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use snow::{Builder, TransportState};
-use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
@@ -14,7 +13,6 @@ const TAG: usize = 16;
 
 #[derive(Clone, Copy)]
 pub enum Trust<'a> {
-    Pair(&'a str),
     Paired(&'a [PublicKey]),
 }
 
@@ -36,30 +34,11 @@ impl Link {
         identity: &[u8; 32],
         trust: Trust<'_>,
     ) -> Result<(Self, PublicKey), LinkError> {
-        match trust {
-            Trust::Pair(code) => {
-                Self::establish_with(
-                    socket,
-                    initiator,
-                    account,
-                    identity,
-                    Some(code),
-                    |_| async { true },
-                )
-                .await
-            }
-            Trust::Paired(pins) => {
-                Self::establish_with(
-                    socket,
-                    initiator,
-                    account,
-                    identity,
-                    None,
-                    |key| async move { pins.contains(&key) },
-                )
-                .await
-            }
-        }
+        let Trust::Paired(pins) = trust;
+        Self::establish_with(socket, initiator, account, identity, |key| async move {
+            pins.contains(&key)
+        })
+        .await
     }
 
     pub(super) async fn establish_with<F>(
@@ -67,28 +46,19 @@ impl Link {
         initiator: bool,
         account: &[u8; 32],
         identity: &[u8; 32],
-        code: Option<&str>,
         approve: impl FnOnce(PublicKey) -> F,
     ) -> Result<(Self, PublicKey), LinkError>
     where
         F: Future<Output = bool>,
     {
-        let psk = match code {
-            Some(code) => Some(pair_key(&mut socket, initiator, account, code).await?),
-            None => None,
-        };
-        let protocol = if psk.is_some() {
-            "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
-        } else {
+        let prologue = [b"sonora-lan-v2:".as_slice(), account].concat();
+        let builder = Builder::new(
             "Noise_NN_25519_ChaChaPoly_SHA256"
-        };
-        let prologue = [b"sonora-lan-v1:".as_slice(), account].concat();
-        let mut builder = Builder::new(protocol.parse().map_err(|_| LinkError)?)
-            .prologue(&prologue)
-            .map_err(|_| LinkError)?;
-        if let Some(psk) = &psk {
-            builder = builder.psk(0, psk).map_err(|_| LinkError)?;
-        }
+                .parse()
+                .map_err(|_| LinkError)?,
+        )
+        .prologue(&prologue)
+        .map_err(|_| LinkError)?;
         let mut handshake = if initiator {
             builder.build_initiator()
         } else {
@@ -201,32 +171,6 @@ fn proof_input(transcript: &[u8], initiator: bool) -> Vec<u8> {
         transcript,
     ]
     .concat()
-}
-
-async fn pair_key(
-    socket: &mut Socket,
-    initiator: bool,
-    account: &[u8; 32],
-    code: &str,
-) -> Result<[u8; 32], LinkError> {
-    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(LinkError);
-    }
-    let password = Password::new(code.as_bytes());
-    let a = Identity::new(&[b"sonora-lan-v1-a:".as_slice(), account].concat());
-    let b = Identity::new(&[b"sonora-lan-v1-b:".as_slice(), account].concat());
-    let (exchange, outgoing) = if initiator {
-        Spake2::<Ed25519Group>::start_a(&password, &a, &b)
-    } else {
-        Spake2::<Ed25519Group>::start_b(&password, &a, &b)
-    };
-    send_frame(socket, outgoing).await?;
-    let incoming = recv_frame(socket, 33).await?;
-    exchange
-        .finish(&incoming)
-        .map_err(|_| LinkError)?
-        .try_into()
-        .map_err(|_| LinkError)
 }
 
 async fn send_frame(socket: &mut Socket, payload: Vec<u8>) -> Result<(), LinkError> {

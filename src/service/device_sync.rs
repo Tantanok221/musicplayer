@@ -7,7 +7,7 @@ use crate::{
     server::Server,
     sync::{
         DeviceStatus, RelayEvent, SharedPreferences,
-        lan::{LanNode, user_hash},
+        lan::{LanNode, Port, user_hash},
         lan_registry::LanRegistry,
         position_at,
         relay::{self, RelayTransport, SyncTask},
@@ -15,11 +15,12 @@ use crate::{
         wall_ms,
     },
 };
+use crate::{playback::QueueEdit, sync::local_placement};
 use anyhow::Result;
 use flume::Sender;
 use sonora_sync_protocol::{
-    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, ServerMessage, TRANSFER_TIMEOUT,
-    VersionedSettings, valid_settings,
+    ClientMessage, Device, Hello, PlaybackCommand, PlaybackState, QueueChange, ServerMessage,
+    TRANSFER_TIMEOUT, VersionedSettings, queue_fingerprint, valid_settings,
 };
 use std::time::Duration;
 use tokio::{
@@ -49,8 +50,6 @@ struct PreparedTransfer {
 }
 
 pub(super) enum LanAction {
-    ShowCode,
-    Pair(std::net::SocketAddr, String),
     Revoke(String),
 }
 
@@ -171,7 +170,10 @@ impl DeviceSync {
         };
         let identity = paths.sync_signing_key()?;
         let group = user_hash(account);
-        let pins = paths.data.join(format!("sync-pins-{namespace}.json"));
+        let port = match port {
+            0 => Port::Remembered(paths.data.join("sync-lan-port")),
+            port => Port::Fixed(port),
+        };
         let registry = registry_server.and_then(|server| {
             LanRegistry::open(
                 server,
@@ -193,9 +195,8 @@ impl DeviceSync {
         self.lan = Some(actions);
         let events = events.clone();
         self.task = Some(self.runtime.spawn(async move {
-            let Ok(node) = LanNode::start(device, identity, group, port, Some(pins), registry).await else {
+            let Ok(node) = LanNode::start(device, identity, group, port, registry, Vec::new()).await else {
                 let _ = events.send(Event::LanStatus(Default::default()));
-                let _ = events.send(Event::LanOffer(Default::default()));
                 let _ = events.send(Event::Error("Could not start local device sync".into()));
                 Box::pin(task.run(None)).await;
                 return;
@@ -206,14 +207,6 @@ impl DeviceSync {
                 loop {
                     tokio::select! {
                         action = requests.recv_async() => match action {
-                            Ok(LanAction::ShowCode) => {
-                                node.offer_code();
-                            }
-                            Ok(LanAction::Pair(address, code)) => {
-                                if node.pair(address, &code).await.is_err() {
-                                    let _ = events.send(Event::Error("Could not pair LAN device".into()));
-                                }
-                            }
                             Ok(LanAction::Revoke(id)) => {
                                 if node.revoke(&id).is_err() {
                                     let _ = events.send(Event::Error("Could not revoke LAN device".into()));
@@ -227,15 +220,6 @@ impl DeviceSync {
                         changed = changes.changed() => {
                             if changed.is_err() || events.send(Event::LanStatus(node.status())).is_err() { break; }
                         }
-                    }
-                }
-            };
-            let offers = async {
-                let mut offers = node.offers();
-                loop {
-                    let state = offers.borrow_and_update().state();
-                    if events.send(Event::LanOffer(state)).is_err() || offers.changed().await.is_err() {
-                        break;
                     }
                 }
             };
@@ -256,7 +240,6 @@ impl DeviceSync {
             tokio::select! {
                 _ = Box::pin(task.run(Some(&node))) => {}
                 _ = control => {}
-                _ = offers => {}
                 _ = directory => {}
             }
         }));
@@ -405,6 +388,18 @@ impl DeviceSync {
             .map(|id| catalog.by_ids(&[id.into()]))
             .transpose()?
             .and_then(|mut tracks| tracks.pop());
+        let ids = self
+            .status
+            .playback
+            .as_ref()
+            .filter(|_| self.status.remote_id().is_some())
+            .map_or(&[][..], |state| state.queue.as_slice());
+        if !ids
+            .iter()
+            .eq(self.status.queue.iter().map(|track| &track.id))
+        {
+            self.status.queue = resolve_queue(catalog, ids)?.into();
+        }
         events.send(Event::DeviceSync(self.status.clone()))?;
         Ok(())
     }
@@ -682,6 +677,44 @@ impl DeviceSync {
                 events.send(Event::LocalVolume(volume))?;
                 return Ok(());
             }
+            PlaybackCommand::EditQueue { queue, change } => {
+                let (current, revision) = {
+                    let playback = self.playback.borrow();
+                    let ids: Vec<_> = playback
+                        .queue
+                        .iter()
+                        .map(|track| track.id.clone())
+                        .collect();
+                    (queue_fingerprint(&ids), playback.queue_revision)
+                };
+                let command = match change {
+                    QueueChange::Insert {
+                        track_ids,
+                        placement,
+                    } => {
+                        let tracks = catalog.by_ids(&track_ids)?;
+                        if tracks.len() != track_ids.len() {
+                            return Ok(());
+                        }
+                        PlayerCommand::Insert(tracks, local_placement(placement))
+                    }
+                    // Positions refer to the queue the controller saw; skip edits to an older queue.
+                    _ if queue != current => return Ok(()),
+                    QueueChange::RemoveAt { index } => PlayerCommand::Remove(index),
+                    QueueChange::MoveTo { from, to } => PlayerCommand::Move(from, to),
+                    QueueChange::Remove { indices } => {
+                        PlayerCommand::EditQueue(revision, QueueEdit::Remove(indices))
+                    }
+                    QueueChange::Move { indices, before } => {
+                        PlayerCommand::EditQueue(revision, QueueEdit::Move { indices, before })
+                    }
+                    QueueChange::ClearUpcoming => {
+                        PlayerCommand::EditQueue(revision, QueueEdit::ClearUpcoming)
+                    }
+                };
+                player.send(command);
+                return Ok(());
+            }
             PlaybackCommand::SetQueue {
                 track_ids,
                 index,
@@ -728,9 +761,24 @@ impl DeviceSync {
             player.send(command);
             return;
         }
-        if let PlayerCommand::Replace(tracks, index) = command {
-            self.replace_remote_queue(&tracks, index);
+        if let PlayerCommand::Replace(tracks, index) = &command {
+            self.replace_remote_queue(tracks, *index);
+        } else if let Some(change) = crate::sync::queue_change(&command) {
+            self.send(PlaybackCommand::EditQueue {
+                queue: self.remote_fingerprint(),
+                change,
+            });
         }
+    }
+
+    /// The fingerprint of the active remote device's queue as last reported.
+    fn remote_fingerprint(&self) -> String {
+        queue_fingerprint(
+            self.status
+                .playback
+                .as_ref()
+                .map_or(&[][..], |state| state.queue.as_slice()),
+        )
     }
 
     pub fn replace_remote_queue(
@@ -760,6 +808,30 @@ impl DeviceSync {
         self.settings_flight = None;
         self.status = DeviceStatus::default();
     }
+}
+
+/// The tracks of a remote queue in order; IDs missing here show as untitled entries.
+fn resolve_queue(
+    catalog: &Catalog,
+    ids: &[String],
+) -> Result<Vec<std::sync::Arc<crate::model::Track>>> {
+    let known: std::collections::HashMap<_, _> = catalog
+        .by_ids(ids)?
+        .into_iter()
+        .map(|track| (track.id.clone(), track))
+        .collect();
+    Ok(ids
+        .iter()
+        .map(|id| {
+            known.get(id).cloned().unwrap_or_else(|| {
+                std::sync::Arc::new(crate::model::Track {
+                    id: id.clone(),
+                    title: "Unknown track".into(),
+                    ..Default::default()
+                })
+            })
+        })
+        .collect())
 }
 
 impl Drop for DeviceSync {

@@ -198,10 +198,10 @@ impl MusicApp {
             .into_any_element()
     }
     pub(super) fn queue_summary(&self) -> String {
-        let start = next_index(&self.playback);
-        let upcoming = &self.playback.queue[start..];
+        let start = next_index(self.queue_playback());
+        let upcoming = &self.queue_playback().queue[start..];
         let seconds = upcoming.iter().map(|t| t.duration.max(0.)).sum::<f64>()
-            + (self.playback.duration - self.playback.position).max(0.);
+            + (self.queue_playback().duration - self.queue_playback().position).max(0.);
         format!(
             "{} upcoming · {} {}",
             upcoming.len(),
@@ -214,22 +214,21 @@ impl MusicApp {
         )
     }
     fn queue_edit(&self, edit: QueueEdit) {
-        self.service
-            .player
-            .send(PlayerCommand::EditQueue(self.playback.queue_revision, edit));
+        self.playback_intent(PlayerCommand::EditQueue(
+            self.queue_playback().queue_revision,
+            edit,
+        ));
     }
     fn queue_edit_at(&self, revision: u64, edit: QueueEdit) {
-        self.service
-            .player
-            .send(PlayerCommand::EditQueue(revision, edit));
+        self.playback_intent(PlayerCommand::EditQueue(revision, edit));
     }
     fn selected_queue_indices(&self) -> Vec<usize> {
-        self.playback
+        self.queue_playback()
             .queue_ids
             .iter()
             .enumerate()
             .filter(|(index, id)| {
-                *index >= next_index(&self.playback) && self.queue_ui.selected.contains(id)
+                *index >= next_index(self.queue_playback()) && self.queue_ui.selected.contains(id)
             })
             .map(|(index, _)| index)
             .collect()
@@ -242,12 +241,12 @@ impl MusicApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.playback.queue_ids.get(index).copied() else {
+        let Some(id) = self.queue_playback().queue_ids.get(index).copied() else {
             return;
         };
         if range
             && let Some(anchor) = self.queue_ui.anchor.and_then(|id| {
-                self.playback
+                self.queue_playback()
                     .queue_ids
                     .iter()
                     .position(|value| *value == id)
@@ -256,11 +255,12 @@ impl MusicApp {
             if !multiple {
                 self.queue_ui.selected.clear();
             }
+            let ids = self.queue_playback().queue_ids.clone();
             self.queue_ui
                 .selected
                 .extend(self.queue_ui.rows.iter().filter_map(|row| match row {
                     QueueRow::Track(i) if (anchor.min(index)..=anchor.max(index)).contains(i) => {
-                        self.playback.queue_ids.get(*i).copied()
+                        ids.get(*i).copied()
                     }
                     _ => None,
                 }));
@@ -275,7 +275,7 @@ impl MusicApp {
             self.queue_ui.anchor = Some(id);
         }
         self.queue_ui.cursor = Some(id);
-        if let Some(track) = self.playback.queue.get(index).cloned() {
+        if let Some(track) = self.queue_playback().queue.get(index).cloned() {
             self.select_track(track, cx);
         }
         self.queue_ui.focus.focus(window, cx);
@@ -305,7 +305,7 @@ impl MusicApp {
             .cursor
             .or(self.queue_ui.anchor)
             .and_then(|id| {
-                self.playback
+                self.queue_playback()
                     .queue_ids
                     .iter()
                     .position(|value| *value == id)
@@ -322,7 +322,7 @@ impl MusicApp {
             self.queue_select(index, false, range, window, cx);
             // Move the keyboard cursor independently of the range's selection anchor.
             if !range {
-                self.queue_ui.anchor = self.playback.queue_ids.get(index).copied();
+                self.queue_ui.anchor = self.queue_playback().queue_ids.get(index).copied();
             }
             if let Some(row) = self
                 .queue_ui
@@ -341,9 +341,11 @@ impl MusicApp {
         let indices = self.selected_queue_indices();
         if let (Some(first), Some(last)) = (indices.first(), indices.last()) {
             let before = if later {
-                (last + 2).min(self.playback.queue.len())
+                (last + 2).min(self.queue_playback().queue.len())
             } else {
-                first.saturating_sub(1).max(next_index(&self.playback))
+                first
+                    .saturating_sub(1)
+                    .max(next_index(self.queue_playback()))
             };
             self.queue_edit(QueueEdit::Move { indices, before });
         }
@@ -355,11 +357,11 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) {
         let start = if upcoming {
-            next_index(&self.playback)
+            next_index(self.queue_playback())
         } else {
             0
         };
-        let ids = self.playback.queue[start..]
+        let ids = self.queue_playback().queue[start..]
             .iter()
             .map(|track| track.id.clone())
             .collect();
@@ -372,8 +374,8 @@ impl MusicApp {
     }
     pub(super) fn queue_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
-        let empty = self.playback.queue.is_empty();
-        let no_upcoming = next_index(&self.playback) == self.playback.queue.len();
+        let empty = self.queue_playback().queue.is_empty();
+        let no_upcoming = next_index(self.queue_playback()) == self.queue_playback().queue.len();
         div()
             .flex()
             .items_center()
@@ -416,9 +418,9 @@ impl MusicApp {
                     Glyph::LocateFixed,
                     "Scroll to the playing track",
                 )
-                .disabled(self.playback.index.is_none())
+                .disabled(self.queue_playback().index.is_none())
                 .on_click(cx.listener(|app, _, _, cx| {
-                    if let Some(index) = app.playback.index
+                    if let Some(index) = app.queue_playback().index
                         && let Some(row) = app
                             .queue_ui
                             .rows
@@ -435,7 +437,7 @@ impl MusicApp {
             )
             .child(
                 short_button("undo-queue-edit", Glyph::Undo2, "Undo queue edit")
-                    .disabled(!self.playback.can_undo_queue)
+                    .disabled(!self.queue_playback().can_undo_queue)
                     .on_click(cx.listener(|app, _, _, _| {
                         app.service.player.send(PlayerCommand::UndoQueue)
                     })),
@@ -443,8 +445,9 @@ impl MusicApp {
             .into_any_element()
     }
     pub(super) fn queue_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.queue_ui.prepare(&self.playback, &self.queue_search);
-        if self.playback.queue.is_empty() {
+        let shown = self.remote_queue.as_ref().unwrap_or(&self.playback);
+        self.queue_ui.prepare(shown, &self.queue_search);
+        if self.queue_playback().queue.is_empty() {
             return div()
                 .size_full()
                 .flex()
@@ -475,7 +478,10 @@ impl MusicApp {
             .key_context("Queue")
             .track_focus(&self.queue_ui.focus)
             .on_action(cx.listener(|app, _: &UndoQueueEdit, _, _| {
-                app.service.player.send(PlayerCommand::UndoQueue)
+                // Undo history belongs to this device's queue only.
+                if app.remote_queue.is_none() {
+                    app.service.player.send(PlayerCommand::UndoQueue)
+                }
             }))
             .on_action(
                 cx.listener(|app, _: &RemoveQueueSelection, _, _| app.queue_remove_selection()),
@@ -491,7 +497,7 @@ impl MusicApp {
                     .iter()
                     .filter_map(|row| {
                         if let QueueRow::Track(i) = row {
-                            app.playback.queue_ids.get(*i).copied()
+                            app.queue_playback().queue_ids.get(*i).copied()
                         } else {
                             None
                         }
@@ -512,11 +518,12 @@ impl MusicApp {
                 app.queue_step_selection(false, true, window, cx)
             }))
             .on_action(cx.listener(|app, _: &PlayQueueSelection, _, _| {
-                if let Some(index) = app
-                    .queue_ui
-                    .anchor
-                    .and_then(|id| app.playback.queue_ids.iter().position(|value| *value == id))
-                {
+                if let Some(index) = app.queue_ui.anchor.and_then(|id| {
+                    app.queue_playback()
+                        .queue_ids
+                        .iter()
+                        .position(|value| *value == id)
+                }) {
                     app.playback_intent(PlayerCommand::JumpTo(index));
                 }
             }))
@@ -572,11 +579,12 @@ impl MusicApp {
                         .child(if label == "Now playing" {
                             format!(
                                 "Track {} of {}",
-                                self.playback.index.unwrap_or(0) + 1,
-                                self.playback.queue.len()
+                                self.queue_playback().index.unwrap_or(0) + 1,
+                                self.queue_playback().queue.len()
                             )
                         } else {
-                            let upcoming = &self.playback.queue[next_index(&self.playback)..];
+                            let upcoming =
+                                &self.queue_playback().queue[next_index(self.queue_playback())..];
                             format!(
                                 "{} tracks · {}",
                                 upcoming.len(),
@@ -586,7 +594,7 @@ impl MusicApp {
                 )
                 .into_any_element(),
             Some(QueueRow::Album(index, _)) => {
-                let track = self.playback.queue[index].clone();
+                let track = self.queue_playback().queue[index].clone();
                 div()
                     .w_full()
                     .min_w_0()
@@ -640,7 +648,7 @@ impl MusicApp {
                         )
                     })
                     .on_drop(cx.listener(|app, drag: &QueueDrag, _, _| {
-                        app.drop_queue_tracks(drag, app.playback.queue.len())
+                        app.drop_queue_tracks(drag, app.queue_playback().queue.len())
                     }))
                     .into_any_element()
             }
@@ -656,14 +664,14 @@ impl MusicApp {
                     s.border_t_2().border_color(colors.accent)
                 })
                 .on_drop(cx.listener(|app, drag: &QueueDrag, _, _| {
-                    app.drop_queue_tracks(drag, app.playback.queue.len())
+                    app.drop_queue_tracks(drag, app.queue_playback().queue.len())
                 }))
                 .into_any_element(),
             None => div().into_any_element(),
         }
     }
     fn drop_queue_tracks(&self, drag: &QueueDrag, before: usize) {
-        if let Some(edit) = drag.edit(&self.playback, before) {
+        if let Some(edit) = drag.edit(self.queue_playback(), before) {
             self.queue_edit(edit);
         }
     }
@@ -676,11 +684,13 @@ impl MusicApp {
         selection: Option<&[usize]>,
         cx: &Context<Self>,
     ) -> E {
-        if index < next_index(&self.playback) || self.playback.queue_ids.get(index).is_none() {
+        if index < next_index(self.queue_playback())
+            || self.queue_playback().queue_ids.get(index).is_none()
+        {
             return row;
         }
-        let drag = QueueDrag::new(&self.playback, selection.unwrap_or(&[index]), title);
-        let revision = self.playback.queue_revision;
+        let drag = QueueDrag::new(self.queue_playback(), selection.unwrap_or(&[index]), title);
+        let revision = self.queue_playback().queue_revision;
         let accent = ink(cx).accent;
         let selection_owner = selection.map(|_| cx.weak_entity());
 
@@ -704,7 +714,7 @@ impl MusicApp {
                 }
             })
             .on_drop(cx.listener(move |app, drag: &QueueDrag, _, _| {
-                if index >= next_index(&app.playback)
+                if index >= next_index(app.queue_playback())
                     && let Some(before) = drag.row_destination(revision, index)
                 {
                     app.drop_queue_tracks(drag, before);
@@ -713,14 +723,14 @@ impl MusicApp {
     }
 
     fn queue_track_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let track = self.playback.queue[index].clone();
-        let Some(id) = self.playback.queue_ids.get(index).copied() else {
+        let track = self.queue_playback().queue[index].clone();
+        let Some(id) = self.queue_playback().queue_ids.get(index).copied() else {
             return div().into_any_element();
         };
         let colors = ink(cx);
-        let revision = self.playback.queue_revision;
-        let active = self.playback.index == Some(index);
-        let upcoming = index >= next_index(&self.playback);
+        let revision = self.queue_playback().queue_revision;
+        let active = self.queue_playback().index == Some(index);
+        let upcoming = index >= next_index(self.queue_playback());
         let selected = self.queue_ui.selected.contains(&id);
         let mut indices = self.selected_queue_indices();
         if !indices.contains(&index) {
@@ -771,7 +781,7 @@ impl MusicApp {
                     .text_xs()
                     .text_color(if active { colors.accent } else { colors.muted })
                     .child(if active {
-                        Icon::new(if self.playback.playing {
+                        Icon::new(if self.queue_playback().playing {
                             Glyph::Volume2
                         } else {
                             Glyph::Pause
@@ -781,7 +791,7 @@ impl MusicApp {
                     } else {
                         div()
                             .child(if upcoming {
-                                (index - next_index(&self.playback) + 1).to_string()
+                                (index - next_index(self.queue_playback()) + 1).to_string()
                             } else {
                                 (index + 1).to_string()
                             })
@@ -830,7 +840,7 @@ impl MusicApp {
                     .child(if active {
                         format!(
                             "{} / {}",
-                            duration_label(self.playback.position),
+                            duration_label(self.queue_playback().position),
                             duration_label(track.duration)
                         )
                     } else {
@@ -876,7 +886,7 @@ impl MusicApp {
                                         revision,
                                         QueueEdit::Move {
                                             indices: next_indices.clone(),
-                                            before: next_index(&app.playback),
+                                            before: next_index(app.queue_playback()),
                                         },
                                     )
                                 });
@@ -893,7 +903,7 @@ impl MusicApp {
                                             indices: vec![index],
                                             before: index
                                                 .saturating_sub(1)
-                                                .max(next_index(&app.playback)),
+                                                .max(next_index(app.queue_playback())),
                                         },
                                     )
                                 });
@@ -908,7 +918,8 @@ impl MusicApp {
                                         revision,
                                         QueueEdit::Move {
                                             indices: vec![index],
-                                            before: (index + 2).min(app.playback.queue.len()),
+                                            before: (index + 2)
+                                                .min(app.queue_playback().queue.len()),
                                         },
                                     )
                                 });

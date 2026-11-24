@@ -6,6 +6,7 @@ use sonora::{
     sync::DeviceStatus,
 };
 use sonora_sync_protocol::{Device, PlaybackCommand, PlaybackState};
+use sonora_sync_protocol::{QueueChange, queue_fingerprint};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[gpui_kit::test]
@@ -123,4 +124,88 @@ fn devices_shows_remote_playback_and_controls_only_the_active_peer(cx: &mut Test
         fixture.backend.player_commands().try_recv(),
         Ok(PlayerCommand::Toggle)
     ));
+}
+
+#[gpui_kit::test]
+fn queue_panel_shows_and_edits_the_active_devices_queue(cx: &mut TestAppContext) {
+    let (_dir, mut fixture, window, _) = start(cx);
+    let ids: Vec<String> = ["track-1", "track-2", "track-3"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let tracks = fixture.catalog.by_ids(&ids).unwrap();
+    let _ = fixture.backend.player_commands().try_iter().count();
+    fixture.backend.emit(Event::DeviceSync(DeviceStatus {
+        connected: true,
+        local_device_id: "local".into(),
+        active_device_id: Some("remote".into()),
+        devices: vec![Device {
+            id: "remote".into(),
+            name: "Mac".into(),
+            os: "macos".into(),
+            online: true,
+            last_seen: 1,
+        }],
+        playback: Some(PlaybackState {
+            queue: ids.clone(),
+            index: Some(0),
+            playing: true,
+            seq: 7,
+            ..Default::default()
+        }),
+        track: tracks.first().cloned(),
+        queue: tracks.clone().into(),
+        ..Default::default()
+    }));
+    fixture.settle(window, cx);
+    cx.update_window(window, |_, window, _| {
+        for (index, track) in tracks.iter().enumerate() {
+            let row = window.find(format!("queue-entry-{index}").as_str().to_owned());
+            assert_eq!(
+                row.label(),
+                Some(
+                    format!(
+                        "Queue {}: {} · {}",
+                        index + 1,
+                        track.title,
+                        track.artist_label()
+                    )
+                    .as_str()
+                ),
+                "the queue panel shows the playing device's queue"
+            );
+        }
+        assert_eq!(
+            window.find("undo-queue-edit").disabled(),
+            Some(true),
+            "local undo history never applies to another device's queue"
+        );
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        window.right_click("queue-entry-2", cx)
+    })
+    .unwrap();
+    fixture.settle(window, cx);
+    let fingerprint = queue_fingerprint(&ids);
+    fixture.expect(
+        "remove from the playing device's queue",
+        move |command, _| {
+            assert!(matches!(
+                command,
+                Command::RemotePlayback(PlaybackCommand::EditQueue {
+                    queue,
+                    change: QueueChange::Remove { indices },
+                }) if *queue == fingerprint && *indices == [2]
+            ));
+            vec![]
+        },
+    );
+    fixture.menu_item(window, "Remove from Queue", cx);
+    fixture.assert_script_finished();
+    assert!(
+        fixture.backend.player_commands().is_empty(),
+        "the local queue is not edited"
+    );
 }

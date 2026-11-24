@@ -1645,7 +1645,6 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto",
- "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -7813,6 +7812,7 @@ dependencies = [
  "gpui-kit",
  "hound",
  "html-escape",
+ "if-addrs",
  "image",
  "lofty",
  "md5",
@@ -7828,10 +7828,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snow",
- "sonora-sync",
  "sonora-sync-protocol",
  "souvlaki",
- "spake2",
  "stream-download",
  "tempfile",
  "thiserror 2.0.21",
@@ -7887,18 +7885,6 @@ dependencies = [
  "objc",
  "thiserror 1.0.69",
  "windows 0.44.0",
-]
-
-[[package]]
-name = "spake2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
-dependencies = [
- "curve25519-dalek",
- "hkdf",
- "rand_core 0.6.4",
- "sha2 0.10.9",
 ]
 
 [[package]]

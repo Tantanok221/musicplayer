@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    service::SettingsCredentials, settings_save::SaveOutcome, sync::lan::LanOfferState,
+    service::SettingsCredentials,
+    settings_save::SaveOutcome,
+    sync::lan::{LanDevice, LanReach},
     tags::MusicFolderCheck,
 };
 use gpui_kit::base::{Toast, ToastTransitionStatus};
@@ -1149,31 +1151,16 @@ impl MusicApp {
     }
 
     fn paired_devices_settings(&self, app: WeakEntity<Self>) -> SettingGroup {
-        let port_app = app.clone();
-        let pair_app = app;
-        let discovery_app = pair_app.clone();
+        let port_app = app;
         let controls = self.service.clone();
         let port = self.lan_status.port;
-        let offer_notice = match &self.lan_offer {
-            LanOfferState::Idle => None,
-            LanOfferState::Available(code) => Some((
-                "lan-pairing-code",
-                format!("{} · use within 2 minutes", code.0),
-            )),
-            LanOfferState::UsedOrExpired => Some((
-                "lan-pairing-code-unavailable",
-                "Code used or expired — generate a new code".to_owned(),
-            )),
-        };
-        let peers = self.lan_status.peers.clone();
-        let discovered = self.lan_status.discovered.clone();
-        let automatic = self.lan_status.automatic.clone();
+        let devices = self.lan_status.devices.clone();
         SettingGroup::new()
             .title("Paired devices")
             .item(credential_field(
                 "LAN listener port",
                 self.lan_port.clone(),
-                Some("Leave empty for an automatic port."),
+                Some("Leave empty to keep the port Sonora picked."),
                 &["lan", "port"],
             ))
             .item(SettingItem::render(move |_, _, _| {
@@ -1206,97 +1193,24 @@ impl MusicApp {
                         });
                     })
             }))
-            .item(credential_field(
-                "LAN peer address",
-                self.lan_address.clone(),
-                None,
-                &["lan", "address", "pair"],
-            ))
-            .item(credential_field(
-                "LAN pairing code",
-                self.lan_code.clone(),
-                None,
-                &["lan", "pair", "code"],
-            ))
             .item(SettingItem::render(move |_, _, _| {
-                let app = pair_app.clone();
-                let show = controls.clone();
                 v_flex()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("lan-show-code")
-                                    .label("Show pairing code")
-                                    .on_click(move |_, _, _| show.send(Command::LanShowCode)),
-                            )
-                            .child(Button::new("lan-pair").label("Pair with device").on_click(
-                                move |_, window, cx| {
-                                    let _ = app.update(cx, |app, cx| {
-                                        let address = app
-                                            .lan_address
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .parse::<std::net::SocketAddr>();
-                                        let code = app.lan_code.read(cx).value().trim().to_owned();
-                                        if let Ok(address) = address
-                                            && address.port() != 0
-                                            && code.len() == 6
-                                            && code.bytes().all(|b| b.is_ascii_digit())
-                                        {
-                                            app.error = None;
-                                            app.service.send(Command::LanPair(address, code));
-                                            app.lan_code.update(cx, |input, cx| {
-                                                input.set_value("", window, cx)
-                                            });
-                                        } else {
-                                            app.error = Some(
-                                                "Enter a peer IP:port and its six-digit code"
-                                                    .into(),
-                                            );
-                                        }
-                                        cx.notify();
-                                    });
-                                },
-                            )),
-                    )
                     .when(port != 0, |el| {
                         el.child(format!("Listening on port {port}"))
                     })
-                    .when_some(offer_notice.clone(), |el, (id, text)| {
-                        el.child(
-                            div()
-                                .id(id)
-                                .test_support()
-                                .role(Role::Label)
-                                .aria_label(text.clone())
-                                .child(text),
-                        )
+                    .when(devices.is_empty(), |el| {
+                        el.child("Sign in to the same Navidrome account on another device to sync with it.")
                     })
-                    .children(discovered.iter().map(|peer| {
-                        let address = peer.address.to_string();
-                        let app = discovery_app.clone();
-                        Button::new(SharedString::from(format!("lan-select-{}", peer.id)))
-                            .label(format!("Use {} · {address}", peer.name))
-                            .on_click(move |_, window, cx| {
-                                let _ = app.update(cx, |app, cx| {
-                                    app.lan_address.update(cx, |input, cx| {
-                                        input.set_value(address.clone(), window, cx)
-                                    });
-                                });
-                            })
-                    }))
-                    .children(automatic.iter().map(|peer| {
+                    .children(devices.iter().map(|device| {
                         let service = controls.clone();
-                        let id = peer.id.clone();
-                        let label = format!("{} · Trusted via Navidrome", peer.name);
+                        let id = device.id.clone();
+                        let label = lan_device_label(device);
                         h_flex()
                             .gap_2()
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("lan-trust-{id}")))
+                                    .id(SharedString::from(format!("lan-device-{id}")))
                                     .test_support()
                                     .role(Role::Label)
                                     .aria_label(label.clone())
@@ -1310,33 +1224,6 @@ impl MusicApp {
                                     }),
                             )
                     }))
-                    .children(
-                        peers
-                            .iter()
-                            .filter(|peer| automatic.iter().all(|auto| auto.id != peer.id))
-                            .map(|peer| {
-                                let service = controls.clone();
-                                let id = peer.id.clone();
-                                h_flex()
-                                    .gap_2()
-                                    .child(format!(
-                                        "{} · Manually paired · {}",
-                                        peer.name, peer.address
-                                    ))
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "lan-revoke-{}",
-                                            peer.id
-                                        )))
-                                        .label("Revoke")
-                                        .on_click(
-                                            move |_, _, _| {
-                                                service.send(Command::LanRevoke(id.clone()))
-                                            },
-                                        ),
-                                    )
-                            }),
-                    )
             }))
     }
 
@@ -1548,6 +1435,15 @@ impl MusicApp {
                     ),
                 ),
             )
+    }
+}
+
+/// How a trusted LAN device appears in Settings → Paired devices.
+fn lan_device_label(device: &LanDevice) -> String {
+    match device.reach {
+        LanReach::Connected(address) => format!("{} · Connected · {address}", device.name),
+        LanReach::Found(address) => format!("{} · Found · {address}", device.name),
+        LanReach::NotFound => format!("{} · Not found on this network", device.name),
     }
 }
 
