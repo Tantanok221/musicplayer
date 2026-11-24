@@ -45,9 +45,7 @@ impl MusicApp {
                 let key = self.preferences.metadata.acoustid_key.clone();
                 self.acoustid_key
                     .update(cx, |input, cx| input.set_value(key, window, cx));
-                let slskd = self.preferences.downloads.url.clone();
-                self.slskd_url
-                    .update(cx, |input, cx| input.set_value(slskd, window, cx));
+                self.restore_slskd(window, cx);
                 self.discographies.clear();
                 if let Some(account) = account {
                     self.server_url
@@ -60,6 +58,7 @@ impl MusicApp {
                 self.show_active_tab(window, cx);
                 // Restoring tab content must not dismiss sign-in or an open form.
                 self.settings = show_settings;
+                self.watch_slskd(cx);
             }
             Event::SignInRequired(message) => {
                 self.settings = true;
@@ -229,7 +228,7 @@ impl MusicApp {
                     start.failure = Some(reason);
                 }
             }
-            Event::SlskdStatus(status) => self.slskd_status = Some(status),
+            Event::SlskdTested(id, status) => self.slskd_connection.complete(id, status),
             Event::TagsWritten(report) => self.tags_written(report, window, cx),
             Event::TagProgress(progress) => self.tag_progress(progress),
             Event::Album(id, tracks) if self.tag_editor_album.as_ref() == Some(&id) => {

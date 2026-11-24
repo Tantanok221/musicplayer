@@ -405,7 +405,9 @@ fn client(url: &str) -> Slskd {
 async fn search_polls_to_completion_then_cleans_up() {
     let (url, log) = serve(true).await;
     let client = client(&url);
-    assert_eq!(client.test().await.unwrap(), "Connected to slskd 0.26.2");
+    assert!(
+        matches!(client.test().await.unwrap(), sonora::slskd::ConnectionStatus::Connected { version, .. } if version == "0.26.2")
+    );
     let mut counts = Vec::new();
     let responses = client
         .search("  Artist   Album ", |count| counts.push(count))
@@ -501,7 +503,9 @@ async fn web_login_is_exchanged_for_a_token_and_renewed_when_it_lapses() {
         .unwrap()
     };
     let client = login("hunter2 hunter2");
-    assert_eq!(client.test().await.unwrap(), "Connected to slskd 0.26.2");
+    assert!(
+        matches!(client.test().await.unwrap(), sonora::slskd::ConnectionStatus::Connected { version, .. } if version == "0.26.2")
+    );
     // The first token was turned away, so the client signed in once more and then kept it.
     assert_eq!(log.take(), ["sign in", "sign in"]);
     client.test().await.unwrap();
