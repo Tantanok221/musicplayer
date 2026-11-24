@@ -1,9 +1,135 @@
 use super::*;
-use crate::{service::SettingsCredentials, settings_save::SaveOutcome};
+use crate::{service::SettingsCredentials, settings_save::SaveOutcome, tags::MusicFolderCheck};
 use gpui_kit::base::{Toast, ToastTransitionStatus};
 use gpui_kit::component::switch::Switch;
 
 const PLAYLIST_SETTINGS_PAGE: usize = 6;
+
+#[derive(Default)]
+enum FolderStatus {
+    #[default]
+    Idle,
+    Verified,
+    Checking,
+    Done(MusicFolderCheck),
+}
+
+#[derive(Default)]
+pub(super) struct FolderCheck {
+    folder: String,
+    revision: u64,
+    status: FolderStatus,
+    picker_failed: bool,
+}
+
+impl FolderCheck {
+    fn restore(&mut self, prefs: &MetadataPreferences) {
+        self.revision += 1;
+        self.folder.clone_from(&prefs.library_folder);
+        self.status = if prefs.folder_verified() {
+            FolderStatus::Verified
+        } else {
+            FolderStatus::Idle
+        };
+        self.picker_failed = false;
+    }
+
+    fn change(&mut self, folder: &str) -> bool {
+        if self.folder == folder {
+            return false;
+        }
+        self.revision += 1;
+        self.folder = folder.into();
+        self.status = FolderStatus::Idle;
+        self.picker_failed = false;
+        true
+    }
+
+    fn begin(&mut self) -> u64 {
+        self.revision += 1;
+        self.status = FolderStatus::Checking;
+        self.picker_failed = false;
+        self.revision
+    }
+
+    fn complete(&mut self, request: u64, result: MusicFolderCheck) -> bool {
+        if self.revision != request {
+            return false;
+        }
+        self.status = FolderStatus::Done(result);
+        true
+    }
+
+    fn verified(&self) -> bool {
+        matches!(
+            self.status,
+            FolderStatus::Verified | FolderStatus::Done(MusicFolderCheck::Passed { .. })
+        )
+    }
+
+    fn save_folder(&self, prefs: &mut MetadataPreferences) {
+        if self.folder != prefs.library_folder || !self.verified() {
+            prefs.write_tags = false;
+        }
+        prefs.library_folder.clone_from(&self.folder);
+        prefs.verified_library_folder = self.verified().then(|| self.folder.clone());
+    }
+}
+
+fn folder_check_label(status: &FolderStatus) -> (Option<String>, Option<String>) {
+    let label = match status {
+        FolderStatus::Idle => return (None, None),
+        FolderStatus::Verified => "✓ Music folder verified".into(),
+        FolderStatus::Checking => "Checking sample tracks…".into(),
+        FolderStatus::Done(result) => match result {
+            MusicFolderCheck::Passed {
+                found,
+                server_path,
+                local_path,
+            } => {
+                return (
+                    Some(format!("✓ Found {found}/{found} sample tracks")),
+                    Some(format!("{server_path} → {}", local_path.display())),
+                );
+            }
+            MusicFolderCheck::MissingFolder => {
+                "✗ Music folder not found. Mount the share or choose another folder.".into()
+            }
+            MusicFolderCheck::NoTracks => "Can't check until the library syncs.".into(),
+            MusicFolderCheck::Unmatched { found, total } => format!(
+                "✗ Found {found}/{total} sample tracks. Choose the folder that holds your artist folders, \
+                 or turn on Report Real Path for the Sonora player in Navidrome, then check again."
+            ),
+            MusicFolderCheck::FileProblem(message) | MusicFolderCheck::Failed(message) => {
+                format!("✗ {message}")
+            }
+        },
+    };
+    (Some(label), None)
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::{FolderCheck, MusicFolderCheck};
+
+    #[test]
+    fn an_old_result_cannot_verify_a_folder_after_editing_away_and_back() {
+        let mut check = FolderCheck::default();
+        check.change("/music");
+        let request = check.begin();
+        check.change("/other");
+        check.change("/music");
+        assert!(!check.complete(
+            request,
+            MusicFolderCheck::Passed {
+                found: 1,
+                server_path: "/server/song.flac".into(),
+                local_path: "/music/song.flac".into(),
+            }
+        ));
+        assert!(!check.verified());
+    }
+}
 
 fn gain_index(mode: &GainMode) -> usize {
     match mode {
@@ -307,13 +433,22 @@ impl MusicApp {
     }
 
     fn save_settings_with(&mut self, credentials: SettingsCredentials, cx: &mut Context<Self>) {
+        self.save_settings_with_label(credentials, "Settings saved", cx);
+    }
+
+    fn save_settings_with_label(
+        &mut self,
+        credentials: SettingsCredentials,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         let request = self.settings_save.begin();
         let result = self
             .service
             .save_settings(self.preferences.clone(), credentials);
         cx.spawn(async move |this, cx| {
             let outcome = if result.recv_async().await == Ok(true) {
-                SaveOutcome::Saved
+                SaveOutcome::Saved(label)
             } else {
                 SaveOutcome::Failed
             };
@@ -340,7 +475,7 @@ impl MusicApp {
     pub(super) fn settings_save_toast(&self, cx: &App) -> Option<impl IntoElement> {
         let colors = ink(cx);
         let (id, label) = match self.settings_save.outcome()? {
-            SaveOutcome::Saved => ("settings-saved", "Settings saved"),
+            SaveOutcome::Saved(label) => ("settings-saved", label),
             SaveOutcome::Failed => ("settings-save-failed", "Could not save settings"),
         };
         Some(
@@ -788,7 +923,150 @@ impl MusicApp {
             )
     }
 
+    pub(super) fn restore_metadata_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prefs = &mut self.preferences.metadata;
+        prefs.write_tags = prefs.tag_writes_enabled();
+        self.metadata_check.restore(prefs);
+        let folder = prefs.library_folder.clone();
+        self.metadata_folder
+            .update(cx, |input, cx| input.set_value(folder, window, cx));
+    }
+
+    pub(super) fn metadata_folder_input(
+        &mut self,
+        input: &Entity<InputState>,
+        event: &InputEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, InputEvent::Change)
+            && self.metadata_check.change(input.read(cx).value().trim())
+        {
+            cx.notify();
+        }
+    }
+
+    fn choose_music_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose music folder".into()),
+        });
+        let revision = self.metadata_check.revision;
+        cx.spawn_in(window, async move |this, cx| {
+            let selection = selection.await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                if app.metadata_check.revision != revision {
+                    return;
+                }
+                match selection {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.first().and_then(|path| path.to_str()) {
+                            let path = path.to_string();
+                            app.metadata_folder.update(cx, |input, cx| {
+                                input.set_value(path.clone(), window, cx);
+                            });
+                            app.metadata_check.change(path.trim());
+                            app.check_music_folder(cx);
+                            return;
+                        }
+                    }
+                    Ok(Ok(None)) => return,
+                    _ => {}
+                }
+                app.metadata_check.picker_failed = true;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn check_music_folder(&mut self, cx: &mut Context<Self>) {
+        if self.metadata_check.folder.is_empty() {
+            return;
+        }
+        let request = self.metadata_check.begin();
+        let (reply, result) = flume::bounded(1);
+        self.service.send(Command::CheckMusicFolder(
+            self.metadata_check.folder.as_str().into(),
+            reply,
+        ));
+        cx.spawn(async move |this, cx| {
+            let result = result.recv_async().await.unwrap_or_else(|_| {
+                MusicFolderCheck::Failed("The library service did not finish the check.".into())
+            });
+            let _ = this.update(cx, |app, cx| {
+                let check = &app.metadata_check;
+                let active_folder = check.folder == app.preferences.metadata.library_folder;
+                if app.metadata_check.complete(request, result) {
+                    if active_folder
+                        && !app.metadata_check.verified()
+                        && app.preferences.metadata.folder_verified()
+                    {
+                        app.metadata_check
+                            .save_folder(&mut app.preferences.metadata);
+                        app.save_preferences();
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_metadata_folder(&mut self, cx: &mut Context<Self>) {
+        self.metadata_check
+            .save_folder(&mut self.preferences.metadata);
+        let message = if self.metadata_check.verified() {
+            "Music folder saved · verified"
+        } else {
+            "Music folder saved · not verified"
+        };
+        self.save_metadata_settings(message, cx);
+    }
+
+    fn set_tag_writes(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if !self.metadata_check.verified() {
+            return;
+        }
+        self.metadata_check
+            .save_folder(&mut self.preferences.metadata);
+        self.preferences.metadata.write_tags = enabled;
+        let message = if enabled {
+            "Tag writing turned on · music folder verified"
+        } else {
+            "Tag writing turned off · music folder verified"
+        };
+        self.save_metadata_settings(message, cx);
+    }
+
+    fn save_acoustid_key(&mut self, cx: &mut Context<Self>) {
+        self.preferences.metadata.acoustid_key =
+            self.acoustid_key.read(cx).value().trim().to_string();
+        let message = if self.preferences.metadata.folder_verified() {
+            "AcoustID key saved · music folder verified"
+        } else {
+            "AcoustID key saved · music folder not verified"
+        };
+        self.save_metadata_settings(message, cx);
+    }
+
+    fn save_metadata_settings(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        self.save_settings_with_label(SettingsCredentials::Unchanged, message, cx);
+        cx.notify();
+    }
+
     pub(super) fn metadata_settings(&self, app: WeakEntity<Self>) -> SettingPage {
+        let can_check = !self.metadata_check.folder.is_empty()
+            && !matches!(self.metadata_check.status, FolderStatus::Checking);
+        let verified = self.metadata_check.verified();
+        let write_tags = verified
+            && self.metadata_check.folder == self.preferences.metadata.library_folder
+            && self.preferences.metadata.tag_writes_enabled();
+        let picker_failed = self.metadata_check.picker_failed;
+        let (status, mapping) = folder_check_label(&self.metadata_check.status);
         SettingPage::new("Metadata")
             .icon(Icon::new(Glyph::SlidersHorizontal))
             .resettable(false)
@@ -796,53 +1074,90 @@ impl MusicApp {
                 SettingGroup::new()
                     .title("Tag editing")
                     .description(
-                        "Navidrome can't save tags, so Sonora writes them into your files through a \
-                         folder that holds the same music: a network share or a folder on this computer. \
-                         Navidrome then rescans. Turn on Report Real Path for Sonora in Navidrome's \
-                         player settings so Sonora can find each file.",
+                        "Set a music folder to edit tags or use Identify by Sound on local files.",
+                    )
+                    .item(
+                        credential_field(
+                            "Music folder",
+                            self.metadata_folder.clone(),
+                            Some("The local folder or mounted share that holds the same files Navidrome serves."),
+                            &["metadata", "tags", "folder", "library", "mount"],
+                        )
+                        .layout(Axis::Vertical),
+                    )
+                    .item(
+                        SettingItem::render({
+                            let app = app.clone();
+                            move |_, _, _| {
+                                let chooser = app.clone();
+                                let checker = app.clone();
+                                let saver = app.clone();
+                                v_flex()
+                                    .gap_2()
+                                    .child(h_flex().flex_wrap().gap_2()
+                                        .child(Button::new("choose-music-folder")
+                                            .small()
+                                            .label("Choose music folder…")
+                                            .on_click(move |_, window, cx| {
+                                                let _ = chooser.update(cx, |app, cx| app.choose_music_folder(window, cx));
+                                            }))
+                                        .child(Button::new("check-music-folder")
+                                            .small()
+                                            .label("Check folder")
+                                            .disabled(!can_check)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = checker.update(cx, |app, cx| app.check_music_folder(cx));
+                                            }))
+                                        .child(Button::new("save-music-folder")
+                                            .small()
+                                            .label("Save folder")
+                                            .on_click(move |_, _, cx| {
+                                                let _ = saver.update(cx, MusicApp::save_metadata_folder);
+                                            })))
+                                    .when(picker_failed, |el| {
+                                        el.child(div().text_sm().child("Couldn't open or use that folder. Paste the path instead."))
+                                    })
+                                    .when_some(status.clone(), |el, status| {
+                                        el.child(div()
+                                            .id("music-folder-check-result")
+                                            .test_support()
+                                            .aria_label(status.clone())
+                                            .text_sm()
+                                            .child(status)
+                                            .when_some(mapping.clone(), |el, mapping| el.child(div().child(mapping))))
+                                    })
+                            }
+                        })
+                        .keywords(["metadata", "tags", "folder", "check", "choose", "save"]),
                     )
                     .item(
                         SettingItem::new(
                             "Write tags to files",
-                            SettingField::switch(
-                                {
+                            SettingField::render({
+                                let app = app.clone();
+                                move |options, _, _| {
                                     let app = app.clone();
-                                    move |cx: &App| {
-                                        app.read_with(cx, |app, _| {
-                                            app.preferences.metadata.write_tags
+                                    Switch::new("write-tags-to-files")
+                                        .with_size(options.size())
+                                        .accessibility_label("Write tags to files")
+                                        .disabled(!verified)
+                                        .checked(write_tags)
+                                        .on_change(move |value, _, cx| {
+                                            let _ = app.update(cx, |app, cx| app.set_tag_writes(*value, cx));
                                         })
-                                        .unwrap_or(false)
-                                    }
-                                },
-                                {
-                                    let app = app.clone();
-                                    move |value, cx: &mut App| {
-                                        let _ = app.update(cx, |app, cx| {
-                                            app.preferences.metadata.write_tags = value;
-                                            app.preferences.metadata.library_folder = app
-                                                .metadata_folder
-                                                .read(cx)
-                                                .value()
-                                                .trim()
-                                                .to_string();
-                                            app.save_settings(cx);
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                            )
-                            .default_value(false),
+                                }
+                            }),
                         )
                         .description(
-                            "Off by default. When off, Sonora never changes your music files.",
+                            "Off by default. Check the folder before turning this on. A passing check \
+                             doesn't promise write permission or that a share stays mounted. Sonora \
+                             still checks each file before writing.",
                         ),
-                    )
-                    .item(credential_field(
-                        "Music folder",
-                        self.metadata_folder.clone(),
-                        Some("The folder that matches Navidrome's music library, such as a mounted share."),
-                        &["metadata", "tags", "folder", "library", "mount"],
-                    ))
+                    ),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("AcoustID")
                     .item(credential_field(
                         "AcoustID key",
                         self.acoustid_key.clone(),
@@ -852,29 +1167,14 @@ impl MusicApp {
                     .item(
                         SettingItem::render(move |_, _, _| {
                             let app = app.clone();
-                            Button::new("save-music-folder")
+                            Button::new("save-acoustid")
                                 .small()
-                                .label("Save")
+                                .label("Save AcoustID key")
                                 .on_click(move |_, _, cx| {
-                                    let _ = app.update(cx, |app, cx| {
-                                        app.preferences.metadata.library_folder = app
-                                            .metadata_folder
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .to_string();
-                                        app.preferences.metadata.acoustid_key = app
-                                            .acoustid_key
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .to_string();
-                                        app.save_settings(cx);
-                                        cx.notify();
-                                    });
+                                    let _ = app.update(cx, MusicApp::save_acoustid_key);
                                 })
                         })
-                        .keywords(["metadata", "tags", "folder"]),
+                        .keywords(["metadata", "acoustid", "key", "save"]),
                     ),
             )
     }
