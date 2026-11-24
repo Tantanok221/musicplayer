@@ -467,7 +467,7 @@ impl MusicApp {
     fn album_deletion_allowed(&self, deletion: &AlbumDeletion) -> bool {
         deletion.allowed(
             self.account.as_ref().map(Account::namespace),
-            self.preferences.metadata.write_tags,
+            self.preferences.metadata.tag_writes_enabled(),
         )
     }
 
@@ -553,7 +553,7 @@ impl MusicApp {
 fn writes_tags(state: &MenuState, cx: &App) -> bool {
     state
         .app
-        .read_with(cx, |app, _| app.preferences.metadata.write_tags)
+        .read_with(cx, |app, _| app.preferences.metadata.tag_writes_enabled())
         .unwrap_or(false)
 }
 
