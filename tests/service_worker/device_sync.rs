@@ -1178,3 +1178,183 @@ async fn configured_worker_uses_saved_login_and_bridges_relay_controls() {
     task.abort();
     fixture.finish();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_peer_keeps_its_playback_when_joining_an_idle_host() {
+    use sonora::sync::PlaybackObservation;
+    use std::sync::Arc;
+
+    let low_id = "00000000000000000000000000000001";
+    let high_id = "ffffffffffffffffffffffffffffffff";
+    let low = Fixture::new(Library::default());
+    let mut high = Fixture::new(Library::default());
+    high.account = low.account.clone();
+    high.paths.save_account(&high.account).unwrap();
+    high.paths
+        .save_credentials(
+            &high.account,
+            &low.paths.credentials(&low.account).unwrap().unwrap(),
+        )
+        .unwrap();
+    for (fixture, id) in [(&low, low_id), (&high, high_id)] {
+        std::fs::write(fixture.paths.data.join("sync-device-id"), id).unwrap();
+        fixture.seed();
+    }
+
+    // The lower-ID device keeps a fixed port so its pinned address survives a restart.
+    let low_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    low.catalog()
+        .set_state(
+            "preferences",
+            &Preferences {
+                lan_port: Some(low_port),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut playing = high.start();
+    let (account, _) = playing.wait_ready(WAIT).unwrap();
+    let mut idle = low.start();
+    event(
+        &idle,
+        |event| matches!(event, Event::LanStatus(status) if status.port == low_port),
+    );
+    idle.service().send(Command::LanShowCode);
+    let Event::LanOffer(LanOfferState::Available(code)) = event(&idle, |event| {
+        matches!(event, Event::LanOffer(LanOfferState::Available(_)))
+    }) else {
+        unreachable!();
+    };
+    playing
+        .service()
+        .send(Command::LanPair(([127, 0, 0, 1], low_port).into(), code.0));
+    event(
+        &playing,
+        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.devices.iter().any(|device| device.id == low_id && device.online)),
+    );
+
+    // The lower-ID device closes; the higher-ID device plays alone and becomes the authority.
+    idle.shutdown(WAIT).unwrap();
+    event(
+        &playing,
+        |event| matches!(event, Event::DeviceSync(status) if status.connected && status.devices.iter().all(|device| device.id != low_id)),
+    );
+    playing.publish_playback(PlaybackSnapshot {
+        sync: Some(Arc::new(PlaybackObservation {
+            namespace: account.unwrap().namespace(),
+            revision: 1,
+            volume: 50,
+            shuffle: false,
+            repeat: Default::default(),
+        })),
+        queue: high.catalog().by_ids(&["song".into()]).unwrap().into(),
+        index: Some(0),
+        playing: true,
+        ..Default::default()
+    });
+    // Let the solo host publish the higher-ID device as the active player.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // The idle lower-ID device opens again; the playing device joins its session.
+    let mut idle = low.start();
+
+    // Both must end up in one session that shows the other device and the high device playing.
+    for (worker, other) in [(&idle, high_id), (&playing, low_id)] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let event = worker
+                .events()
+                .recv_deadline(deadline)
+                .expect("the joining device stays active with its playback in the shared session");
+            if matches!(&event, Event::DeviceSync(status)
+                if status.connected
+                    && status.active_device_id.as_deref() == Some(high_id)
+                    && status.playback.as_ref().is_some_and(|state| state.playing)
+                    && status.devices.iter().any(|device| device.id == other && device.online))
+            {
+                break;
+            }
+        }
+    }
+
+    // The idle device never takes control back from the playing one.
+    let stable = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(event) = playing.events().recv_deadline(stable) {
+        if let Event::DeviceSync(status) = event {
+            assert_eq!(status.active_device_id.as_deref(), Some(high_id));
+        }
+    }
+
+    idle.shutdown(WAIT).unwrap();
+    playing.shutdown(WAIT).unwrap();
+    low.finish();
+    high.finish();
+}
+
+#[tokio::test]
+async fn lan_host_accepts_only_the_peers_own_or_its_own_playback() {
+    use sonora::sync::lan::LanNode;
+    use sonora_sync_protocol::ReconciledPlayback;
+
+    let device = |id: &str| Device {
+        id: id.into(),
+        name: id.into(),
+        os: "linux".into(),
+        online: true,
+        last_seen: 0,
+    };
+    let host = LanNode::listen(device("a"), [1; 32], [3; 32], 0)
+        .await
+        .unwrap();
+    let guest = LanNode::listen(device("b"), [2; 32], [3; 32], 0)
+        .await
+        .unwrap();
+    guest
+        .pair(host.address(), &host.offer_code())
+        .await
+        .unwrap();
+    let (mut local, _) = host.connect(host.address()).await.unwrap();
+    let (mut remote, _) = guest.connect(host.address()).await.unwrap();
+    let snapshot = |device_id: &str, seq| ReconciledPlayback {
+        device_id: device_id.into(),
+        state: PlaybackState {
+            queue: vec!["track".into()],
+            index: Some(0),
+            playing: true,
+            seq,
+            ..Default::default()
+        },
+    };
+    for playback in [snapshot("c", 7), snapshot("b", 5)] {
+        remote
+            .send(ClientMessage::Reconcile {
+                playback: Some(playback),
+                settings: None,
+            })
+            .await
+            .unwrap();
+    }
+    loop {
+        let incoming = tokio::time::timeout(WAIT, local.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        if let ServerMessage::State {
+            state,
+            from_device_id,
+        } = incoming
+        {
+            assert_eq!(
+                (from_device_id.as_str(), state.seq),
+                ("b", 5),
+                "a third device's forged playback is dropped"
+            );
+            break;
+        }
+    }
+}

@@ -732,7 +732,10 @@ impl Network {
             return Ok(());
         };
         let mut changed = self.change.subscribe();
-        if !self.has_key(&key) || hosting.borrow_and_update().is_none() {
+        let Some((device, _)) = self.trusted().remove(&key) else {
+            return Ok(());
+        };
+        if hosting.borrow_and_update().is_none() {
             return Ok(());
         }
         time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&welcome)?)).await??;
@@ -753,8 +756,11 @@ impl Network {
                     let own = &self.announcement.device.id;
                     match &mut message {
                         ClientMessage::Command { target_device_id, .. } if target_device_id != own => continue,
+                        // A peer may reconcile its own playback or the host's, never a third device's.
                         ClientMessage::Reconcile { playback, .. }
-                            if playback.as_ref().is_some_and(|snapshot| &snapshot.device_id != own) => {
+                            if playback.as_ref().is_some_and(|snapshot| {
+                                snapshot.device_id != *own && snapshot.device_id != device.id
+                            }) => {
                             *playback = None;
                         }
                         _ => {}
