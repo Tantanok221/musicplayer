@@ -13,7 +13,13 @@ Requires Apple Silicon, Apple Command Line Tools (`xcode-select --install`) and 
 open dist/Sonora.app
 ```
 
-This builds a locally signed `dist/Sonora.app`. To update, rebuild and replace your installed app while Sonora is closed. Rebuilding may make macOS ask for Local Network access again.
+This builds a locally signed `dist/Sonora.app`. Move it to **Applications** (or another folder you can write to) and open it from there.
+
+An installed Sonora updates itself. Every commit on `main` that passes CI is published as a [GitHub release](https://github.com/Tantanok221/musicplayer/releases) with a signed Apple Silicon build, `sonora-macos-aarch64.zip`. Sonora checks for a newer one shortly after it starts, then every six hours, and installs it only when its signature matches Sonora's release key, its checksum matches, its commit comes after the one you're running, and the downloaded app's code signature is intact. It replaces the whole app; **Restart to update** in the status bar starts the new version. **Settings → About** shows your version and lets you check now. If it says **Move Sonora to Applications to enable updates**, macOS is running the app from a temporary read-only copy (as it does for a downloaded app that was never moved); move it and open it again. Updates may make macOS ask for Local Network access again.
+
+To install from a release instead of building, download the zip from the releases page, unzip it and move `Sonora.app` to **Applications**. The app isn't notarized, so the first time you open it macOS refuses: open **System Settings → Privacy & Security** and click **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/Sonora.app`. Later updates install without this.
+
+To update from source instead, rebuild and replace your installed app while Sonora is closed.
 
 ### Linux
 

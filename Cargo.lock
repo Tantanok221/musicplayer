@@ -7814,6 +7814,7 @@ dependencies = [
  "html-escape",
  "if-addrs",
  "image",
+ "libc",
  "lofty",
  "md5",
  "mdns-sd",

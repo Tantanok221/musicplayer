@@ -28,20 +28,21 @@ impl Worker {
     /// Uses the production command loop, SQLite, HTTP clients and event ordering.
     /// The supplied metadata client must use fixture endpoints in isolated tests.
     pub fn start(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, false, Hooks::default(), None)
+        Self::start_inner(paths, metadata, false, Hooks::default(), Err(None))
     }
 
-    /// Like `start`, with an updater that uses fixture endpoints.
+    /// Like `start`, with an updater that uses fixture endpoints, or the
+    /// reason this build can't update.
     pub fn start_with_updater(
         paths: Paths,
         metadata: MusicBrainz,
-        updater: crate::update::Updater,
+        updater: Result<crate::update::Updater, Option<String>>,
     ) -> Result<Self> {
-        Self::start_inner(paths, metadata, false, Hooks::default(), Some(updater))
+        Self::start_inner(paths, metadata, false, Hooks::default(), updater)
     }
 
     pub fn start_paused(paths: Paths, metadata: MusicBrainz) -> Result<Self> {
-        Self::start_inner(paths, metadata, true, Hooks::default(), None)
+        Self::start_inner(paths, metadata, true, Hooks::default(), Err(None))
     }
 
     /// Like `start`, but every file of a tag job waits for a message on the
@@ -55,7 +56,7 @@ impl Worker {
             tag_gate: Some(tag_gate),
         };
         Ok((
-            Self::start_inner(paths, metadata, false, hooks, None)?,
+            Self::start_inner(paths, metadata, false, hooks, Err(None))?,
             gate,
         ))
     }
@@ -65,7 +66,7 @@ impl Worker {
         metadata: MusicBrainz,
         paused: bool,
         hooks: Hooks,
-        updater: Option<crate::update::Updater>,
+        updater: Result<crate::update::Updater, Option<String>>,
     ) -> Result<Self> {
         let (tx, commands) = flume::unbounded();
         let (events, received_events) = flume::unbounded();

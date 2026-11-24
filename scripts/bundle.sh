@@ -37,7 +37,9 @@ cat > "$app_path/Contents/Info.plist" <<'PLIST'
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST
-/usr/bin/codesign --force --sign - "$app_path"
+# Ad-hoc by default. A stable identity (SONORA_CODESIGN_IDENTITY) keeps macOS
+# from asking for Local Network access again after each update.
+/usr/bin/codesign --force --sign "${SONORA_CODESIGN_IDENTITY:--}" "$app_path"
 destination="$PWD/dist/Sonora.app"
 # Replace the bundle without overwriting the running executable's inode.
 if [[ -d "$destination" ]]; then

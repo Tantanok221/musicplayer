@@ -329,8 +329,8 @@ pub mod test_support;
 pub(crate) struct Clients {
     pub musicbrainz: MusicBrainz,
     pub hooks: Hooks,
-    /// Replaces this build with newer releases; `None` when it can't.
-    pub updater: Option<crate::update::Updater>,
+    /// Replaces this build with newer releases, or why it can't.
+    pub updater: Result<crate::update::Updater, Option<String>>,
 }
 
 /// Points where tests can hold the worker. Production passes the default.

@@ -21,18 +21,26 @@ pub(super) struct Updates {
 }
 
 impl Updates {
-    pub fn start(updater: Option<Updater>, runtime: &Handle, events: Sender<Event>) -> Self {
+    /// Starts checking with `updater`, or reports why this build can't update.
+    pub fn start(
+        updater: Result<Updater, Option<String>>,
+        runtime: &Handle,
+        events: Sender<Event>,
+    ) -> Self {
         let installed = Arc::new(Mutex::new(None));
-        let Some(updater) = updater.map(Arc::new) else {
-            let _ = events.send(Event::Update(UpdateStatus {
-                current: COMMIT.to_owned(),
-                state: UpdateState::Unavailable,
-            }));
-            return Self {
-                updater: None,
-                wake: None,
-                installed,
-            };
+        let updater = match updater {
+            Ok(updater) => Arc::new(updater),
+            Err(reason) => {
+                let _ = events.send(Event::Update(UpdateStatus {
+                    current: COMMIT.to_owned(),
+                    state: UpdateState::Unavailable(reason),
+                }));
+                return Self {
+                    updater: None,
+                    wake: None,
+                    installed,
+                };
+            }
         };
         let (wake, mut woken) = mpsc::unbounded_channel();
         let (task_updater, task_installed) = (updater.clone(), installed.clone());

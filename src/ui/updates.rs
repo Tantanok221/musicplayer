@@ -24,7 +24,7 @@ impl MusicApp {
     pub(super) fn about_settings(&self) -> SettingPage {
         let status = self.update.clone().unwrap_or(UpdateStatus {
             current: crate::update::COMMIT.to_owned(),
-            state: UpdateState::Unavailable,
+            state: UpdateState::Unavailable(None),
         });
         let service = self.service.clone();
         SettingPage::new("About")
@@ -36,7 +36,7 @@ impl MusicApp {
                         let label = status.label();
                         let can_check = !matches!(
                             status.state,
-                            UpdateState::Unavailable | UpdateState::Checking
+                            UpdateState::Unavailable(_) | UpdateState::Checking
                         );
                         let service = service.clone();
                         v_flex()

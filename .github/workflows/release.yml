@@ -1,7 +1,9 @@
 name: Release
 
-# Publishes each commit on main that passed CI as a signed Linux build. Installed
-# Linux copies of Sonora check the latest release and update themselves.
+# Publishes each commit on main that passed CI as signed Linux x86-64 and
+# Apple Silicon builds. Installed copies of Sonora check the latest release and
+# update themselves. A release is only published when both platforms built, so
+# an installed copy never sees a release without its asset.
 on:
   workflow_run:
     workflows: [CI]
@@ -17,6 +19,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  COMMIT: ${{ github.event.workflow_run.head_sha }}
 
 jobs:
   linux:
@@ -24,9 +27,8 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      COMMIT: ${{ github.event.workflow_run.head_sha }}
-      GH_TOKEN: ${{ github.token }}
+    outputs:
+      current: ${{ steps.tip.outputs.current }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,11 +63,126 @@ jobs:
         env:
           SONORA_COMMIT: ${{ env.COMMIT }}
         run: cargo build --release --locked --bin sonora
+      - uses: actions/upload-artifact@v4
+        if: steps.tip.outputs.current == 'true'
+        with:
+          name: linux-x86_64
+          path: target/release/sonora
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS Apple Silicon
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      current: ${{ steps.tip.outputs.current }}
+    env:
+      HAS_CERT: ${{ secrets.SONORA_MACOS_CERT_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Skip commits that are no longer the tip of main
+        id: tip
+        run: |
+          tip=$(git ls-remote origin refs/heads/main | cut -f 1)
+          if [ "$tip" = "$COMMIT" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main moved on to $tip; skipping $COMMIT"
+          fi
+      - name: Install pinned Rust toolchain
+        if: steps.tip.outputs.current == 'true'
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        if: steps.tip.outputs.current == 'true'
+        with:
+          key: release-macos
+      # Optional: a stable self-signed identity, so macOS doesn't ask for Local
+      # Network access again after every update. Without it the app is signed
+      # ad hoc.
+      - name: Import the code signing certificate
+        if: steps.tip.outputs.current == 'true' && env.HAS_CERT == 'true'
+        env:
+          CERT: ${{ secrets.SONORA_MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.SONORA_MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/sonora-signing.keychain-db"
+          keychain_password=$(openssl rand -hex 16)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          (umask 077 && printf '%s' "$CERT" | base64 --decode > "$RUNNER_TEMP/sonora.p12")
+          security import "$RUNNER_TEMP/sonora.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/sonora.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          # A self-signed certificate isn't trusted, so it isn't listed with -v.
+          identity=$(security find-identity -p codesigning "$keychain" |
+            awk '/^ *1\)/ { print $2; exit }')
+          if [ -z "$identity" ]; then
+            echo "The certificate has no code signing identity." >&2
+            exit 1
+          fi
+          echo "SONORA_CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Build and bundle
+        if: steps.tip.outputs.current == 'true'
+        env:
+          SONORA_COMMIT: ${{ env.COMMIT }}
+        run: |
+          cargo build --release --locked --bin sonora
+          scripts/bundle.sh release
+          codesign -d -r- dist/Sonora.app
+          ditto -c -k --keepParent dist/Sonora.app dist/sonora-macos-aarch64.zip
+      - name: Remove the signing keychain
+        if: always() && env.HAS_CERT == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/sonora-signing.keychain-db" || true
+      - uses: actions/upload-artifact@v4
+        if: steps.tip.outputs.current == 'true'
+        with:
+          name: macos-aarch64
+          path: dist/sonora-macos-aarch64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish
+    needs: [linux, macos]
+    if: needs.linux.outputs.current == 'true' && needs.macos.outputs.current == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Skip commits that are no longer the tip of main
+        id: tip
+        run: |
+          tip=$(git ls-remote origin refs/heads/main | cut -f 1)
+          if [ "$tip" = "$COMMIT" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main moved on to $tip; skipping $COMMIT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.tip.outputs.current == 'true'
+        with:
+          path: artifacts
       - name: Sign
         if: steps.tip.outputs.current == 'true'
         env:
           SONORA_UPDATE_SIGNING_KEY: ${{ secrets.SONORA_UPDATE_SIGNING_KEY }}
-        run: scripts/sign-release.sh target/release/sonora "$COMMIT" dist/release
+        run: |
+          scripts/sign-release.sh linux-x86_64 artifacts/linux-x86_64/sonora "$COMMIT" dist/release
+          scripts/sign-release.sh macos-aarch64 \
+            artifacts/macos-aarch64/sonora-macos-aarch64.zip "$COMMIT" dist/release
       - name: Publish
         if: steps.tip.outputs.current == 'true'
         run: |
@@ -73,7 +190,7 @@ jobs:
           gh release create "sonora-$short" dist/release/* \
             --target "$COMMIT" \
             --title "Sonora $short" \
-            --notes "Linux x86-64 build of $COMMIT. Installed copies update automatically." \
+            --notes "Linux x86-64 and Apple Silicon builds of $COMMIT. Installed copies update automatically." \
             --latest
       - name: Keep the five newest releases
         if: steps.tip.outputs.current == 'true'

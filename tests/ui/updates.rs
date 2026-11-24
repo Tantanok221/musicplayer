@@ -58,7 +58,7 @@ fn settings_check_for_updates_and_restart_into_a_ready_one(cx: &mut TestAppConte
 #[gpui_kit::test]
 fn builds_that_cannot_update_say_so_and_offer_no_check(cx: &mut TestAppContext) {
     let (_dir, mut f, window, _) = start(cx);
-    f.backend.emit(status(UpdateState::Unavailable));
+    f.backend.emit(status(UpdateState::Unavailable(None)));
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     page(&mut f, window, "About", cx);
     cx.update_window(window, |_, window, _| {
@@ -68,6 +68,24 @@ fn builds_that_cannot_update_say_so_and_offer_no_check(cx: &mut TestAppContext) 
         );
         assert_eq!(window.find("update-check").disabled(), Some(true));
         assert!(window.try_find("update-restart").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_app_that_must_move_to_update_says_so(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.backend.emit(status(UpdateState::Unavailable(Some(
+        "Move Sonora to Applications to enable updates".into(),
+    ))));
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "About", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("update-status").label(),
+            Some("Version aaaaaaa · Move Sonora to Applications to enable updates")
+        );
+        assert_eq!(window.find("update-check").disabled(), Some(true));
     })
     .unwrap();
 }
