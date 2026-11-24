@@ -33,7 +33,9 @@ use std::{
 const SIGN_IN_NOTICE: &str =
     "Sign in once to save your login locally. Sonora no longer uses Keychain.";
 
+mod device_sync;
 pub mod native;
+mod play_queue;
 
 #[derive(Clone)]
 pub enum SettingsCredentials {
@@ -172,6 +174,16 @@ pub enum Command {
     Preferences(Preferences),
     SaveSettings(Preferences, SettingsCredentials, Sender<bool>),
     Player(PlayerCommand),
+    RemotePlayback(sonora_sync_protocol::PlaybackCommand),
+    TransferTo(String, bool),
+    TransferPrepared(u64, String, bool),
+    TransferExpired(u64, String),
+    RemoteQueueFound(String, i64, crate::server::RemotePlayQueue),
+    ResumeServerQueue,
+    DeviceSync(u64, crate::sync::RelayEvent),
+    LanPair(std::net::SocketAddr, String),
+    LanShowCode,
+    LanRevoke(String),
     Persist(String, SavedQueue),
     Scrobble(ListenReport),
     Connected {
@@ -272,6 +284,12 @@ pub enum Event {
     Backdrop(String, Arc<Backdrop>),
     Lyrics(String, Result<Arc<Lyrics>, String>),
     Playback(PlaybackSnapshot),
+    DeviceSync(crate::sync::DeviceStatus),
+    LocalVolume(f32),
+    ResumeQueue(Option<String>),
+    SharedPreferences(crate::sync::SharedPreferences),
+    LanStatus(crate::sync::lan::LanStatus),
+    LanOffer(crate::sync::lan::LanOfferState),
     Status(String),
     Connection(Connection),
     LibrarySyncing(bool),
@@ -297,6 +315,7 @@ pub struct Service {
     pub tx: Sender<Command>,
     pub player: PlayerHandle,
     query_epoch: Arc<AtomicU64>,
+    playback_sample: tokio::sync::watch::Sender<PlaybackSnapshot>,
 }
 
 #[cfg(feature = "test-support")]
@@ -670,7 +689,7 @@ fn reconcile_tags(catalog: &Catalog) -> Result<Reconciled> {
 
 fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
     catalog.set_state("preferences", &prefs)?;
-    player.send(PlayerCommand::Preferences(prefs));
+    player.send(PlayerCommand::Preferences(Box::new(prefs)));
     Ok(())
 }
 impl Service {
@@ -683,11 +702,13 @@ impl Service {
             tx: tx.clone(),
             player,
             query_epoch,
+            playback_sample: tokio::sync::watch::Sender::new(PlaybackSnapshot::default()),
         };
         let event_tx = events.clone();
+        let playback_sample = service.playback_sample.clone();
         std::thread::Builder::new()
             .name("sonora-player-events".into())
-            .spawn(move || forward_player_events(player_events, tx, event_tx))
+            .spawn(move || forward_player_events(player_events, tx, event_tx, playback_sample))
             .expect("Could not start playback bridge");
         let worker = service.clone();
         std::thread::Builder::new()
@@ -730,6 +751,7 @@ fn forward_player_events(
     player_events: Receiver<PlayerEvent>,
     command_tx: Sender<Command>,
     event_tx: Sender<Event>,
+    playback_sample: tokio::sync::watch::Sender<PlaybackSnapshot>,
 ) {
     let mut playback_failed = false;
     while let Ok(event) = player_events.recv() {
@@ -741,6 +763,7 @@ fn forward_player_events(
                     let _ = command_tx.send(Command::CheckConnection(true));
                 }
                 playback_failed = failed;
+                playback_sample.send_replace(snapshot.clone());
                 let _ = event_tx.send(Event::Playback(snapshot));
             }
             PlayerEvent::Persist(namespace, queue) => {
@@ -1134,19 +1157,24 @@ fn run(
         player,
         tx,
         query_epoch,
+        playback_sample,
         ..
     } = service;
+    let mut devices =
+        device_sync::DeviceSync::new(runtime.clone(), tx.clone(), playback_sample.subscribe());
+    let mut queue_sync = play_queue::QueueSync::new(&runtime);
     let mut account = paths.account()?;
     let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
-    player.send(PlayerCommand::Preferences(prefs.clone()));
+    player.send(PlayerCommand::Preferences(Box::new(prefs.clone())));
     restore_queue(
         &catalog,
         &player,
         account.as_ref().map(Account::namespace).unwrap_or_default(),
     )?;
-    events.send(Event::Ready(account.clone(), prefs))?;
+    events.send(Event::Ready(account.clone(), prefs.clone()))?;
+    devices.configure(&paths, account.as_ref(), &prefs, &events);
     events.send(Event::Playlists(catalog.playlist_summaries()?))?;
     let interrupted = catalog.interrupted_tag_edits()?;
     if !interrupted.is_empty() {
@@ -1310,10 +1338,15 @@ fn run(
             Err(flume::RecvTimeoutError::Disconnected) => break,
         };
         if let Command::Shutdown(ack) = command {
+            let _ = devices.rollback_transfer(&catalog, &player);
             let (reply, queue) = flume::bounded(1);
             player.send(PlayerCommand::SaveQueue(reply));
             if let Ok(queue) = queue.recv_timeout(std::time::Duration::from_secs(2)) {
-                catalog.set_state("queue", &queue)?;
+                queue_sync.quit(
+                    &catalog,
+                    queue,
+                    server.as_ref().filter(|_| devices.can_save_queue()),
+                )?;
             }
             player.send(PlayerCommand::Shutdown);
             let _ = ack.send(());
@@ -1482,7 +1515,7 @@ fn run(
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
                         account_epoch += 1;
                         let prefs: Preferences = catalog.state("preferences")?;
-                        player.send(PlayerCommand::Preferences(prefs.clone()));
+                        player.send(PlayerCommand::Preferences(Box::new(prefs.clone())));
                         restore_queue(&catalog, &player, value.account.namespace())?;
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
                         slskd = None;
@@ -1493,7 +1526,16 @@ fn run(
                     paths.save_account(&value.account)?;
                     native_editor.session(session);
                     account = Some(value.account.clone());
+                    let prefs: Preferences = catalog.state("preferences")?;
+                    devices.configure(&paths, account.as_ref(), &prefs, &events);
                     checking = None;
+                    queue_sync.connected(
+                        &value,
+                        !prefs.sync_server_url.is_empty(),
+                        &catalog,
+                        &runtime,
+                        &tx,
+                    )?;
                     last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
@@ -1661,7 +1703,10 @@ fn run(
                     }
                 }
                 Command::PlayTrack(id) => {
-                    player.send(PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_queue_from(&id)?, 0),
+                    );
                 }
                 Command::AlbumDetails(id) => {
                     if let Some(album) = catalog.album(&id)? {
@@ -2288,16 +2333,19 @@ fn run(
                 }
                 Command::PlayIds(ids, at) => {
                     let tracks = catalog.by_ids(&ids)?;
-                    player.send(PlayerCommand::Replace(tracks, at));
+                    devices.playback_intent(&player, PlayerCommand::Replace(tracks, at));
                 }
                 Command::PlayAlbum(id) => {
-                    player.send(PlayerCommand::Replace(catalog.album_tracks(&id)?, 0));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_tracks(&id)?, 0),
+                    );
                 }
                 Command::PlayAlbumMatching(query, id) => {
-                    player.send(PlayerCommand::Replace(
-                        catalog.album_tracks_matching(&query, &id)?,
-                        0,
-                    ));
+                    devices.playback_intent(
+                        &player,
+                        PlayerCommand::Replace(catalog.album_tracks_matching(&query, &id)?, 0),
+                    );
                 }
                 Command::Enqueue(ids, placement) => {
                     player.send(PlayerCommand::Insert(catalog.by_ids(&ids)?, placement));
@@ -2343,6 +2391,50 @@ fn run(
                     }
                 }
                 Command::Player(command) => player.send(command),
+                Command::RemotePlayback(cmd) => {
+                    if !devices.send(cmd) && devices.status.remote_id().is_some() {
+                        events.send(Event::Error("Remote device is unavailable".into()))?;
+                    }
+                }
+                Command::DeviceSync(generation, event) => {
+                    devices.receive(generation, event, &catalog, &player, &events)?;
+                }
+                Command::LanPair(address, code) => {
+                    if !devices.lan(device_sync::LanAction::Pair(address, code)) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
+                Command::LanShowCode => {
+                    if !devices.lan(device_sync::LanAction::ShowCode) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
+                Command::LanRevoke(id) => {
+                    if !devices.lan(device_sync::LanAction::Revoke(id)) {
+                        events.send(Event::Error("LAN pairing is unavailable".into()))?;
+                    }
+                }
+                Command::TransferTo(id, start_playing) => {
+                    if !devices.transfer_to(id, start_playing) {
+                        events.send(Event::Error("Device is not available for transfer".into()))?;
+                    }
+                }
+                Command::TransferPrepared(generation, id, ok) => {
+                    devices.transfer_prepared(generation, id, ok, &catalog, &player)?;
+                }
+                Command::TransferExpired(generation, id) => {
+                    devices.transfer_expired(generation, &id, &catalog, &player)?;
+                }
+                Command::RemoteQueueFound(namespace, local, queue) => {
+                    if devices.can_offer_queue_resume() {
+                        queue_sync.offer(queue, &namespace, local, &catalog, &events)?;
+                    }
+                }
+                Command::ResumeServerQueue => {
+                    if devices.can_offer_queue_resume() {
+                        queue_sync.resume(&catalog, &player, &events)?;
+                    }
+                }
                 Command::WriteTags(edits) => {
                     let covers = crate::tags::wanted_covers(&edits);
                     if !covers.is_empty() {
@@ -2534,11 +2626,30 @@ fn run(
                         let _ = events.send(Event::ReleaseLoaded(id, result));
                     });
                 }
-                Command::Preferences(prefs) => {
-                    persist_preferences(&catalog, &player, prefs)?;
-                }
-                Command::SaveSettings(prefs, credentials, reply) => {
-                    let saved = persist_preferences(&catalog, &player, prefs).is_ok()
+                command @ (Command::Preferences(_) | Command::SaveSettings(..)) => {
+                    let (prefs, confirmation) = match command {
+                        Command::Preferences(prefs) => (prefs, None),
+                        Command::SaveSettings(prefs, credentials, reply) => {
+                            (prefs, Some((credentials, reply)))
+                        }
+                        _ => unreachable!(),
+                    };
+                    let persisted = (|| {
+                        let previous: Preferences = catalog.state("preferences")?;
+                        if previous.sync_server_url != prefs.sync_server_url
+                            || previous.lan_port != prefs.lan_port
+                        {
+                            devices.rollback_transfer(&catalog, &player)?;
+                            queue_sync.dismiss(&events)?;
+                        }
+                        persist_preferences(&catalog, &player, prefs.clone())?;
+                        devices.configure(&paths, account.as_ref(), &prefs, &events);
+                        devices.share_preferences(&previous, &prefs, &catalog)
+                    })();
+                    let Some((credentials, reply)) = confirmation else {
+                        return persisted;
+                    };
+                    let saved = persisted.is_ok()
                         && match credentials {
                             SettingsCredentials::Unchanged => true,
                             SettingsCredentials::Slskd(key, username, password) => {
@@ -2553,8 +2664,17 @@ fn run(
                     let _ = reply.send(saved);
                 }
                 Command::Persist(namespace, queue) => {
-                    if namespace == account.as_ref().map(Account::namespace).unwrap_or_default() {
-                        catalog.set_state("queue", &queue)?;
+                    if namespace == account.as_ref().map(Account::namespace).unwrap_or_default()
+                        && !devices.preparing_transfer()
+                    {
+                        let playing = playback_sample.borrow().playing;
+                        queue_sync.persist(
+                            &catalog,
+                            queue,
+                            server.as_ref().filter(|_| devices.can_save_queue()),
+                            playing,
+                            &events,
+                        )?;
                     }
                 }
                 Command::Scrobble(report) => {

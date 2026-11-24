@@ -61,6 +61,7 @@ impl Worker {
             tx,
             player,
             query_epoch: Arc::new(AtomicU64::new(0)),
+            playback_sample: tokio::sync::watch::Sender::default(),
         };
         let mut service = service;
         let mut player_threads = Vec::new();
@@ -71,8 +72,14 @@ impl Worker {
             player_threads.push(thread);
             let command_tx = service.tx.clone();
             let event_tx = events.clone();
+            let playback_sample = service.playback_sample.clone();
             player_threads.push(thread::spawn(move || {
-                super::super::forward_player_events(player_events, command_tx, event_tx)
+                super::super::forward_player_events(
+                    player_events,
+                    command_tx,
+                    event_tx,
+                    playback_sample,
+                )
             }));
         }
         let worker = service.clone();
@@ -123,6 +130,10 @@ impl Worker {
 
     pub fn player_commands(&self) -> &Receiver<PlayerCommand> {
         &self.player_commands
+    }
+
+    pub fn publish_playback(&self, snapshot: crate::model::PlaybackSnapshot) {
+        self.service.playback_sample.send_replace(snapshot);
     }
 
     pub fn wait_ready(&self, timeout: Duration) -> Result<(Option<Account>, Preferences)> {

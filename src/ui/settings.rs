@@ -1,5 +1,8 @@
 use super::*;
-use crate::{service::SettingsCredentials, settings_save::SaveOutcome, tags::MusicFolderCheck};
+use crate::{
+    service::SettingsCredentials, settings_save::SaveOutcome, sync::lan::LanOfferState,
+    tags::MusicFolderCheck,
+};
 use gpui_kit::base::{Toast, ToastTransitionStatus};
 use gpui_kit::component::switch::Switch;
 
@@ -344,6 +347,31 @@ fn layout_choice<const N: usize>(
 }
 
 impl MusicApp {
+    pub(super) fn apply_shared_preferences(
+        &mut self,
+        shared: &crate::sync::SharedPreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = &self.preferences;
+        let mut updated = previous.clone();
+        if shared.apply(&mut updated).is_err() {
+            return;
+        }
+        let theme_changed = previous.dark != updated.dark;
+        let query_changed = previous.favorites != updated.favorites
+            || previous.sorting.albums != updated.sorting.albums
+            || previous.sorting.tracks != updated.sorting.tracks;
+        self.preferences = updated;
+        if theme_changed {
+            self.apply_theme(window, cx);
+        }
+        if query_changed {
+            self.request_query(cx);
+        }
+        self.notify_part(Part::Center, cx);
+    }
+
     pub(super) fn apply_theme(&self, window: &mut Window, cx: &mut App) {
         let mode = self.preferences.dark.map_or_else(
             || ThemeMode::from(window.appearance()),
@@ -517,7 +545,12 @@ impl MusicApp {
                     // Keep the Layout page at LAYOUT_SETTINGS_PAGE.
                     .page(self.layout_settings(app.clone()))
                     .page(self.metadata_settings(app.clone()))
-                    .page(self.playlist_settings(app)),
+                    .page(self.playlist_settings(app.clone()))
+                    .page(
+                        SettingPage::new("Paired devices")
+                            .icon(Icon::new(Glyph::Monitor))
+                            .group(self.paired_devices_settings(app)),
+                    ),
             )
             .into_any_element()
     }
@@ -1030,6 +1063,7 @@ impl MusicApp {
     pub(super) fn playback_settings(&self, app: WeakEntity<Self>) -> SettingPage {
         let gain = self.preferences.gain.clone();
         let selected = gain_index(&gain);
+        let sync_app = app.clone();
         SettingPage::new("Playback")
             .icon(Icon::new(Glyph::AudioLines))
             .group(
@@ -1066,7 +1100,7 @@ impl MusicApp {
                                     .unwrap_or(false)
                                 }
                             },
-                            move |_, cx| {
+                    move |_, cx| {
                                 let _ = app.update(cx, |app, cx| {
                                     app.preferences.gain = GainMode::Smart;
                                     app.save_settings(cx);
@@ -1085,6 +1119,225 @@ impl MusicApp {
                     ]),
                 ),
             )
+            .group(
+                SettingGroup::new()
+                    .title("Device sync")
+                    .item(credential_field(
+                        "Sync server URL",
+                        self.sync_server_url.clone(),
+                        Some("Use the HTTPS URL of your Sonora sync server. Leave empty for local network sync."),
+                        &["relay", "connect", "devices"],
+                    ))
+                    .item(SettingItem::render(move |_, _, _| {
+                        let app = sync_app.clone();
+                        Button::new("save-sync-url").label("Save").on_click(move |_, window, cx| {
+                            let _ = app.update(cx, |app, cx| {
+                                let url = app.sync_server_url.read(cx).value().trim().to_owned();
+                                if let Err(error) = crate::sync::relay::endpoint(&url) {
+                                    app.error = Some(error.to_string());
+                                } else {
+                                    app.error = None;
+                                    app.sync_server_url.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
+                                    app.preferences.sync_server_url = url;
+                                    app.save_settings(cx);
+                                }
+                                cx.notify();
+                            });
+                        })
+                    })),
+            )
+    }
+
+    fn paired_devices_settings(&self, app: WeakEntity<Self>) -> SettingGroup {
+        let port_app = app.clone();
+        let pair_app = app;
+        let discovery_app = pair_app.clone();
+        let controls = self.service.clone();
+        let port = self.lan_status.port;
+        let offer_notice = match &self.lan_offer {
+            LanOfferState::Idle => None,
+            LanOfferState::Available(code) => Some((
+                "lan-pairing-code",
+                format!("{} · use within 2 minutes", code.0),
+            )),
+            LanOfferState::UsedOrExpired => Some((
+                "lan-pairing-code-unavailable",
+                "Code used or expired — generate a new code".to_owned(),
+            )),
+        };
+        let peers = self.lan_status.peers.clone();
+        let discovered = self.lan_status.discovered.clone();
+        let automatic = self.lan_status.automatic.clone();
+        SettingGroup::new()
+            .title("Paired devices")
+            .item(credential_field(
+                "LAN listener port",
+                self.lan_port.clone(),
+                Some("Leave empty for an automatic port."),
+                &["lan", "port"],
+            ))
+            .item(SettingItem::render(move |_, _, _| {
+                let app = port_app.clone();
+                Button::new("lan-save-port")
+                    .label("Save port")
+                    .on_click(move |_, _, cx| {
+                        let _ = app.update(cx, |app, cx| {
+                            let raw = app.lan_port.read(cx).value();
+                            let port = if raw.trim().is_empty() {
+                                Ok(None)
+                            } else {
+                                raw.trim()
+                                    .parse::<std::num::NonZeroU16>()
+                                    .map(|port| Some(port.get()))
+                            };
+                            match port {
+                                Ok(port) => {
+                                    app.error = None;
+                                    app.preferences.lan_port = port;
+                                    app.save_settings(cx);
+                                }
+                                Err(_) => {
+                                    app.error = Some(
+                                        "Enter a port from 1 to 65535 or leave it blank".into(),
+                                    )
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+            }))
+            .item(credential_field(
+                "LAN peer address",
+                self.lan_address.clone(),
+                None,
+                &["lan", "address", "pair"],
+            ))
+            .item(credential_field(
+                "LAN pairing code",
+                self.lan_code.clone(),
+                None,
+                &["lan", "pair", "code"],
+            ))
+            .item(SettingItem::render(move |_, _, _| {
+                let app = pair_app.clone();
+                let show = controls.clone();
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("lan-show-code")
+                                    .label("Show pairing code")
+                                    .on_click(move |_, _, _| show.send(Command::LanShowCode)),
+                            )
+                            .child(Button::new("lan-pair").label("Pair with device").on_click(
+                                move |_, window, cx| {
+                                    let _ = app.update(cx, |app, cx| {
+                                        let address = app
+                                            .lan_address
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .parse::<std::net::SocketAddr>();
+                                        let code = app.lan_code.read(cx).value().trim().to_owned();
+                                        if let Ok(address) = address
+                                            && address.port() != 0
+                                            && code.len() == 6
+                                            && code.bytes().all(|b| b.is_ascii_digit())
+                                        {
+                                            app.error = None;
+                                            app.service.send(Command::LanPair(address, code));
+                                            app.lan_code.update(cx, |input, cx| {
+                                                input.set_value("", window, cx)
+                                            });
+                                        } else {
+                                            app.error = Some(
+                                                "Enter a peer IP:port and its six-digit code"
+                                                    .into(),
+                                            );
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                            )),
+                    )
+                    .when(port != 0, |el| {
+                        el.child(format!("Listening on port {port}"))
+                    })
+                    .when_some(offer_notice.clone(), |el, (id, text)| {
+                        el.child(
+                            div()
+                                .id(id)
+                                .test_support()
+                                .role(Role::Label)
+                                .aria_label(text.clone())
+                                .child(text),
+                        )
+                    })
+                    .children(discovered.iter().map(|peer| {
+                        let address = peer.address.to_string();
+                        let app = discovery_app.clone();
+                        Button::new(SharedString::from(format!("lan-select-{}", peer.id)))
+                            .label(format!("Use {} · {address}", peer.name))
+                            .on_click(move |_, window, cx| {
+                                let _ = app.update(cx, |app, cx| {
+                                    app.lan_address.update(cx, |input, cx| {
+                                        input.set_value(address.clone(), window, cx)
+                                    });
+                                });
+                            })
+                    }))
+                    .children(automatic.iter().map(|peer| {
+                        let service = controls.clone();
+                        let id = peer.id.clone();
+                        let label = format!("{} · Trusted via Navidrome", peer.name);
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("lan-trust-{id}")))
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_label(label.clone())
+                                    .child(label),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("lan-revoke-{id}")))
+                                    .label("Revoke")
+                                    .on_click(move |_, _, _| {
+                                        service.send(Command::LanRevoke(id.clone()))
+                                    }),
+                            )
+                    }))
+                    .children(
+                        peers
+                            .iter()
+                            .filter(|peer| automatic.iter().all(|auto| auto.id != peer.id))
+                            .map(|peer| {
+                                let service = controls.clone();
+                                let id = peer.id.clone();
+                                h_flex()
+                                    .gap_2()
+                                    .child(format!(
+                                        "{} · Manually paired · {}",
+                                        peer.name, peer.address
+                                    ))
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "lan-revoke-{}",
+                                            peer.id
+                                        )))
+                                        .label("Revoke")
+                                        .on_click(
+                                            move |_, _, _| {
+                                                service.send(Command::LanRevoke(id.clone()))
+                                            },
+                                        ),
+                                    )
+                            }),
+                    )
+            }))
     }
 
     pub(super) fn appearance_settings(&self, app: WeakEntity<Self>) -> SettingPage {

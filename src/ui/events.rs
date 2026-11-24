@@ -21,6 +21,9 @@ impl MusicApp {
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
+                    self.resume_queue = None;
+                    self.lan_status = Default::default();
+                    self.lan_offer = Default::default();
                 }
                 let show_settings = self.settings || account.is_none();
                 self.account = account.clone();
@@ -29,6 +32,15 @@ impl MusicApp {
                     self.layout_generation += 1;
                 }
                 self.preferences = prefs;
+                let sync_server_url = self.preferences.sync_server_url.clone();
+                self.sync_server_url
+                    .update(cx, |input, cx| input.set_value(sync_server_url, window, cx));
+                let port = self
+                    .preferences
+                    .lan_port
+                    .map_or_else(String::new, |port| port.to_string());
+                self.lan_port
+                    .update(cx, |input, cx| input.set_value(port, window, cx));
                 self.preferences.tabs = std::mem::take(&mut self.preferences.tabs).normalized();
                 self.prefs_loaded = true;
                 self.histories.clear();
@@ -302,7 +314,7 @@ impl MusicApp {
                 } else {
                     0.
                 };
-                if self.scrub.is_none() {
+                if self.scrub.is_none() && self.device_status.remote_id().is_none() {
                     self.seek.update(cx, |slider, cx| {
                         slider.set_value(progress as f32, window, cx)
                     });
@@ -324,6 +336,31 @@ impl MusicApp {
                     }
                     return;
                 }
+            }
+            Event::DeviceSync(status) => {
+                self.device_status_changed(status, window, cx);
+                return;
+            }
+            Event::LocalVolume(volume) => {
+                self.preferences.volume = volume;
+                if self.device_status.remote_id().is_none() {
+                    self.volume
+                        .update(cx, |slider, cx| slider.set_value(volume, window, cx));
+                }
+            }
+            Event::ResumeQueue(label) => {
+                self.resume_queue = label;
+                self.notify_part(Part::Player, cx);
+                return;
+            }
+            Event::SharedPreferences(shared) => self.apply_shared_preferences(&shared, window, cx),
+            Event::LanStatus(status) => {
+                self.lan_status = status;
+                self.notify_part(Part::Center, cx);
+            }
+            Event::LanOffer(offer) => {
+                self.lan_offer = offer;
+                self.notify_part(Part::Center, cx);
             }
             Event::Status(status) => self.status = status,
             Event::Connection(connection) => self.connection = connection,

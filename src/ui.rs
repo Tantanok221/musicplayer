@@ -40,6 +40,7 @@ mod albums;
 mod artist_page;
 mod bindings;
 mod chrome;
+mod devices;
 mod events;
 mod feedback;
 mod information;
@@ -374,6 +375,12 @@ pub struct MusicApp {
     scrub: Option<f32>,
     workspace_scroll: ScrollHandle,
     server_url: Entity<InputState>,
+    sync_server_url: Entity<InputState>,
+    lan_port: Entity<InputState>,
+    lan_address: Entity<InputState>,
+    lan_code: Entity<InputState>,
+    lan_status: crate::sync::lan::LanStatus,
+    lan_offer: crate::sync::lan::LanOfferState,
     username: Entity<InputState>,
     password: Entity<InputState>,
     playlist_name: Entity<InputState>,
@@ -428,6 +435,8 @@ pub struct MusicApp {
     playlist_album_list: ListState,
     playlist_track_scroll: ScrollHandle,
     playback: PlaybackSnapshot,
+    device_status: crate::sync::DeviceStatus,
+    resume_queue: Option<String>,
     account_cache: account_cache::AccountCache,
     /// When each missing cover was last asked for; repeats keep visible covers first in line.
     art_requested: HashMap<String, Instant>,
@@ -545,6 +554,10 @@ impl MusicApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search music"));
+        let sync_server_url = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
+        let lan_port = cx.new(|cx| InputState::new(window, cx).placeholder("Automatic"));
+        let lan_address = cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.20:8088"));
+        let lan_code = cx.new(|cx| InputState::new(window, cx).placeholder("Six-digit code"));
         let server_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username"));
@@ -636,10 +649,12 @@ impl MusicApp {
                     }
                     SliderEvent::Release(SliderValue::Single(value)) => {
                         app.scrub = None;
-                        let target = *value as f64 / 1000. * app.playback.duration;
-                        app.playback.position = target;
-                        app.playback_at = Instant::now();
-                        app.service.player.send(PlayerCommand::Seek(target));
+                        let target = *value as f64 / 1000. * app.display_duration();
+                        if app.device_status.remote_id().is_none() {
+                            app.playback.position = target;
+                            app.playback_at = Instant::now();
+                        }
+                        app.playback_intent(PlayerCommand::Seek(target));
                         cx.notify();
                     }
                     _ => {}
@@ -647,9 +662,8 @@ impl MusicApp {
             }),
             cx.subscribe_in(&volume, window, |app, _, event: &SliderEvent, _, _| {
                 if let SliderEvent::Change(SliderValue::Single(value)) = event {
-                    app.preferences.volume = *value;
                     app.volume_before_mute = None;
-                    app.save_preferences();
+                    app.control_volume(*value);
                 }
             }),
         ];
@@ -686,6 +700,12 @@ impl MusicApp {
             scrub: None,
             workspace_scroll: ScrollHandle::new(),
             server_url,
+            sync_server_url,
+            lan_port,
+            lan_address,
+            lan_code,
+            lan_status: Default::default(),
+            lan_offer: Default::default(),
             username,
             password,
             playlist_name,
@@ -752,6 +772,8 @@ impl MusicApp {
             lyrics_snap: 0,
             lyrics_wake: None,
             playback_at: Instant::now(),
+            device_status: Default::default(),
+            resume_queue: None,
             frame_timers: HashMap::new(),
             sections: HashMap::new(),
             full_frame: true,
@@ -1015,15 +1037,13 @@ impl Render for MusicApp {
             .bg(colors.background)
             .on_action(|_: &Quit, _, cx| cx.quit())
             .on_action(cx.listener(|app, _: &TogglePlayback, _, _| {
-                app.service.player.send(PlayerCommand::Toggle)
+                app.playback_intent(PlayerCommand::Toggle)
             }))
             .on_action(
-                cx.listener(|app, _: &NextTrack, _, _| {
-                    app.service.player.send(PlayerCommand::Next)
-                }),
+                cx.listener(|app, _: &NextTrack, _, _| app.playback_intent(PlayerCommand::Next)),
             )
             .on_action(cx.listener(|app, _: &PreviousTrack, _, _| {
-                app.service.player.send(PlayerCommand::Previous)
+                app.playback_intent(PlayerCommand::Previous)
             }))
             .on_action(cx.listener(|app, _: &OpenSettings, _, cx| {
                 app.settings = !app.settings;

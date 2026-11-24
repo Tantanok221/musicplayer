@@ -379,9 +379,7 @@ impl MusicApp {
                             )
                             .on_click(cx.listener(move |app, event: &ClickEvent, _, cx| {
                                 if event.click_count() == 2 {
-                                    app.service
-                                        .player
-                                        .send(PlayerCommand::Replace(play.clone(), 0));
+                                    app.playback_intent(PlayerCommand::Replace(play.clone(), 0));
                                 } else if let Some(id) = app.playlists.toggle_album(key.clone()) {
                                     app.service.send(Command::AlbumDetails(id.to_owned()));
                                 }
@@ -598,9 +596,10 @@ impl MusicApp {
                                 .disabled(play.is_empty())
                                 .on_click(cx.listener(move |app, _, _, _| {
                                     if !play.is_empty() {
-                                        app.service
-                                            .player
-                                            .send(PlayerCommand::Replace(play.as_ref().clone(), 0));
+                                        app.playback_intent(PlayerCommand::Replace(
+                                            play.as_ref().clone(),
+                                            0,
+                                        ));
                                     }
                                 })),
                         )

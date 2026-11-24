@@ -33,6 +33,7 @@ impl ControlledService {
                 tx,
                 player,
                 query_epoch: Arc::new(AtomicU64::new(0)),
+                playback_sample: tokio::sync::watch::Sender::default(),
             },
             commands,
             events,

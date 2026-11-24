@@ -270,6 +270,8 @@ pub struct Playlist {
     pub name: String,
     pub comment: String,
     pub owner: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
     pub readonly: bool,
     pub valid_until: Option<String>,
     pub song_count: u32,
@@ -367,6 +369,10 @@ pub struct Preferences {
     pub tabs: crate::browser::Tabs,
     /// Whose Last.fm history Memory lane reaches back through; empty is off.
     pub lastfm_user: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sync_server_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lan_port: Option<u16>,
     /// Whose ListenBrainz history Memory lane reaches back through; empty is off.
     pub listenbrainz_user: String,
     /// Which service Memory lane reads; unset in preferences saved before
@@ -458,6 +464,8 @@ impl Default for Preferences {
             favorites: FavoritesFilter::default(),
             tabs: crate::browser::Tabs::default(),
             lastfm_user: String::new(),
+            sync_server_url: String::new(),
+            lan_port: None,
             listenbrainz_user: String::new(),
             history_provider: None,
         }
@@ -492,6 +500,7 @@ pub struct SavedQueue {
 
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackSnapshot {
+    pub sync: Option<Arc<crate::sync::PlaybackObservation>>,
     pub track: Option<Arc<Track>>,
     pub playing: bool,
     pub buffering: bool,

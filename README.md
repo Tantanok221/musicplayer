@@ -55,6 +55,37 @@ Open **Settings**, enter your Navidrome address (including any subpath), usernam
 
 Linux uses Ctrl instead of ⌘. On macOS, closing the window keeps music playing; reopen Sonora from the Dock. On Linux, closing the last window quits.
 
+## Sync playback across devices
+
+Run one Sonora sync relay for your Navidrome server. On each Sonora device, sign in to the same Navidrome account and enter the relay's HTTPS URL under **Settings → Device sync → Sync server URL**. Open **Devices** in the player bar to see what's playing elsewhere, control the active device, or move playback here. Shared preferences such as theme and ReplayGain follow the account; volume, paths, and Last.fm credentials stay on each device.
+
+To start a new Navidrome and relay together, set `MUSIC_DIR` to your music folder and run:
+
+```sh
+docker compose -f compose.sync.example.yaml up -d --build
+curl --fail http://127.0.0.1:8088/health
+```
+
+If you already run Navidrome, add only the relay service to your Compose project and set `NAVIDROME_URL` to the address the relay can reach, including any Navidrome subpath. Keep the relay's `/data` volume to retain its SQLite database across restarts. Without Docker, use `cargo build --locked --release -p sonora-sync` and run `target/release/sonora-sync` with `NAVIDROME_URL`, `BIND_ADDR` (default `127.0.0.1:8088`), and `DB_PATH` (default `sonora-sync.sqlite`).
+
+Use TLS for access from other devices: the relay authenticates with the saved Subsonic token and salt. Keep the relay bound to loopback on the host and forward its endpoints through a reverse proxy that supports WebSocket upgrades on `/ws`. For example, a Caddy instance running on the same host can use:
+
+```caddyfile
+sync.example.com {
+    reverse_proxy 127.0.0.1:8088
+}
+```
+
+For private tailnet access instead, run `tailscale serve --bg 8088` on the relay host and use the HTTPS URL it prints on your devices. Use Tailscale Serve, not Funnel, to keep the endpoint private. The relay doesn't proxy your music: each device still needs access to Navidrome for streaming.
+
+### Local network fallback
+
+Sonora prefers the relay when it's reachable. For LAN sync without a relay, or when the relay goes offline, open Sonora on devices on the same network and sign in with the same Navidrome URL and username. The devices can discover and authenticate each other without a code. Sonora stores their public keys and names in a private playlist called **Sonora devices (sync keys — do not edit)**. It is hidden in Sonora but may appear in other apps. Don't edit it. No password, login token, or private key is shared with peers. Use HTTPS for Navidrome on networks you don't trust.
+
+**Settings → Paired devices** shows which devices are trusted via Navidrome and which were paired manually. Sonora remembers the last device list while Navidrome is offline. If a new device hasn't been seen yet, choose **Show pairing code** on one device, then select it on the other, enter its six-digit code, and choose **Pair with device**. **Revoke** removes trust on this device immediately and updates the Navidrome list when reachable. Other devices learn about a revocation the next time they refresh that list.
+
+On macOS or Windows, allow Sonora to accept incoming connections on your private network if prompted. Don't forward the LAN port to the internet. If your network blocks mDNS discovery, type the other device's local IP and its displayed listening port (for example, `192.168.1.20:8088`) in **LAN peer address**. Set a fixed **LAN listener port** on that device if you need the address to keep working after a restart. Client-isolated guest networks may block direct connections entirely; use the relay there.
+
 ## Offline use
 
 Your library, playlists, artist information and previously viewed artwork stay available without a connection. Playing music still needs the server. Sonora reconnects automatically, and a failed or interrupted refresh never removes music you already have.

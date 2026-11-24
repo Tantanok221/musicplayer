@@ -16,7 +16,9 @@ use std::{
 use url::Url;
 
 mod native;
+mod play_queue;
 pub use native::NativeError;
+pub use play_queue::RemotePlayQueue;
 
 pub(crate) fn validate_server_address(address: &str) -> Result<Url> {
     let url =
@@ -114,10 +116,22 @@ impl Server {
         Ok(url)
     }
     async fn request(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Value> {
+        let request = self.http.get(self.url(endpoint, params)?);
+        self.subsonic_response(endpoint, request).await
+    }
+
+    async fn device_list_request(&self, endpoint: &str, params: &[(&str, &str)]) -> Result<Value> {
+        let request = self.http.post(self.url(endpoint, &[])?).form(params);
+        self.subsonic_response(endpoint, request).await
+    }
+
+    async fn subsonic_response(
+        &self,
+        endpoint: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Value> {
         // Strip reqwest's URL-bearing errors before returning anything user-visible.
-        let response = self
-            .http
-            .get(self.url(endpoint, params)?)
+        let response = request
             .send()
             .await
             .map_err(|e| anyhow::Error::new(e.without_url()).context("Cannot reach server. For a local server, allow Sonora in System Settings → Privacy & Security → Local Network"))?;
@@ -294,7 +308,48 @@ impl Server {
         Ok((album, tracks))
     }
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
-        let response = self.request("getPlaylists", &[]).await?;
+        let mut playlists = Self::parse_playlists(self.request("getPlaylists", &[]).await?)?;
+        playlists.retain(|playlist| !crate::sync::lan_registry::is_device_list(playlist));
+        Ok(playlists)
+    }
+    pub(crate) async fn device_lists(&self) -> Result<Vec<Playlist>> {
+        Self::parse_playlists(self.device_list_request("getPlaylists", &[]).await?)
+    }
+    pub(crate) async fn create_device_list(&self) -> Result<()> {
+        let response = self
+            .device_list_request(
+                "createPlaylist",
+                &[("name", crate::sync::lan_registry::NAME)],
+            )
+            .await?;
+        if response["playlist"]["public"] == true {
+            let id = response["playlist"]["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .context("Missing newly created device playlist")?;
+            self.update_device_list(id, "").await?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn update_device_list(&self, id: &str, comment: &str) -> Result<()> {
+        self.device_list_request(
+            "updatePlaylist",
+            &[
+                ("playlistId", id),
+                ("name", crate::sync::lan_registry::NAME),
+                ("comment", comment),
+                ("public", "false"),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+    pub(crate) async fn delete_device_list(&self, id: &str) -> Result<()> {
+        self.device_list_request("deletePlaylist", &[("id", id)])
+            .await?;
+        Ok(())
+    }
+    fn parse_playlists(response: Value) -> Result<Vec<Playlist>> {
         let Some(playlists) = response.get("playlists").and_then(Value::as_object) else {
             bail!("Invalid getPlaylists response: expected a playlists object");
         };

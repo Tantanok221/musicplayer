@@ -202,6 +202,35 @@ impl Paths {
         Ok(Some(credentials))
     }
 
+    pub(crate) fn sync_device_id(&self) -> Result<String> {
+        let path = self.data.join("sync-device-id");
+        match std::fs::read_to_string(&path) {
+            Ok(id) if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) => return Ok(id),
+            Ok(_) => anyhow::bail!("Stored sync device ID is invalid"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => anyhow::bail!("Could not read sync device ID"),
+        }
+        let id = format!("{:032x}", rand::random::<u128>());
+        atomic_write(&path, id.as_bytes()).context("Could not save sync device ID")?;
+        Ok(id)
+    }
+
+    pub(crate) fn sync_signing_key(&self) -> Result<[u8; 32]> {
+        let path = self.data.join("sync-signing-key");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                return bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Stored sync signing key is invalid"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => anyhow::bail!("Could not read sync signing key"),
+        }
+        let key = rand::random::<[u8; 32]>();
+        atomic_write(&path, &key).context("Could not save sync signing key")?;
+        Ok(key)
+    }
+
     pub fn save_credentials(
         &self,
         account: &Account,

@@ -342,10 +342,10 @@ impl QueueModel {
             self.undo = None;
         }
         self.shuffled = value;
-        PlayerCommand::Preferences(Preferences {
+        PlayerCommand::Preferences(Box::new(Preferences {
             shuffle: value,
             ..Default::default()
-        })
+        }))
     }
 
     fn jump_to(&mut self, at: usize) -> PlayerCommand {
@@ -499,10 +499,10 @@ fn check_metadata_refresh(len: usize, chosen: usize, moves: Vec<(usize, usize)>)
     }
     player
         .command(
-            PlayerCommand::Preferences(Preferences {
+            PlayerCommand::Preferences(Box::new(Preferences {
                 shuffle: true,
                 ..Default::default()
-            }),
+            })),
             WAIT,
         )
         .unwrap();
@@ -520,7 +520,7 @@ fn check_metadata_refresh(len: usize, chosen: usize, moves: Vec<(usize, usize)>)
     assert_eq!(state.index, Some(current));
     assert!(state.queue.iter().all(|t| t.title == "Updated"));
     state = player
-        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .command(PlayerCommand::Preferences(Box::default()), WAIT)
         .unwrap();
     assert_eq!(state.index, Some(current));
     assert!(state.queue.iter().all(|t| t.title == "Updated"));
@@ -715,10 +715,10 @@ fn unshuffle_after_replace_keeps_selected_duplicate_and_its_next_track() {
     let mut player = PausedPlayer::start(WAIT).unwrap();
     player
         .command(
-            PlayerCommand::Preferences(Preferences {
+            PlayerCommand::Preferences(Box::new(Preferences {
                 shuffle: true,
                 ..Default::default()
-            }),
+            })),
             WAIT,
         )
         .unwrap();
@@ -731,7 +731,7 @@ fn unshuffle_after_replace_keeps_selected_duplicate_and_its_next_track() {
     assert_eq!(shuffled.index, Some(0));
     assert_eq!(shuffled.queue[0].id, "same");
     let restored = player
-        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .command(PlayerCommand::Preferences(Box::default()), WAIT)
         .unwrap();
     assert_eq!(ids(&restored), ["same", "middle", "same", "last"]);
     assert_eq!(restored.index, Some(2));
@@ -757,10 +757,10 @@ fn unshuffle_after_track_update_keeps_later_duplicate_current() {
         .unwrap();
     player
         .command(
-            PlayerCommand::Preferences(Preferences {
+            PlayerCommand::Preferences(Box::new(Preferences {
                 shuffle: true,
                 ..Default::default()
-            }),
+            })),
             WAIT,
         )
         .unwrap();
@@ -777,7 +777,7 @@ fn unshuffle_after_track_update_keeps_later_duplicate_current() {
         .unwrap();
     assert_eq!(updated.index, Some(2));
     let restored = player
-        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .command(PlayerCommand::Preferences(Box::default()), WAIT)
         .unwrap();
     assert_eq!(restored.index, Some(2));
     assert_eq!(ids(&restored), ids(&initial));
@@ -792,10 +792,10 @@ fn shuffled_occurrences_survive_insert_remove_undo_and_metadata_refresh() {
     let mut player = PausedPlayer::start(WAIT).unwrap();
     player
         .command(
-            PlayerCommand::Preferences(Preferences {
+            PlayerCommand::Preferences(Box::new(Preferences {
                 shuffle: true,
                 ..Default::default()
-            }),
+            })),
             WAIT,
         )
         .unwrap();
@@ -872,7 +872,7 @@ fn shuffled_occurrences_survive_insert_remove_undo_and_metadata_refresh() {
         )
         .unwrap();
     let restored = player
-        .command(PlayerCommand::Preferences(Preferences::default()), WAIT)
+        .command(PlayerCommand::Preferences(Box::default()), WAIT)
         .unwrap();
     assert_eq!(
         ids(&restored),

@@ -99,7 +99,7 @@ pub enum PlayerCommand {
     JumpTo(usize),
     Previous,
     Seek(f64),
-    Preferences(Preferences),
+    Preferences(Box<Preferences>),
     UpdateTrack(Arc<Track>),
     /// A rescan gave a queued song a new ID: replace the old ID's entries.
     RetagTrack(String, Arc<Track>),
@@ -1340,7 +1340,7 @@ fn run(
                         (queue, index) = order.restore(std::mem::take(&mut queue), index);
                         queue_dirty = true;
                     }
-                    prefs = value;
+                    prefs = *value;
                     clock.volume.store(
                         (prefs.volume.clamp(0., 1.) as f64).to_bits(),
                         Ordering::Relaxed,
@@ -1581,6 +1581,13 @@ fn run(
             if changed {
                 snapshot_stamp = Some(stamp);
                 let _ = events.send(PlayerEvent::Snapshot(PlaybackSnapshot {
+                    sync: Some(Arc::new(crate::sync::PlaybackObservation {
+                        namespace: queue_account.clone(),
+                        revision,
+                        volume: crate::sync::volume(prefs.volume),
+                        shuffle: prefs.shuffle,
+                        repeat: crate::sync::repeat(prefs.repeat),
+                    })),
                     duration: track.as_ref().map_or(0., |t| t.duration),
                     track,
                     playing,

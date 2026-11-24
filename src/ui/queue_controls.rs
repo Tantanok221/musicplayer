@@ -517,7 +517,7 @@ impl MusicApp {
                     .anchor
                     .and_then(|id| app.playback.queue_ids.iter().position(|value| *value == id))
                 {
-                    app.service.player.send(PlayerCommand::JumpTo(index));
+                    app.playback_intent(PlayerCommand::JumpTo(index));
                 }
             }))
             .child(
@@ -846,7 +846,7 @@ impl MusicApp {
                     cx,
                 );
                 if event.click_count() == 2 {
-                    app.service.player.send(PlayerCommand::JumpTo(index));
+                    app.playback_intent(PlayerCommand::JumpTo(index));
                 }
             }));
         let context_menu = move |menu: PopupMenu,
@@ -863,7 +863,7 @@ impl MusicApp {
                     .item(
                         menu_row(Glyph::Play, "Play from Here").on_click(move |_, _, cx| {
                             let _ = play.update(cx, |app, _| {
-                                app.service.player.send(PlayerCommand::JumpTo(index))
+                                app.playback_intent(PlayerCommand::JumpTo(index))
                             });
                         }),
                     )

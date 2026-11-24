@@ -3,6 +3,8 @@
 #[path = "ui/album_feedback.rs"]
 mod album_feedback;
 mod common;
+#[path = "ui/devices.rs"]
+mod devices;
 #[path = "ui/downloads.rs"]
 mod downloads;
 #[path = "ui/explorer.rs"]
