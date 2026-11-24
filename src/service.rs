@@ -684,7 +684,7 @@ fn reconcile_tags(catalog: &Catalog) -> Result<Reconciled> {
 
 fn persist_preferences(catalog: &Catalog, player: &PlayerHandle, prefs: Preferences) -> Result<()> {
     catalog.set_state("preferences", &prefs)?;
-    player.send(PlayerCommand::Preferences(prefs));
+    player.send(PlayerCommand::Preferences(Box::new(prefs)));
     Ok(())
 }
 impl Service {
@@ -1147,7 +1147,7 @@ fn run(
     let playlist_track_edits = Arc::new(tokio::sync::Mutex::new(()));
     let mut catalog = Catalog::open(&catalog_path(&paths, account.as_ref()))?;
     let prefs: Preferences = catalog.state("preferences")?;
-    player.send(PlayerCommand::Preferences(prefs.clone()));
+    player.send(PlayerCommand::Preferences(Box::new(prefs.clone())));
     restore_queue(
         &catalog,
         &player,
@@ -1484,7 +1484,7 @@ fn run(
                         catalog = Catalog::open(&catalog_path(&paths, Some(&value.account)))?;
                         account_epoch += 1;
                         let prefs: Preferences = catalog.state("preferences")?;
-                        player.send(PlayerCommand::Preferences(prefs.clone()));
+                        player.send(PlayerCommand::Preferences(Box::new(prefs.clone())));
                         restore_queue(&catalog, &player, value.account.namespace())?;
                         events.send(Event::Ready(Some(value.account.clone()), prefs))?;
                         slskd = None;

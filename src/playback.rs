@@ -99,7 +99,7 @@ pub enum PlayerCommand {
     JumpTo(usize),
     Previous,
     Seek(f64),
-    Preferences(Preferences),
+    Preferences(Box<Preferences>),
     UpdateTrack(Arc<Track>),
     /// A rescan gave a queued song a new ID: replace the old ID's entries.
     RetagTrack(String, Arc<Track>),
@@ -1340,7 +1340,7 @@ fn run(
                         (queue, index) = order.restore(std::mem::take(&mut queue), index);
                         queue_dirty = true;
                     }
-                    prefs = value;
+                    prefs = *value;
                     clock.volume.store(
                         (prefs.volume.clamp(0., 1.) as f64).to_bits(),
                         Ordering::Relaxed,
