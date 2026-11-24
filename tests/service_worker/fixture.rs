@@ -198,6 +198,14 @@ async fn slskd_download(
     StatusCode::BAD_REQUEST.into_response()
 }
 
+async fn slskd_application(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+    state.record(Request::new("slskd/application", &[]));
+    if headers.get("X-API-Key").and_then(|key| key.to_str().ok()) != Some("synthetic-slskd-key") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(json!({"version":{"current":"0.26.2"},"server":{"state":"Connected"}})).into_response()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub endpoint: String,
@@ -1118,6 +1126,7 @@ impl Fixture {
             .route("/metadata/{*endpoint}", any(metadata))
             .route("/coverart/{*path}", any(cover_art))
             .route("/acoustid/lookup", any(acoustid))
+            .route("/api/v0/application", axum::routing::get(slskd_application))
             .route("/api/v0/{*endpoint}", any(slskd_download))
             .fallback(unexpected)
             .with_state(state.clone());

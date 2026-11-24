@@ -2,6 +2,52 @@ use crate::fixture::{Fixture, Library, WAIT, album, event, song, synced, view};
 use sonora::service::{Command, Connection, Event};
 
 #[test]
+fn slskd_check_uses_saved_auth_even_when_download_offers_are_disabled() {
+    use sonora::{model::Preferences, service::SettingsCredentials, slskd::ConnectionStatus};
+    let fixture = Fixture::new(Library::default());
+    let mut worker = fixture.start();
+    let mut prefs = Preferences::default();
+    prefs.downloads.url = fixture.account.url.clone();
+    assert!(!prefs.downloads.enabled);
+    let save = |key: &str| {
+        assert_eq!(
+            worker
+                .service()
+                .save_settings(
+                    prefs.clone(),
+                    SettingsCredentials::Slskd(key.into(), String::new(), String::new())
+                )
+                .recv_timeout(WAIT),
+            Ok(true)
+        );
+    };
+    save("synthetic-invalid-key");
+    worker.service().send(Command::SlskdTest(7));
+    event(&worker, |event| {
+        matches!(
+            event,
+            Event::SlskdTested(7, ConnectionStatus::AuthenticationFailed(_))
+        )
+    });
+    save("synthetic-slskd-key");
+    worker.service().send(Command::SlskdTest(8));
+    event(&worker, |event| {
+        matches!(
+            event,
+            Event::SlskdTested(
+                8,
+                ConnectionStatus::Connected {
+                    logged_in: Some(false),
+                    ..
+                }
+            )
+        )
+    });
+    worker.shutdown(WAIT).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn checking_the_saved_server_reports_each_result_and_updates_reachability() {
     let fixture = Fixture::new(Library::default());
     let mut worker = fixture.start();

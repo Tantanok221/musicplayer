@@ -52,6 +52,7 @@ mod playlist_creation;
 mod playlists;
 mod settings;
 mod sign_in;
+mod slskd_settings;
 mod smart_playlists;
 mod tracks;
 mod window;
@@ -382,7 +383,8 @@ pub struct MusicApp {
     slskd_username: Entity<InputState>,
     slskd_password: Entity<InputState>,
     soulseek_query: Entity<InputState>,
-    slskd_status: Option<Result<String, String>>,
+    slskd_connection: slskd_settings::SlskdConnection,
+    slskd_monitor: Option<Task<()>>,
     discographies: HashMap<String, Arc<DiscographyView>>,
     selected_missing: Option<String>,
     missing_expanded: bool,
@@ -693,7 +695,8 @@ impl MusicApp {
             slskd_username,
             slskd_password,
             soulseek_query,
-            slskd_status: None,
+            slskd_connection: Default::default(),
+            slskd_monitor: None,
             discographies: HashMap::new(),
             selected_missing: None,
             release_details: HashMap::new(),
@@ -1024,6 +1027,7 @@ impl Render for MusicApp {
             }))
             .on_action(cx.listener(|app, _: &OpenSettings, _, cx| {
                 app.settings = !app.settings;
+                app.watch_slskd(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {

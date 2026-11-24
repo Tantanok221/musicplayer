@@ -990,6 +990,53 @@ fn offline_indicator_keeps_cached_music_browsable_and_playable_then_retry_resync
 }
 
 #[gpui_kit::test]
+fn slskd_settings_check_reaches_the_real_worker(cx: &mut TestAppContext) {
+    use sonora::slskd::ConnectionStatus;
+    cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
+    let fixture = Fixture::new(Library::default());
+    let (worker, tx, window, app) = mount_worker(&fixture, cx);
+    wait_library(&worker, &tx, window, cx, "explorer-album-album");
+    cx.update_window(window, |_, window, cx| {
+        window.press(sonora::platform::shortcut("cmd-,", "ctrl-,"), cx);
+        window.render_frame(cx);
+        window.within("settings-sidebar").click("0-2", cx);
+        window.render_frame(cx);
+        window.click("slskd address", cx);
+        window.input(fixture.account.url.as_str(), cx);
+        window.click("API key", cx);
+        window.input("synthetic-slskd-key", cx);
+        window.click("link-slskd", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        matches!(
+            event,
+            Event::SlskdTested(_, ConnectionStatus::Connected { .. })
+        )
+    });
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(window.find("slskd-status").label(), Some("Connected"));
+        window.click("check-slskd", cx);
+    })
+    .unwrap();
+    deliver_until(&worker, &tx, window, cx, |event, _| {
+        matches!(
+            event,
+            Event::SlskdTested(_, ConnectionStatus::Connected { .. })
+        )
+    });
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("slskd-check-result").label(),
+            Some("Connected to slskd 0.26.2 · Not logged in to Soulseek")
+        );
+    })
+    .unwrap();
+    close_worker(worker, window, app, cx);
+    fixture.finish();
+}
+
+#[gpui_kit::test]
 fn sign_in_fields_and_connect_reach_the_real_worker(cx: &mut TestAppContext) {
     cx.update(|cx| cx.bind_keys(sonora::ui::settings_bindings()));
     let fixture = Fixture::new(Library::default());

@@ -202,7 +202,7 @@ fn credential_field(
     }
 }
 
-fn connection_message(
+pub(super) fn connection_message(
     id: &'static str,
     message: String,
     error: bool,
@@ -222,7 +222,7 @@ fn connection_message(
         .child(message)
 }
 
-fn connection_field(
+pub(super) fn connection_field(
     name: &'static str,
     input: Entity<InputState>,
     hint: Option<&'static str>,
@@ -428,7 +428,7 @@ impl MusicApp {
             .send(Command::Preferences(self.preferences.clone()));
     }
 
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_settings(&mut self, cx: &mut Context<Self>) {
         self.save_settings_with(SettingsCredentials::Unchanged, cx);
     }
 
@@ -769,112 +769,6 @@ impl MusicApp {
                         .child("Open Navidrome")
                 }).keywords(["listenbrainz", "last.fm", "scrobble", "navidrome"])),
         )
-    }
-
-    pub(super) fn download_settings(&self, app: WeakEntity<Self>) -> SettingPage {
-        let status = match &self.slskd_status {
-            Some(Ok(message)) => message.clone(),
-            Some(Err(message)) => format!("Not linked · {message}"),
-            None => "Sonora searches Soulseek only when you ask it to, one release at a time, and slskd does the downloading.".into(),
-        };
-        SettingPage::new("Downloads")
-            .icon(Icon::new(Glyph::Save))
-            .resettable(false)
-            .group(
-                SettingGroup::new()
-                    .title("slskd")
-                    .description(status.clone())
-                    .item(
-                        SettingItem::new(
-                            "Offer missing releases for download",
-                            SettingField::switch(
-                                {
-                                    let app = app.clone();
-                                    move |cx: &App| {
-                                        app.read_with(cx, |app, _| {
-                                            app.preferences.downloads.enabled
-                                        })
-                                        .unwrap_or(false)
-                                    }
-                                },
-                                {
-                                    let app = app.clone();
-                                    move |value, cx: &mut App| {
-                                        let _ = app.update(cx, |app, cx| {
-                                            app.preferences.downloads.enabled = value;
-                                            app.save_settings(cx);
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                            )
-                            .default_value(false),
-                        )
-                        .description("Adds Find on Soulseek to missing releases on artist pages."),
-                    )
-                    .item(credential_field(
-                        "slskd address",
-                        self.slskd_url.clone(),
-                        None,
-                        &["soulseek", "slskd", "url", "host"],
-                    ))
-                    .item(credential_field(
-                        "API key",
-                        self.slskd_key.clone(),
-                        Some("A key with the readwrite role from slskd's web.authentication.api_keys, if you have set one up."),
-                        &["soulseek", "slskd", "token"],
-                    ))
-                    .item(credential_field(
-                        "Username",
-                        self.slskd_username.clone(),
-                        Some("Without an API key, sign in with the username and password of slskd's web page."),
-                        &["soulseek", "slskd", "login"],
-                    ))
-                    .item(credential_field(
-                        "Password",
-                        self.slskd_password.clone(),
-                        Some("Leave all three empty to keep the saved login, or if your slskd needs none. Saved in a private file on this Mac."),
-                        &["soulseek", "slskd", "login"],
-                    ))
-                    .item(
-                        SettingItem::render(move |_, _, _| {
-                            let app = app.clone();
-                            div().id("slskd-status").test_support().role(Role::Group)
-                                .aria_label(status.clone())
-                                .child(Button::new("link-slskd")
-                                .primary()
-                                .label("Save and test")
-                                .on_click(move |_, window, cx| {
-                                    let _ = app.update(cx, |app, cx| {
-                                        app.preferences.downloads.url =
-                                            app.slskd_url.read(cx).value().trim().to_string();
-                                        app.preferences.downloads.enabled = true;
-                                        let fields = [
-                                            app.slskd_key.clone(),
-                                            app.slskd_username.clone(),
-                                            app.slskd_password.clone(),
-                                        ];
-                                        let [key, username, password] = fields
-                                            .each_ref()
-                                            .map(|field| field.read(cx).value().to_string());
-                                        app.save_settings_with(
-                                            SettingsCredentials::Slskd(key, username, password),
-                                            cx,
-                                        );
-                                        for field in fields {
-                                            field.update(cx, |input, cx| {
-                                                input.set_value("", window, cx)
-                                            });
-                                        }
-                                        app.slskd_status = Some(Ok("Testing…".into()));
-                                        app.service.send(Command::SlskdTest);
-                                        cx.notify();
-                                    });
-                                }))
-                        })
-                        .keywords(["soulseek", "slskd", "download", "test"]),
-                    ),
-            )
     }
 
     pub(super) fn restore_metadata_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {

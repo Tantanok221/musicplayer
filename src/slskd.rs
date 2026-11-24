@@ -7,6 +7,90 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 use url::Url;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connected {
+        version: String,
+        logged_in: Option<bool>,
+    },
+    Unreachable(String),
+    AuthenticationFailed(String),
+    Failed(String),
+}
+
+impl ConnectionStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Connected { .. } => "Connected",
+            Self::Unreachable(_) => "Unreachable",
+            Self::AuthenticationFailed(_) => "Authentication failed",
+            Self::Failed(_) => "Check failed",
+        }
+    }
+
+    pub fn feedback(&self) -> (String, bool) {
+        match self {
+            Self::Connected { version, logged_in } => {
+                let mut message = if version.is_empty() {
+                    "Connected to slskd".to_string()
+                } else {
+                    format!("Connected to slskd {version}")
+                };
+                if let Some(logged_in) = logged_in {
+                    message.push_str(if *logged_in {
+                        " · Logged in to Soulseek"
+                    } else {
+                        " · Not logged in to Soulseek"
+                    });
+                }
+                (message, false)
+            }
+            Self::Unreachable(message)
+            | Self::AuthenticationFailed(message)
+            | Self::Failed(message) => (message.clone(), true),
+        }
+    }
+
+    pub(crate) fn from_error(error: anyhow::Error) -> Self {
+        let message = format!("{error:#}");
+        if error.is::<AuthRejected>() {
+            Self::AuthenticationFailed(message)
+        } else if error.is::<reqwest::Error>() {
+            Self::Unreachable(message)
+        } else {
+            Self::Failed(message)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AuthRejected(&'static str);
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
+pub(crate) fn connection_address(url: &str) -> Result<Url> {
+    let mut base =
+        Url::parse(url.trim()).context("Enter the complete slskd URL, including http://")?;
+    if !matches!(base.scheme(), "https" | "http") || base.host_str().is_none() {
+        bail!("Use an http:// or https:// slskd URL");
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        bail!("Enter credentials in their own fields, not in the URL");
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    Ok(base)
+}
+
 /// The Soulseek server bans clients that search too often.
 const SEARCH_GAP: Duration = Duration::from_secs(5);
 const AUDIO: [&str; 14] = [
@@ -463,19 +547,7 @@ impl Slskd {
         Self::with_gap(url, auth, SEARCH_GAP)
     }
     pub fn with_gap(url: &str, auth: impl Into<SlskdAuth>, gap: Duration) -> Result<Self> {
-        let mut base =
-            Url::parse(url.trim()).context("Enter the complete slskd URL, including http://")?;
-        if !matches!(base.scheme(), "https" | "http") || base.host_str().is_none() {
-            bail!("Use an http:// or https:// slskd URL");
-        }
-        if !base.username().is_empty() || base.password().is_some() {
-            bail!("Enter the slskd API key in its own field");
-        }
-        base.set_query(None);
-        base.set_fragment(None);
-        if !base.path().ends_with('/') {
-            base.set_path(&format!("{}/", base.path()));
-        }
+        let base = connection_address(url)?;
         Ok(Self {
             base,
             auth: auth.into(),
@@ -530,11 +602,11 @@ impl Slskd {
             if status == 401 || status == 403 {
                 match &self.auth {
                     SlskdAuth::Login { .. } if !renew => continue,
-                    SlskdAuth::Login { .. } => bail!("slskd rejected the username or password"),
-                    SlskdAuth::Key(_) => bail!("slskd rejected the API key"),
-                    SlskdAuth::None => bail!(
+                    SlskdAuth::Login { .. } => return Err(AuthRejected("slskd rejected the username or password").into()),
+                    SlskdAuth::Key(_) => return Err(AuthRejected("slskd rejected the API key").into()),
+                    SlskdAuth::None => return Err(AuthRejected(
                         "slskd asks for a login. Enter its API key, or its web username and password."
-                    ),
+                    ).into()),
                 }
             }
             let text = response.text().await.unwrap_or_default();
@@ -568,7 +640,7 @@ impl Slskd {
             })?;
         let status = response.status().as_u16();
         if status == 401 || status == 403 {
-            bail!("slskd rejected the username or password");
+            return Err(AuthRejected("slskd rejected the username or password").into());
         }
         if !(200..300).contains(&status) {
             bail!("slskd returned HTTP {status}");
@@ -599,21 +671,41 @@ impl Slskd {
     }
 
     /// Confirms the address and key, and reports whether slskd is logged in to Soulseek.
-    pub async fn test(&self) -> Result<String> {
-        let value = self
-            .ok(reqwest::Method::GET, &["application"], None)
-            .await?;
+    pub async fn test(&self) -> Result<ConnectionStatus> {
+        let value = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.ok(reqwest::Method::GET, &["application"], None),
+        )
+        .await;
+        let value = match value {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(ConnectionStatus::Unreachable(
+                    "slskd did not respond in time".into(),
+                ));
+            }
+        };
         let version = value["version"]["current"]
             .as_str()
             .or_else(|| value["version"]["full"].as_str())
             .unwrap_or_default();
-        let state = value["server"]["state"].as_str().unwrap_or_default();
-        Ok(if state.is_empty() || state.contains("LoggedIn") {
-            format!("Connected to slskd {version}")
-        } else {
-            format!("Connected to slskd {version}, but it is not logged in to Soulseek")
-        }
-        .replace("  ", " "))
+        let state = value["server"]["state"]
+            .as_str()
+            .filter(|state| !state.is_empty());
+        anyhow::ensure!(
+            !version.is_empty() || state.is_some(),
+            "The address did not return slskd application status"
+        );
+        Ok(ConnectionStatus::Connected {
+            version: version.into(),
+            logged_in: value["server"]["isLoggedIn"].as_bool().or_else(|| {
+                state.map(|state| {
+                    state
+                        .split(|ch: char| !ch.is_ascii_alphanumeric())
+                        .any(|flag| flag == "LoggedIn")
+                })
+            }),
+        })
     }
 
     /// Runs one search to completion. `update` receives the response count as it grows.

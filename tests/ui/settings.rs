@@ -486,68 +486,132 @@ fn first_sign_in_failure_preserves_input_reenables_connect_and_retry_succeeds(
 }
 
 #[gpui_kit::test]
+fn slskd_form_reports_bad_address_and_missing_password_inline(cx: &mut TestAppContext) {
+    let (_dir, mut f, window, _) = start(cx);
+    f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
+    page(&mut f, window, "Downloads", cx);
+    fill(window, "slskd address", "ftp://slskd.example.com", cx);
+    fill(window, "Username", "fixture-user", cx);
+    f.click(window, "link-slskd", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.find("slskd-address-error").visible());
+        assert!(window.find("slskd-password-error").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn soulseek_key_and_login_submit_clear_secrets_and_keep_saved_auth_on_empty_retry(
     cx: &mut TestAppContext,
 ) {
+    use sonora::slskd::ConnectionStatus;
     let (_dir, mut f, window, _) = start(cx);
     f.press(window, shortcut("cmd-,", "ctrl-,"), cx);
     page(&mut f, window, "Downloads", cx);
     fill(window, "slskd address", " http://127.0.0.1:5030/ ", cx);
     fill(window, "API key", "synthetic-slskd-key", cx);
     f.expect("slskd API-key auth", |command, _| {
-        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(key, user, password), _) if key == "synthetic-slskd-key" && user.is_empty() && password.is_empty())); vec![]
+        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(key, user, password), _) if key == "synthetic-slskd-key" && user.is_empty() && password.is_empty()));
+        vec![]
     });
     f.expect("slskd test after credentials", |command, _| {
-        assert!(matches!(command, Command::SlskdTest));
+        assert!(matches!(command, Command::SlskdTest(1)));
         vec![]
     });
     f.click(window, "link-slskd", cx);
     cx.update_window(window, |_, window, _| {
         assert_eq!(window.find("API key").value().unwrap_or_default(), "");
         assert_eq!(window.find("Password").value().unwrap_or_default(), "");
+        assert!(window.find("slskd-progress").visible());
     })
     .unwrap();
     let prefs: sonora::model::Preferences = f.catalog.state("preferences").unwrap();
     assert_eq!(prefs.downloads.url, "http://127.0.0.1:5030/");
     assert!(prefs.downloads.enabled);
-    f.backend.emit(Event::SlskdStatus(Err(
-        "Fixture slskd rejected login".into()
-    )));
+    f.backend.emit(Event::SlskdTested(
+        1,
+        ConnectionStatus::AuthenticationFailed("Fixture slskd rejected login".into()),
+    ));
     f.settle(window, cx);
     cx.update_window(window, |_, window, _| {
-        assert!(
-            window
-                .find("slskd-status")
-                .label()
-                .unwrap()
-                .contains("Fixture slskd rejected login")
-        )
+        assert_eq!(
+            window.find("slskd-status").label(),
+            Some("Authentication failed")
+        );
+        assert_eq!(
+            window.find("slskd-form-error").label(),
+            Some("Fixture slskd rejected login")
+        );
     })
     .unwrap();
     // Blank fields mean reuse the saved auth, not erase it.
-    f.expect("keep saved slskd auth", |command, _| { assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k, u, p), _) if k.is_empty() && u.is_empty() && p.is_empty())); vec![] });
-    f.expect("retry saved slskd auth", |command, _| {
-        assert!(matches!(command, Command::SlskdTest));
-        vec![Event::SlskdStatus(Ok("Fixture linked".into()))]
+    f.expect("keep saved slskd auth", |command, _| {
+        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k, u, p), _) if k.is_empty() && u.is_empty() && p.is_empty()));
+        vec![]
     });
-    f.click(window, "link-slskd", cx);
+    f.expect("retry saved slskd auth", |command, _| {
+        assert!(matches!(command, Command::SlskdTest(2)));
+        vec![Event::SlskdTested(
+            2,
+            ConnectionStatus::Connected {
+                version: "fixture".into(),
+                logged_in: Some(true),
+            },
+        )]
+    });
+    f.click(window, "retry-slskd", cx);
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("slskd address").is_none());
+        assert_eq!(window.find("slskd-status").label(), Some("Connected"));
+        assert_eq!(
+            window.find("slskd-check-result").label(),
+            Some("Connected to slskd fixture · Logged in to Soulseek")
+        );
+    })
+    .unwrap();
+
+    f.click(window, "change-slskd", cx);
     fill(window, "Username", "fixture-admin", cx);
     fill(window, "Password", "synthetic-slskd-password", cx);
-    f.expect("slskd username and password", |command, _| { assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k,u,p), _) if k.is_empty() && u == "fixture-admin" && p == "synthetic-slskd-password")); vec![] });
+    f.expect("slskd username and password", |command, _| {
+        assert!(matches!(command, Command::SaveSettings(_, SettingsCredentials::Slskd(k,u,p), _) if k.is_empty() && u == "fixture-admin" && p == "synthetic-slskd-password"));
+        vec![]
+    });
     f.expect("test replacement slskd login", |command, _| {
-        assert!(matches!(command, Command::SlskdTest));
-        vec![Event::SlskdStatus(Ok("Fixture linked".into()))]
+        assert!(matches!(command, Command::SlskdTest(3)));
+        vec![]
     });
     f.click(window, "link-slskd", cx);
     cx.update_window(window, |_, window, _| {
         assert_eq!(window.find("Username").value().unwrap_or_default(), "");
         assert_eq!(window.find("Password").value().unwrap_or_default(), "");
-        assert!(
-            window
-                .find("slskd-status")
-                .label()
-                .unwrap()
-                .contains("Fixture linked")
+    })
+    .unwrap();
+    f.backend.emit(Event::SlskdTested(
+        3,
+        ConnectionStatus::Connected {
+            version: "fixture".into(),
+            logged_in: Some(false),
+        },
+    ));
+    f.settle(window, cx);
+
+    f.expect("check the saved slskd", |command, _| {
+        assert!(matches!(command, Command::SlskdTest(4)));
+        vec![
+            Event::SlskdTested(3, ConnectionStatus::AuthenticationFailed("stale".into())),
+            Event::SlskdTested(
+                4,
+                ConnectionStatus::Unreachable("Fixture unavailable".into()),
+            ),
+        ]
+    });
+    f.click(window, "check-slskd", cx);
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(window.find("slskd-status").label(), Some("Unreachable"));
+        assert_eq!(
+            window.find("slskd-check-result").label(),
+            Some("Fixture unavailable")
         );
     })
     .unwrap();

@@ -11,7 +11,10 @@ use crate::{
     platform::{Account, Paths},
     playback::{Placement, PlayerCommand, PlayerEvent, PlayerHandle},
     server::Server,
-    slskd::{Candidate, DownloadJob, JobState, Slskd, SlskdAuth},
+    slskd::{
+        Candidate, ConnectionStatus as SlskdConnectionStatus, DownloadJob, JobState, Slskd,
+        SlskdAuth,
+    },
     sorting::{Field as SortField, Scope as SortScope},
     thumbnail,
 };
@@ -117,7 +120,7 @@ pub enum Command {
     ReleaseDetailsLoaded(String, Result<ReleaseDetails, String>),
     /// Artist name, artist ID, release group: stop offering this release.
     HideRelease(String, String, String),
-    SlskdTest,
+    SlskdTest(u64),
     /// Release group and search text.
     SoulseekSearch(String, String),
     Download(Box<DownloadRequest>),
@@ -258,7 +261,7 @@ pub enum Event {
     Downloads(Arc<Vec<DownloadJob>>),
     /// Release ID and why slskd did not accept the download, shown beside the search results.
     DownloadNotStarted(String, String),
-    SlskdStatus(Result<String, String>),
+    SlskdTested(u64, SlskdConnectionStatus),
     GroupTracks(u64, String, Vec<Arc<Track>>),
     Playlists(Vec<Playlist>),
     Playlist(Playlist),
@@ -900,13 +903,21 @@ fn slskd_client(
         downloads.enabled && !downloads.url.trim().is_empty(),
         "Link slskd in Settings → Downloads first"
     );
+    saved_slskd_client(cache, &downloads.url, paths)
+}
+
+fn saved_slskd_client(
+    cache: &mut Option<(String, Slskd)>,
+    address: &str,
+    paths: &Paths,
+) -> Result<Slskd> {
     if let Some((url, client)) = cache
-        && *url == downloads.url
+        && url == address
     {
         return Ok(client.clone());
     }
-    let client = Slskd::new(&downloads.url, paths.slskd_auth()?)?;
-    *cache = Some((downloads.url, client.clone()));
+    let client = Slskd::new(address, paths.slskd_auth()?)?;
+    *cache = Some((address.into(), client.clone()));
     Ok(client)
 }
 
@@ -1798,15 +1809,24 @@ fn run(
                     }
                     publish_discography(&catalog, &events, &name, &id, false)?;
                 }
-                Command::SlskdTest => match slskd_client(&mut slskd, &catalog, &paths) {
+                Command::SlskdTest(id) => match catalog
+                    .state::<Preferences>("preferences")
+                    .and_then(|prefs| saved_slskd_client(&mut slskd, &prefs.downloads.url, &paths))
+                {
                     Ok(client) => {
                         let events = events.clone();
                         runtime.spawn(async move {
-                            let result = client.test().await.map_err(|error| format!("{error:#}"));
-                            let _ = events.send(Event::SlskdStatus(result));
+                            let status = client
+                                .test()
+                                .await
+                                .unwrap_or_else(SlskdConnectionStatus::from_error);
+                            let _ = events.send(Event::SlskdTested(id, status));
                         });
                     }
-                    Err(error) => events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?,
+                    Err(error) => events.send(Event::SlskdTested(
+                        id,
+                        SlskdConnectionStatus::from_error(error),
+                    ))?,
                 },
                 Command::SoulseekSearch(release, query) => {
                     match slskd_client(&mut slskd, &catalog, &paths) {
@@ -2527,9 +2547,6 @@ fn run(
                                     .and_then(|auth| {
                                         auth.map_or(Ok(()), |auth| paths.save_slskd_auth(&auth))
                                     });
-                                if let Err(error) = &saved {
-                                    events.send(Event::SlskdStatus(Err(format!("{error:#}"))))?;
-                                }
                                 saved.is_ok()
                             }
                         };
