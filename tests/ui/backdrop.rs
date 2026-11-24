@@ -62,7 +62,7 @@ fn reconnect_keeps_cached_cover_and_backdrop_but_account_switch_drops_them(
     };
     stop(&mut f, cx);
     f.backend
-        .emit(Event::Connected(account.clone(), "Connected".into()));
+        .emit(Event::Connected(account.clone(), "Connected".into(), false));
     f.settle(window, cx);
     play(&f);
     f.settle(window, cx);
@@ -83,7 +83,7 @@ fn reconnect_keeps_cached_cover_and_backdrop_but_account_switch_drops_them(
     );
     f.backend.emit(Event::Ready(Some(account.clone()), prefs));
     f.backend
-        .emit(Event::Connected(account, "Connected".into()));
+        .emit(Event::Connected(account, "Connected".into(), true));
     f.settle(window, cx);
     play(&f);
     f.settle(window, cx);

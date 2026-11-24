@@ -205,6 +205,61 @@ fn credential_field(
     }
 }
 
+fn connection_message(
+    id: &'static str,
+    message: String,
+    error: bool,
+    cx: &App,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .role(if error { Role::Alert } else { Role::Status })
+        .aria_label(message.clone())
+        .text_sm()
+        .text_color(if error {
+            cx.theme().danger
+        } else {
+            ink(cx).muted
+        })
+        .child(message)
+}
+
+fn connection_field(
+    name: &'static str,
+    input: Entity<InputState>,
+    hint: Option<&'static str>,
+    error: Option<(&'static str, String)>,
+    keywords: &'static [&'static str],
+) -> SettingItem {
+    let item = SettingItem::new(
+        name,
+        SettingField::render(move |options, _, cx| {
+            div()
+                .max_w(px(440.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    Input::new(&input)
+                        .id(name)
+                        .with_size(options.size())
+                        .w_full(),
+                )
+                .when_some(error.clone(), |field, (id, message)| {
+                    field.child(connection_message(id, message, true, cx))
+                })
+        }),
+    )
+    .layout(Axis::Vertical)
+    .keywords(keywords.iter().copied());
+    if let Some(hint) = hint {
+        item.description(hint)
+    } else {
+        item
+    }
+}
+
 fn layout_switch(
     app: WeakEntity<MusicApp>,
     title: &'static str,
@@ -543,89 +598,210 @@ impl MusicApp {
     }
 
     pub(super) fn connect_library(&mut self, cx: &mut Context<Self>) {
-        if !self.sign_in.begin() {
+        let url = self.server_url.read(cx).value().to_string();
+        let username = self.username.read(cx).value().to_string();
+        if !self.sign_in.begin(&url, &username) {
+            cx.notify();
             return;
         }
         self.status = "Connecting…".into();
         self.error = None;
         self.service.send(Command::Connect(
-            Account {
-                url: self.server_url.read(cx).value().to_string(),
-                username: self.username.read(cx).value().to_string(),
-            },
+            Account { url, username },
             self.password.read(cx).value().to_string(),
         ));
         cx.notify();
     }
 
-    pub(super) fn library_settings(&self, app: WeakEntity<Self>) -> SettingPage {
-        let signed_in = self
-            .account
-            .as_ref()
-            .map(|account| format!("Signed in as {} · {}", account.username, account.url));
-        let server = self.account.as_ref().map(|account| account.url.clone());
+    fn connection_form(&self, app: WeakEntity<Self>) -> SettingGroup {
+        let (address_error, username_error) = self.sign_in.field_errors();
         let connecting = self.sign_in.is_connecting();
-        SettingPage::new("Library")
-            .icon(Icon::new(Glyph::Library))
-            .resettable(false)
-            .group(
-                SettingGroup::new()
-                    .title("Connection")
-                    .description(signed_in.unwrap_or_else(|| "Not connected".into()))
-                    .item(credential_field(
-                        "Server address",
-                        self.server_url.clone(),
-                        None,
-                        &["navidrome", "url", "host"],
-                    ))
-                    .item(credential_field(
-                        "Username",
-                        self.username.clone(),
-                        None,
-                        &["account"],
-                    ))
-                    .item(credential_field(
-                        "Password",
-                        self.password.clone(),
-                        None,
-                        &["token", "sign in"],
-                    ))
-                    .item(
-                        SettingItem::render(move |_, _, _| {
-                            let app = app.clone();
-                            Button::new("connect-library")
-                                .primary()
-                                .label("Connect")
-                                .disabled(connecting)
-                                .on_click(move |_, _, cx| {
-                                    let _ = app.update(cx, |app, cx| app.connect_library(cx));
-                                })
-                        })
-                        .keywords(["connect", "sign in", "library"]),
-                    ),
-            )
-            .group(
-                SettingGroup::new()
-                    .title("Scrobbling")
-                    .description("Sonora reports plays only to Navidrome. Link ListenBrainz or Last.fm in your server's personal settings to forward them. Artist information follows the server's metadata-agent order. Uncertain submissions are not resent, to avoid duplicates.")
-                    .item(SettingItem::render(move |_, _, cx| {
-                        server.as_ref().map_or_else(
-                            || {
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Connect to open your server")
-                                    .into_any_element()
-                            },
-                            |url| {
-                                Link::new("open-navidrome")
-                                    .href(url.clone())
-                                    .child("Open Navidrome")
-                                    .into_any_element()
-                            },
+        let failure = self.sign_in.error().map(str::to_owned);
+        let saved_account = self.account.is_some();
+        SettingGroup::new()
+            .title(if saved_account {
+                "Change server or login"
+            } else {
+                "Connect your music library"
+            })
+            .item(connection_field(
+                "Server address",
+                self.server_url.clone(),
+                None,
+                address_error.map(|error| ("server-address-error", error.to_owned())),
+                &["navidrome", "url", "host"],
+            ))
+            .item(connection_field(
+                "Username",
+                self.username.clone(),
+                None,
+                username_error.map(|error| ("username-error", error.to_owned())),
+                &["account"],
+            ))
+            .item(connection_field(
+                "Password",
+                self.password.clone(),
+                saved_account.then_some(
+                    "Leave blank to keep your current password for this server and username.",
+                ),
+                None,
+                &["token", "sign in"],
+            ))
+            .item(
+                SettingItem::render(move |_, _, cx| {
+                    let submit = app.clone();
+                    let retry = app.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div().flex().child(
+                                Button::new("connect-library")
+                                    .primary()
+                                    .label("Connect")
+                                    .disabled(connecting)
+                                    .on_click(move |_, _, cx| {
+                                        let _ =
+                                            submit.update(cx, |app, cx| app.connect_library(cx));
+                                    }),
+                            ),
                         )
-                    }).keywords(["listenbrainz", "last.fm", "scrobble", "navidrome"])),
+                        .when(connecting, |form| {
+                            form.child(connection_message(
+                                "sign-in-progress",
+                                "Connecting…".into(),
+                                false,
+                                cx,
+                            ))
+                        })
+                        .when_some(failure.clone(), |form, message| {
+                            form.child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .child(connection_message("sign-in-error", message, true, cx))
+                                    .child(
+                                        Button::new("retry-sign-in")
+                                            .small()
+                                            .label("Retry")
+                                            .on_click(move |_, _, cx| {
+                                                let _ = retry
+                                                    .update(cx, |app, cx| app.connect_library(cx));
+                                            }),
+                                    ),
+                            )
+                        })
+                })
+                .keywords(["connect", "sign in", "library"]),
             )
+    }
+
+    fn connection_summary(&self, account: &Account, app: WeakEntity<Self>) -> SettingGroup {
+        let status = self.library_connection.status(&self.connection);
+        let description = format!("{} · {}", account.username, account.url);
+        let pending = self.library_connection.check_pending();
+        let feedback = self
+            .library_connection
+            .check_feedback()
+            .map(|(text, error)| (text.to_owned(), error));
+        let editing = self.library_connection.editing;
+        SettingGroup::new()
+            .title("Connection")
+            .variant(gpui_kit::component::group_box::GroupBoxVariant::Outline)
+            .description(description)
+            .item(
+                SettingItem::render(move |_, _, cx| {
+                    let check = app.clone();
+                    let edit = app.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(connection_message(
+                            "connection-card-status",
+                            status.into(),
+                            false,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Button::new("check-saved-connection")
+                                        .label("Check connection")
+                                        .disabled(pending)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = check.update(cx, |app, cx| {
+                                                if let Some(id) =
+                                                    app.library_connection.begin_check()
+                                                {
+                                                    app.service
+                                                        .send(Command::TestSavedConnection(id));
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }),
+                                )
+                                .when(!editing, |actions| {
+                                    actions.child(
+                                        Button::new("change-library-login")
+                                            .label("Change server or login")
+                                            .on_click(move |_, _, cx| {
+                                                let _ = edit.update(cx, |app, cx| {
+                                                    app.library_connection.editing = true;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                }),
+                        )
+                        .when_some(feedback.clone(), |card, (message, error)| {
+                            card.child(connection_message(
+                                "saved-connection-result",
+                                message,
+                                error,
+                                cx,
+                            ))
+                        })
+                })
+                .keywords([
+                    "connection",
+                    "server",
+                    "account",
+                    "login",
+                    "navidrome",
+                ]),
+            )
+    }
+
+    pub(super) fn library_settings(&self, app: WeakEntity<Self>) -> SettingPage {
+        let page = SettingPage::new("Library")
+            .icon(Icon::new(Glyph::Library))
+            .resettable(false);
+        let Some(account) = &self.account else {
+            return page.group(self.connection_form(app));
+        };
+        let page = page.group(self.connection_summary(account, app.clone()));
+        let page = if self.library_connection.editing {
+            page.group(self.connection_form(app))
+        } else {
+            page
+        };
+        let server = account.url.clone();
+        page.group(
+            SettingGroup::new()
+                .title("Scrobbling")
+                .description("Sonora reports plays only to Navidrome. Link ListenBrainz or Last.fm in your server's personal settings to forward them. Artist information follows the server's metadata-agent order. Uncertain submissions are not resent, to avoid duplicates.")
+                .item(SettingItem::render(move |_, _, _| {
+                    Link::new("open-navidrome")
+                        .href(server.clone())
+                        .child("Open Navidrome")
+                }).keywords(["listenbrainz", "last.fm", "scrobble", "navidrome"])),
+        )
     }
 
     pub(super) fn download_settings(&self, app: WeakEntity<Self>) -> SettingPage {

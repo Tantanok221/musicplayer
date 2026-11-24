@@ -932,7 +932,7 @@ fn navidrome_queue_preserves_duplicate_occurrences_and_falls_back_without_extens
         });
         fixture.seed();
         let mut worker = fixture.start();
-        let Event::Connected(account, _) =
+        let Event::Connected(account, ..) =
             event(&worker, |event| matches!(event, Event::Connected(..)))
         else {
             unreachable!();
