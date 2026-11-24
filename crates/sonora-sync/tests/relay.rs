@@ -184,11 +184,13 @@ async fn relay_authenticates_and_isolates_accounts_then_relays_presence_state_an
         },
     )
     .await;
+    // A paused device that isn't active can't replace the active device's state.
     send(
         &mut b,
         ClientMessage::StateUpdate {
             state: PlaybackState {
                 seq: 10,
+                playing: false,
                 ..state.clone()
             },
         },

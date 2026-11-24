@@ -18,7 +18,6 @@ use url::Url;
 mod native;
 mod play_queue;
 pub use native::NativeError;
-pub use play_queue::RemotePlayQueue;
 
 pub(crate) fn validate_server_address(address: &str) -> Result<Url> {
     let url =

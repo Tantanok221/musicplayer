@@ -24,6 +24,8 @@ pub struct DeviceStatus {
     pub connected: bool,
     pub local_device_id: String,
     pub active_device_id: Option<String>,
+    /// The other device this one chose to show and control in Devices.
+    pub controlled: Option<String>,
     pub devices: Vec<Device>,
     pub playback: Option<PlaybackState>,
     pub track: Option<Arc<Track>>,
@@ -32,10 +34,34 @@ pub struct DeviceStatus {
 }
 
 impl DeviceStatus {
+    /// The device this one controls: another active device that was chosen in Devices.
     pub fn remote_id(&self) -> Option<&str> {
+        self.other_active()
+            .filter(|id| self.controlled.as_deref() == Some(*id))
+    }
+
+    /// Another device that is playing, whether or not this one controls it.
+    pub fn other_active(&self) -> Option<&str> {
         self.active_device_id
             .as_deref()
             .filter(|id| self.connected && *id != self.local_device_id)
+    }
+
+    /// Stop controlling a device that left, or when another device took over.
+    /// A reconnect keeps the choice; `devices_changed` marks a live device-list update.
+    pub(crate) fn settle_control(&mut self, was_remote: bool, devices_changed: bool) {
+        let Some(controlled) = self.controlled.as_deref() else {
+            return;
+        };
+        let gone = devices_changed && !self.devices.iter().any(|device| device.id == controlled);
+        let replaced = self
+            .other_active()
+            .is_some_and(|active| active != controlled);
+        // This device took over playback while it was showing another device's.
+        let local = was_remote && self.active_device_id.as_deref() == Some(&self.local_device_id);
+        if gone || replaced || local {
+            self.controlled = None;
+        }
     }
 
     pub fn track_id(&self) -> Option<&str> {
@@ -180,6 +206,7 @@ mod tests {
             connected: true,
             local_device_id: "local".into(),
             active_device_id: Some("remote".into()),
+            controlled: Some("remote".into()),
             playback: Some(PlaybackState {
                 queue: vec!["a".into(), "b".into()],
                 index: Some(1),
@@ -203,6 +230,60 @@ mod tests {
         status.active_device_id = Some("remote".into());
         status.connected = false;
         assert!(status.queue_snapshot().is_none());
+    }
+
+    #[test]
+    fn another_device_is_controlled_only_once_chosen() {
+        let device = |id: &str| Device {
+            id: id.into(),
+            name: id.into(),
+            os: "linux".into(),
+            online: true,
+            last_seen: 1,
+        };
+        let mut status = DeviceStatus {
+            connected: true,
+            local_device_id: "local".into(),
+            active_device_id: Some("linux".into()),
+            devices: vec![device("local"), device("linux"), device("laptop")],
+            ..Default::default()
+        };
+        assert_eq!(status.other_active(), Some("linux"));
+        assert_eq!(
+            status.remote_id(),
+            None,
+            "playing elsewhere is not followed"
+        );
+
+        status.controlled = Some("linux".into());
+        assert_eq!(status.remote_id(), Some("linux"));
+
+        // Another device starting playback ends control instead of following it.
+        status.active_device_id = Some("laptop".into());
+        status.settle_control(true, false);
+        assert_eq!(status.controlled, None);
+        assert_eq!(status.remote_id(), None);
+
+        // Choosing a device before its transfer lands keeps the choice.
+        status.active_device_id = Some("local".into());
+        status.controlled = Some("linux".into());
+        status.settle_control(false, false);
+        assert_eq!(status.controlled.as_deref(), Some("linux"));
+        // Playing here while showing another device's playback ends control.
+        status.settle_control(true, false);
+        assert_eq!(status.controlled, None);
+
+        // A device that leaves is no longer controlled.
+        status.controlled = Some("linux".into());
+        status.devices.retain(|device| device.id != "linux");
+        status.settle_control(false, false);
+        assert_eq!(
+            status.controlled.as_deref(),
+            Some("linux"),
+            "a reconnect that hasn't listed the device yet keeps the choice"
+        );
+        status.settle_control(false, true);
+        assert_eq!(status.controlled, None);
     }
 
     #[test]

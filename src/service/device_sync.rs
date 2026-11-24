@@ -264,6 +264,11 @@ impl DeviceSync {
             return Ok(());
         }
         let was_remote = self.status.remote_id().is_some();
+        let was_other = self.status.other_active().is_some();
+        let devices_changed = matches!(
+            event,
+            RelayEvent::Incoming(ServerMessage::DevicesChanged { .. })
+        );
         match event {
             RelayEvent::Online {
                 welcome:
@@ -367,6 +372,8 @@ impl DeviceSync {
                     }
                 }
                 if !ok {
+                    // Playback stayed here, so stop showing the device it was sent to.
+                    self.status.controlled = None;
                     events.send(Event::Error(
                         error.unwrap_or_else(|| "Playback transfer failed".into()),
                     ))?;
@@ -379,9 +386,27 @@ impl DeviceSync {
             }
             _ => return Ok(()),
         }
-        if !was_remote && self.status.remote_id().is_some() && self.playback.borrow().playing {
+        self.status.settle_control(was_remote, devices_changed);
+        // Another device started playing: only one device plays at a time.
+        if !was_other && self.status.other_active().is_some() && self.playback.borrow().playing {
             player.send(PlayerCommand::Pause);
         }
+        self.refresh(catalog, events)
+    }
+
+    /// Choose another device to show and control, or `None` for this device.
+    pub fn control(
+        &mut self,
+        device: Option<String>,
+        catalog: &Catalog,
+        events: &Sender<Event>,
+    ) -> Result<()> {
+        self.status.controlled = device.filter(|id| *id != self.status.local_device_id);
+        self.status.settle_control(false, false);
+        self.refresh(catalog, events)
+    }
+
+    fn refresh(&mut self, catalog: &Catalog, events: &Sender<Event>) -> Result<()> {
         self.status.track = self
             .status
             .track_id()
@@ -485,11 +510,16 @@ impl DeviceSync {
         }
     }
 
-    pub fn transfer_to(&self, target_device_id: String, start_playing: bool) -> bool {
-        self.outbound(ClientMessage::Transfer {
-            target_device_id,
+    pub fn transfer_to(&mut self, target_device_id: String, start_playing: bool) -> bool {
+        let sent = self.outbound(ClientMessage::Transfer {
+            target_device_id: target_device_id.clone(),
             start_playing,
-        })
+        });
+        if sent {
+            // Keep showing the playback after it moves, like choosing that device.
+            self.status.controlled = Some(target_device_id);
+        }
+        sent
     }
 
     pub fn preparing_transfer(&self) -> bool {
@@ -498,14 +528,6 @@ impl DeviceSync {
 
     pub fn can_save_queue(&self) -> bool {
         !self.preparing_transfer() && self.status.remote_id().is_none()
-    }
-
-    pub fn can_offer_queue_resume(&self) -> bool {
-        self.can_save_queue()
-            && self
-                .configuration
-                .as_ref()
-                .is_none_or(|(_, relay, _, _)| relay.is_empty())
     }
 
     fn prepare_transfer(

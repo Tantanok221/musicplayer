@@ -1,4 +1,4 @@
-use super::fixture::{Fixture, Library, Request, WAIT, event};
+use super::fixture::{Fixture, Library, Request, WAIT, event, synced};
 use axum::{
     Router,
     extract::{WebSocketUpgrade, ws::Message},
@@ -244,7 +244,7 @@ async fn reconnect_publishes_above_the_last_sequence_even_after_relay_rollback()
     let (account, _) = worker.wait_ready(WAIT).unwrap();
     event(
         &worker,
-        |event| matches!(event, Event::DeviceSync(status) if status.remote_id() == Some("speaker")),
+        |event| matches!(event, Event::DeviceSync(status) if status.other_active() == Some("speaker")),
     );
     disconnect.send(()).unwrap();
     event(
@@ -387,7 +387,7 @@ async fn shared_settings_rebase(acknowledged: bool) {
 }
 
 #[test]
-fn navidrome_queue_preserves_duplicate_occurrences_and_falls_back_without_extension() {
+fn navidrome_queue_is_saved_but_never_offered_for_resume() {
     for indexed in [true, false] {
         let fixture = Fixture::new(Library {
             indexed_play_queue: indexed.then(|| {
@@ -408,32 +408,22 @@ fn navidrome_queue_preserves_duplicate_occurrences_and_falls_back_without_extens
         else {
             unreachable!();
         };
-        if indexed {
-            fixture.wait_request(&Request::new("getPlayQueueByIndex.view", &[]));
-            assert!(matches!(
-                event(&worker, |event| matches!(event, Event::ResumeQueue(Some(_)))),
-                Event::ResumeQueue(Some(device)) if device == "Kitchen"
-            ));
-            worker.service().send(Command::ResumeServerQueue);
-            let deadline = std::time::Instant::now() + WAIT;
-            loop {
-                if let PlayerCommand::Restore(tracks, 1, 1.5, None) =
-                    worker.player_commands().recv_deadline(deadline).unwrap()
-                {
-                    assert!(
-                        tracks
-                            .iter()
-                            .map(|track| track.id.as_str())
-                            .eq(["other-song", "song"])
-                    );
-                    break;
-                }
-            }
-            assert!(matches!(
-                worker.player_commands().recv_deadline(deadline).unwrap(),
-                PlayerCommand::Play
-            ));
-        }
+        // Another device's saved queue is never offered or restored on connect.
+        synced(&worker);
+        assert!(
+            !fixture
+                .requests()
+                .iter()
+                .any(|request| request.endpoint.starts_with("getPlayQueue")),
+            "the saved server queue is not fetched"
+        );
+        assert!(
+            worker
+                .player_commands()
+                .try_iter()
+                .all(|command| !matches!(command, PlayerCommand::Restore(..))),
+            "the local queue is untouched"
+        );
         worker.service().send(Command::Persist(
             account.namespace(),
             SavedQueue {
@@ -587,8 +577,12 @@ async fn configured_worker_uses_saved_login_and_bridges_relay_controls() {
     assert!(
         matches!(event(&worker, |event| matches!(event, Event::DeviceSync(status) if status.connected)),
         Event::DeviceSync(status) if status.active_device_id.as_deref() == Some("speaker")
+            && status.remote_id().is_none()
             && status.playback.as_ref().is_some_and(|state| state.seq == 8))
     );
+    worker
+        .service()
+        .send(Command::ControlDevice(Some("speaker".into())));
     worker
         .service()
         .send(Command::RemotePlayback(PlaybackCommand::Next));
@@ -874,11 +868,12 @@ async fn lan_controller_sees_and_controls_the_playing_device() {
         status.active_device_id.as_deref() == Some(MAC)
     });
 
-    // The Linux PC opens later and sees the Mac's session.
+    // The Linux PC opens later and sees the Mac playing, but keeps its own
+    // player until someone chooses the Mac in Devices.
     let mut linux = fixture.start_on(linux_paths);
     linux.wait_ready(WAIT).unwrap();
     device_sync(&linux, |status| {
-        status.remote_id() == Some(MAC)
+        status.active_device_id.as_deref() == Some(MAC)
             && status
                 .playback
                 .as_ref()
@@ -888,6 +883,20 @@ async fn lan_controller_sees_and_controls_the_playing_device() {
                 .iter()
                 .any(|device| device.id == MAC && device.online)
     });
+    linux.service().send(Command::Enqueue(
+        vec!["song".into()],
+        sonora::playback::Placement::Next,
+    ));
+    player_command(&linux, |command| {
+        matches!(
+            command,
+            PlayerCommand::Insert(_, sonora::playback::Placement::Next)
+        )
+    });
+    linux
+        .service()
+        .send(Command::ControlDevice(Some(MAC.into())));
+    device_sync(&linux, |status| status.remote_id() == Some(MAC));
 
     // Transport controls and picking a song both run on the Mac.
     linux
@@ -957,7 +966,9 @@ async fn lan_transfer_moves_playback_and_keeps_the_source_on_failure() {
         status.devices.iter().any(|device| device.id == LINUX)
     });
     mac.publish_playback(playing(&fixture, &["song"]));
-    device_sync(&linux, |status| status.remote_id() == Some(MAC));
+    device_sync(&linux, |status| {
+        status.other_active() == Some(MAC) && status.remote_id().is_none()
+    });
 
     let prepare = |saved: Vec<&str>| {
         let reply = loop {
@@ -1092,8 +1103,13 @@ async fn lan_nodes_keep_one_link_and_drop_untrusted_or_revoked_devices() {
     })
     .await
     .expect("the controller sees the playing device's state");
-    // A controller cannot publish over the active device.
-    controller.send(ClientMessage::StateUpdate { state: state(2) });
+    // A paused device cannot publish over the active device.
+    controller.send(ClientMessage::StateUpdate {
+        state: PlaybackState {
+            playing: false,
+            ..state(2)
+        },
+    });
     // Both devices dial each other; a duplicate link must not replace the kept one.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     assert_eq!(a.linked(), ["b"]);
@@ -1103,7 +1119,7 @@ async fn lan_nodes_keep_one_link_and_drop_untrusted_or_revoked_devices() {
     {
         assert!(
             !matches!(&message, ServerMessage::State { from_device_id, .. } if from_device_id == "b"),
-            "a controller's playback never replaces the active device's"
+            "a paused device's playback never replaces the active device's"
         );
         assert!(
             !matches!(&message, ServerMessage::DevicesChanged { devices } if devices.len() != 2),
@@ -1326,6 +1342,10 @@ async fn worker_falls_back_to_lan_and_returns_to_relay() {
         settings: serde_json::json!({"dark": true}),
         base_version: 0,
     });
+    device_sync(&worker, |status| status.other_active() == Some(speaker));
+    worker
+        .service()
+        .send(Command::ControlDevice(Some(speaker.into())));
     device_sync(&worker, |status| status.remote_id() == Some(speaker));
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while node.linked() != [MAC] {
@@ -1381,5 +1401,59 @@ async fn worker_falls_back_to_lan_and_returns_to_relay() {
     }
     worker.shutdown(WAIT).unwrap();
     task.abort();
+    fixture.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_playing_locally_takes_over_without_other_devices_following() {
+    let fixture = Fixture::new(Library {
+        device_playlists: Some(vec![]),
+        ..Default::default()
+    });
+    let mut paths = sign_in_devices(&fixture, &[MAC, LINUX]).into_iter();
+    let (mac_paths, linux_paths) = (paths.next().unwrap(), paths.next().unwrap());
+    let mut mac = fixture.start_on(mac_paths);
+    mac.wait_ready(WAIT).unwrap();
+    device_sync(&mac, |status| status.connected);
+    mac.publish_playback(playing(&fixture, &["song"]));
+    device_sync(&mac, |status| {
+        status.active_device_id.as_deref() == Some(MAC)
+    });
+    let mut linux = fixture.start_on(linux_paths);
+    linux.wait_ready(WAIT).unwrap();
+    device_sync(&linux, |status| {
+        status.active_device_id.as_deref() == Some(MAC) && status.remote_id().is_none()
+    });
+
+    // Playing on the Linux PC makes it the active device and pauses the Mac,
+    // and the Mac keeps showing its own player.
+    linux.publish_playback(playing(&fixture, &["other-song"]));
+    player_command(&mac, |command| matches!(command, PlayerCommand::Pause));
+    device_sync(&mac, |status| {
+        status.active_device_id.as_deref() == Some(LINUX)
+            && status.remote_id().is_none()
+            && status
+                .playback
+                .as_ref()
+                .is_some_and(|state| state.queue == ["other-song"])
+    });
+    device_sync(&linux, |status| {
+        status.active_device_id.as_deref() == Some(LINUX)
+    });
+
+    // Choosing the Linux PC on the Mac controls it; choosing this device again stops.
+    mac.service()
+        .send(Command::ControlDevice(Some(LINUX.into())));
+    device_sync(&mac, |status| status.remote_id() == Some(LINUX));
+    mac.service()
+        .send(Command::RemotePlayback(PlaybackCommand::Pause));
+    player_command(&linux, |command| matches!(command, PlayerCommand::Pause));
+    mac.service().send(Command::ControlDevice(None));
+    device_sync(&mac, |status| {
+        status.remote_id().is_none() && status.active_device_id.as_deref() == Some(LINUX)
+    });
+
+    mac.shutdown(WAIT).unwrap();
+    linux.shutdown(WAIT).unwrap();
     fixture.finish();
 }

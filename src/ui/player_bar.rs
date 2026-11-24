@@ -291,9 +291,6 @@ impl MusicApp {
                     .items_center()
                     .flex_shrink_0()
                     .gap(px(if compact { 4. } else { 10. }))
-                    .when_some(self.resume_queue.as_deref(), |row, from| {
-                        row.child(self.resume_queue_button(from))
-                    })
                     .when(
                         self.device_status.enabled || self.device_status.connected,
                         |row| row.child(self.devices_button()),

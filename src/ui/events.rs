@@ -21,7 +21,6 @@ impl MusicApp {
                     self.artist_request += 1;
                     self.artist_name = None;
                     self.artist_albums = None;
-                    self.resume_queue = None;
                     self.lan_status = Default::default();
                 }
                 let show_settings = self.settings || account.is_none();
@@ -347,11 +346,6 @@ impl MusicApp {
                     self.volume
                         .update(cx, |slider, cx| slider.set_value(volume, window, cx));
                 }
-            }
-            Event::ResumeQueue(label) => {
-                self.resume_queue = label;
-                self.notify_part(Part::Player, cx);
-                return;
             }
             Event::SharedPreferences(shared) => self.apply_shared_preferences(&shared, window, cx),
             Event::LanStatus(status) => {

@@ -420,9 +420,10 @@ impl Mesh {
         let before = self.active().map(str::to_owned);
         let mut effects = Vec::new();
         match before.as_deref() {
-            Some(active) if active != self.own.id => return effects,
-            Some(_) => {}
-            None => effects.extend(self.take_claim()),
+            // Playing here while another device is active takes over from it.
+            Some(active) if active != self.own.id && !state.playing => return effects,
+            Some(active) if active == self.own.id => {}
+            _ => effects.extend(self.take_claim()),
         }
         self.states.insert(self.own.id.clone(), state.clone());
         effects.push(Effect::Broadcast(PeerMessage::State { state }));
@@ -658,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn a_controller_cannot_publish_over_the_active_device() {
+    fn only_starting_playback_takes_over_from_the_active_device() {
         let mut mac = Mesh::new(device("mac"));
         let mut linux = Mesh::new(device("linux"));
         mac.session_message(
@@ -666,12 +667,34 @@ mod tests {
             Instant::now(),
         );
         link(&mut mac, &mut linux);
+        let paused = PlaybackState {
+            playing: false,
+            ..state(2)
+        };
+        let effects =
+            linux.session_message(ClientMessage::StateUpdate { state: paused }, Instant::now());
+        assert!(
+            effects.is_empty(),
+            "paused playback elsewhere doesn't take over"
+        );
+        assert_eq!(linux.active(), Some("mac"));
+
         let effects = linux.session_message(
-            ClientMessage::StateUpdate { state: state(2) },
+            ClientMessage::StateUpdate { state: state(3) },
             Instant::now(),
         );
-        assert!(effects.is_empty(), "only the active device publishes");
-        assert_eq!(linux.active(), Some("mac"));
+        let (mac_session, _) = deliver(
+            &mut mac,
+            &mut linux,
+            &mut vec![("linux".to_owned(), effects)],
+        );
+        assert_eq!(linux.active(), Some("linux"));
+        assert_eq!(
+            mac.active(),
+            Some("linux"),
+            "the last device to play is active"
+        );
+        assert_eq!(active_change(&mac_session), Some(Some("linux")));
     }
 
     #[test]

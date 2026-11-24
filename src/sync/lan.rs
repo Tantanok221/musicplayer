@@ -44,6 +44,8 @@ use tokio_tungstenite::{
 const TIMEOUT: Duration = Duration::from_secs(7);
 const DIAL_TIMEOUT: Duration = Duration::from_millis(1500);
 const REDIAL: Duration = Duration::from_secs(3);
+/// How long a replaced duplicate link keeps reading messages already sent on it.
+const REPLACED_GRACE: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 const SERVICE_TYPE: &str = "_sonora._tcp.local.";
@@ -495,6 +497,20 @@ impl Network {
     }
 
     /// Runs one authenticated link until it closes, then forgets it.
+    /// Applies messages the peer already sent on a link this device is dropping.
+    async fn drain(&self, link: &mut Link, id: &str) -> Result<()> {
+        while let Ok(Ok(data)) = time::timeout(REPLACED_GRACE, link.recv()).await {
+            let message: PeerMessage = serde_json::from_slice(&data)?;
+            let effects = self
+                .mesh
+                .lock()
+                .map(|mut mesh| mesh.peer_message(id, message))
+                .unwrap_or_default();
+            self.apply(effects);
+        }
+        Ok(())
+    }
+
     async fn run_link(
         self: Arc<Self>,
         mut link: Link,
@@ -526,29 +542,37 @@ impl Network {
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let (out, mut outgoing) = mpsc::channel(256);
         let (close, mut closed) = watch::channel(false);
-        {
+        let duplicate = {
             let mut links = self
                 .links
                 .lock()
                 .map_err(|_| anyhow::anyhow!("LAN sync unavailable"))?;
             // Both devices may dial at once; both keep the link the lower ID dialed.
             let preferred = std::cmp::min(&self.own.id, &id).clone();
-            if let Some(existing) = links.get(&id) {
-                if existing.dialer == preferred || dialer != preferred {
-                    return Ok(());
+            match links.get(&id) {
+                Some(existing) if existing.dialer == preferred || dialer != preferred => true,
+                existing => {
+                    if let Some(existing) = existing {
+                        existing.close.send_replace(true);
+                    }
+                    links.insert(
+                        id.clone(),
+                        Slot {
+                            serial,
+                            dialer,
+                            address,
+                            out,
+                            close,
+                        },
+                    );
+                    false
                 }
-                existing.close.send_replace(true);
             }
-            links.insert(
-                id.clone(),
-                Slot {
-                    serial,
-                    dialer,
-                    address,
-                    out,
-                    close,
-                },
-            );
+        };
+        if duplicate {
+            // The peer may not have seen the kept link yet and is using this one.
+            self.drain(&mut link, &id).await?;
+            return Ok(());
         }
         let effects = self
             .mesh
@@ -565,7 +589,15 @@ impl Network {
             loop {
                 tokio::select! {
                     biased;
-                    () = async { let _ = closed.wait_for(|closed| *closed).await; } => return Ok(()),
+                    () = async { let _ = closed.wait_for(|closed| *closed).await; } => {
+                        // A newer link replaced this one. Deliver what is already in
+                        // flight both ways so nothing sent during the switch is lost.
+                        while let Ok(message) = outgoing.try_recv() {
+                            time::timeout(TIMEOUT, link.send(&serde_json::to_vec(&message)?)).await??;
+                        }
+                        self.drain(&mut link, &id).await?;
+                        return Ok(());
+                    }
                     changed = trust.changed() => {
                         if changed.is_err() || !self.has_key(&key) {
                             return Ok(());

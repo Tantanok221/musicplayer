@@ -135,7 +135,8 @@ impl AccountSession {
     }
 
     fn accepts_state(&self, id: &str, state: &PlaybackState) -> Result<bool, InvalidState> {
-        if self.active.as_deref().is_some_and(|active| active != id) {
+        // Another device's state is accepted only when it starts playing, which takes over.
+        if self.active.as_deref().is_some_and(|active| active != id) && !state.playing {
             return Ok(false);
         }
         if !state.valid() {
@@ -388,7 +389,7 @@ impl Hub {
                     state.captured_at_ms = wall_ms();
                     self.store.save_playback(user, &state)?;
                     account.state = Some(state.clone());
-                    if account.active.is_none() {
+                    if account.active.as_deref() != Some(id) {
                         account.active = Some(id.into());
                         account.broadcast(
                             "",
@@ -763,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn only_active_device_can_advance_sequence() {
+    fn only_the_active_device_or_one_starting_playback_advances_sequence() {
         let account = AccountSession {
             active: Some("a".into()),
             state: Some(PlaybackState {
@@ -780,6 +781,14 @@ mod tests {
         incoming.seq = 8;
         assert_eq!(account.accepts_state("b", &incoming), Ok(false));
         assert_eq!(account.accepts_state("a", &incoming), Ok(true));
+        incoming.playing = true;
+        assert_eq!(
+            account.accepts_state("b", &incoming),
+            Ok(true),
+            "starting playback on another device takes over"
+        );
+        incoming.seq = 7;
+        assert_eq!(account.accepts_state("b", &incoming), Ok(false));
     }
 
     #[test]

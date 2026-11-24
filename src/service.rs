@@ -176,10 +176,10 @@ pub enum Command {
     Player(PlayerCommand),
     RemotePlayback(sonora_sync_protocol::PlaybackCommand),
     TransferTo(String, bool),
+    /// Show and control another device's playback, or `None` for this device's.
+    ControlDevice(Option<String>),
     TransferPrepared(u64, String, bool),
     TransferExpired(u64, String),
-    RemoteQueueFound(String, i64, crate::server::RemotePlayQueue),
-    ResumeServerQueue,
     DeviceSync(u64, crate::sync::RelayEvent),
     LanRevoke(String),
     Persist(String, SavedQueue),
@@ -284,7 +284,6 @@ pub enum Event {
     Playback(PlaybackSnapshot),
     DeviceSync(crate::sync::DeviceStatus),
     LocalVolume(f32),
-    ResumeQueue(Option<String>),
     SharedPreferences(crate::sync::SharedPreferences),
     LanStatus(crate::sync::lan::LanStatus),
     Status(String),
@@ -1527,13 +1526,7 @@ fn run(
                     let prefs: Preferences = catalog.state("preferences")?;
                     devices.configure(&paths, account.as_ref(), &prefs, &events);
                     checking = None;
-                    queue_sync.connected(
-                        &value,
-                        !prefs.sync_server_url.is_empty(),
-                        &catalog,
-                        &runtime,
-                        &tx,
-                    )?;
+                    queue_sync.connected(&value);
                     last_check = Instant::now();
                     set_connection(&mut connection, Connection::Online, &events);
                     player.send(PlayerCommand::Server(value.clone()));
@@ -2408,6 +2401,7 @@ fn run(
                         events.send(Event::Error("Local device sync is unavailable".into()))?;
                     }
                 }
+                Command::ControlDevice(device) => devices.control(device, &catalog, &events)?,
                 Command::TransferTo(id, start_playing) => {
                     if !devices.transfer_to(id, start_playing) {
                         events.send(Event::Error("Device is not available for transfer".into()))?;
@@ -2418,16 +2412,6 @@ fn run(
                 }
                 Command::TransferExpired(generation, id) => {
                     devices.transfer_expired(generation, &id, &catalog, &player)?;
-                }
-                Command::RemoteQueueFound(namespace, local, queue) => {
-                    if devices.can_offer_queue_resume() {
-                        queue_sync.offer(queue, &namespace, local, &catalog, &events)?;
-                    }
-                }
-                Command::ResumeServerQueue => {
-                    if devices.can_offer_queue_resume() {
-                        queue_sync.resume(&catalog, &player, &events)?;
-                    }
                 }
                 Command::WriteTags(edits) => {
                     let covers = crate::tags::wanted_covers(&edits);
@@ -2634,7 +2618,6 @@ fn run(
                             || previous.lan_port != prefs.lan_port
                         {
                             devices.rollback_transfer(&catalog, &player)?;
-                            queue_sync.dismiss(&events)?;
                         }
                         persist_preferences(&catalog, &player, prefs.clone())?;
                         devices.configure(&paths, account.as_ref(), &prefs, &events);
@@ -2667,7 +2650,6 @@ fn run(
                             queue,
                             server.as_ref().filter(|_| devices.can_save_queue()),
                             playing,
-                            &events,
                         )?;
                     }
                 }

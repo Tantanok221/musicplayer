@@ -3,14 +3,6 @@ use crate::sync::DeviceStatus;
 use sonora_sync_protocol::PlaybackCommand;
 
 impl MusicApp {
-    pub(super) fn resume_queue_button(&self, from: &str) -> Button {
-        let service = self.service.clone();
-        Button::new("resume-server-queue")
-            .small()
-            .label(format!("Resume from {from}"))
-            .on_click(move |_, _, _| service.send(Command::ResumeServerQueue))
-    }
-
     pub(super) fn devices_button(&self) -> impl IntoElement {
         let status = self.device_status.clone();
         let service = self.service.clone();
@@ -25,31 +17,17 @@ impl MusicApp {
                 if !status.connected {
                     return menu.item(PopupMenuItem::new("Sync server unavailable").disabled(true));
                 }
-                for device in &status.devices {
-                    let active = status.active_device_id.as_deref() == Some(&device.id);
-                    let mut label = device.name.clone();
-                    if active {
-                        label.push_str(" · Active");
-                    }
-                    if device.id == status.local_device_id {
-                        label.push_str(" · This device");
-                    }
-                    if !device.online {
-                        label.push_str(" · Offline");
-                    }
-                    let icon = match device.os.as_str() {
+                for choice in device_menu(&status, transferable, start_playing) {
+                    let icon = match choice.os.as_str() {
                         "macos" | "ios" => Glyph::Apple,
                         "linux" => Glyph::Terminal,
                         "android" => Glyph::Smartphone,
                         _ => Glyph::Monitor,
                     };
-                    let mut item = PopupMenuItem::new(label).icon(icon);
-                    if device.online && !active && transferable {
-                        let id = device.id.clone();
+                    let mut item = PopupMenuItem::new(choice.label).icon(icon);
+                    if let Some(command) = choice.command {
                         let service = service.clone();
-                        item = item.on_click(move |_, _, _| {
-                            service.send(Command::TransferTo(id.clone(), start_playing))
-                        });
+                        item = item.on_click(move |_, _, _| service.send(command.clone()));
                     } else {
                         item = item.disabled(true);
                     }
@@ -224,5 +202,155 @@ impl MusicApp {
         } else {
             position
         }
+    }
+}
+
+/// One device in the Devices menu, and what choosing it does.
+struct DeviceChoice {
+    label: String,
+    os: String,
+    command: Option<Command>,
+}
+
+/// Choosing the playing device shows and controls it, choosing this device goes
+/// back to its own player, and choosing any other device moves playback there.
+fn device_menu(
+    status: &DeviceStatus,
+    transferable: bool,
+    start_playing: bool,
+) -> Vec<DeviceChoice> {
+    let controlled = status.remote_id();
+    status
+        .devices
+        .iter()
+        .map(|device| {
+            let active = status.active_device_id.as_deref() == Some(&device.id);
+            let local = device.id == status.local_device_id;
+            let mut label = device.name.clone();
+            if active && !local {
+                let playing = status.playback.as_ref().is_some_and(|state| state.playing);
+                label.push_str(if playing { " · Playing" } else { " · Paused" });
+            } else if active {
+                label.push_str(" · Active");
+            }
+            if controlled == Some(device.id.as_str()) {
+                label.push_str(" · Controlling");
+            }
+            if local {
+                label.push_str(" · This device");
+            }
+            if !device.online {
+                label.push_str(" · Offline");
+            }
+            let command = if local {
+                controlled.map(|_| Command::ControlDevice(None))
+            } else if !device.online || controlled == Some(device.id.as_str()) {
+                None
+            } else if active {
+                Some(Command::ControlDevice(Some(device.id.clone())))
+            } else if transferable && status.other_active().is_none() {
+                Some(Command::TransferTo(device.id.clone(), start_playing))
+            } else {
+                None
+            };
+            DeviceChoice {
+                label,
+                os: device.os.clone(),
+                command,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceStatus, device_menu};
+    use crate::service::Command;
+    use sonora_sync_protocol::{Device, PlaybackState};
+
+    fn status(active: Option<&str>, controlled: Option<&str>) -> DeviceStatus {
+        let device = |id: &str, online| Device {
+            id: id.into(),
+            name: id.into(),
+            os: "linux".into(),
+            online,
+            last_seen: 1,
+        };
+        DeviceStatus {
+            connected: true,
+            local_device_id: "mac".into(),
+            active_device_id: active.map(str::to_owned),
+            controlled: controlled.map(str::to_owned),
+            devices: vec![
+                device("mac", true),
+                device("linux", true),
+                device("laptop", true),
+                device("old", false),
+            ],
+            playback: Some(PlaybackState {
+                playing: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn choices(status: &DeviceStatus) -> Vec<(String, &'static str)> {
+        device_menu(status, true, true)
+            .into_iter()
+            .map(|choice| (choice.label, action(choice.command)))
+            .collect()
+    }
+
+    fn action(command: Option<Command>) -> &'static str {
+        match command {
+            None => "none",
+            Some(Command::ControlDevice(None)) => "this device",
+            Some(Command::ControlDevice(Some(id))) if id == "linux" => "control linux",
+            Some(Command::TransferTo(id, true)) if id == "linux" => "transfer to linux",
+            Some(_) => "other",
+        }
+    }
+
+    fn pair(label: &str, action: &'static str) -> (String, &'static str) {
+        (label.into(), action)
+    }
+
+    #[test]
+    fn the_playing_device_is_offered_for_control() {
+        assert_eq!(
+            choices(&status(Some("linux"), None)),
+            [
+                pair("mac · This device", "none"),
+                pair("linux · Playing", "control linux"),
+                // Playback here can't be moved while another device plays.
+                pair("laptop", "none"),
+                pair("old · Offline", "none"),
+            ]
+        );
+    }
+
+    #[test]
+    fn this_device_ends_control() {
+        assert_eq!(
+            &choices(&status(Some("linux"), Some("linux")))[..2],
+            [
+                pair("mac · This device", "this device"),
+                pair("linux · Playing · Controlling", "none"),
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_devices_receive_this_devices_playback() {
+        assert_eq!(
+            &choices(&status(Some("mac"), None))[..2],
+            [
+                pair("mac · Active · This device", "none"),
+                pair("linux", "transfer to linux"),
+            ]
+        );
+        let nothing = device_menu(&status(None, None), false, true);
+        assert!(nothing[1].command.is_none(), "nothing to move");
     }
 }

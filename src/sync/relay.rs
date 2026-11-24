@@ -208,7 +208,10 @@ impl SyncTask {
         if let (Some(active), Some(state)) = (&active_device_id, &state) {
             publisher.remember(active, state);
         }
-        publisher.active = active_device_id;
+        publisher.set_active(
+            active_device_id,
+            stamp(&self.playback.borrow(), &self.namespace),
+        );
         publisher.latest_seq = publisher.latest_seq.max(state.map(|state| state.seq));
         publisher.remember_settings(&settings, settings_version);
         publisher.stamp = None;
@@ -230,7 +233,7 @@ impl SyncTask {
                                     publisher.remember(from_device_id, state);
                                 }
                                 ServerMessage::ActiveDeviceChanged { device_id } => {
-                                    publisher.active.clone_from(device_id);
+                                    publisher.set_active(device_id.clone(), stamp(&self.playback.borrow(), &self.namespace));
                                     publisher.last_sent = None;
                                 }
                                 ServerMessage::Settings { settings, version }
@@ -312,15 +315,35 @@ impl SyncLink for Socket {
     }
 }
 
+/// What identifies a change in local playback: queue revision, index, playing, buffering.
+type Stamp = (u64, Option<usize>, bool, bool);
+
+fn stamp(sample: &PlaybackSnapshot, namespace: &str) -> Option<Stamp> {
+    let observed = sample
+        .sync
+        .as_ref()
+        .filter(|observed| observed.namespace == namespace)?;
+    Some((
+        observed.revision,
+        sample.index,
+        sample.playing,
+        sample.buffering,
+    ))
+}
+
 #[derive(Default)]
 struct Publisher {
     active: Option<String>,
     latest_seq: Option<u64>,
     snapshot: Option<ReconciledPlayback>,
     settings: Option<VersionedSettings>,
-    stamp: Option<(u64, Option<usize>, bool, bool)>,
+    stamp: Option<Stamp>,
     changed: Option<Instant>,
     last_sent: Option<Instant>,
+    /// This device's playback when another device became active. Playing
+    /// something new here after that takes over; leftover playback does not.
+    yielded: Option<Stamp>,
+    taking_over: bool,
 }
 
 impl Publisher {
@@ -351,6 +374,14 @@ impl Publisher {
         }
     }
 
+    /// `current` is this device's playback at the moment, kept as the baseline
+    /// that must change before playing here takes over from another device.
+    fn set_active(&mut self, active: Option<String>, current: Option<Stamp>) {
+        self.active = active;
+        self.yielded = current;
+        self.taking_over = false;
+    }
+
     fn update(
         &mut self,
         device: &str,
@@ -362,16 +393,23 @@ impl Publisher {
             .sync
             .as_ref()
             .filter(|observed| observed.namespace == namespace)?;
+        let stamp = stamp(sample, namespace)?;
         let active = self.active.as_deref();
-        if active.is_some_and(|active| active != device) || (active.is_none() && !sample.playing) {
+        if active.is_some_and(|active| active != device) && !self.taking_over {
+            // Another device is playing. Starting playback here takes over;
+            // what was playing when it took over (and is being paused) does not.
+            if !sample.playing {
+                self.yielded = Some(stamp);
+                return None;
+            }
+            if self.yielded == Some(stamp) {
+                return None;
+            }
+            self.taking_over = true;
+        }
+        if active.is_none() && !sample.playing {
             return None;
         }
-        let stamp = (
-            observed.revision,
-            sample.index,
-            sample.playing,
-            sample.buffering,
-        );
         if self.stamp != Some(stamp) {
             self.stamp = Some(stamp);
             self.changed = Some(now);
